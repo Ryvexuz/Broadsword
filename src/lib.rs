@@ -10,7 +10,7 @@ use vec3::Vec3;
 pub const GRAVITY: f64 = 9.81;
 pub const NODE_MASS: f64 = 1.0;
 /// Beam stiffness (N/m). The highest cube mode is roughly sqrt(10 k / m), about
-/// 450 rad/s, so at the default 1 ms substep omega*dt is about 0.45, well under
+/// 400 rad/s, so at the default 1 ms substep omega*dt is about 0.40, well under
 /// the symplectic Euler stability limit of 2.
 pub const BEAM_STIFFNESS: f64 = 20_000.0;
 /// Axial damping (N*s/m). Damps impact ringing within the 5 s run;
@@ -32,7 +32,7 @@ pub const TILT_DEG: f64 = 5.0;
 ///
 /// Each node has 7 beams, so by Gershgorin the stiffness matrix has largest
 /// eigenvalue <= 2 * 7 * k / m, i.e. omega_max <= sqrt(14 k / m) (about 529 rad/s;
-/// the real cube mode is about 450). Symplectic Euler is stable for omega * h < 2.
+/// the real cube mode is exactly 400). Symplectic Euler is stable for omega * h < 2.
 /// This is a conservative bound, no extra margin needed.
 pub fn max_stable_step() -> f64 {
     2.0 / (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
