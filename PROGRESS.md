@@ -17,7 +17,7 @@ Stage 0 (Setup) has passed its done check but is not closed or tagged. One item 
 
 ## Unfinished
 
-- **"TokenWise kept, task-router removed"** (Stage 0, item 2). task-router is an account-level skill and still loads in every session. Nothing named TokenWise was found on this machine. Lazlo decides how to handle both.
+- **"TokenWise kept, task-router removed"** (Stage 0, item 2). Lazlo turned task-router off; its folder and its manifest entry were gone at 10:36. A headless session started from the running app still listed it, likely because it inherits the app's skill list from before the change. Confirm in a new session started from the app. Nothing named TokenWise was found on this machine.
 - **Stage 0 close-out.** Once the item above is settled: write three lessons at the top of `LAB_LOG.md`, adjust `AGENTS.md` if a rule got in the way, and tag `stage-0-done`.
 
 ## Failed
