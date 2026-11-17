@@ -26,10 +26,11 @@ Stage 0 is still untagged; see Unfinished.
 ## Unfinished
 
 - **Stage 0 close-out.** Confirm in a new session started from the app that task-router no longer loads, then tag `stage-0-done`.
-- **Proposed `AGENTS.md` changes** from the Stage 1 checkpoint. They are not applied yet, because `AGENTS.md` is a copy of Lazlo's Development Instructions doc and the two should stay in step. They need Lazlo's OK:
-  1. Build and test only through `broadsword build|test|check`, never plain `cargo`, so worktrees use the shared build folder.
-  2. Every milestone gets at least two review passes. When a finding is about an invariant, the fix enforces it in one place.
-  3. Tool descriptions are part of the done check: an AI reading only the description must get the behaviour right.
+- **`AGENTS.md` changes from the Stage 1 checkpoint.**
+  - **Applied 2026-11-17 with Lazlo's OK,** in both `AGENTS.md` and the Development Instructions doc, under Standing rules:
+    - "Build through Broadsword";
+    - "Review" (at least two passes; fix an invariant in one place).
+  - **Still only proposed:** tool descriptions are part of the done check, meaning an AI reading only the description must get the behaviour right.
 - **Agent cap and roles:** keep `max_agents = 2`. Stage 1 never ran two coders at once, so there is no evidence yet for raising it; that is Stage 3's job. Keep the reviewer on Opus. The test writer added little once the coder wrote real tests, so consider making it optional in the role list.
 - **Not running yet:** nothing starts `broadsword watch` automatically. That needs Lazlo's OK.
 - **Waiting on the network:** phone alerts and `cargo-sweep`. Both need network access and Lazlo's OK.

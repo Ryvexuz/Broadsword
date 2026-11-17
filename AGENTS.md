@@ -17,6 +17,8 @@ Every area is in scope (rendering, 3D creation, physics, games, CAD, media), as 
 - **Scope:** work only on the current stage. Ideas for later go in `IDEAS.md`, not into code.
 - **Done means verified:** a stage is finished only when its done check passes and the evidence (commands and output) is saved. Passing tests is not the same as delivering the capability.
 - **Testing:** run targeted tests while working and the full suite before merging. Fix causes, not symptoms. Never stub or fake anything to make a test pass.
+- **Build through Broadsword:** build and test only with `broadsword build|test|check <project>`, never plain `cargo`. Other cargo commands, such as clippy, run as `broadsword run <project> -- cargo ...`. This gives every build the disk guard, the shared build folder, a Git checkpoint and a job log.
+- **Review:** plan for at least two review passes per milestone; a first-pass FAIL is normal. When a finding breaks a rule that must always hold, the fix enforces that rule in one place, not only for the reported case.
 - **Resources:** follow the Disk rules below. Never delete work, history or failure evidence.
 - **Ask first:** before spending money, using credentials or network services, publishing, or deleting anything outside the scratch area.
 - **Continuity:** commit often. End every session by updating `PROGRESS.md` and adding a `LAB_LOG.md` entry.
