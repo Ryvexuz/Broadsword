@@ -7,6 +7,9 @@
 /shared/*
 !/shared/.gitkeep
 
+# Workload projects, each its own Git repo
+/projects/
+
 # Pause flag written by the resource monitor
 /broadsword.paused
 
