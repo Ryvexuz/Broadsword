@@ -20,9 +20,20 @@ pub const SUPPORTED_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-1
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "Broadsword is a local development ecosystem: it builds, tests and checks projects as tracked jobs, \
-guards disk space, takes Git checkpoints and recovers interrupted work. Call the `tools` tool first to see everything it offers, and \
-`status` to see disk, memory and whether Broadsword is paused. Run builds, tests and checks through Broadsword's tools rather than \
-raw cargo commands.";
+guards disk space, takes Git checkpoints and recovers interrupted work. The tools/list result already carries every tool's full \
+description, inputs, exit codes and flags. In this version tools can be listed but not yet called: tools/call returns an error \
+until a later milestone.";
+
+/// Longest numeric id echoed: a finite integer of at most this many digits (no fraction, no exponent).
+const MAX_ID_DIGITS: usize = 15;
+
+fn id_ok(id: &J) -> bool {
+    match id {
+        J::Str(_) => true,
+        J::Num(n) => !n.contains(['.', 'e', 'E']) && n.trim_start_matches('-').len() <= MAX_ID_DIGITS,
+        _ => false,
+    }
+}
 
 // JSON-RPC 2.0 error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -105,20 +116,30 @@ pub fn handle(line: &str, what: &mut String) -> Option<String> {
     let id = msg.get("id");
     // An id must be a string or a number; anything else cannot be echoed meaningfully.
     let reply_id = match id {
-        Some(i @ (J::Str(_) | J::Num(_))) => i.clone(),
+        Some(i) if id_ok(i) => i.clone(),
         _ => J::Null,
     };
     let method = msg.get("method").and_then(J::str);
     let versioned = msg.get("jsonrpc").and_then(J::str) == Some("2.0");
-    let (true, Some(method), true) = (versioned, method, id.is_none() || matches!(id, Some(J::Str(_) | J::Num(_)))) else {
+    // A message with an id, a result or error and no method is a JSON-RPC response (to a request we never send): ignore it.
+    if versioned && method.is_none() && id.is_some_and(id_ok) && (msg.get("result").is_some() || msg.get("error").is_some()) {
+        *what = "response from client ignored".into();
+        return None;
+    }
+    let (true, Some(method), true) = (versioned, method, id.is_none_or(id_ok)) else {
         *what = "invalid request".into();
-        return Some(error(&reply_id, INVALID_REQUEST, "Invalid Request: need an object with jsonrpc \"2.0\", a string method, and a string or number id (or no id for a notification)"));
+        return Some(error(&reply_id, INVALID_REQUEST, "Invalid Request: need an object with jsonrpc \"2.0\", a string method, and a string id or an integer id of at most 15 digits (or no id for a notification)"));
     };
     *what = format!("{method}{}", if id.is_none() { " (notification)" } else { "" });
     id?; // a notification (no id) never gets a response, known method or not
     Some(match method {
         "initialize" => match initialize(msg.get("params")) {
-            Ok(r) => result(&reply_id, r),
+            Ok(r) => {
+                let asked = msg.get("params").and_then(|p| p.get("protocolVersion")).and_then(J::str).unwrap_or("");
+                let chose = r.get("protocolVersion").and_then(J::str).unwrap_or("");
+                *what = format!("initialize: client asked {asked:?}, negotiated {chose}");
+                result(&reply_id, r)
+            }
             Err(e) => error(&reply_id, INVALID_PARAMS, &e),
         },
         "ping" => result(&reply_id, obj(vec![])),
@@ -132,16 +153,22 @@ pub fn handle(line: &str, what: &mut String) -> Option<String> {
 /// long; the rest of it has been skipped. `Ok(None)` is end of input.
 fn read_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> io::Result<Result<Option<()>, ()>> {
     buf.clear();
-    let n = r.by_ref().take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', buf)?;
+    // Room for the limit plus a `\r\n`, which do not count toward it.
+    let cap = MAX_LINE_BYTES as u64 + 2;
+    let n = r.by_ref().take(cap).read_until(b'\n', buf)?;
     if n == 0 {
         return Ok(Ok(None));
     }
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-        return Ok(Ok(Some(())));
-    }
-    if buf.len() <= MAX_LINE_BYTES {
-        return Ok(Ok(Some(()))); // final line without a newline
+    let complete = buf.last() == Some(&b'\n');
+    if complete || (n as u64) < cap {
+        // a whole line (or the final line without a newline)
+        if complete {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        return Ok(if buf.len() <= MAX_LINE_BYTES { Ok(Some(())) } else { Err(()) });
     }
     // Too long: discard through the next newline (or EOF) in bounded chunks.
     buf.clear();
@@ -244,7 +271,7 @@ mod tests {
         assert_eq!(res.get("protocolVersion").and_then(J::str), SUPPORTED_VERSIONS.last().copied());
         assert_eq!(res.get("capabilities").unwrap().to_json(), r#"{"tools":{"listChanged":false}}"#);
         assert_eq!(res.get("serverInfo").and_then(|s| s.get("name")).and_then(J::str), Some("broadsword"));
-        assert!(res.get("instructions").and_then(J::str).unwrap().contains("`tools`"));
+        assert!(res.get("instructions").and_then(J::str).unwrap().contains("not yet called"));
         assert_eq!(err_code(&call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap()), "-32602");
         assert_eq!(err_code(&call(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":5}}"#).unwrap()), "-32602");
     }
@@ -265,7 +292,7 @@ mod tests {
 
     #[test]
     fn ping_and_ids_are_echoed_exactly() {
-        for id in ["1", "0", "-7", "1.50", "1e3", "12345678901234567890", r#""abc""#, r#""""#, r#""a\"bé😀""#] {
+        for id in ["1", "0", "-7", "123456789012345", r#""abc""#, r#""""#, r#""a\"bé😀""#] {
             let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
             let r = call(&line).unwrap();
             assert_eq!(r.get("id"), json::parse(id).ok().as_ref(), "id {id}");
@@ -294,6 +321,42 @@ mod tests {
     fn unknown_method() {
         let r = call(r#"{"jsonrpc":"2.0","id":"x","method":"resources/list"}"#).unwrap();
         assert_eq!((err_code(&r).as_str(), r.get("id")), ("-32601", Some(&J::Str("x".into()))));
+    }
+
+    #[test]
+    fn client_responses_are_ignored() {
+        for m in [r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, r#"{"jsonrpc":"2.0","id":"a","error":{"code":-1,"message":"x"}}"#] {
+            let mut what = String::new();
+            assert!(handle(m, &mut what).is_none(), "{m}");
+            assert!(what.contains("ignored"));
+        }
+    }
+
+    #[test]
+    fn ids_must_be_strings_or_small_integers() {
+        for id in ["1.5", "1e3", "1E3", "1234567890123456", "-1234567890123456", "1.0", "true", "[]"] {
+            let r = call(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#)).unwrap();
+            assert_eq!((err_code(&r).as_str(), r.get("id")), ("-32600", Some(&J::Null)), "id {id}");
+        }
+    }
+
+    #[test]
+    fn trailing_cr_does_not_count_toward_the_limit() {
+        let mut line = vec![b' '; MAX_LINE_BYTES - 2];
+        line.extend_from_slice(b"{}\r\n");
+        let out = run_lines(&line);
+        assert_eq!(err_code(&out[0]), "-32600", "an exactly-at-limit line with CRLF is read, not refused as too long");
+        let mut over = vec![b' '; MAX_LINE_BYTES - 1];
+        over.extend_from_slice(b"{}\r\n");
+        let out = run_lines(&over);
+        assert!(out[0].get("error").unwrap().get("message").and_then(J::str).unwrap().contains("longer"));
+    }
+
+    #[test]
+    fn initialize_logs_the_negotiated_version() {
+        let mut what = String::new();
+        handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#, &mut what);
+        assert!(what.contains("2099-01-01") && what.contains("negotiated 2025-11-25"), "{what}");
     }
 
     #[test]

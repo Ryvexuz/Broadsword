@@ -133,12 +133,12 @@ fn string_and_number_ids_are_echoed_exactly() {
     let (out, _) = session(&[
         r#"{"jsonrpc":"2.0","id":"abc-1","method":"ping"}"#,
         r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#,
-        r#"{"jsonrpc":"2.0","id":1.50,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":-7,"method":"ping"}"#,
         r#"{"jsonrpc":"2.0","id":"\u00e9\ud83d\ude00","method":"ping"}"#,
     ]);
     assert_eq!(out[0], r#"{"jsonrpc":"2.0","id":"abc-1","result":{}}"#);
     assert_eq!(out[1], r#"{"jsonrpc":"2.0","id":42,"result":{}}"#);
-    assert_eq!(out[2], r#"{"jsonrpc":"2.0","id":1.50,"result":{}}"#);
+    assert_eq!(out[2], r#"{"jsonrpc":"2.0","id":-7,"result":{}}"#);
     assert_eq!(parse(&out[3]).unwrap().get("id").and_then(J::str), Some("\u{e9}\u{1F600}"));
 }
 

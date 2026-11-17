@@ -406,7 +406,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "tools",
         summary: "List these tools, or describe one in full.",
-        description: "Prints this registry: every tool Broadsword offers, with its inputs and flags. Give a tool name to see that tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get the registry as JSON: a bare array of tool objects in the shape of the entries of MCP's tools/list (an MCP server wraps it as {\"tools\": [...]}). Use it to discover what Broadsword can do. It only reads and returns immediately.",
+        description: "Returns this registry: every tool Broadsword offers, with its inputs, outputs, exit codes and flags. Give a tool name to get that one tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get JSON instead of text: the same tool objects an MCP client already sees in tools/list. Use it to re-check what Broadsword can do. It only reads and returns immediately.",
         params: &[
             Param { name: "name", ty: Ty::String, required: false, description: "Show only this tool, in full. Omit to list all tools. An unknown name fails with exit code 2." },
             Param { name: "json", ty: Ty::Boolean, required: false, description: "Print JSON instead of text: an array of {name, description, inputSchema, annotations, _meta}, or one such object when name is given. The array is what an MCP server puts under the `tools` key of its tools/list result. Default false." },
