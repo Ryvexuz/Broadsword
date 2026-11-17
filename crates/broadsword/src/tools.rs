@@ -11,7 +11,7 @@
 //! should choose to call, so it lives in `main.rs` as a CLI command outside this table.
 
 use crate::config::Config;
-use crate::{cleanup, install, job, json, pause, recover, sys, task};
+use crate::{cleanup, install, job, json, pause, recover, sys, task, worktree};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -533,12 +533,12 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "task_start",
         summary: "Start an open task, taking its claims, unless a running task overlaps them.",
-        description: "Moves an `open` task to `running`, which takes its claims, but only if no running task in the same project has an overlapping claim. The check and the change are one atomic step under the board lock (state/tasks/board.lock), so when several agents start overlapping tasks at the same moment, from any checkout or worktree, exactly one succeeds and the others are refused. A refusal (exit code 3) names every conflicting task with its id, owner and the pair of overlapping claims; wait until that task is done, failed or abandoned and try again, or start a task that does not overlap. Starting runs nothing: a task is a claim on files, and the agent does the work itself. The claims stay held, however long the work takes, until `task_done`, `task_fail` or `task_abandon`. Only an `open` task can be started (exit code 1 otherwise). If the lock is held by another task command for longer than the task_lock_wait_seconds setting the call exits 4 `board busy` having changed nothing, and can simply be repeated.",
-        params: &[TASK_ID, TASK_OWNER],
-        outputs: "`task <id> is running (owner <owner>)...` on success. On a refusal, stderr lists each conflicting running task as `task <id> (owner <owner>): your claim <x> overlaps its claim <y>`.",
+        description: "Moves an `open` task to `running`, which takes its claims, but only if no running task in the same project has an overlapping claim. The check and the change are one atomic step under the board lock (state/tasks/board.lock), so when several agents start overlapping tasks at the same moment, from any checkout or worktree, exactly one succeeds and the others are refused. A refusal (exit code 3) names every conflicting task with its id, owner and the pair of overlapping claims; wait until that task is done, failed or abandoned and try again, or start a task that does not overlap. Starting runs nothing: a task is a claim on files, and the agent does the work itself. The claims stay held, however long the work takes, until `task_done`, `task_fail` or `task_abandon`. With `worktree` set it ALSO makes the task's own Git worktree (see `worktree_create` for the layout and its refusals) in the same locked step: if and only if the start succeeded, it runs `git worktree add -b task/<id> <path> <base>` where <base> is the tip of the project's current branch in its main checkout (resolved fresh; the main checkout must be on a branch, not detached), and records `worktree`, `branch` and `base` in the task. If the worktree cannot be made (the project is not a Git repo, the branch or folder already exists, detached HEAD, a git error) the task is rolled back to `open` (owner and start time cleared, claims not held) and the command exits 1 saying so: a task is never left running with a half-made worktree. Only an `open` task can be started (exit code 1 otherwise). If the lock is held by another task command for longer than the task_lock_wait_seconds setting the call exits 4 `board busy` having changed nothing, and can simply be repeated.",
+        params: &[TASK_ID, TASK_OWNER, TASK_WORKTREE],
+        outputs: "`task <id> is running (owner <owner>)...` on success; with `worktree` also the lines `worktree: <absolute path>`, `branch: task/<id>` and `base: <commit>`. On a refusal, stderr lists each conflicting running task as `task <id> (owner <owner>): your claim <x> overlaps its claim <y>`.",
         exit_codes: &[
             E0,
-            ExitDoc { code: "1", meaning: "no task with that id, or the task is not `open` (it is already running, finished or abandoned), or the record could not be read or written" },
+            ExitDoc { code: "1", meaning: "no task with that id, or the task is not `open` (it is already running, finished or abandoned), or the record could not be read or written, or (with `worktree`) the worktree could not be made, in which case the task was rolled back to `open`" },
             ExitDoc { code: "2", meaning: "the owner is empty or has more than one line" },
             ExitDoc { code: "3", meaning: "refused: a running task in the same project has an overlapping claim; nothing was changed" },
             ExitDoc { code: "4", meaning: "board busy: the board lock could not be taken in time; nothing was changed, repeat the call" },
@@ -548,19 +548,34 @@ pub static TOOLS: &[Tool] = &[
         changes_files: false,
         destructive: false,
         idempotent: false,
-        cli: "broadsword task start <id> --owner <name>",
-        cli_examples: &["task start t-1 --owner coder-1"],
-        parse: |a| parse_task(a, "start", Some("id"), &[("--owner", "owner", false)], &["id", "owner"]),
+        cli: "broadsword task start <id> --owner <name> [--worktree]",
+        cli_examples: &["task start t-1 --owner coder-1", "task start t-1 --owner coder-1 --worktree"],
+        parse: |a| {
+            let n = a.iter().filter(|w| **w == "--worktree").count();
+            let rest: Vec<&str> = a.iter().copied().filter(|w| *w != "--worktree").collect();
+            let i = parse_task(&rest, "start", Some("id"), &[("--owner", "owner", false)], &["id", "owner"])?;
+            match n {
+                0 => Some(i),
+                1 => Some(i.with("worktree", Val::Bool(true))),
+                _ => None,
+            }
+        },
         mcp_callable: true,
-        to_args: |i| vec!["task".into(), "start".into(), i.str("id").unwrap_or_default().into(), "--owner".into(), i.str("owner").unwrap_or_default().into()],
-        handler: |cfg, i| Ok(task::cmd_start(cfg, i.require("id")?, i.require("owner")?)),
+        to_args: |i| {
+            let mut v = vec!["task".to_string(), "start".into(), i.str("id").unwrap_or_default().into(), "--owner".into(), i.str("owner").unwrap_or_default().into()];
+            if i.bool("worktree") {
+                v.push("--worktree".into());
+            }
+            v
+        },
+        handler: |cfg, i| Ok(task::cmd_start(cfg, i.require("id")?, i.require("owner")?, i.bool("worktree"))),
     },
     Tool {
         name: "task_done",
         summary: "Mark a running task done and release its claims.",
-        description: "Marks a `running` task as `done` and releases its claims, so overlapping tasks can start. Call it when the work is finished (and reviewed or merged, as the project requires). An optional note is stored with the record. Only a running task can be finished (exit code 1 for an open, finished or abandoned task). The record is kept for good. It takes the board lock for a moment (see `task_start` for exit code 4).",
+        description: "Marks a `running` task as `done` and releases its claims, so overlapping tasks can start. Call it when the work is finished (and reviewed or merged, as the project requires). An optional note is stored with the record. If the task has a worktree (see `worktree_create`), `task_done` also removes it, but ONLY when that is safe: the worktree has no uncommitted or untracked changes AND the branch `task/<id>` is merged into the project's current branch in its main checkout; then it runs `git worktree remove` and `git branch -d` (never forced) and deletes the now-empty folders. If either condition fails, the task is STILL marked done and the exit code is still 0, but a `WARNING:` on stderr says exactly why the worktree and branch were kept and what to do (commit or discard, merge, then `worktree_remove`); nothing is ever deleted that holds unmerged or uncommitted work. Only a running task can be finished (exit code 1 for an open, finished or abandoned task). The record is kept for good. It takes the board lock for a moment (see `task_start` for exit code 4).",
         params: &[TASK_ID, TASK_NOTE],
-        outputs: "`task <id> is done; its claims are released`.",
+        outputs: "`task <id> is done; its claims are released`; then, only for a task with a worktree, either `worktree removed: <path>; branch ... deleted` or `worktree kept: <path>` with a `WARNING:` block on stderr listing the reasons and the fix.",
         exit_codes: &[E0, ExitDoc { code: "1", meaning: "no task with that id, or it is not `running`, or the record could not be written" }, EXIT_BUSY_DOC],
         read_only: false,
         long_running: false,
@@ -693,6 +708,116 @@ pub static TOOLS: &[Tool] = &[
         },
         handler: |cfg, i| Ok(task::cmd_check(cfg, i.require("project")?, &i.list("claims"))),
     },
+    Tool {
+        name: "worktree_create",
+        summary: "Make the Git worktree and branch for an already-running task.",
+        description: "Gives a `running` task its own Git worktree, for a task that was started without one (`task_start` with `worktree` does the same in the start itself). The worktree is a separate folder checked out on a new branch `task/<task id>` in the PROJECT's own Git repo (the Broadsword repo for project `broadsword`, `projects/<project>` for the others), at <root>/<worktrees_dir>/<canonical project>/<task id>, so the agent edits there and never in the main checkout. The branch starts at the commit at the tip of the project's current branch in its main checkout, resolved fresh (`git rev-parse HEAD`); that commit is recorded as `base` together with `worktree` (path relative to root) and `branch` in the task record. It refuses, changing nothing: when the task is not running or already has a worktree; when the project folder is not a Git repo of its own; when the branch `task/<id>` or the folder already exists; and when the main checkout is on a detached HEAD (check out a branch first). It takes the board lock for its short time (see `task_start` for exit code 4). Remove the worktree again with `task_done` (automatic when safe) or `worktree_remove`.",
+        params: &[TASK_ID],
+        outputs: "`worktree: <absolute path>`, `branch: task/<id>`, `base: <commit>`, one per line.",
+        exit_codes: &[
+            E0,
+            ExitDoc { code: "1", meaning: "no task with that id, or it is not `running`, or it already has a worktree, or the worktree could not be made (not a Git repo, branch or folder exists, detached HEAD, git error); nothing was left behind" },
+            EXIT_BUSY_DOC,
+        ],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword worktree create <id>",
+        cli_examples: &["worktree create t-1"],
+        parse: |a| parse_worktree(a, "create", true, None),
+        mcp_callable: true,
+        to_args: |i| vec!["worktree".into(), "create".into(), i.str("id").unwrap_or_default().into()],
+        handler: |cfg, i| Ok(worktree::cmd_create(cfg, i.require("id")?)),
+    },
+    Tool {
+        name: "worktree_remove",
+        summary: "Remove one task's worktree, only if it is clean and merged (destructive, never forced).",
+        description: "Removes the Git worktree of a task that is no longer running (done, failed or abandoned), but only when that cannot lose work. It is removed only if ALL of these hold: the worktree has no uncommitted, staged or untracked changes (`git status --porcelain --ignored=no` is empty; ignored files such as build output do not count); it is still on its branch `task/<id>`; and that branch is merged, meaning its tip is an ancestor of the main checkout's HEAD. Then it runs `git worktree remove` and `git branch -d` (never `--force`, never `-D`, so Git refuses an unmerged branch too) and deletes the now-empty parent folders under worktrees_dir. With `keep_branch` set the merged rule is dropped but the branch is NEVER deleted: use it for an abandoned or failed task whose work was not merged, to free the folder while every commit stays reachable on `task/<id>`; the worktree must still be clean. If the folder was already deleted by hand it just clears Git's record (and deletes the branch only if merged). It refuses (exit code 3) with the reasons and what to do, changing nothing, when it is not safe; it refuses (exit 1) for a running task, whose worktree is in use. It takes the board lock for a moment (see `task_start` for exit code 4).",
+        params: &[TASK_ID, WT_KEEP_BRANCH],
+        outputs: "`worktree removed: <path>; branch ... deleted|kept` on success, or `the worktree of task <id> was already removed`. On refusal (exit 3), stderr lists each reason and a `to fix:` line.",
+        exit_codes: &[
+            E0,
+            ExitDoc { code: "1", meaning: "no task with that id, or the task is running, or it has no worktree, or git/the record could not be read or written" },
+            ExitDoc { code: "3", meaning: "refused: the worktree has uncommitted or untracked changes, or its branch is not merged (and keep_branch was not set), or git refused; nothing was changed" },
+            EXIT_BUSY_DOC,
+        ],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: true,
+        idempotent: true,
+        cli: "broadsword worktree remove <id> [--keep-branch]",
+        cli_examples: &["worktree remove t-1", "worktree remove t-1 --keep-branch"],
+        parse: |a| parse_worktree(a, "remove", true, Some(("--keep-branch", "keep_branch"))),
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["worktree".to_string(), "remove".into(), i.str("id").unwrap_or_default().into()];
+            if i.bool("keep_branch") {
+                v.push("--keep-branch".into());
+            }
+            v
+        },
+        handler: |cfg, i| Ok(worktree::cmd_remove(cfg, i.require("id")?, i.bool("keep_branch"))),
+    },
+    Tool {
+        name: "worktree_prune",
+        summary: "Sweep finished tasks' worktrees: remove the clean, merged ones, list the rest (destructive, never forced).",
+        description: "Looks at every task whose status is done, failed or abandoned and whose worktree still exists, and removes each one that is clean and merged, by exactly the safety rules of `worktree_remove` (no uncommitted or untracked changes, branch `task/<id>` merged into the main checkout's HEAD; `git worktree remove` then `git branch -d`, never forced). The rest are listed with the reason and the fix and left untouched; that is not an error. A `running` (or open) task's worktree is NEVER touched. Afterwards it runs `git worktree prune` in every project repo, which clears Git's records of worktree folders that were deleted by hand. Use it as the periodic tidy-up after merges. It takes the board lock for the whole sweep (see `task_start` for exit code 4).",
+        params: &[],
+        outputs: "One `removed <id>: ...` line per removed worktree, one `kept <id> (<status>): <path>` block with its reasons per kept one, then a summary line `prune: N removed, N kept, N running or open task(s) left alone; ...`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "a task record or a git call failed (the output says which); worktrees that were already removed stay removed" }, EXIT_BUSY_DOC],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: true,
+        idempotent: true,
+        cli: "broadsword worktree prune",
+        cli_examples: &["worktree prune"],
+        parse: |a| (a == ["worktree", "prune"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["worktree".into(), "prune".into()],
+        handler: |cfg, _| Ok(worktree::cmd_prune(cfg)),
+    },
+    Tool {
+        name: "worktree_list",
+        summary: "List the worktrees of tasks, with branch, base, and whether each is clean and merged. (read-only)",
+        description: "Lists every task whose worktree has been made and not yet removed, so you can see what exists and what would be safe to remove. For each: the task id, its status, the worktree path relative to root, its branch, the base commit it started from, whether the worktree is `clean`, `dirty` (uncommitted or untracked changes), `missing` (the folder is gone) or `unknown`, and whether the branch is `merged` into the main checkout's HEAD, `unmerged`, `no-branch` or `unknown`. It only reads (it runs `git status` and `git merge-base --is-ancestor`) and returns immediately.",
+        params: &[],
+        outputs: "One tab-separated line per worktree: task id, status, path, branch, base commit, clean|dirty|missing|unknown, merged|unmerged|no-branch|unknown; or `no worktrees`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable)" }],
+        read_only: true,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
+        cli: "broadsword worktree list",
+        cli_examples: &["worktree list"],
+        parse: |a| (a == ["worktree", "list"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["worktree".into(), "list".into()],
+        handler: |cfg, _| Ok(worktree::cmd_list(cfg)),
+    },
+    Tool {
+        name: "worktree_repair",
+        summary: "After moving the project folder, fix Git's stored worktree paths in every project repo.",
+        description: "Run this once after the Broadsword folder was moved or copied to another drive or folder. Git records the full path of every worktree (and each worktree records its repo), so after a move they all point at the old location. For the Broadsword repo and every project repo it runs `git worktree repair`, giving it the worktree folders found under <worktrees_dir>/<project>/, which rewrites those links in both directions. A project that is not a Git repo is skipped. It changes only Git's own link files; it never deletes anything and is safe to repeat.",
+        params: &[],
+        outputs: "One line per project: `<project>: ok (N worktree folder(s) checked)`, `<project>: repaired ...` with what git fixed, or `not a Git repo, skipped`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "git could not repair at least one project (stderr says which)" }],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
+        cli: "broadsword worktree repair",
+        cli_examples: &["worktree repair"],
+        parse: |a| (a == ["worktree", "repair"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["worktree".into(), "repair".into()],
+        handler: |cfg, _| Ok(worktree::cmd_repair(cfg)),
+    },
 ];
 
 const TASK_PROJECT: Param = Param {
@@ -711,6 +836,18 @@ const TASK_CLAIMS: Param = Param {
 const TASK_ID: Param = Param { name: "id", ty: Ty::String, required: true, description: "The exact task id, as printed by `task_add` and shown in the first column of `task_list`." };
 const TASK_OWNER: Param = Param { name: "owner", ty: Ty::String, required: true, description: "Free text naming who runs the task, for example `coder-1`. Shown in conflict messages so others know whom to wait for. Must not be empty." };
 const TASK_NOTE: Param = Param { name: "note", ty: Ty::String, required: false, description: "A short note stored with the task, for example what was merged or why it failed. Whitespace runs are collapsed. Default: none." };
+const TASK_WORKTREE: Param = Param {
+    name: "worktree",
+    ty: Ty::Boolean,
+    required: false,
+    description: "Also make the task's own Git worktree and branch `task/<id>` right after the start succeeds (see `worktree_create`). If that fails the task is rolled back to `open`. Default false.",
+};
+const WT_KEEP_BRANCH: Param = Param {
+    name: "keep_branch",
+    ty: Ty::Boolean,
+    required: false,
+    description: "Remove only the worktree folder, require only that it is clean (not that the branch is merged), and NEVER delete the branch `task/<id>`, so all its commits stay reachable. Use it for abandoned or failed tasks whose work was not merged. Default false.",
+};
 const EXIT_BUSY_DOC: ExitDoc = ExitDoc { code: "4", meaning: "board busy: the board lock could not be taken in time; nothing was changed, repeat the call" };
 
 fn finish_args(verb: &str, i: &Inputs) -> Vec<String> {
@@ -764,6 +901,33 @@ fn parse_task(a: &[&str], sub: &str, positional: Option<&'static str>, flags: &[
         } else if required_by_shape(sub, name) {
             return None;
         }
+    }
+    Some(inputs)
+}
+
+/// Parse `worktree <sub> [<id>] [flag]`: the id is the one positional (when `positional`), `flag` an optional boolean flag
+/// given as (command-line flag, input name). Anything else makes it `None`.
+fn parse_worktree(a: &[&str], sub: &str, positional: bool, flag: Option<(&str, &'static str)>) -> Option<Inputs> {
+    let rest = match a {
+        ["worktree", s, rest @ ..] if *s == sub => rest,
+        _ => return None,
+    };
+    let (mut id, mut on) = (None, false);
+    for w in rest {
+        if flag.is_some_and(|(f, _)| f == *w) && !on {
+            on = true;
+        } else if w.starts_with("--") || !positional || id.is_some() {
+            return None;
+        } else {
+            id = Some(*w);
+        }
+    }
+    let mut inputs = Inputs::default();
+    if positional {
+        inputs = inputs.with("id", Val::Str(id?.into()));
+    }
+    if on {
+        inputs = inputs.with(flag?.1, Val::Bool(true));
     }
     Some(inputs)
 }
@@ -1272,6 +1436,13 @@ mod tests {
             ("task_list", Inputs::default()),
             ("task_list", Inputs::default().with("status", s("running"))),
             ("task_list", Inputs::default().with("status", s("open")).with("project", s("p"))),
+            ("task_start", Inputs::default().with("id", s("t-1")).with("owner", s("coder-1")).with("worktree", Val::Bool(true))),
+            ("worktree_create", Inputs::default().with("id", s("t-1"))),
+            ("worktree_remove", Inputs::default().with("id", s("t-1"))),
+            ("worktree_remove", Inputs::default().with("id", s("t-1")).with("keep_branch", Val::Bool(true))),
+            ("worktree_prune", Inputs::default()),
+            ("worktree_list", Inputs::default()),
+            ("worktree_repair", Inputs::default()),
             ("task_show", Inputs::default().with("id", s("t-1"))),
             ("task_check", Inputs::default().with("project", s("p")).with("claims", Val::List(vec!["*".into()]))),
             ("tools", Inputs::default()),

@@ -13,6 +13,9 @@
 # Workload projects, each its own Git repo
 /projects/
 
+# One Git worktree per task (broadsword worktree ...)
+/worktrees/
+
 # Pause flag written by the resource monitor
 /broadsword.paused
 

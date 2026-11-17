@@ -12,6 +12,8 @@ mod record;
 mod sys;
 mod task;
 mod tools;
+mod worktree;
+mod wtgit;
 
 use config::Config;
 use std::io::Read;

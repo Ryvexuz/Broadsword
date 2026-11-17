@@ -19,6 +19,7 @@ use crate::job;
 use crate::lock;
 use crate::pause;
 use crate::record::{self, Record};
+use crate::worktree;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -188,13 +189,13 @@ pub fn tasks_dir(cfg: &Config) -> PathBuf {
     cfg.state_dir.join("tasks")
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Every task. A record that cannot be read is an error (never silently skipped: `start` decides on this list);
 /// an empty file, which only exists for an instant while `add` creates a task, is skipped.
-fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
+pub fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
     let dir = tasks_dir(cfg);
     let mut v = Vec::new();
     let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(v) };
@@ -227,7 +228,7 @@ fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
     Ok(v)
 }
 
-fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
+pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     let nope = || format!("no task with the exact id `{id}` (see `broadsword task list`)");
     if id.is_empty() || record::sanitize(id) != id {
         return Err(nope());
@@ -239,12 +240,12 @@ fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     }
 }
 
-fn save(r: &Record) -> Result<(), String> {
+pub fn save(r: &Record) -> Result<(), String> {
     r.save().map_err(|e| format!("cannot write task record {}: {e}", r.path.display()))
 }
 
 /// The board lock. `Err` is already an exit code plus message.
-fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
+pub fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
     let path = tasks_dir(cfg).join("board.lock");
     let wait = cfg.task_lock_wait_seconds;
     lock::acquire(&path, Duration::from_secs(wait), &move |owner| {
@@ -257,7 +258,7 @@ fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
     })
 }
 
-fn fail(code: u8, msg: impl std::fmt::Display) -> ExitCode {
+pub fn fail(code: u8, msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("broadsword: {msg}");
     ExitCode::from(code)
 }
@@ -330,7 +331,7 @@ fn wait_for_test_gate(cfg: &Config) {
     }
 }
 
-pub fn cmd_start(cfg: &Config, id: &str, owner: &str) -> ExitCode {
+pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCode {
     let owner = owner.trim();
     if owner.is_empty() || owner.contains(['\n', '\r']) {
         return fail(EXIT_BAD_INPUT, "the owner must be a non-empty single line, e.g. coder-1");
@@ -363,7 +364,39 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str) -> ExitCode {
         return fail(EXIT_ERROR, e);
     }
     println!("task {id} is running (owner {owner}); its claims are held until it is done, failed or abandoned");
-    ExitCode::SUCCESS
+    if !worktree {
+        return ExitCode::SUCCESS;
+    }
+    // Still under the board lock: nobody can see the task as running until its worktree exists, or it is open again.
+    match worktree::create_for(cfg, &mut t) {
+        Ok(c) => match save(&t) {
+            Ok(()) => {
+                println!("{}", worktree::describe_created(&c));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                let left = worktree::undo_create(cfg, &t, &c).map(|l| format!(" The new worktree could not be removed again: {l}")).unwrap_or_default();
+                roll_back_start(&mut t, &format!("{e}.{left}"))
+            }
+        },
+        Err(e) => roll_back_start(&mut t, &e),
+    }
+}
+
+/// The task was marked running but its worktree could not be made: put it back to `open` (owner and start time cleared),
+/// so a task is never left running without the worktree that was asked for.
+fn roll_back_start(t: &mut Record, why: &str) -> ExitCode {
+    let id = t.id().to_string();
+    for k in ["worktree", "branch", "base", "worktree_removed"] {
+        t.set(k, "");
+    }
+    t.set("status", OPEN);
+    t.set("owner", "");
+    t.set("started", "");
+    match save(t) {
+        Ok(()) => fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\ntask {id} was rolled back to `open` (claims not held, nothing half-made); fix the cause and start it again")),
+        Err(e) => fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\nAND the rollback failed: {e}. Task {id} may still say `running` with no worktree: run `broadsword task abandon {id}` or fix its record")),
+    }
 }
 
 /// done, fail and abandon: change the status under the board lock and release the claims.
@@ -389,6 +422,13 @@ pub fn cmd_finish(cfg: &Config, id: &str, action: Action, note: Option<&str>) ->
         return fail(EXIT_ERROR, e);
     }
     println!("task {id} is {to}; its claims are released");
+    // `done` cleans up the task's worktree, but only when that is safe (see worktree.rs). Either way the task is done:
+    // a kept worktree is a warning, not an error, so the exit code stays 0.
+    if action == Action::Done && worktree::has_worktree(&t) && worktree::after_done(cfg, &mut t) {
+        if let Err(e) = save(&t) {
+            return fail(EXIT_ERROR, format!("{e} (the worktree itself was removed)"));
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -432,6 +472,11 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
     println!("started: {}", when("started"));
     println!("ended: {}", when("ended"));
     println!("note: {}", or_dash("note"));
+    if !t.get("worktree").is_empty() {
+        println!("worktree: {}{}", t.get("worktree"), if t.get("worktree_removed").is_empty() { "" } else { " (removed)" });
+        println!("branch: {}", t.get("branch"));
+        println!("base: {}", t.get("base"));
+    }
     ExitCode::SUCCESS
 }
 
