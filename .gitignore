@@ -7,6 +7,9 @@
 /shared/*
 !/shared/.gitkeep
 
+# Durable job records for recovery
+/state/
+
 # Workload projects, each its own Git repo
 /projects/
 

@@ -13,6 +13,7 @@ scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any 
 build_dir = "build"        # the one shared build folder (CARGO_TARGET_DIR)
 shared_dir = "shared"      # one shared copy of big read-only things
 projects_dir = "projects"  # each folder here with a Cargo.toml is a project (its own repo, git-ignored)
+state_dir = "state"        # durable job records (state/jobs/*.rec); never cleaned up, git-ignored
 
 # Resource monitor
 disk_check_every_seconds = 60   # how often `broadsword watch` checks free space
@@ -24,3 +25,7 @@ alert_command = ""              # shell command run with the alert message as it
 # Job runner (broadsword build | test | check)
 job_disk_reserve_gb = 2         # a job will not start if free space minus this would be below disk_floor_gb
 job_disk_poll_seconds = 5       # while a job runs, free space is checked this often; below the floor kills the job and pauses
+
+# Recovery (broadsword run | recover): checkpoints are refs/broadsword/checkpoints/<job id>; records live in state_dir
+checkpoint_ignored_max_mb = 50  # a checkpoint also saves git-ignored files (e.g. .env) up to this many MB; the rest are listed as skipped (build, scratch, state and `target` folders are never saved)
+max_resumes = 3                 # an interrupted build/test/check is resumed at most this many times in a row, then marked failed

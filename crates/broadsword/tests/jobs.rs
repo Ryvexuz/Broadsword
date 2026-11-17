@@ -34,6 +34,9 @@ impl Root {
              scratch_dir = \"scratch\"\n\
              build_dir = \"build\"\n\
              projects_dir = \"projects\"\n\
+             state_dir = \"state\"\n\
+             checkpoint_ignored_max_mb = 50\n\
+             max_resumes = 3\n\
              job_disk_reserve_gb = {reserve_gb}\n\
              job_disk_poll_seconds = 1\n"
         );
