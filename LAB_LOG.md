@@ -2,6 +2,35 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 3, milestone 2: worktree per agent
+
+**Models and roles**
+- Claude Opus 5.5 as orchestrator: spec, diff read, merge, done check, records.
+- Sonnet as coder, in a worktree, over three passes.
+- Opus as reviewer, over two passes. Each ran stress scripts for 5–10 minutes.
+
+**What went wrong and what fixed it**
+- **Ignored files.** The coder's comment said ignored files are "regenerable by definition". `.env` is ignored, and `AGENTS.md` says that's where keys live. `task done` deleted a `.env` and an ignored notes folder without a word. Now any ignored file blocks removal, with no override.
+- **The board lock.** It was held through `git worktree add`. A realistic 20k-file repo locked other agents out for 10.8 s. Creation is now three steps, with the git work done outside the lock.
+- **Rebase-then-merge.** The reviewer's minor point mattered for the next milestone: the orphan check would have blocked removal for good once the merge queue rebases. Orphan commits are now saved under `refs/broadsword/kept/` instead.
+- **My done-check script stopped early.** It used `set -e`, and an expected refusal (exit 3) ended it. I finished the run by hand. Lesson for scripts that check refusals: don't use `set -e`, or wrap the expected failures.
+- **The fix was real work.** The done check corrected the crash sim's "about 450 rad/s" comments to 400, a leftover from Stage 1.
+
+**Rough cost and time**
+- About 1 h 15 min of wall time.
+- Subagent tokens: coder about 295k, reviewer about 175k.
+
+**Git commands used, beyond a plain commit**
+- Broadsword's code now uses the commands listed in `evidence/stage-3-m2-worktree-per-agent.md`.
+- Two of them, with what each does:
+  - `git merge-base --is-ancestor <branch> HEAD`: is every commit on the task branch already in main?
+  - `git rev-list --stdin --not --all`: which of these commits does no ref reach?
+- Orchestrator, in the crash sim: `git merge --ff-only task/<id>`. This moved crash-sim main forward to the task's commit without a merge commit. A fast-forward was possible because main hadn't moved since the worktree was created.
+
+**One lesson about AI development**
+
+The coder's wrong assumption was written down as a comment ("regenerable by definition"). That made it easy for the reviewer to find and test. Comments that state an assumption invite exactly the adversarial check that catches it.
+
 ## 2026-11-17 — Stage 3, milestone 1: task board
 
 **Models and roles**
