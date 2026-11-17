@@ -1,16 +1,47 @@
 //! Git checkpoints and rollback. Everything runs the `git` program as a child process.
 //!
-//! A checkpoint records the exact state of a project's working tree (tracked changes plus untracked,
-//! non-ignored files) as a commit under `refs/broadsword/checkpoints/<job id>`. It is built in a
-//! temporary index file, so the working tree, HEAD, the branch and the real index are never touched.
+//! A snapshot records the exact bytes of a project's working tree: tracked and untracked non-ignored
+//! files as one commit, and ignored files (minus build, scratch, state and `target` folders, and
+//! subject to a size cap) as a second, parentless commit. Files are stored raw (`hash-object -w
+//! --no-filters`) and trees are built with `update-index --index-info` in a temporary index, so no
+//! line-ending or other filter ever touches the content, and the working tree, HEAD, the branch and
+//! the real index are never changed by taking a snapshot. Restoring writes the raw blobs back.
+//!
+//! Refs (a ref cannot be both a file and a folder, so the ignored snapshots live in sibling folders):
+//! - `refs/broadsword/checkpoints/<id>` and `refs/broadsword/checkpoints-ignored/<id>`
+//! - `refs/broadsword/interrupted/<id>/<attempt>` and `refs/broadsword/interrupted-ignored/<id>/<attempt>`
+//! - `refs/broadsword/index/<id>`: the real index at checkpoint time
+//!
+//! Refs are only ever created (never overwritten or deleted), so no snapshot is ever lost.
 
+use crate::config::{Config, MB};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CHECKPOINT_REFS: &str = "refs/broadsword/checkpoints";
+pub const CHECKPOINT_IGNORED_REFS: &str = "refs/broadsword/checkpoints-ignored";
 pub const INTERRUPTED_REFS: &str = "refs/broadsword/interrupted";
+pub const INTERRUPTED_IGNORED_REFS: &str = "refs/broadsword/interrupted-ignored";
 pub const INDEX_REFS: &str = "refs/broadsword/index";
+
+/// What a snapshot leaves out of the ignored set, and how much of it it keeps.
+pub struct Opts {
+    /// Folders (relative to the project) never captured among ignored files: build, scratch, state.
+    pub excludes: Vec<PathBuf>,
+    pub ignored_max_bytes: u64,
+}
+
+impl Opts {
+    pub fn for_project(cfg: &Config, dir: &Path) -> Opts {
+        Opts {
+            excludes: [&cfg.build_dir, &cfg.scratch_dir, &cfg.state_dir].iter().filter_map(|p| p.strip_prefix(dir).ok().map(Path::to_path_buf)).collect(),
+            ignored_max_bytes: cfg.checkpoint_ignored_max_mb * MB,
+        }
+    }
+}
 
 /// A project is a Git repo of its own when it has its own `.git` (folder, or file for a linked worktree).
 pub fn is_repo(dir: &Path) -> bool {
@@ -76,129 +107,312 @@ fn commit_tree(dir: &Path, tree: &str, parent: Option<&str>, msg: &str) -> Resul
     git_text(dir, &args, None)
 }
 
-/// Snapshot the working tree as a commit stored at `ref_name`. Uses `<state>/tmp-index-<tag>` and removes it after.
-pub fn snapshot(dir: &Path, state: &Path, tag: &str, ref_name: &str, msg: &str) -> Result<String, String> {
-    std::fs::create_dir_all(state).map_err(|e| format!("cannot create {}: {e}", state.display()))?;
-    let idx = state.join(format!("tmp-index-{tag}"));
-    let _ = std::fs::remove_file(&idx);
+/// Create a ref that must not exist yet, then check it reads back as `commit`.
+fn create_ref(dir: &Path, name: &str, commit: &str) -> Result<(), String> {
+    git_text(dir, &["update-ref", name, commit, ""], None)?;
+    match git_text(dir, &["rev-parse", "--verify", name], None) {
+        Ok(c) if c == commit => Ok(()),
+        other => Err(format!("ref {name} did not read back as {commit}: {other:?}")),
+    }
+}
+
+fn unique_index(state: &Path, tag: &str) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    state.join(format!("tmp-index-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn list_files(dir: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    let out = git(dir, args, None, None)?;
+    Ok(String::from_utf8_lossy(&out).split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
+fn is_regular(dir: &Path, rel: &str) -> bool {
+    std::fs::symlink_metadata(dir.join(rel)).map(|m| m.is_file()).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn disk_mode(path: &Path) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(m) if m.permissions().mode() & 0o111 != 0 => "100755",
+        _ => "100644",
+    }
+}
+
+#[cfg(not(unix))]
+fn disk_mode(_: &Path) -> &'static str {
+    "100644" // Windows has no executable bit; tracked files keep the mode Git recorded
+}
+
+/// Store these files raw and build a tree out of them in a temporary index.
+fn tree_of(dir: &Path, state: &Path, tag: &str, files: &[String], tracked_modes: &HashMap<String, String>) -> Result<String, String> {
+    let idx = unique_index(state, tag);
     let result = (|| {
-        let parent = head(dir);
-        if parent.is_some() {
-            git_text(dir, &["read-tree", "HEAD"], Some(&idx))?;
+        if !files.is_empty() {
+            if let Some(bad) = files.iter().find(|f| f.contains('\n')) {
+                return Err(format!("cannot snapshot a file name containing a newline: {bad:?}"));
+            }
+            let shas = git(dir, &["hash-object", "-w", "--no-filters", "--stdin-paths"], None, Some(files.join("\n").as_bytes()))?;
+            let shas: Vec<String> = String::from_utf8_lossy(&shas).lines().map(str::to_string).collect();
+            if shas.len() != files.len() {
+                return Err(format!("hash-object returned {} hashes for {} files", shas.len(), files.len()));
+            }
+            let mut input = Vec::new();
+            for (f, sha) in files.iter().zip(&shas) {
+                let mode = match tracked_modes.get(f).map(String::as_str) {
+                    Some(m @ ("100644" | "100755")) => m,
+                    _ => disk_mode(&dir.join(f)),
+                };
+                input.extend_from_slice(format!("{mode} {sha}\t{f}").as_bytes());
+                input.push(0);
+            }
+            git(dir, &["update-index", "-z", "--index-info"], Some(&idx), Some(&input))?;
         }
-        git_text(dir, &["add", "-A"], Some(&idx))?;
-        let tree = git_text(dir, &["write-tree"], Some(&idx))?;
-        let commit = commit_tree(dir, &tree, parent.as_deref(), msg)?;
-        git_text(dir, &["update-ref", ref_name, &commit], None)?;
-        Ok(commit)
+        git_text(dir, &["write-tree"], Some(&idx))
     })();
     let _ = std::fs::remove_file(&idx);
     result
 }
 
+pub struct Captured {
+    pub tree: String,
+    pub ignored_tree: Option<String>,
+    /// Ignored files left out because the size cap was reached.
+    pub skipped: Vec<String>,
+}
+
+fn excluded(rel: &str, opts: &Opts) -> bool {
+    let p = Path::new(rel);
+    p.components().any(|c| c.as_os_str() == "target") || opts.excludes.iter().any(|e| p.starts_with(e))
+}
+
+/// Read the working tree's raw bytes into Git objects. Touches nothing but the object store.
+pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captured, String> {
+    std::fs::create_dir_all(state).map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let mut modes = HashMap::new();
+    for entry in list_files(dir, &["ls-files", "-s", "-z"])? {
+        if let Some((meta, path)) = entry.split_once('\t') {
+            modes.insert(path.to_string(), meta.split(' ').next().unwrap_or("").to_string());
+        }
+    }
+    let mut files = list_files(dir, &["ls-files", "-z", "-c", "-o", "--exclude-standard"])?;
+    files.sort();
+    files.dedup();
+    files.retain(|p| is_regular(dir, p)); // tracked files deleted from disk are simply absent from the snapshot
+    let tree = tree_of(dir, state, tag, &files, &modes)?;
+
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    let mut used = 0u64;
+    for p in list_files(dir, &["ls-files", "-z", "-o", "-i", "--exclude-standard"])? {
+        if excluded(&p, opts) || !is_regular(dir, &p) {
+            continue;
+        }
+        let len = std::fs::metadata(dir.join(&p)).map(|m| m.len()).unwrap_or(0);
+        if used.saturating_add(len) > opts.ignored_max_bytes {
+            skipped.push(p);
+        } else {
+            used += len;
+            kept.push(p);
+        }
+    }
+    let ignored_tree = if kept.is_empty() { None } else { Some(tree_of(dir, state, &format!("{tag}-ign"), &kept, &HashMap::new())?) };
+    Ok(Captured { tree, ignored_tree, skipped })
+}
+
 pub struct Checkpoint {
     pub ref_name: String,
     pub commit: String,
+    pub ignored_ref: Option<String>,
+    pub skipped: Vec<String>,
     /// Tree of the real index at the time, kept reachable under `refs/broadsword/index/<id>`.
     pub index_tree: Option<String>,
 }
 
-pub fn checkpoint(dir: &Path, state: &Path, id: &str) -> Result<Checkpoint, String> {
+pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Checkpoint, String> {
+    let cap = capture(dir, state, id, opts)?;
+    let parent = head(dir);
+    let ignored_ref = match &cap.ignored_tree {
+        Some(t) => {
+            let c = commit_tree(dir, t, None, &format!("broadsword checkpoint of ignored files {id}"))?;
+            let r = format!("{CHECKPOINT_IGNORED_REFS}/{id}");
+            create_ref(dir, &r, &c)?;
+            Some(r)
+        }
+        None => None,
+    };
+    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword checkpoint {id}"))?;
     let ref_name = format!("{CHECKPOINT_REFS}/{id}");
-    let commit = snapshot(dir, state, id, &ref_name, &format!("broadsword checkpoint {id}"))?;
+    create_ref(dir, &ref_name, &commit)?;
     // `write-tree` only writes tree objects; it does not modify the index. It fails on unmerged entries: then none is kept.
     let index_tree = git_text(dir, &["write-tree"], None).ok().filter(|t| !t.is_empty());
     if let Some(t) = &index_tree {
-        let c = commit_tree(dir, t, head(dir).as_deref(), &format!("broadsword index at checkpoint {id}"))?;
-        git_text(dir, &["update-ref", &format!("{INDEX_REFS}/{id}"), &c], None)?;
+        let c = commit_tree(dir, t, parent.as_deref(), &format!("broadsword index at checkpoint {id}"))?;
+        create_ref(dir, &format!("{INDEX_REFS}/{id}"), &c)?;
     }
-    Ok(Checkpoint { ref_name, commit, index_tree })
+    Ok(Checkpoint { ref_name, commit, ignored_ref, skipped: cap.skipped, index_tree })
 }
 
 pub struct Rollback {
     pub interrupted_ref: String,
+    pub interrupted_ignored_ref: Option<String>,
     pub restored: usize,
     pub removed: usize,
+    pub ignored_restored: usize,
 }
 
-fn safe_rel(p: &str) -> Option<PathBuf> {
+fn safe_rel(p: &str) -> Result<PathBuf, String> {
     let path = Path::new(p);
-    path.components().all(|c| matches!(c, Component::Normal(_))).then(|| path.to_path_buf())
+    if path.components().all(|c| matches!(c, Component::Normal(_))) {
+        Ok(path.to_path_buf())
+    } else {
+        Err(format!("refusing unsafe path from git: {p}"))
+    }
 }
 
-/// Roll a project's working tree back to `checkpoint_ref`.
-/// 1. Save the current tree as `refs/broadsword/interrupted/<id>` (kept if it already exists, so a rollback
-///    that was itself interrupted can be repeated without losing the partial work).
-/// 2. Restore files that differ: tracked files and removed files come back from the checkpoint; files that
-///    were not in the checkpoint (new untracked files, now saved in the interrupted ref) are deleted.
-///    Ignored files are never touched: they are in neither tree.
-/// 3. Put the real index back to what it was at the checkpoint (or to HEAD if that was not recorded).
-///
-/// HEAD and the branch are never touched.
-pub fn rollback(dir: &Path, state: &Path, id: &str, checkpoint_ref: &str, index_tree: Option<&str>) -> Result<Rollback, String> {
-    let interrupted_ref = format!("{INTERRUPTED_REFS}/{id}");
-    if !ref_exists(dir, &interrupted_ref) {
-        snapshot(dir, state, &format!("{id}-int"), &interrupted_ref, &format!("broadsword interrupted work of {id}"))?;
-    }
-    let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
-    let int_tree = git_text(dir, &["rev-parse", "--verify", &format!("{interrupted_ref}^{{tree}}")], None)?;
-    // Changes going from the interrupted state back to the checkpoint.
-    let diff = git(dir, &["diff-tree", "-r", "--no-renames", "--name-status", "-z", &int_tree, &ckpt_tree], None, None)?;
-    let diff = String::from_utf8_lossy(&diff).into_owned();
-    let mut toks = diff.split('\0').filter(|t| !t.is_empty());
-    let (mut delete, mut restore) = (Vec::new(), Vec::new());
-    while let (Some(status), Some(path)) = (toks.next(), toks.next()) {
-        if status.starts_with('D') {
-            delete.push(path.to_string()); // in the interrupted tree only: added by the job
-        } else {
-            restore.push(path.to_string());
+/// One line of `diff-tree --raw -z`: what it takes to go from the first tree to the second.
+struct Change {
+    status: char,
+    #[cfg_attr(not(unix), allow(dead_code))] // only unix sets the executable bit
+    mode: String,
+    sha: String,
+    path: String,
+}
+
+fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
+    let out = git(dir, &["diff-tree", "-r", "--no-renames", "--raw", "-z", from, to], None, None)?;
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let mut toks = out.split('\0').filter(|t| !t.is_empty());
+    let mut v = Vec::new();
+    while let (Some(meta), Some(path)) = (toks.next(), toks.next()) {
+        let f: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        if f.len() < 5 {
+            return Err(format!("unexpected diff-tree line: {meta}"));
         }
+        v.push(Change { status: f[4].chars().next().unwrap_or('M'), mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
     }
-    for p in &delete {
-        let rel = safe_rel(p).ok_or_else(|| format!("refusing unsafe path from git: {p}"))?;
-        let full = dir.join(&rel);
+    Ok(v)
+}
+
+fn write_blob(dir: &Path, c: &Change) -> Result<(), String> {
+    let rel = safe_rel(&c.path)?;
+    let full = dir.join(&rel);
+    let bytes = git(dir, &["cat-file", "blob", &c.sha], None, None)?;
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&full, bytes).map_err(|e| format!("cannot write {}: {e}", full.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if c.mode == "100755" { 0o755 } else { 0o644 };
+        let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode));
+    }
+    Ok(())
+}
+
+/// Roll a project's working tree back to its checkpoint.
+/// 1. Snapshot the CURRENT state (raw bytes, ignored files too) into brand-new refs
+///    `interrupted/<id>/<attempt>`; every attempt gets a new ref, created only if absent and read back
+///    before any file is touched. What to delete and restore is computed from this attempt's snapshot,
+///    so edits made after an earlier failed attempt are kept too.
+/// 2. Files that exist now but not in the checkpoint (new non-ignored files) are deleted; they are
+///    saved. Files that differ from, or are missing since, the checkpoint are restored byte for byte.
+/// 3. Ignored files in the checkpoint that changed or were deleted are restored; ignored files the job
+///    created are left in place (and are in the snapshot).
+/// 4. The real index goes back to what it was at the checkpoint (or to HEAD if none was recorded).
+///
+/// HEAD and the branch are never touched. Empty folders are neither restored nor removed.
+pub fn rollback(
+    dir: &Path,
+    state: &Path,
+    id: &str,
+    checkpoint_ref: &str,
+    checkpoint_ignored_ref: Option<&str>,
+    index_tree: Option<&str>,
+    opts: &Opts,
+) -> Result<Rollback, String> {
+    let cap = capture(dir, state, &format!("{id}-int"), opts)?;
+    let parent = head(dir);
+    let ignored_commit = match &cap.ignored_tree {
+        Some(t) => Some(commit_tree(dir, t, None, &format!("broadsword interrupted ignored files of {id}"))?),
+        None => None,
+    };
+    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword interrupted work of {id}"))?;
+    let mut attempt = 0u32;
+    let (interrupted_ref, interrupted_ignored_ref) = loop {
+        attempt += 1;
+        let r = format!("{INTERRUPTED_REFS}/{id}/{attempt}");
+        match create_ref(dir, &r, &commit) {
+            Ok(()) => {
+                let ri = match &ignored_commit {
+                    Some(c) => {
+                        let ri = format!("{INTERRUPTED_IGNORED_REFS}/{id}/{attempt}");
+                        create_ref(dir, &ri, c)?;
+                        Some(ri)
+                    }
+                    None => None,
+                };
+                break (r, ri);
+            }
+            Err(e) if ref_exists(dir, &r) && attempt < 10_000 => {
+                let _ = e; // an earlier attempt owns this ref: try the next number
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
+    let main = changes(dir, &cap.tree, &ckpt_tree)?;
+    let ignored = match (checkpoint_ignored_ref, &cap.ignored_tree) {
+        (Some(r), now) => {
+            let ckpt_ign = git_text(dir, &["rev-parse", "--verify", &format!("{r}^{{tree}}")], None)?;
+            let now = match now {
+                Some(t) => t.clone(),
+                None => git_text(dir, &["mktree"], None)?, // empty tree: everything in the checkpoint is "missing"
+            };
+            changes(dir, &now, &ckpt_ign)?
+        }
+        (None, _) => Vec::new(),
+    };
+    for c in main.iter().chain(&ignored) {
+        safe_rel(&c.path)?; // validate everything before touching a single file
+    }
+
+    let mut removed = 0;
+    for c in main.iter().filter(|c| c.status == 'D') {
+        let full = dir.join(safe_rel(&c.path)?);
         match std::fs::remove_file(&full) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // an earlier, interrupted rollback already removed it
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot remove {}: {e}", full.display())),
         }
-        let mut parent = full.parent();
-        while let Some(d) = parent {
-            if d == dir || std::fs::remove_dir(d).is_err() {
-                break; // only ever removes folders that are now empty
-            }
-            parent = d.parent();
-        }
     }
-    if !restore.is_empty() {
-        if restore.iter().any(|p| safe_rel(p).is_none()) {
-            return Err("refusing unsafe path from git".into());
-        }
-        let idx = state.join(format!("tmp-index-{id}-restore"));
-        let _ = std::fs::remove_file(&idx);
-        let r = (|| {
-            git_text(dir, &["read-tree", &ckpt_tree], Some(&idx))?;
-            let mut input = Vec::new();
-            for p in &restore {
-                input.extend_from_slice(p.as_bytes());
-                input.push(0);
-            }
-            git(dir, &["checkout-index", "-f", "-z", "--stdin"], Some(&idx), Some(&input)).map(|_| ())
-        })();
-        let _ = std::fs::remove_file(&idx);
-        r?;
+    let mut restored = 0;
+    for c in main.iter().filter(|c| c.status != 'D') {
+        write_blob(dir, c)?;
+        restored += 1;
+    }
+    let mut ignored_restored = 0;
+    for c in ignored.iter().filter(|c| c.status != 'D') {
+        write_blob(dir, c)?;
+        ignored_restored += 1;
     }
     match index_tree {
         Some(t) => git_text(dir, &["read-tree", t], None)?,
         None => git_text(dir, &["reset", "-q"], None)?,
     };
-    Ok(Rollback { interrupted_ref, restored: restore.len(), removed: delete.len() })
+    Ok(Rollback { interrupted_ref, interrupted_ignored_ref, restored, removed, ignored_restored })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    pub fn opts() -> Opts {
+        Opts { excludes: vec![PathBuf::from("state")], ignored_max_bytes: 50 * MB }
+    }
 
     /// A throwaway repo under the repo's scratch folder with one commit: tracked.txt = "one".
     pub fn temp_repo(tag: &str) -> PathBuf {
@@ -210,14 +424,23 @@ mod tests {
             git_text(&d, a, None).unwrap();
         }
         fs::write(d.join("tracked.txt"), "one").unwrap();
-        fs::write(d.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(d.join(".gitignore"), "ignored.txt\n.env*\n*.log\ntarget/\n").unwrap();
         git_text(&d, &["add", "-A"], None).unwrap();
         git_text(&d, &["commit", "-q", "-m", "init"], None).unwrap();
         d
     }
 
+    fn state_for(tag: &str) -> PathBuf {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch");
+        scratch.join(format!("state-{tag}-{}", std::process::id()))
+    }
+
     fn status(d: &Path) -> String {
         git_text(d, &["status", "--porcelain"], None).unwrap()
+    }
+
+    fn show(d: &Path, r: &str, p: &str) -> String {
+        git_text(d, &["show", &format!("{r}:{p}")], None).unwrap_or_else(|e| format!("<{e}>"))
     }
 
     #[test]
@@ -226,20 +449,39 @@ mod tests {
         fs::write(d.join("tracked.txt"), "modified").unwrap();
         fs::write(d.join("new.txt"), "untracked").unwrap();
         fs::write(d.join("ignored.txt"), "ignored").unwrap();
+        fs::create_dir_all(d.join("target")).unwrap();
+        fs::write(d.join("target").join("big.o"), "build output").unwrap();
         let (head_before, status_before) = (head(&d), status(&d));
-        let state = d.join("..").join(format!("state-ckpt-{}", std::process::id()));
-        let c = checkpoint(&d, &state, "job1").unwrap();
+        let state = state_for("ckpt");
+        let c = checkpoint(&d, &state, "job1", &opts()).unwrap();
         assert_eq!(c.ref_name, "refs/broadsword/checkpoints/job1");
         assert_eq!(head(&d), head_before);
         assert_eq!(status(&d), status_before);
         assert_eq!(fs::read_to_string(d.join("tracked.txt")).unwrap(), "modified");
-        assert!(!state.join("tmp-index-job1").exists(), "temp index removed");
-        let show = |p: &str| git_text(&d, &["show", &format!("{}:{p}", c.ref_name)], None);
-        assert_eq!(show("tracked.txt").unwrap(), "modified");
-        assert_eq!(show("new.txt").unwrap(), "untracked");
-        assert!(show("ignored.txt").is_err(), "ignored files are not captured");
-        // the checkpoint's parent is HEAD
+        assert!(fs::read_dir(&state).unwrap().next().is_none(), "temp indexes removed");
+        assert_eq!(show(&d, &c.ref_name, "tracked.txt"), "modified");
+        assert_eq!(show(&d, &c.ref_name, "new.txt"), "untracked");
+        assert!(show(&d, &c.ref_name, "ignored.txt").starts_with('<'), "ignored files are not in the main snapshot");
+        let ir = c.ignored_ref.unwrap();
+        assert_eq!(show(&d, &ir, "ignored.txt"), "ignored");
+        assert!(show(&d, &ir, "target/big.o").starts_with('<'), "target folders are never captured");
         assert_eq!(git_text(&d, &["rev-parse", &format!("{}^", c.ref_name)], None).ok(), head_before);
+        // a ref that exists is never overwritten
+        assert!(checkpoint(&d, &state, "job1", &opts()).is_err());
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn ignored_size_cap_skips_and_lists() {
+        let d = temp_repo("cap");
+        fs::write(d.join("a.log"), vec![b'a'; 600]).unwrap();
+        fs::write(d.join("b.log"), vec![b'b'; 600]).unwrap();
+        let state = state_for("cap");
+        let o = Opts { excludes: vec![], ignored_max_bytes: 1000 };
+        let c = checkpoint(&d, &state, "j", &o).unwrap();
+        assert_eq!(c.skipped, ["b.log"]);
+        assert_eq!(show(&d, &c.ignored_ref.unwrap(), "a.log").len(), 600);
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -249,9 +491,9 @@ mod tests {
         let d = temp_repo("empty");
         fs::remove_dir_all(d.join(".git")).unwrap();
         git_text(&d, &["init", "-q"], None).unwrap();
-        let state = d.join("..").join(format!("state-empty-{}", std::process::id()));
-        let c = checkpoint(&d, &state, "j").unwrap();
-        assert_eq!(git_text(&d, &["show", &format!("{}:tracked.txt", c.ref_name)], None).unwrap(), "one");
+        let state = state_for("empty");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        assert_eq!(show(&d, &c.ref_name, "tracked.txt"), "one");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -260,30 +502,107 @@ mod tests {
     fn rollback_restores_and_keeps_partial_work() {
         let d = temp_repo("rb");
         fs::write(d.join("tracked.txt"), "before-job").unwrap(); // uncommitted state at checkpoint
-        let state = d.join("..").join(format!("state-rb-{}", std::process::id()));
-        let c = checkpoint(&d, &state, "j").unwrap();
-        // the "job": modifies, adds (nested), deletes a tracked file, touches an ignored file
+        let state = state_for("rb");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
         fs::write(d.join("tracked.txt"), "during-job").unwrap();
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("sub").join("made.txt"), "made").unwrap();
-        fs::write(d.join("ignored.txt"), "keep me").unwrap();
-        fs::remove_file(d.join(".gitignore")).unwrap();
-        fs::write(d.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(d.join("ignored.txt"), "created by job").unwrap();
         let head_before = head(&d);
-        let r = rollback(&d, &state, "j", &c.ref_name, c.index_tree.as_deref()).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
         assert_eq!(fs::read_to_string(d.join("tracked.txt")).unwrap(), "before-job");
-        assert!(!d.join("sub").exists(), "new file and its now-empty folder removed");
-        assert_eq!(fs::read_to_string(d.join("ignored.txt")).unwrap(), "keep me");
+        assert!(!d.join("sub").join("made.txt").exists());
+        assert_eq!(fs::read_to_string(d.join("ignored.txt")).unwrap(), "created by job", "ignored files the job created stay");
         assert_eq!(head(&d), head_before);
         assert_eq!((r.restored, r.removed), (1, 1));
-        let show = |p: &str| git_text(&d, &["show", &format!("{}:{p}", r.interrupted_ref)], None).unwrap();
-        assert_eq!(show("tracked.txt"), "during-job");
-        assert_eq!(show("sub/made.txt"), "made");
-        // repeating a rollback keeps the first interrupted snapshot
-        rollback(&d, &state, "j", &c.ref_name, c.index_tree.as_deref()).unwrap();
-        assert_eq!(show("sub/made.txt"), "made");
-        // the index matches HEAD, as before the job: only the unstaged change shows
-        assert_eq!(status(&d), "M tracked.txt");
+        assert_eq!(r.interrupted_ref, "refs/broadsword/interrupted/j/1");
+        assert_eq!(show(&d, &r.interrupted_ref, "tracked.txt"), "during-job");
+        assert_eq!(show(&d, &r.interrupted_ref, "sub/made.txt"), "made");
+        assert_eq!(show(&d, &r.interrupted_ignored_ref.unwrap(), "ignored.txt"), "created by job");
+        assert_eq!(status(&d), "M tracked.txt"); // index matches HEAD again: only the unstaged change shows
+        // a second rollback is a new attempt with its own ref
+        let r2 = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(r2.interrupted_ref, "refs/broadsword/interrupted/j/2");
+        assert_eq!(show(&d, "refs/broadsword/interrupted/j/1", "sub/made.txt"), "made");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression (blocker 1): a retried rollback must not overwrite edits made after a failed attempt.
+    #[cfg(windows)]
+    #[test]
+    fn retry_after_failed_rollback_keeps_later_edits() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = temp_repo("retry");
+        let state = state_for("retry");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        fs::write(d.join("tracked.txt"), "during-job").unwrap();
+        fs::write(d.join("made.txt"), "made").unwrap();
+        // lock the file the job added: it can be read but not deleted
+        let lock = fs::OpenOptions::new().read(true).share_mode(1).open(d.join("made.txt")).unwrap();
+        let first = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts());
+        assert!(first.is_err(), "rollback must fail while the file is locked");
+        // the user edits a file after the failed attempt, then the lock goes away
+        fs::write(d.join("tracked.txt"), "user edit after failure").unwrap();
+        drop(lock);
+        let second = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(fs::read_to_string(d.join("tracked.txt")).unwrap(), "one");
+        assert_eq!(show(&d, &second.interrupted_ref, "tracked.txt"), "user edit after failure", "the edit is saved in this attempt's snapshot");
+        assert_ne!(second.interrupted_ref, "refs/broadsword/interrupted/j/1");
+        assert_eq!(show(&d, "refs/broadsword/interrupted/j/1", "tracked.txt"), "during-job");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression (blocker 2): bytes come back exactly, even with core.autocrlf=true and text=auto.
+    #[test]
+    fn rollback_is_byte_exact_under_autocrlf() {
+        let d = temp_repo("crlf");
+        git_text(&d, &["config", "core.autocrlf", "true"], None).unwrap();
+        fs::write(d.join(".gitattributes"), "* text=auto\n").unwrap();
+        let originals: [(&str, &[u8]); 4] = [("lf.txt", b"a\nb\nc\n"), ("crlf.txt", b"a\r\nb\r\nc\r\n"), ("mixed.txt", b"a\nb\r\nc\n\r\nd"), ("bin.dat", b"\x00\r\n\x01\n\xff")];
+        for (n, b) in originals {
+            fs::write(d.join(n), b).unwrap();
+        }
+        git_text(&d, &["add", "-A"], None).unwrap();
+        git_text(&d, &["commit", "-q", "-m", "files"], None).unwrap();
+        // the state at checkpoint time: raw bytes written straight to disk (differs from what Git would check out)
+        for (n, b) in originals {
+            fs::write(d.join(n), b).unwrap();
+        }
+        fs::write(d.join("untracked-lf.txt"), b"x\ny\n").unwrap();
+        let state = state_for("crlf");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        for (n, _) in originals {
+            fs::write(d.join(n), b"job changed this\n").unwrap();
+        }
+        fs::write(d.join("untracked-lf.txt"), b"changed\r\n").unwrap();
+        rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        for (n, b) in originals {
+            assert_eq!(fs::read(d.join(n)).unwrap(), b, "{n}");
+        }
+        assert_eq!(fs::read(d.join("untracked-lf.txt")).unwrap(), b"x\ny\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression (blocker 3): ignored files (`.env`) the job deleted or changed come back.
+    #[test]
+    fn ignored_files_deleted_or_changed_by_the_job_are_restored() {
+        let d = temp_repo("ign");
+        fs::write(d.join(".env"), "SECRET=1\r\nB=2\n").unwrap();
+        fs::write(d.join(".env2"), "OTHER=1").unwrap();
+        let state = state_for("ign");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        fs::write(d.join(".env"), "SECRET=changed").unwrap();
+        fs::remove_file(d.join(".env2")).unwrap();
+        fs::write(d.join("made.log"), "log made by job").unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(fs::read(d.join(".env")).unwrap(), b"SECRET=1\r\nB=2\n");
+        assert_eq!(fs::read(d.join(".env2")).unwrap(), b"OTHER=1");
+        assert_eq!(fs::read_to_string(d.join("made.log")).unwrap(), "log made by job", "ignored files the job created are never deleted");
+        assert_eq!(r.ignored_restored, 2);
+        assert_eq!(show(&d, &r.interrupted_ignored_ref.unwrap(), ".env"), "SECRET=changed");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }

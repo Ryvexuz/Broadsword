@@ -73,6 +73,8 @@ pub struct Config {
     pub build_dir: PathBuf,
     pub projects_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub checkpoint_ignored_max_mb: u64,
+    pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
     pub job_disk_poll_seconds: u64,
 }
@@ -122,6 +124,13 @@ impl Config {
         let m = parse_flat(text)?;
         let root = normalize(&config_dir.join(get_str(&m, "root")?));
         inside_root(&m, "shared_dir", false)?;
+        let (scratch_dir, build_dir) = (root.join(inside_root(&m, "scratch_dir", true)?), root.join(inside_root(&m, "build_dir", true)?));
+        let state_dir = root.join(inside_root(&m, "state_dir", true)?);
+        for (name, other) in [("scratch_dir", &scratch_dir), ("build_dir", &build_dir)] {
+            if state_dir.starts_with(other) {
+                return Err(format!("state_dir must not be inside {name}: cleanup would delete the job records"));
+            }
+        }
         Ok(Config {
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
@@ -131,10 +140,12 @@ impl Config {
             ram_warn_percent: get_int(&m, "ram_warn_percent")?,
             cpu_warn_percent: get_int(&m, "cpu_warn_percent")?,
             alert_command: get_str(&m, "alert_command")?,
-            scratch_dir: root.join(inside_root(&m, "scratch_dir", true)?),
-            build_dir: root.join(inside_root(&m, "build_dir", true)?),
+            scratch_dir,
+            build_dir,
             projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
-            state_dir: root.join(inside_root(&m, "state_dir", true)?),
+            state_dir,
+            checkpoint_ignored_max_mb: get_int(&m, "checkpoint_ignored_max_mb")?,
+            max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             root,
@@ -224,11 +235,12 @@ mod tests {
         assert_eq!(c.projects_dir, Path::new("proj").join(".").join("projects"));
         assert!(c.job_disk_poll_seconds > 0);
         assert_eq!(c.state_dir, Path::new("proj").join(".").join("state"));
+        assert!(c.checkpoint_ignored_max_mb > 0 && c.max_resumes > 0);
     }
 
     #[test]
     fn worktree_resolves_to_main_root() {
-        let base = std::env::temp_dir().join(format!("bs-wt-{}", std::process::id()));
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-wt-{}", std::process::id()));
         let main = base.join("main");
         let wt = main.join("wt").join("a");
         let gitdir = main.join(".git").join("worktrees").join("a");
@@ -244,7 +256,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");
@@ -259,6 +271,10 @@ mod tests {
             let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"projects\"\nstate_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "state_dir {bad}");
         }
+        for inside in ["scratch/state", "scratch", "build/x"] {
+            let t = format!("{base}scratch_dir = \"scratch\"\nstate_dir = \"{inside}\"\n");
+            assert!(Config::from_text(&t, Path::new("p")).is_err(), "state_dir {inside}");
+        }
         let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\nstate_dir = \"state\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
     }
@@ -270,7 +286,7 @@ mod tests {
 
     #[test]
     fn finds_root_walking_up() {
-        let base = std::env::temp_dir().join(format!("bs-root-{}", std::process::id()));
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-root-{}", std::process::id()));
         let deep = base.join("a").join("b");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(base.join(CONFIG_FILE), "root = \".\"").unwrap();

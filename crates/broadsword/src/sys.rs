@@ -150,8 +150,14 @@ pub fn same_process(recorded_start: Option<u64>, actual: ProcState) -> bool {
     }
 }
 
+/// "Is it still alive?" Lenient: an unreadable creation time counts as the same process. Never use this to kill.
 pub fn is_alive(pid: u32, recorded_start: Option<u64>) -> bool {
     same_process(recorded_start, process_state(pid))
+}
+
+/// Strict identity for killing: only a recorded creation time that equals the live process's counts.
+pub fn exact_match(recorded_start: Option<u64>, actual: ProcState) -> bool {
+    matches!((recorded_start, actual), (Some(r), ProcState::Alive { start: Some(a) }) if r == a)
 }
 
 /// Creation time of a live process, if readable.
@@ -209,6 +215,12 @@ mod tests {
         assert!(!same_process(Some(5), ProcState::Gone));
         assert!(same_process(None, alive(Some(6)))); // nothing recorded: trust the pid
         assert!(same_process(Some(5), alive(None))); // start unreadable: do not call it dead
+        // killing needs an exact match
+        assert!(exact_match(Some(5), alive(Some(5))));
+        assert!(!exact_match(Some(5), alive(Some(6))));
+        assert!(!exact_match(Some(5), alive(None)));
+        assert!(!exact_match(None, alive(Some(5))));
+        assert!(!exact_match(Some(5), ProcState::Gone));
     }
 
     #[cfg(windows)]

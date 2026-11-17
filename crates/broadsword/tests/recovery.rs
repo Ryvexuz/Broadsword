@@ -66,7 +66,7 @@ impl Root {
         let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\n\
                     disk_check_every_seconds = 60\nlog_max_mb = 50\nram_warn_percent = 90\ncpu_warn_percent = 90\n\
                     alert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-                    state_dir = \"state\"\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n";
+                    state_dir = \"state\"\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n";
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir, children: Vec::new() }
     }
@@ -82,6 +82,7 @@ impl Root {
         fs::write(p.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
         fs::write(p.join("src/lib.rs"), lib_rs).unwrap();
         fs::write(p.join("tracked.txt"), "original\n").unwrap();
+        fs::write(p.join(".gitignore"), ".env\n.env2\n*.log\n").unwrap();
         if as_git {
             git(&p, &["init", "-q"]);
             git(&p, &["config", "user.email", "t@t"]);
@@ -228,7 +229,7 @@ fn kill_mid_run_job_then_recover_rolls_back_and_keeps_partial_work() {
     assert_eq!(git(&p, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(&p, &["status", "--porcelain"]), "");
     // the partial changes are kept
-    let int = format!("refs/broadsword/interrupted/{id}");
+    let int = format!("refs/broadsword/interrupted/{id}/1");
     assert_eq!(git(&p, &["show", &format!("{int}:tracked.txt")]), "changed");
     assert_eq!(git(&p, &["show", &format!("{int}:new.txt")]), "partial");
     let ckpt = format!("refs/broadsword/checkpoints/{id}");
@@ -312,4 +313,142 @@ fn recover_with_nothing_to_do_is_a_no_op() {
     assert!(r.records().is_empty());
     let out = r.run(&["jobs"]);
     assert_eq!(out.status.code(), Some(0));
+}
+
+// ---- regression tests for the review findings ------------------------------------------------
+
+impl Root {
+    /// Write a record by hand, as if left behind by a crashed broadsword.
+    fn fake_record(&self, id: &str, fields: &[(&str, &str)]) {
+        let dir = self.dir.join("state/jobs");
+        fs::create_dir_all(&dir).unwrap();
+        let body: String = fields.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+        fs::write(dir.join(format!("{id}.rec")), format!("id = {id}\n{body}")).unwrap();
+    }
+
+    fn sleeper(&mut self) -> u32 {
+        let c = Command::new("ping").args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+        let pid = c.id();
+        self.children.push(c);
+        pid
+    }
+}
+
+fn dead_pid() -> u32 {
+    let mut c = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+/// Blocker 3: a killed job that deleted and changed git-ignored files (`.env`) must not lose them.
+#[test]
+fn kill_mid_run_restores_ignored_files_the_job_deleted_or_changed() {
+    let mut r = Root::new("killenv");
+    r.project("", true);
+    let p = r.project_dir();
+    fs::write(p.join(".env"), "SECRET=1\r\n").unwrap();
+    fs::write(p.join(".env2"), "OTHER=2\n").unwrap();
+    let line = if cfg!(windows) { "echo changed> .env & del .env2 & echo made> made.log & ping -n 30 127.0.0.1 >nul" } else { "echo changed > .env; rm .env2; echo made > made.log; sleep 30" };
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have changed the ignored files", 60, || {
+        r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("made.log").exists() && !p.join(".env2").exists()
+    });
+    let id = Root::field(&r.only_record(), "id");
+    kill_hard(bs_pid);
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    println!("{so}");
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert_eq!(fs::read(p.join(".env")).unwrap(), b"SECRET=1\r\n");
+    assert_eq!(fs::read(p.join(".env2")).unwrap(), b"OTHER=2\n");
+    assert!(p.join("made.log").exists(), "ignored files the job created are never deleted");
+    let ign = format!("refs/broadsword/interrupted-ignored/{id}/1");
+    assert_eq!(git(&p, &["show", &format!("{ign}:.env")]).trim(), "changed");
+    assert_eq!(git(&p, &["show", &format!("{ign}:made.log")]).trim(), "made");
+}
+
+/// Item 9: the automatic recovery before a job never rolls back a `run`; it refuses new jobs on that project.
+#[test]
+fn auto_recover_does_not_roll_back_and_refuses_new_jobs_on_that_project() {
+    let mut r = Root::new("auto");
+    r.project("", true);
+    let p = r.project_dir();
+    let bs_pid = r.spawn(&["run", "p", "--", sleepy_change()]);
+    wait_until("partial changes", 60, || r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("new.txt").exists());
+    let child = Root::field(&r.only_record(), "child_pid");
+    kill_hard(bs_pid);
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    let se = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{}{se}", text(&out.stdout));
+    assert!(se.contains("broadsword recover"), "{se}");
+    assert!(p.join("new.txt").exists(), "auto-recover must not touch the working tree");
+    assert_eq!(Root::field(&r.only_record(), "status"), "running");
+    wait_until("orphan to be killed by auto-recover", 10, || !pid_alive(&child));
+    let out = r.run(&["recover"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(!p.join("new.txt").exists());
+    assert_eq!(Root::field(&r.only_record(), "status"), "rolled_back");
+}
+
+/// Item 4: a live lock stops a second recover; a stale lock is taken over.
+#[test]
+fn recover_lock_blocks_a_second_recover_and_stale_locks_are_taken_over() {
+    let mut r = Root::new("lock");
+    let holder = r.sleeper();
+    fs::create_dir_all(r.dir.join("state")).unwrap();
+    fs::write(r.dir.join("state/recover.lock"), format!("{holder}\n\n")).unwrap();
+    let out = r.run(&["recover"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("another recover is in progress"), "{}", text(&out.stderr));
+    assert!(r.dir.join("state/recover.lock").exists(), "a live owner's lock is left in place");
+    fs::write(r.dir.join("state/recover.lock"), format!("{}\n\n", dead_pid())).unwrap();
+    let out = r.run(&["recover"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!r.dir.join("state/recover.lock").exists(), "lock released afterwards");
+}
+
+/// Item 5: an orphan is killed only when its creation time matches exactly.
+#[test]
+fn unverifiable_child_pids_are_not_killed() {
+    let mut r = Root::new("nokill");
+    r.project("", true);
+    let (a, b) = (r.sleeper(), r.sleeper());
+    for (id, pid, start) in [("20260101-000001-p-run", a, ""), ("20260101-000002-p-run", b, "1")] {
+        let dead = dead_pid().to_string();
+        r.fake_record(id, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("child_pid", &pid.to_string()), ("child_start", start), ("checkpoint", "pending")]);
+    }
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(so.contains("NOT killed"), "{so}");
+    assert!(pid_alive(&a.to_string()) && pid_alive(&b.to_string()), "neither process may be killed");
+}
+
+/// Item 6: a failed rollback leaves the record running, keeps everything, and exits non-zero.
+#[test]
+fn failed_rollback_exits_nonzero_and_names_the_job() {
+    let r = Root::new("failrb");
+    r.project("", true);
+    let dead = dead_pid().to_string();
+    r.fake_record("20260101-000001-p-run", &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("checkpoint", "refs/broadsword/checkpoints/does-not-exist")]);
+    let out = r.run(&["recover"]);
+    assert_eq!(out.status.code(), Some(1));
+    let se = text(&out.stderr);
+    assert!(se.contains("NEEDS ATTENTION") && se.contains("20260101-000001-p-run"), "{se}");
+    assert_eq!(Root::field(&r.only_record(), "status"), "running");
+}
+
+/// Item 7: a job interrupted again and again is not resumed forever.
+#[test]
+fn resume_is_capped_by_max_resumes() {
+    let r = Root::new("cap");
+    r.project("", false);
+    let dead = dead_pid().to_string();
+    r.fake_record("20260101-000001-p-check", &[("project", "p"), ("kind", "check"), ("status", "running"), ("pid", &dead), ("step", "build"), ("resume_count", "3")]);
+    let out = r.run(&["recover"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let rec = r.only_record();
+    assert_eq!(Root::field(&rec, "status"), "failed");
+    assert!(Root::field(&rec, "failure_reason").contains("max_resumes"), "{rec}");
 }

@@ -81,7 +81,11 @@ impl Record {
     /// Write atomically: temp file in the same folder, then rename over the record.
     pub fn save(&self) -> std::io::Result<()> {
         let tmp = self.path.with_extension("rec.tmp");
-        std::fs::write(&tmp, self.render())?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, self.render().as_bytes())?;
+            f.sync_all()?; // on disk before the rename makes it the record
+        }
         std::fs::rename(&tmp, &self.path)
     }
 }
@@ -142,7 +146,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bs-rec-{tag}-{}", std::process::id()));
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-rec-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

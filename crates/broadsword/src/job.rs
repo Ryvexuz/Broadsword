@@ -364,32 +364,40 @@ pub struct JobSpec {
     pub first_step: usize,
     /// Id of the interrupted job this one resumes.
     pub resumed_from: Option<String>,
+    /// How many resumes lie behind this job (0 for a job started by the user).
+    pub resume_count: u64,
 }
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn save_record(rec: &Record) {
-    if let Err(e) = rec.save() {
-        eprintln!("broadsword: warning: cannot write job record {}: {e}", rec.path.display());
-    }
+fn save_record(rec: &Record) -> Result<(), String> {
+    rec.save().map_err(|e| format!("cannot write job record {}: {e}", rec.path.display()))
 }
 
-fn finish(rec: &mut Record, status: &str) {
+/// Record the final status and return `code`. A record that cannot be written is an error: the job
+/// then exits `EXIT_FAILED` so nobody is told it succeeded while its record says `running`.
+fn end(rec: &mut Record, status: &str, code: ExitCode) -> ExitCode {
     rec.set("status", status);
     rec.set("child_pid", "");
     rec.set("child_start", "");
     rec.set("ended", now_secs().to_string());
-    save_record(rec);
+    match save_record(rec) {
+        Ok(()) => code,
+        Err(e) => {
+            eprintln!("broadsword: ERROR: {e}; the job's real status is `{status}`");
+            ExitCode::from(EXIT_FAILED)
+        }
+    }
 }
 
 pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
-    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None })
+    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None, resume_count: 0 })
 }
 
 pub fn cmd_run(cfg: &Config, name: &str, command: &[&str]) -> ExitCode {
-    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None })
+    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None, resume_count: 0 })
 }
 
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
@@ -444,29 +452,33 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     rec.set("step", steps.get(spec.first_step).copied().unwrap_or(steps[0]));
     rec.set("checkpoint", "pending");
     rec.set("log", log_path.display().to_string());
+    rec.set("resume_count", spec.resume_count.to_string());
     if let Some(old) = &spec.resumed_from {
         rec.set("resumed_from", old.as_str());
     }
-    if let Err(e) = rec.save() {
-        eprintln!("broadsword: cannot write job record {}: {e}", rec.path.display());
+    if let Err(e) = save_record(&rec) {
+        eprintln!("broadsword: {e}");
         return ExitCode::from(EXIT_FAILED);
     }
     let job_id = rec.id().to_string();
     if let Some(old) = &spec.resumed_from {
         // Hand over before running: the old record now points at this job.
         let path = record::jobs_dir(cfg).join(format!("{old}.rec"));
-        if let Ok(mut o) = record::load(&path) {
+        let handed = record::load(&path).and_then(|mut o| {
             o.set("status", record::RESUMED);
             o.set("resumed_as", job_id.as_str());
-            save_record(&o);
+            save_record(&o)
+        });
+        if let Err(e) = handed {
+            eprintln!("broadsword: ERROR: cannot mark {old} as resumed: {e}");
+            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
         }
     }
     println!("job: {kind} {name} (id {job_id}, log: {})", log_path.display());
 
     if kind == "run" && !git::is_repo(&project_dir) {
         eprintln!("broadsword: refusing to run: project `{name}` is not a Git repository, so there is no checkpoint to roll back to (run `git init` in {} first)", project_dir.display());
-        finish(&mut rec, record::REFUSED);
-        return ExitCode::from(EXIT_REFUSED);
+        return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
     }
 
     let mut summary: Vec<String> = Vec::new();
@@ -476,22 +488,30 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         let free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
             eprintln!("broadsword: refusing to start {step}: {why}");
-            finish(&mut rec, record::REFUSED);
-            return ExitCode::from(EXIT_REFUSED);
+            return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
         }
         if i == spec.first_step {
             if git::is_repo(&project_dir) {
-                match git::checkpoint(&project_dir, &cfg.state_dir, &job_id) {
+                match git::checkpoint(&project_dir, &cfg.state_dir, &job_id, &git::Opts::for_project(cfg, &project_dir)) {
                     Ok(c) => {
                         println!("checkpoint: {} ({})", c.ref_name, &c.commit[..c.commit.len().min(10)]);
                         rec.set("checkpoint", c.ref_name);
                         rec.set("checkpoint_commit", c.commit);
+                        rec.set("checkpoint_ignored", c.ignored_ref.unwrap_or_default());
                         rec.set("index_tree", c.index_tree.unwrap_or_default());
+                        if !c.skipped.is_empty() {
+                            eprintln!(
+                                "broadsword: warning: {} ignored file(s) were NOT saved in the checkpoint (over the {} MB checkpoint_ignored_max_mb limit): {}",
+                                c.skipped.len(),
+                                cfg.checkpoint_ignored_max_mb,
+                                c.skipped.join(", ")
+                            );
+                            rec.set("ignored_skipped", c.skipped.join("|"));
+                        }
                     }
                     Err(e) if kind == "run" => {
                         eprintln!("broadsword: refusing to run: cannot take a checkpoint: {e}");
-                        finish(&mut rec, record::REFUSED);
-                        return ExitCode::from(EXIT_REFUSED);
+                        return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
                     }
                     Err(e) => {
                         eprintln!("broadsword: warning: no checkpoint: {e}");
@@ -503,7 +523,10 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
             }
         }
         rec.set("step", *step);
-        save_record(&rec);
+        if let Err(e) = save_record(&rec) {
+            eprintln!("broadsword: {e}");
+            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+        }
         if let Ok(mut f) = log.lock() {
             let _ = writeln!(f, "=== {step} {name} ({}) ===", pause::now_string());
         }
@@ -511,26 +534,31 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
             (Some(line), "run") => shell_command(&project_dir, line),
             _ => cargo_command(cfg, &project_dir, step),
         };
+        let mut spawn_err: Option<String> = None;
         let mut on_spawn = |pid: u32| {
             rec.set("child_pid", pid.to_string());
             rec.set("child_start", sys::start_time(pid).map(|t| t.to_string()).unwrap_or_default());
-            save_record(&rec);
+            if let Err(e) = save_record(&rec) {
+                spawn_err = Some(e);
+            }
         };
         let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("broadsword: {e}");
-                finish(&mut rec, record::FAILED);
-                return ExitCode::from(EXIT_FAILED);
+                return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
             }
         };
+        if let Some(e) = spawn_err {
+            eprintln!("broadsword: ERROR: {e}");
+            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+        }
         if let Outcome::DiskDropped(f) = run.outcome {
             let reason = format!("free space {} fell below the {} GB floor during `{kind} {name}`; job killed", pause::gb(f), cfg.disk_floor_gb);
             let _ = pause::write_pause(&cfg.root, f, &reason);
             pause::alert(cfg, &format!("Broadsword PAUSED: {reason}"));
             eprintln!("broadsword: {reason}");
-            finish(&mut rec, record::KILLED_LOW_DISK);
-            return ExitCode::from(EXIT_DISK_DROPPED);
+            return end(&mut rec, record::KILLED_LOW_DISK, ExitCode::from(EXIT_DISK_DROPPED));
         }
         if let Outcome::Exited(c) = run.outcome {
             exit_code = c;
@@ -550,16 +578,19 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     for l in &summary {
         println!("{l}");
     }
-    finish(&mut rec, if all_ok { record::DONE } else { record::FAILED });
-    if kind == "run" {
+    let code = if kind == "run" {
         // the command's own exit code becomes the job's (never 0 for a failure)
-        return ExitCode::from(match exit_code {
+        match exit_code {
             Some(0) => 0,
             Some(c) if (c & 0xFF) != 0 => (c & 0xFF) as u8,
             _ => EXIT_FAILED,
-        });
-    }
-    ExitCode::from(if all_ok { 0 } else { EXIT_FAILED })
+        }
+    } else if all_ok {
+        0
+    } else {
+        EXIT_FAILED
+    };
+    end(&mut rec, if all_ok { record::DONE } else { record::FAILED }, ExitCode::from(code))
 }
 
 #[cfg(test)]
@@ -568,7 +599,7 @@ mod tests {
     use crate::config::GB;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bs-job-{tag}-{}", std::process::id()));
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-job-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

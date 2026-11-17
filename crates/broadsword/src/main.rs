@@ -121,6 +121,17 @@ fn cmd_hook(cfg: &Config) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Run a job after the automatic recovery step. A job is refused (exit 3) while an interrupted `run`
+/// job on the same project still waits for `broadsword recover`, because it may have left files half changed.
+fn guarded(cfg: &Config, project: &str, job: impl FnOnce() -> ExitCode) -> ExitCode {
+    let _ = recover::recover(cfg, recover::Mode::Auto); // kills orphans, resumes read-only jobs; never rolls back
+    if let Some(id) = recover::blocked_by_interrupted_run(cfg, project) {
+        eprintln!("broadsword: refusing to start: job {id} (run {project}) was interrupted and may have changed files; run `broadsword recover` first");
+        return ExitCode::from(job::EXIT_REFUSED);
+    }
+    job()
+}
+
 fn usage() -> ExitCode {
     eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build|test|check <project> | run <project> -- <command...> | recover [--list] | jobs>");
     ExitCode::from(64)
@@ -147,15 +158,9 @@ fn main() -> ExitCode {
         ["resume"] => cmd_resume(&cfg, false),
         ["resume", "--force"] => cmd_resume(&cfg, true),
         ["projects"] => Ok(job::cmd_projects(&cfg)),
-        [k @ ("build" | "test" | "check"), name] => {
-            let _ = recover::recover(&cfg); // finish or roll back anything a crash left behind first
-            Ok(job::cmd_job(&cfg, k, name))
-        }
-        ["run", name, "--", command @ ..] if !command.is_empty() => {
-            let _ = recover::recover(&cfg);
-            Ok(job::cmd_run(&cfg, name, command))
-        }
-        ["recover"] => Ok(recover::recover(&cfg)),
+        [k @ ("build" | "test" | "check"), name] => Ok(guarded(&cfg, name, || job::cmd_job(&cfg, k, name))),
+        ["run", name, "--", command @ ..] if !command.is_empty() => Ok(guarded(&cfg, name, || job::cmd_run(&cfg, name, command))),
+        ["recover"] => Ok(recover::recover(&cfg, recover::Mode::Explicit)),
         ["recover", "--list"] | ["jobs"] => Ok(recover::cmd_list(&cfg)),
         ["hook", "pre-tool"] => Ok(cmd_hook(&cfg)),
         _ => return usage(),
