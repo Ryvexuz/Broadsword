@@ -2,6 +2,38 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 2, milestone 1: MCP server
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator. It wrote the spec, read the minor-fix diff itself, merged and ran the done check.
+- Sonnet as coder, in a worktree, over two passes.
+- Opus as reviewer, one pass, with a real Claude Code client.
+- Claude Opus 5.5 again as the fresh headless client in the done check.
+
+**What went wrong and what fixed it**
+
+- **First first-pass PASS.** The spec named the protocol edge cases up front: stdout purity, notifications, id rules, a parser depth limit, a line size limit, and no faked `tools/call`. The coder built to that list.
+- **The instructions misled the client.** They said "call the `tools` tool first", and the real client tried exactly that before calls existed. After the fix, the client in the done check still said the `tools` tool "would give the full list". It treats `tools` as a discovery tool because of its name and description. This is data for the Stage 2 lesson focus.
+- **The new "Build through Broadsword" rule doesn't work for worktrees yet.** `broadsword build broadsword` always builds the main checkout. The coder used plain `cargo` with the shared build folder, as the spec allowed. Noted in `IDEAS.md`.
+- **`git worktree remove` failed with "Permission denied".** My shell's working directory was inside the worktree. Git still unregistered the worktree but left empty folders. Those folders, and one empty folder left over from milestone 5, were removed with `rmdir`, which only removes empty folders.
+- **The worktree again started on the Stage 0 commit,** the fourth time.
+
+**Rough cost and time**
+
+- About 25 minutes of wall time.
+- Subagent tokens: coder about 125k, reviewer about 105k.
+- The done-check client session cost $0.098.
+
+**Git commands used, beyond a plain commit**
+
+- `git merge --no-ff` and `git branch -d`, as before.
+- `git worktree prune -v`: asked Git to drop records of worktrees whose folders are gone. There were none left to prune.
+
+**One lesson about AI development**
+
+The first thing a real AI client did was follow the server's instructions literally, into a dead end. Testing a tool surface with a real model as the client caught what 22 protocol tests could not.
+
 ## Stage 1 lessons (Foundation, closed 2026-11-17)
 
 1. **An independent reviewer on a strong model is the role that pays for itself.**
