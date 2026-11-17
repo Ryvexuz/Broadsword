@@ -2,6 +2,39 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 2, milestone 3: second provider
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator: spec, merge, both real runs, records.
+- Sonnet as coder, in a worktree, over three passes.
+- Opus as reviewer, over two passes. It used fake keys only and never called the real API.
+- Clients in the done check: `gpt-4.1-mini` through `clients/openai_mcp.py`, and Claude Opus 5.5 through headless Claude Code.
+
+**What went wrong and what fixed it**
+
+- **Python, not Rust.** The client is Python's standard library, because Rust's std has no TLS. `AGENTS.md` allows Python for tooling. Reason: HTTPS without crates.
+- **The reviewer found a real key leak.** The MCP server inherited `OPENAI_API_KEY`. A tool that echoed the environment sent the full key back into the model's context and wrote it to Broadsword's job log in plain text.
+  - The first fix dropped the variable by name. The reviewer then stored the same key as `OPENAI_KEY` and as `MYVAR`, and it leaked again.
+  - The final fix also drops any variable whose value contains the key. This is milestone 4's lesson again: the reported case was a sample of a class.
+- **The first real run got HTTP 401.** An older, different `OPENAI_API_KEY` is saved in Lazlo's Windows user environment, and the client reads the environment before `.env`. I cleared it for one run only and did not change Windows settings. Lazlo needs to know about it.
+- **Both models made the identical single call:** `check` on crash-sim. That's with the "in one job" prompt; without that phrasing, milestone 2's reviewer run saw Claude split it into `build` + `test`.
+
+**Rough cost and time**
+
+- About 35 minutes of wall time.
+- Subagent tokens: coder about 165k, reviewer about 130k.
+- Real runs: OpenAI 3,724 tokens (a fraction of a cent for `gpt-4.1-mini`), Claude $0.061.
+
+**Git commands used, beyond a plain commit**
+
+- `git rm --cached` (by the coder): removed committed `.pyc` files from the index while keeping them on disk. They are now ignored.
+- `git merge --no-ff`, `git worktree remove` and `git branch -d`, as before.
+
+**One lesson about AI development**
+
+Secrets leak through side channels, not the obvious ones. The redaction everyone checked held fine; the leak was the child process's environment, and then a different variable name. Only an adversarial reviewer actively trying to exfiltrate the key found both.
+
 ## 2026-11-17 — Stage 2, milestone 2: headless mode
 
 **Models and roles**
