@@ -61,6 +61,10 @@ pub struct Tool {
     pub read_only: bool,
     pub long_running: bool,
     pub changes_files: bool,
+    /// MCP `destructiveHint`: may delete or overwrite existing data.
+    pub destructive: bool,
+    /// MCP `idempotentHint`: repeating the call with the same inputs has no further effect.
+    pub idempotent: bool,
     /// The command-line form, for usage text.
     pub cli: &'static str,
     /// Command lines (without the program name, space separated) that must resolve to this tool,
@@ -134,11 +138,13 @@ pub static TOOLS: &[Tool] = &[
         outputs: "Four text lines: disk, ram and cpu, each ending in [ok] or [WARN], then `paused: no`, or `paused: YES` followed by the reason from the pause file.",
         exit_codes: &[
             E0,
-            ExitDoc { code: "1", meaning: "a probe (disk, RAM or CPU) could not be read, or broadsword.toml could not be loaded" },
+            ExitDoc { code: "1", meaning: "a probe (disk, RAM or CPU) could not be read" },
         ],
         read_only: true,
         long_running: false,
         changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword status",
         cli_examples: &["status"],
         parse: |a| (a == ["status"]).then(Inputs::default),
@@ -146,14 +152,16 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "cleanup",
-        summary: "Free disk space now: scratch files older than the limit, oversized logs, old build output.",
-        description: "Runs one disk cleanup pass: `cargo sweep` on the shared build folder, deletes files in the scratch folder older than scratch_max_age_hours, and cuts every *.log file in scratch to its last log_max_mb. If free space is still below the disk floor afterwards, it writes the pause file and sends the configured alert, which makes every job refuse to start until the `resume` tool succeeds. Use it when `status` shows low disk. It deletes only expired scratch files and build output (never source, state or job records), so it is safe to repeat, but it does change files and may take a while if the build folder is large.",
+        summary: "Free disk space now: old scratch files, oversized logs, and old build artifacts if cargo-sweep is installed.",
+        description: "Runs one disk cleanup pass: deletes files in the scratch folder older than scratch_max_age_hours, cuts every *.log file in scratch to its last log_max_mb, and runs `cargo sweep --time 7` on the shared build folder only if the cargo-sweep program is installed (if it is not, the report says `cargo-sweep not installed, skipped` and the other steps still run, so do not count on old build output being freed). If free space is still below the disk floor afterwards, it writes the pause file and sends the configured alert, which makes every job refuse to start until the `resume` tool succeeds. Use it when `status` shows low disk. It deletes only expired scratch files and, when cargo-sweep is installed, build artifacts older than 7 days (never project source, state or job records), so it is safe to repeat. It does not touch any project's working tree.",
         params: &[],
-        outputs: "A report: the cargo sweep result, each deleted file and capped log, bytes freed, free space before and after, and `PAUSED: still below the floor` if it paused Broadsword.",
+        outputs: "A report: the cargo sweep result (or that it was skipped), each deleted file and capped log, bytes freed, free space before and after, and `PAUSED: still below the floor` if it paused Broadsword.",
         exit_codes: &[E0],
         read_only: false,
         long_running: false,
-        changes_files: true,
+        changes_files: false,
+        destructive: true,
+        idempotent: true,
         cli: "broadsword cleanup",
         cli_examples: &["cleanup"],
         parse: |a| (a == ["cleanup"]).then(Inputs::default),
@@ -171,7 +179,9 @@ pub static TOOLS: &[Tool] = &[
         exit_codes: &[ExitDoc { code: "1", meaning: "the monitor could not run (it has no success exit: it only ends when killed)" }],
         read_only: false,
         long_running: true,
-        changes_files: true,
+        changes_files: false,
+        destructive: true,
+        idempotent: false,
         cli: "broadsword watch",
         cli_examples: &["watch"],
         parse: |a| (a == ["watch"]).then(Inputs::default),
@@ -194,7 +204,9 @@ pub static TOOLS: &[Tool] = &[
         ],
         read_only: false,
         long_running: false,
-        changes_files: true,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword resume [--force]",
         cli_examples: &["resume", "resume --force"],
         parse: |a| match a {
@@ -214,6 +226,8 @@ pub static TOOLS: &[Tool] = &[
         read_only: true,
         long_running: false,
         changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword projects",
         cli_examples: &["projects"],
         parse: |a| (a == ["projects"]).then(Inputs::default),
@@ -222,13 +236,15 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "build",
         summary: "Run `cargo build` on a project, with the disk guard and a Git checkpoint.",
-        description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and takes a Git checkpoint of the project. While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It writes build output to the shared build folder, plus a log in scratch and a job record in state, and can run for minutes, so give it a long timeout or run it in the background. Use it to compile a project; use `check` to build and test in one go.",
+        description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes, so give it a long timeout or run it in the background. Use it to compile a project; use `check` to build and test in one go.",
         params: &[PROJECT],
-        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then a summary line `build: ok` or `build: FAILED (exit N)`. Full compiler output goes to the log file, not to the terminal.",
+        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Full compiler output goes to the log file, not to the terminal.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
-        changes_files: true,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
         cli: "broadsword build <project>",
         cli_examples: &["build broadsword", "build nope"],
         parse: |a| match a {
@@ -240,13 +256,15 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "test",
         summary: "Run `cargo test` on a project, with the disk guard and a Git checkpoint.",
-        description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It writes build output and a log, and can run for minutes, so give it a long timeout or run it in the background. Use it when only the test result matters; use `check` for build then test.",
+        description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes, so give it a long timeout or run it in the background. Use it when only the test result matters; use `check` for build then test.",
         params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then `test: ok - N passed` or `test: FAILED (exit N) - N passed, N failed`. Full output goes to the log file.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Full output goes to the log file.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
-        changes_files: true,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
         cli: "broadsword test <project>",
         cli_examples: &["test broadsword", "test nope"],
         parse: |a| match a {
@@ -258,13 +276,15 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "check",
         summary: "Build, then test, a project in one job (stops at the first failure).",
-        description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint and low-disk kill as `build`, and the disk guard is re-checked before each step. It writes build output and a log and can run for many minutes, so give it a long timeout or run it in the background. Use it as the default way to verify a change.",
+        description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes, so give it a long timeout or run it in the background. Use it as the default way to verify a change.",
         params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then one summary line per step (`build: ok`, `test: ok - N passed`, or the failure). Full output goes to the log file.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Full output goes to the log file.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
-        changes_files: true,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
         cli: "broadsword check <project>",
         cli_examples: &["check broadsword", "check nope"],
         parse: |a| match a {
@@ -276,7 +296,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those.",
         params: &[
             PROJECT,
             Param {
@@ -286,18 +306,20 @@ pub static TOOLS: &[Tool] = &[
                 description: "The command and its arguments, as separate strings. They are joined with single spaces and run by the shell in the project folder, so quoting inside one string is not preserved. Must not be empty.",
             },
         ],
-        outputs: "A `job:` line, the checkpoint ref, then `run: ok` or `run: FAILED (exit N)`. The command's own output goes to the log file.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `run: ok` or `run: FAILED (exit N)`. The command's own output goes to the log file. The `--- summary ---` line is printed only when the command actually ran to completion.",
         exit_codes: &[
             ExitDoc { code: "0", meaning: "the command exited 0" },
-            ExitDoc { code: "1", meaning: "the command failed with a code that cannot be reported, or the job could not be set up (log or record could not be written)" },
-            ExitDoc { code: "2", meaning: "unknown project name" },
-            ExitDoc { code: "3", meaning: "refused: paused or not enough free disk; the project is not a Git repository or no checkpoint could be taken; or an earlier interrupted run on this project still needs `recover`" },
-            ExitDoc { code: "4", meaning: "killed: free disk fell below the floor while the command ran, and Broadsword is now paused" },
-            ExitDoc { code: "N", meaning: "any other number is the command's own exit code" },
+            ExitDoc { code: "1", meaning: "the command exited 1 or failed without a usable code, or Broadsword could not set the job up (log or record could not be written)" },
+            ExitDoc { code: "2", meaning: "Broadsword: unknown project name; or the command itself exited 2" },
+            ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run on this project still needs `recover`); or the command itself exited 3" },
+            ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, and is now paused; or the command itself exited 4" },
+            ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: the command's exit code is reported only after a `--- summary ---` line on stdout followed by `run: ok` or `run: FAILED (exit N)`. If there is no `--- summary ---` line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
         ],
         read_only: false,
         long_running: true,
         changes_files: true,
+        destructive: true,
+        idempotent: false,
         cli: "broadsword run <project> -- <command...>",
         cli_examples: &["run broadsword -- cargo --version", "run nope -- x"],
         parse: |a| match a {
@@ -328,6 +350,8 @@ pub static TOOLS: &[Tool] = &[
         read_only: false,
         long_running: true,
         changes_files: true,
+        destructive: true,
+        idempotent: true,
         cli: "broadsword recover",
         cli_examples: &["recover"],
         parse: |a| (a == ["recover"]).then(Inputs::default),
@@ -350,7 +374,9 @@ pub static TOOLS: &[Tool] = &[
         ],
         read_only: false,
         long_running: false,
-        changes_files: true,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword recover --abandon <id>",
         cli_examples: &["recover --abandon some-id"],
         parse: |a| match a {
@@ -369,6 +395,8 @@ pub static TOOLS: &[Tool] = &[
         read_only: true,
         long_running: false,
         changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword jobs  (alias: broadsword recover --list)",
         cli_examples: &["jobs", "recover --list"],
         parse: |a| (a == ["jobs"] || a == ["recover", "--list"]).then(Inputs::default),
@@ -377,16 +405,18 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "tools",
         summary: "List these tools, or describe one in full.",
-        description: "Prints this registry: every tool Broadsword offers, with its inputs and flags. Give a tool name to see that tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get the whole registry as JSON in the shape of MCP's tools/list. Use it to discover what Broadsword can do. It only reads and returns immediately.",
+        description: "Prints this registry: every tool Broadsword offers, with its inputs and flags. Give a tool name to see that tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get the registry as JSON: a bare array of tool objects in the shape of the entries of MCP's tools/list (an MCP server wraps it as {\"tools\": [...]}). Use it to discover what Broadsword can do. It only reads and returns immediately.",
         params: &[
             Param { name: "name", ty: Ty::String, required: false, description: "Show only this tool, in full. Omit to list all tools. An unknown name fails with exit code 2." },
-            Param { name: "json", ty: Ty::Boolean, required: false, description: "Print JSON instead of text: an array of {name, description, inputSchema, annotations, x-broadsword}, or one such object when name is given. Default false." },
+            Param { name: "json", ty: Ty::Boolean, required: false, description: "Print JSON instead of text: an array of {name, description, inputSchema, annotations, _meta}, or one such object when name is given. The array is what an MCP server puts under the `tools` key of its tools/list result. Default false." },
         ],
         outputs: "The tool list, or one tool in full, as text or (with json) as JSON.",
         exit_codes: &[E0, ExitDoc { code: "2", meaning: "no tool with that name" }],
         read_only: true,
         long_running: false,
         changes_files: false,
+        destructive: false,
+        idempotent: true,
         cli: "broadsword tools [<name>] [--json]",
         cli_examples: &["tools", "tools check", "tools --json", "tools check --json"],
         parse: parse_tools,
@@ -618,10 +648,22 @@ pub fn tool_full(t: &Tool) -> String {
         s.push_str(&format!("  {} ({}, {}): {}\n", p.name, p.ty.name(), if p.required { "required" } else { "optional" }, p.description));
     }
     s.push_str(&format!("\noutputs:\n  {}\n\nexit codes:\n", t.outputs));
-    for e in t.exit_codes {
+    for e in all_exits(t) {
         s.push_str(&format!("  {}  {}\n", e.code, e.meaning));
     }
+    s.push_str(&format!("\nflag meanings:\n  {READ_ONLY_MEANS}\n  {LONG_RUNNING_MEANS}\n  {CHANGES_FILES_MEANS}\n"));
     s
+}
+
+/// Exit codes that every tool can produce, documented once.
+pub const COMMON_EXITS: &[ExitDoc] = &[ExitDoc {
+    code: "1",
+    meaning: "any tool: broadsword.toml could not be loaded, or the tool failed with an error (printed on stderr as `broadsword: ...`)",
+}];
+
+/// A tool's own exit codes followed by the common ones.
+pub fn all_exits(t: &Tool) -> impl Iterator<Item = &ExitDoc> {
+    t.exit_codes.iter().chain(COMMON_EXITS)
 }
 
 // ---- JSON output (MCP tools/list shape) -------------------------------------------------
@@ -635,7 +677,7 @@ fn json_type(ty: Ty) -> &'static str {
     }
 }
 
-/// One tool as `{name, description, inputSchema, annotations, x-broadsword}`. `ind` is the indent of the opening brace.
+/// One tool as `{name, description, inputSchema, annotations, _meta}`, an entry of MCP's tools/list `tools` array (the server wraps the array as `{"tools": [...]}`). `ind` is the indent of the opening brace.
 pub fn tool_json(t: &Tool, ind: &str) -> String {
     let i1 = format!("{ind}  ");
     let i2 = format!("{ind}    ");
@@ -650,7 +692,7 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
         .collect();
     let props = if props.is_empty() { "{}".to_string() } else { format!("{{\n{}\n{i2}}}", props.join(",\n")) };
     let required: Vec<String> = t.params.iter().filter(|p| p.required).map(|p| json::string(p.name)).collect();
-    let codes: Vec<String> = t.exit_codes.iter().map(|e| format!("{{\"code\": {}, \"meaning\": {}}}", json::string(e.code), json::string(e.meaning))).collect();
+    let codes: Vec<String> = all_exits(t).map(|e| format!("{{\"code\": {}, \"meaning\": {}}}", json::string(e.code), json::string(e.meaning))).collect();
     format!(
         "{{\n\
          {i1}\"name\": {},\n\
@@ -660,27 +702,39 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
          {i2}\"properties\": {props},\n\
          {i2}\"required\": [{}]\n\
          {i1}}},\n\
-         {i1}\"annotations\": {{\"readOnlyHint\": {}}},\n\
-         {i1}\"x-broadsword\": {{\n\
+         {i1}\"annotations\": {{\"readOnlyHint\": {}, \"destructiveHint\": {}, \"idempotentHint\": {}}},\n\
+         {i1}\"_meta\": {{\"broadsword\": {{\n\
          {i2}\"cli\": {},\n\
          {i2}\"outputs\": {},\n\
          {i2}\"exit_codes\": [{}],\n\
          {i2}\"read_only\": {},\n\
          {i2}\"long_running\": {},\n\
-         {i2}\"changes_files\": {}\n\
-         {i1}}}\n\
+         {i2}\"changes_files\": {},\n\
+         {i2}\"flag_meanings\": {}\n\
+         {i1}}}}}\n\
          {ind}}}",
         json::string(t.name),
         json::string(t.description),
         required.join(", "),
         t.read_only,
+        t.destructive,
+        t.idempotent,
         json::string(t.cli),
         json::string(t.outputs),
         codes.join(", "),
         t.read_only,
         t.long_running,
         t.changes_files,
+        flag_meanings_json(),
     )
+}
+
+pub const READ_ONLY_MEANS: &str = "read_only: makes no change anywhere (writes no files, deletes nothing).";
+pub const LONG_RUNNING_MEANS: &str = "long_running: can run for minutes or indefinitely; give it a long timeout or run it in the background.";
+pub const CHANGES_FILES_MEANS: &str = "changes_files: modifies the project's working tree (its source files). Build output, logs, job records and Git refs do not count.";
+
+fn flag_meanings_json() -> String {
+    format!("{{\"read_only\": {}, \"long_running\": {}, \"changes_files\": {}}}", json::string(READ_ONLY_MEANS), json::string(LONG_RUNNING_MEANS), json::string(CHANGES_FILES_MEANS))
 }
 
 pub fn registry_json() -> String {
@@ -710,8 +764,8 @@ mod tests {
             assert!(t.description.trim().len() > 80, "{} description too short", t.name);
             assert!(!t.description.contains('\n'), "{} description must be one paragraph", t.name);
             assert!(!t.outputs.trim().is_empty(), "{} outputs", t.name);
-            assert!(!t.exit_codes.is_empty(), "{} exit codes", t.name);
-            for e in t.exit_codes {
+            assert!(all_exits(t).count() >= 2, "{} exit codes", t.name);
+            for e in all_exits(t) {
                 assert!(!e.meaning.trim().is_empty(), "{} exit {}", t.name, e.code);
             }
             for p in t.params {
@@ -734,8 +788,11 @@ mod tests {
     #[test]
     fn read_only_tools_do_not_change_files() {
         for t in TOOLS {
-            assert!(!(t.read_only && t.changes_files), "{} cannot be both", t.name);
+            assert!(!(t.read_only && (t.changes_files || t.destructive)), "{} cannot be read-only and change anything", t.name);
         }
+        // changes_files = modifies the project's working tree: only a free-form command and a rollback do.
+        let changing: Vec<&str> = TOOLS.iter().filter(|t| t.changes_files).map(|t| t.name).collect();
+        assert_eq!(changing, ["run", "recover"]);
         assert!(find("tools").unwrap().read_only);
     }
 
@@ -763,12 +820,19 @@ mod tests {
                     assert_eq!(pj.get("items").and_then(|i| i.get("type")).and_then(J::str), Some("string"));
                 }
             }
-            let x = j.get("x-broadsword").expect("x-broadsword");
-            for k in ["cli", "outputs", "exit_codes", "read_only", "long_running", "changes_files"] {
-                assert!(x.get(k).is_some(), "{} missing x-broadsword.{k}", t.name);
+            assert!(j.get("x-broadsword").is_none(), "extras live under _meta");
+            let x = j.get("_meta").and_then(|m| m.get("broadsword")).expect("_meta.broadsword");
+            for k in ["cli", "outputs", "exit_codes", "read_only", "long_running", "changes_files", "flag_meanings"] {
+                assert!(x.get(k).is_some(), "{} missing _meta.broadsword.{k}", t.name);
             }
             assert_eq!(x.get("read_only"), Some(&J::Bool(t.read_only)));
-            assert_eq!(j.get("annotations").and_then(|a| a.get("readOnlyHint")), Some(&J::Bool(t.read_only)));
+            assert_eq!(x.get("changes_files"), Some(&J::Bool(t.changes_files)));
+            let a = j.get("annotations").expect("annotations");
+            assert_eq!(a.get("readOnlyHint"), Some(&J::Bool(t.read_only)));
+            assert_eq!(a.get("destructiveHint"), Some(&J::Bool(t.destructive)));
+            assert_eq!(a.get("idempotentHint"), Some(&J::Bool(t.idempotent)));
+            let J::Arr(codes) = x.get("exit_codes").unwrap() else { panic!("exit_codes array") };
+            assert_eq!(codes.len(), all_exits(t).count());
         }
     }
 
@@ -790,6 +854,8 @@ mod tests {
             read_only: true,
             long_running: false,
             changes_files: false,
+        destructive: false,
+        idempotent: true,
             cli: "broadsword odd \"x\"",
             cli_examples: &[],
             parse: |_| None,
@@ -814,13 +880,16 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
         else {
+            eprintln!("skipped: python not found");
             return;
         };
         child.stdin.take().unwrap().write_all(registry_json().as_bytes()).unwrap();
         let out = child.wait_with_output().unwrap();
         if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Microsoft Store") {
-            return; // the Windows python shim, not a real python
+            eprintln!("skipped: python not found (only the Windows Store shim)");
+            return;
         }
+        eprintln!("python validated the registry JSON");
         assert!(out.status.success(), "python rejected the JSON: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), TOOLS.len().to_string());
     }
@@ -874,31 +943,10 @@ mod tests {
     }
 
     #[test]
-    fn documented_exit_codes_exist_in_the_code() {
+    fn job_exit_constants_match_the_documented_codes() {
+        // The behaviour of each code is proved through the real binary in tests/tools.rs; this pins the numbers.
         assert_eq!((job::EXIT_FAILED, job::EXIT_UNKNOWN_PROJECT, job::EXIT_REFUSED, job::EXIT_DISK_DROPPED), (1, 2, 3, 4));
-        let job_src = include_str!("job.rs");
-        let rec_src = include_str!("recover.rs");
-        let tools_src = include_str!("tools.rs");
-        let main_src = include_str!("main.rs");
-        let needle = |tool: &str, code: &str| -> (&'static str, &'static str) {
-            match (tool, code) {
-                ("build" | "test" | "check" | "run", "1") => (job_src, "ExitCode::from(EXIT_FAILED)"),
-                ("build" | "test" | "check" | "run", "2") => (job_src, "ExitCode::from(EXIT_UNKNOWN_PROJECT)"),
-                ("build" | "test" | "check" | "run", "3") => (job_src, "ExitCode::from(EXIT_REFUSED)"),
-                ("build" | "test" | "check" | "run", "4") => (job_src, "ExitCode::from(EXIT_DISK_DROPPED)"),
-                ("run", "N") => (job_src, "(c & 0xFF) as u8"),
-                ("recover" | "abandon", "1") => (rec_src, "ExitCode::from(1)"),
-                ("resume", "1") => (tools_src, "Ok(ExitCode::from(1))"),
-                ("status" | "watch", "1") => (main_src, "ExitCode::from(1)"), // a handler Err is printed and exits 1
-                ("tools", "2") => (tools_src, "ExitCode::from(job::EXIT_UNKNOWN_PROJECT)"),
-                _ => ("", "<undocumented>"),
-            }
-        };
-        for t in TOOLS {
-            for e in t.exit_codes.iter().filter(|e| e.code != "0") {
-                let (src, n) = needle(t.name, e.code);
-                assert!(src.contains(n), "{} documents exit {} but no code path produces it", t.name, e.code);
-            }
-        }
+        let docs: Vec<&str> = JOB_EXITS.iter().map(|e| e.code).collect();
+        assert_eq!(docs, ["0", "1", "2", "3", "4"]);
     }
 }
