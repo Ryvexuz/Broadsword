@@ -4,6 +4,8 @@
 !/scratch/.gitkeep
 /build/*
 !/build/.gitkeep
+# Cargo refuses `cargo clean -p` on a target folder without this tag; build/ existed before cargo did, so it is tracked
+!/build/CACHEDIR.TAG
 /shared/*
 !/shared/.gitkeep
 

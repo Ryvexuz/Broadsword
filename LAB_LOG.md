@@ -2,6 +2,44 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Between Stage 3 milestones 2 and 3: worktree builds
+
+**Models and roles**
+- Claude Opus 5.5 as orchestrator (main session): spec, merge, bootstrap, done check, the `build/CACHEDIR.TAG` fix, and checking the records.
+- Haiku as Housekeeper: wrote this entry, the evidence file, `PROGRESS.md` and the `IDEAS.md` changes, about 108k tokens. This was the first time records were moved off the orchestrator. The orchestrator corrected four small gaps, all in its own brief.
+- Sonnet as coder, first pass, commit `36bca91`: about 265k tokens, 15 min.
+- Sonnet as a fresh coder for the fix round, commit `9a05924`: about 130k tokens. First use of the "fresh coder for fix rounds" practice, instead of resuming the first coder.
+- Haiku as reviewer, over two passes. First use of the cheaper review tier.
+
+**What went wrong and what fixed it**
+- **Haiku's first pass failed on one real bug and one false positive.**
+  - Real: `run broadsword --task <id> -- cargo build` left a worktree binary that `install` would accept. Fixed.
+  - False: "resume skips the lock". The loop is `enumerate().skip(first_step)`, so a resume already took the lock. The fresh coder pushed back, and the orchestrator confirmed it by reading the original code. The coder still added a regression test, which fails under a mutation.
+  - The minor points were real, and were fixed or documented in the fix round:
+    - junctions: `clean` refuses them;
+    - `current_exe`: `install` requires main's `build/debug` exe;
+    - path dependencies: documented as not covered.
+- **Haiku's second pass passed** after it ran the end-to-end check the coder had skipped: `run --task -- cargo build`, then `install` refused, then `build broadsword` from main, then `install` accepted.
+- **The first done-check marker was wrong.** Changing `GRAVITY` did not fail any test, because the free-fall test computes its expected value from the same constant. The orchestrator chose a bad marker. The rerun used a test that always panics, in the worktree only.
+- **The first build after the merge failed.** Cargo 1.100 refused `cargo clean -p` because `build/` had no `CACHEDIR.TAG`. The folder was made in Stage 0 with a `.gitkeep`, so cargo never wrote the tag. Broadsword failed safely: exit 1, nothing built, no note written, `install` refused. Fix: `build/CACHEDIR.TAG` added and un-ignored in `.gitignore`. Then the bootstrap: build from a temporary copy of the binary, write the note `.`, then `install`.
+- **Two junctions were left behind** in the coder's worktree by the junction tests, which do not remove their links. Removed by hand, non-recursively. Now in `IDEAS.md`.
+- **The coder's worktree again started on the Stage 0 commit,** the eighth time.
+
+**Rough cost and time**
+- About 50 min of wall time.
+- Subagent tokens: coder about 265k, fresh coder about 130k, Haiku reviewer about 155k (cumulative over two passes). Opus reviews of similar changes earlier today: about 130–180k each.
+- Claude plan usage, when checked earlier: 5% of the weekly all-models limit. Extra usage was on, with $35.46 spent.
+
+**Git commands used, beyond a plain commit**
+- `git merge --no-ff`: merged the reviewed branch into `main` as merge commit `4ebba07`, so the coder's commits show as one piece of work.
+- `git worktree remove`: removed the coder's worktree folder after the merge.
+- `git branch -d`: deleted the merged branch. It refuses unmerged work.
+- Broadsword's code now runs `cargo clean -p <package> --offline`. It removes one package's build output from the shared folder, so the next build relinks it from the right source. This is not a git command.
+
+**One lesson about AI development**
+
+A cheaper reviewer found a real blocking bug and gave sound design advice, and also raised one false positive that the coder correctly pushed back on. Cheap review works when its findings are checked against the code before acting. And a done check in the real environment found what every test in fresh folders could not.
+
 ## 2026-11-17 — Stage 3, milestone 2: worktree per agent
 
 **Models and roles**
