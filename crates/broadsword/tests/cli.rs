@@ -1,0 +1,261 @@
+//! End-to-end tests: run the built `broadsword` binary inside a throwaway project
+//! folder under the repo's `scratch/` area. Nothing here touches the real project
+//! files; each test deletes its own folder when it ends.
+
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime};
+
+const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+
+/// A throwaway project folder with its own broadsword.toml. Removed on drop.
+struct Project {
+    dir: PathBuf,
+}
+
+impl Project {
+    fn new(name: &str, disk_floor_gb: u64) -> Project {
+        let scratch_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch");
+        let dir = scratch_root.join(format!("cli-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("scratch")).unwrap();
+        let toml = format!(
+            "root = \".\"\n\
+             disk_floor_gb = {disk_floor_gb}\n\
+             cleanup_every_hours = 1\n\
+             scratch_max_age_hours = 24\n\
+             disk_check_every_seconds = 60\n\
+             log_max_mb = 50\n\
+             ram_warn_percent = 90\n\
+             cpu_warn_percent = 90\n\
+             alert_command = \"\"\n\
+             scratch_dir = \"scratch\"\n\
+             build_dir = \"build\"\n"
+        );
+        fs::write(dir.join("broadsword.toml"), toml).unwrap();
+        Project { dir }
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.dir.join(rel)
+    }
+
+    fn pause_file(&self) -> PathBuf {
+        self.path("broadsword.paused")
+    }
+
+    fn monitor_log(&self) -> PathBuf {
+        self.path("scratch/logs/monitor.log")
+    }
+
+    /// Run the binary with the project as the working directory, feeding `stdin`.
+    fn run(&self, args: &[&str], stdin: &str) -> Output {
+        let mut child = Command::new(BIN)
+            .args(args)
+            .current_dir(&self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start broadsword");
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// Run `broadsword cleanup` and check that it paused the project.
+    fn pause_via_cleanup(&self) {
+        let out = self.run(&["cleanup"], "");
+        assert!(out.status.success(), "cleanup failed: {}", text(&out.stderr));
+        assert!(self.pause_file().is_file(), "cleanup below the floor should create broadsword.paused");
+    }
+
+    /// Set a file's modified time to `hours` ago.
+    fn age(&self, rel: &str, hours: u64) {
+        let p = self.path(rel);
+        let f = File::options().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(hours * 3600)).unwrap();
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn hook_json(tool: &str) -> String {
+    format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#)
+}
+
+fn bash_json(command: &str) -> String {
+    format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#)
+}
+
+fn code(out: &Output) -> Option<i32> {
+    out.status.code()
+}
+
+// ---- cleanup and the pause file -------------------------------------------
+
+#[test]
+fn cleanup_below_floor_creates_pause_file_and_appends_log() {
+    let p = Project::new("below-floor", 99999);
+    // Pre-existing log line: the alert must append, not overwrite.
+    fs::create_dir_all(p.path("scratch/logs")).unwrap();
+    fs::write(p.monitor_log(), "earlier line\n").unwrap();
+
+    let out = p.run(&["cleanup"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(p.pause_file().is_file(), "broadsword.paused should exist");
+    let pause_body = fs::read_to_string(p.pause_file()).unwrap();
+    assert!(pause_body.contains("reason:"), "pause file: {pause_body}");
+
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("PAUSED"), "stdout: {stdout}");
+    assert!(text(&out.stderr).contains("ALERT:"), "alert should go to stderr");
+
+    let log = fs::read_to_string(p.monitor_log()).unwrap();
+    assert!(log.starts_with("earlier line\n"), "log was overwritten: {log}");
+    assert!(log.contains("PAUSED"), "log: {log}");
+}
+
+#[test]
+fn cleanup_above_floor_does_not_pause() {
+    let p = Project::new("above-floor", 1);
+    let out = p.run(&["cleanup"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(!p.pause_file().exists(), "no pause file expected above the floor");
+    assert!(!p.monitor_log().exists() || !fs::read_to_string(p.monitor_log()).unwrap().contains("PAUSED"));
+}
+
+#[test]
+fn cleanup_deletes_only_old_scratch_files() {
+    let p = Project::new("expiry", 1);
+    fs::create_dir_all(p.path("scratch/sub")).unwrap();
+    fs::write(p.path("scratch/old.txt"), "old").unwrap();
+    fs::write(p.path("scratch/sub/old-nested.txt"), "old").unwrap();
+    fs::write(p.path("scratch/fresh.txt"), "fresh").unwrap();
+    fs::write(p.path("scratch/.gitkeep"), "").unwrap();
+    p.age("scratch/old.txt", 25);
+    p.age("scratch/sub/old-nested.txt", 48);
+    p.age("scratch/.gitkeep", 500);
+    // fresh.txt keeps its just-written mtime.
+
+    let out = p.run(&["cleanup"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(!p.path("scratch/old.txt").exists(), "old scratch file should be deleted");
+    assert!(!p.path("scratch/sub/old-nested.txt").exists(), "old nested scratch file should be deleted");
+    assert!(p.path("scratch/fresh.txt").exists(), "fresh scratch file must be kept");
+    assert!(p.path("scratch/.gitkeep").exists(), ".gitkeep must be kept");
+}
+
+#[test]
+fn cleanup_never_deletes_files_outside_scratch() {
+    let p = Project::new("outside", 1);
+    fs::create_dir_all(p.path("notes")).unwrap();
+    fs::write(p.path("keep.txt"), "keep").unwrap();
+    fs::write(p.path("notes/keep-too.txt"), "keep").unwrap();
+    fs::write(p.path("scratch/old.txt"), "gone").unwrap();
+    p.age("keep.txt", 1000);
+    p.age("notes/keep-too.txt", 1000);
+    p.age("scratch/old.txt", 1000);
+
+    let out = p.run(&["cleanup"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(p.path("keep.txt").exists(), "file outside scratch was deleted");
+    assert!(p.path("notes/keep-too.txt").exists(), "file in sibling folder was deleted");
+    assert!(!p.path("scratch/old.txt").exists(), "control: old scratch file should be gone");
+}
+
+// ---- hook exit codes -------------------------------------------------------
+
+#[test]
+fn hook_write_is_blocked_while_paused() {
+    let p = Project::new("hook-write-paused", 99999);
+    p.pause_via_cleanup();
+    let out = p.run(&["hook", "pre-tool"], &hook_json("Write"));
+    assert_eq!(code(&out), Some(2), "stderr: {}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("PAUSED"));
+}
+
+#[test]
+fn hook_read_glob_grep_allowed_while_paused() {
+    let p = Project::new("hook-readonly-paused", 99999);
+    p.pause_via_cleanup();
+    for tool in ["Read", "Glob", "Grep"] {
+        let out = p.run(&["hook", "pre-tool"], &hook_json(tool));
+        assert_eq!(code(&out), Some(0), "{tool} should pass while paused: {}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn hook_bash_broadsword_status_allowed_while_paused() {
+    let p = Project::new("hook-bash-paused", 99999);
+    p.pause_via_cleanup();
+    let out = p.run(&["hook", "pre-tool"], &bash_json("broadsword status"));
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+}
+
+#[test]
+fn hook_bash_other_commands_blocked_while_paused() {
+    let p = Project::new("hook-bash-blocked", 99999);
+    p.pause_via_cleanup();
+    let out = p.run(&["hook", "pre-tool"], &bash_json("cargo build"));
+    assert_eq!(code(&out), Some(2), "stderr: {}", text(&out.stderr));
+}
+
+#[test]
+fn hook_write_allowed_when_not_paused() {
+    let p = Project::new("hook-write-free", 1);
+    assert!(!p.pause_file().exists());
+    let out = p.run(&["hook", "pre-tool"], &hook_json("Write"));
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+}
+
+// ---- resume ----------------------------------------------------------------
+
+#[test]
+fn resume_refused_while_below_floor() {
+    let p = Project::new("resume-refused", 99999);
+    p.pause_via_cleanup();
+    let out = p.run(&["resume"], "");
+    assert_eq!(code(&out), Some(1), "stdout: {}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("refusing to resume"));
+    assert!(p.pause_file().is_file(), "refused resume must keep the pause file");
+    let hook = p.run(&["hook", "pre-tool"], &hook_json("Write"));
+    assert_eq!(code(&hook), Some(2), "still paused after refused resume");
+}
+
+#[test]
+fn resume_force_removes_pause_file() {
+    let p = Project::new("resume-force", 99999);
+    p.pause_via_cleanup();
+    let out = p.run(&["resume", "--force"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(!p.pause_file().exists(), "--force should remove broadsword.paused");
+    let hook = p.run(&["hook", "pre-tool"], &hook_json("Write"));
+    assert_eq!(code(&hook), Some(0), "Write should pass after forced resume");
+}
+
+#[test]
+fn resume_removes_pause_file_when_above_floor() {
+    let p = Project::new("resume-above", 1);
+    fs::write(p.pause_file(), "reason: test\n").unwrap();
+    let out = p.run(&["resume"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(!p.pause_file().exists());
+}
+
+#[test]
+fn resume_when_not_paused_is_a_no_op() {
+    let p = Project::new("resume-noop", 1);
+    let out = p.run(&["resume"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("not paused"));
+}
