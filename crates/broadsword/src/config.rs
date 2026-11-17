@@ -84,21 +84,17 @@ fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
     }
 }
 
-/// Optional integer: `default` when the key is absent (older config files keep working).
-fn get_int_or(m: &HashMap<String, Value>, k: &str, default: u64) -> Result<u64, String> {
-    if m.contains_key(k) {
-        get_int(m, k)
-    } else {
-        Ok(default)
-    }
-}
-
 fn get_str(m: &HashMap<String, Value>, k: &str) -> Result<String, String> {
     match m.get(k) {
         Some(Value::Str(s)) => Ok(s.clone()),
         Some(_) => Err(format!("{k}: expected a quoted string")),
         None => Err(format!("{k}: missing from {CONFIG_FILE}")),
     }
+}
+
+/// Drop `.` parts and unify separators without touching the disk (no canonicalize: no verbatim-prefix paths).
+pub fn normalize(p: &Path) -> PathBuf {
+    p.components().collect()
 }
 
 /// A path setting must be relative and stay inside root: no absolute paths, no `..`.
@@ -123,9 +119,8 @@ impl Config {
     /// `root` and every path in the file are resolved relative to it.
     pub fn from_text(text: &str, config_dir: &Path) -> Result<Config, String> {
         let m = parse_flat(text)?;
-        let root = config_dir.join(get_str(&m, "root")?);
+        let root = normalize(&config_dir.join(get_str(&m, "root")?));
         inside_root(&m, "shared_dir", false)?;
-        let projects_dir = if m.contains_key("projects_dir") { inside_root(&m, "projects_dir", true)? } else { PathBuf::from("projects") };
         Ok(Config {
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
@@ -137,9 +132,9 @@ impl Config {
             alert_command: get_str(&m, "alert_command")?,
             scratch_dir: root.join(inside_root(&m, "scratch_dir", true)?),
             build_dir: root.join(inside_root(&m, "build_dir", true)?),
-            projects_dir: root.join(projects_dir),
-            job_disk_reserve_gb: get_int_or(&m, "job_disk_reserve_gb", 2)?,
-            job_disk_poll_seconds: get_int_or(&m, "job_disk_poll_seconds", 5)?,
+            projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
+            job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
+            job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             root,
         })
     }
@@ -183,13 +178,13 @@ pub fn main_checkout_root(dir: &Path) -> PathBuf {
                 // <main>/.git/worktrees/<name>: three parents up is <main>
                 if let Some(main_root) = gitdir.parent().and_then(Path::parent).and_then(Path::parent) {
                     if main_root.join(CONFIG_FILE).is_file() {
-                        return main_root.to_path_buf();
+                        return normalize(main_root);
                     }
                 }
             }
         }
     }
-    dir.to_path_buf()
+    normalize(dir)
 }
 
 pub fn load() -> Result<Config, String> {
@@ -246,7 +241,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");
@@ -257,7 +252,7 @@ mod tests {
             let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "projects_dir {bad}");
         }
-        let t = format!("{base}scratch_dir = \"a/b\"\n");
+        let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
     }
 

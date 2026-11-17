@@ -87,10 +87,12 @@ pub fn guard_decision(paused: bool, free: u64, reserve: u64, floor: u64) -> Resu
 
 /// Free-space source for a running job. Normally the real disk. TEST ONLY: if the env var
 /// `BROADSWORD_INTERNAL_TEST_FREE_BYTES_FILE` names a file inside this root's scratch folder, its
-/// whitespace-separated byte counts are returned one per call (the last repeats), which lets
-/// integration tests simulate the disk filling mid-job. Files outside scratch are ignored, so a
-/// stray variable in a real shell can never change what a real job sees; use is announced on stderr.
+/// whitespace-separated byte counts are used one per call (the last repeats) to simulate the disk
+/// filling mid-job. Every reading is `min(hook value, real free space)`, so the hook can only make
+/// the disk look fuller, never emptier: it can never switch off the real guard. Files outside
+/// scratch are ignored, and use is announced on stderr.
 pub fn hooked_free_source(cfg: &Config) -> Box<dyn FnMut() -> u64> {
+    let root = cfg.root.clone();
     if let Ok(v) = std::env::var(TEST_FREE_HOOK_ENV) {
         let path = PathBuf::from(&v);
         let inside = match (path.canonicalize(), cfg.scratch_dir.canonicalize()) {
@@ -98,24 +100,26 @@ pub fn hooked_free_source(cfg: &Config) -> Box<dyn FnMut() -> u64> {
             _ => false,
         };
         if inside {
-            eprintln!("broadsword: TEST HOOK ACTIVE: free space is read from {v}");
+            eprintln!("broadsword: TEST HOOK ACTIVE: free space is read from {v} (never above the real free space)");
             let mut n = 0usize;
             return Box::new(move || {
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let vals: Vec<u64> = text.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                let v = vals.get(n.min(vals.len().saturating_sub(1))).copied().unwrap_or(0);
+                let hooked = vals.get(n.min(vals.len().saturating_sub(1))).copied().unwrap_or(0);
                 n += 1;
-                v
+                hooked.min(real_free(&root))
             });
         }
         eprintln!("broadsword: ignoring {TEST_FREE_HOOK_ENV}: file is not inside the scratch folder");
     }
-    let root = cfg.root.clone();
-    Box::new(move || {
-        sys::disk(&root).map(|d| d.free).unwrap_or_else(|e| {
-            eprintln!("disk check failed: {e}");
-            0
-        })
+    Box::new(move || real_free(&root))
+}
+
+/// Real free space on the root's disk.
+fn real_free(root: &Path) -> u64 {
+    sys::disk(root).map(|d| d.free).unwrap_or_else(|e| {
+        eprintln!("disk check failed: {e}");
+        0
     })
 }
 
@@ -297,6 +301,20 @@ pub fn step_line_test(run: &StepRun) -> (String, bool) {
     (line, ok)
 }
 
+/// Create `<base>.log`, or `<base>-2.log`, `-3`... if taken: an earlier log is never overwritten.
+pub fn create_log(dir: &Path, base: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for n in 1u32.. {
+        let file = if n == 1 { format!("{base}.log") } else { format!("{base}-{n}.log") };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
 /// Run a job: `kind` is build, test or check.
 pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
     let project_dir = match resolve_project(&cfg.root, &cfg.projects_dir, name) {
@@ -317,11 +335,11 @@ pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
 
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let log_dir = cfg.scratch_dir.join("logs").join("jobs");
-    let log_path = log_dir.join(format!("{}-{name}-{kind}.log", file_stamp(secs)));
-    let log: Log = match std::fs::create_dir_all(&log_dir).and_then(|_| std::fs::File::create(&log_path)) {
-        Ok(f) => Arc::new(Mutex::new(f)),
+    let log_opened = std::fs::create_dir_all(&log_dir).and_then(|_| create_log(&log_dir, &format!("{}-{name}-{kind}", file_stamp(secs))));
+    let (log_path, log): (PathBuf, Log) = match log_opened {
+        Ok((p, f)) => (p, Arc::new(Mutex::new(f))),
         Err(e) => {
-            eprintln!("broadsword: cannot create job log {}: {e}", log_path.display());
+            eprintln!("broadsword: cannot create job log in {}: {e}", log_dir.display());
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -430,6 +448,17 @@ mod tests {
         assert!(ok && l.contains("no `test result:`") && !l.contains("0 passed"), "{l}");
         assert_eq!(step_line_build(&run(0, "")).0, "build: ok (1.0 s)");
         assert_eq!(step_line_build(&run(101, "")).0, "build: FAILED (exit 101)");
+    }
+
+    #[test]
+    fn log_names_never_collide() {
+        let d = tmp("logs");
+        let (a, _) = create_log(&d, "x").unwrap();
+        let (b, _) = create_log(&d, "x").unwrap();
+        let (c, _) = create_log(&d, "x").unwrap();
+        let names = [a, b, c].map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(names, ["x.log", "x-2.log", "x-3.log"]);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

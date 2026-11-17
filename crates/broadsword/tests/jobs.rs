@@ -194,3 +194,25 @@ fn test_hook_outside_scratch_is_ignored() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("ignoring"), "{}", text(&out.stderr));
 }
+
+#[test]
+fn test_hook_cannot_defeat_the_real_disk_guard() {
+    // The real disk cannot clear this floor; the hook claims a huge free space. Still refused.
+    let r = Root::new("hookguard", 99_999_999, 2);
+    r.project("ok", TWO_TESTS, None);
+    let hook = r.dir.join("scratch/free.txt");
+    fs::write(&hook, "99999999999999999").unwrap();
+    let out = r.cmd(&["build", "ok"]).env(HOOK, &hook).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    assert!(!r.dir.join("build").exists(), "cargo must not have run");
+}
+
+#[test]
+fn same_second_jobs_keep_separate_logs() {
+    let r = Root::new("logs", 1, 0);
+    r.project("ok", TWO_TESTS, None);
+    for _ in 0..3 {
+        assert_eq!(r.run(&["build", "ok"]).status.code(), Some(0));
+    }
+    assert_eq!(r.job_logs().len(), 3, "{:?}", r.job_logs());
+}

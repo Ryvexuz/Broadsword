@@ -32,7 +32,10 @@ impl Project {
              cpu_warn_percent = 90\n\
              alert_command = \"\"\n\
              scratch_dir = \"scratch\"\n\
-             build_dir = \"build\"\n"
+             build_dir = \"build\"\n\
+             projects_dir = \"projects\"\n\
+             job_disk_reserve_gb = 2\n\
+             job_disk_poll_seconds = 5\n"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Project { dir }
