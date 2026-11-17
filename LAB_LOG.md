@@ -2,6 +2,42 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 1, milestone 3: job runner and test runner
+
+**Models and roles**
+
+- Claude Opus 5.5 as the orchestrator: spec, merge, done check, records.
+- Sonnet as the coder, in a Broadsword worktree.
+- Opus as the reviewer, over two passes.
+- No test writer. The coder wrote both unit and integration tests, as in milestone 2.
+
+**What went wrong and what fixed it**
+
+- To test "kill the job when the disk runs low", the coder added a test-only environment variable to the real binary. It fakes the free-space reading from a file in `scratch/`. The reviewer showed that it could fake more space too, so any agent could switch off the disk guard. The fix caps every faked reading at the real free space. The lesson: a test seam must only be able to make the guard stricter.
+- Same-second job logs overwrote each other, losing failure evidence. They now get `-2`, `-3` suffixes.
+- Three new settings had silent defaults, against the rule that every value lives in `broadsword.toml`. They are now required keys.
+- **The coder's worktree started on the Stage 0 commit,** not on `main`'s tip. The coder ran `git merge --ff-only main` inside its branch to catch up. The same thing happened in milestone 1. The worktree tool seems to branch from an older commit than `main`'s tip; worth checking before Stage 3.
+- **Disk space jumped** from 23.9 GB to 128.5 GB free during the session. That was outside Broadsword, presumably Lazlo freeing space.
+
+**Rough cost and time**
+
+- About 15 minutes of wall time. Subagent tokens: coder about 250k over two passes, reviewer about 220k over two passes. No dollar figure was available.
+
+**Git commands used, beyond a plain commit**
+
+- `git merge --ff-only main`, run by the coder on its own branch: moved the branch forward to `main`'s tip without a merge commit, because the branch had no commits of its own yet.
+- `git merge --no-ff`, `git worktree remove` and `git branch -d`: the same as milestone 1. A merge commit for the milestone, then removal of the merged worktree and branch.
+
+**One lesson about AI development**
+
+The reviewer failed all three Stage 1 milestones on their first pass, each time on a real problem the tests didn't catch:
+
+1. The monitor ignored worktrees.
+2. The sim failed silently.
+3. The override could disable the guard.
+
+Each fix was small. Budget for a second review pass as the normal case, not a failure.
+
 ## 2026-11-17 — Stage 1, milestone 2: starter crash sim
 
 **Models and roles**
