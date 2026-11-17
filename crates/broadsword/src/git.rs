@@ -178,7 +178,7 @@ pub struct Captured {
     pub tree: String,
     pub ignored_tree: Option<String>,
     /// Ignored files left out because the size cap was reached.
-    pub skipped: Vec<String>,
+    pub skipped: Vec<(String, u64)>,
 }
 
 fn excluded(rel: &str, opts: &Opts) -> bool {
@@ -210,7 +210,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
         }
         let len = std::fs::metadata(dir.join(&p)).map(|m| m.len()).unwrap_or(0);
         if used.saturating_add(len) > opts.ignored_max_bytes {
-            skipped.push(p);
+            skipped.push((p, len));
         } else {
             used += len;
             kept.push(p);
@@ -224,7 +224,7 @@ pub struct Checkpoint {
     pub ref_name: String,
     pub commit: String,
     pub ignored_ref: Option<String>,
-    pub skipped: Vec<String>,
+    pub skipped: Vec<(String, u64)>,
     /// Tree of the real index at the time, kept reachable under `refs/broadsword/index/<id>`.
     pub index_tree: Option<String>,
 }
@@ -259,6 +259,10 @@ pub struct Rollback {
     pub restored: usize,
     pub removed: usize,
     pub ignored_restored: usize,
+    /// Ignored files rollback did not touch: restoring them would overwrite bytes this attempt did not capture.
+    pub not_restored: Vec<String>,
+    /// Ignored files the checkpoint itself skipped (over the cap) that are missing or changed now.
+    pub not_protected: Vec<String>,
 }
 
 fn safe_rel(p: &str) -> Result<PathBuf, String> {
@@ -323,12 +327,14 @@ fn write_blob(dir: &Path, c: &Change) -> Result<(), String> {
 /// 4. The real index goes back to what it was at the checkpoint (or to HEAD if none was recorded).
 ///
 /// HEAD and the branch are never touched. Empty folders are neither restored nor removed.
+#[allow(clippy::too_many_arguments)] // each argument is one recorded fact about the job; a struct would only rename them
 pub fn rollback(
     dir: &Path,
     state: &Path,
     id: &str,
     checkpoint_ref: &str,
     checkpoint_ignored_ref: Option<&str>,
+    checkpoint_skipped: &[(String, u64)],
     index_tree: Option<&str>,
     opts: &Opts,
 ) -> Result<Rollback, String> {
@@ -362,6 +368,7 @@ pub fn rollback(
         }
     };
 
+    let apply = || -> Result<Rollback, String> {
     let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
     let main = changes(dir, &cap.tree, &ckpt_tree)?;
     let ignored = match (checkpoint_ignored_ref, &cap.ignored_tree) {
@@ -387,22 +394,49 @@ pub fn rollback(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot remove {}: {e}", full.display())),
         }
+        // Folders the removal left empty go too (deepest first, never recursive: `remove_dir` only
+        // succeeds on an empty folder), so a file the checkpoint had can take the place of a folder.
+        let mut parent = full.parent();
+        while let Some(d) = parent {
+            if d == dir || std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            parent = d.parent();
+        }
     }
     let mut restored = 0;
     for c in main.iter().filter(|c| c.status != 'D') {
         write_blob(dir, c)?;
         restored += 1;
     }
-    let mut ignored_restored = 0;
+    // Never write over a path whose current bytes are not in THIS attempt's snapshot (the size cap can leave one out).
+    let uncaptured: std::collections::HashSet<&str> = cap.skipped.iter().map(|(p, _)| p.as_str()).collect();
+    let (mut ignored_restored, mut not_restored) = (0, Vec::new());
     for c in ignored.iter().filter(|c| c.status != 'D') {
+        if uncaptured.contains(c.path.as_str()) {
+            not_restored.push(c.path.clone());
+            continue;
+        }
         write_blob(dir, c)?;
         ignored_restored += 1;
+    }
+    let mut not_protected = Vec::new();
+    for (p, len) in checkpoint_skipped {
+        match std::fs::metadata(dir.join(p)) {
+            Err(_) => not_protected.push(format!("{p} (missing now)")),
+            Ok(m) if m.len() != *len => not_protected.push(format!("{p} (size changed from {len} to {} bytes)", m.len())),
+            Ok(_) => {}
+        }
     }
     match index_tree {
         Some(t) => git_text(dir, &["read-tree", t], None)?,
         None => git_text(dir, &["reset", "-q"], None)?,
     };
-    Ok(Rollback { interrupted_ref, interrupted_ignored_ref, restored, removed, ignored_restored })
+    Ok(Rollback { interrupted_ref: interrupted_ref.clone(), interrupted_ignored_ref: interrupted_ignored_ref.clone(), restored, removed, ignored_restored, not_restored, not_protected })
+    };
+    apply().map_err(|e| {
+        format!("{e}. The work as it was before this attempt is saved in {interrupted_ref}; steps before the failure may already have been applied")
+    })
 }
 
 #[cfg(test)]
@@ -480,7 +514,7 @@ mod tests {
         let state = state_for("cap");
         let o = Opts { excludes: vec![], ignored_max_bytes: 1000 };
         let c = checkpoint(&d, &state, "j", &o).unwrap();
-        assert_eq!(c.skipped, ["b.log"]);
+        assert_eq!(c.skipped, [("b.log".to_string(), 600)]);
         assert_eq!(show(&d, &c.ignored_ref.unwrap(), "a.log").len(), 600);
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
@@ -509,7 +543,7 @@ mod tests {
         fs::write(d.join("sub").join("made.txt"), "made").unwrap();
         fs::write(d.join("ignored.txt"), "created by job").unwrap();
         let head_before = head(&d);
-        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
         assert_eq!(fs::read_to_string(d.join("tracked.txt")).unwrap(), "before-job");
         assert!(!d.join("sub").join("made.txt").exists());
         assert_eq!(fs::read_to_string(d.join("ignored.txt")).unwrap(), "created by job", "ignored files the job created stay");
@@ -521,7 +555,7 @@ mod tests {
         assert_eq!(show(&d, &r.interrupted_ignored_ref.unwrap(), "ignored.txt"), "created by job");
         assert_eq!(status(&d), "M tracked.txt"); // index matches HEAD again: only the unstaged change shows
         // a second rollback is a new attempt with its own ref
-        let r2 = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        let r2 = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
         assert_eq!(r2.interrupted_ref, "refs/broadsword/interrupted/j/2");
         assert_eq!(show(&d, "refs/broadsword/interrupted/j/1", "sub/made.txt"), "made");
         let _ = fs::remove_dir_all(&state);
@@ -540,12 +574,12 @@ mod tests {
         fs::write(d.join("made.txt"), "made").unwrap();
         // lock the file the job added: it can be read but not deleted
         let lock = fs::OpenOptions::new().read(true).share_mode(1).open(d.join("made.txt")).unwrap();
-        let first = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts());
+        let first = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts());
         assert!(first.is_err(), "rollback must fail while the file is locked");
         // the user edits a file after the failed attempt, then the lock goes away
         fs::write(d.join("tracked.txt"), "user edit after failure").unwrap();
         drop(lock);
-        let second = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        let second = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
         assert_eq!(fs::read_to_string(d.join("tracked.txt")).unwrap(), "one");
         assert_eq!(show(&d, &second.interrupted_ref, "tracked.txt"), "user edit after failure", "the edit is saved in this attempt's snapshot");
         assert_ne!(second.interrupted_ref, "refs/broadsword/interrupted/j/1");
@@ -577,11 +611,72 @@ mod tests {
             fs::write(d.join(n), b"job changed this\n").unwrap();
         }
         fs::write(d.join("untracked-lf.txt"), b"changed\r\n").unwrap();
-        rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
         for (n, b) in originals {
             assert_eq!(fs::read(d.join(n)).unwrap(), b, "{n}");
         }
         assert_eq!(fs::read(d.join("untracked-lf.txt")).unwrap(), b"x\ny\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression (cap): rollback must never write over an ignored file whose current bytes were not captured.
+    #[test]
+    fn cap_never_lets_rollback_overwrite_an_uncaptured_file() {
+        let d = temp_repo("capover");
+        fs::write(d.join(".env"), "SECRET=original").unwrap();
+        fs::write(d.join("big.log"), vec![b'x'; 500]).unwrap(); // 515 bytes in total: fits the checkpoint's cap
+        let o = Opts { excludes: vec![], ignored_max_bytes: 1000 };
+        let state = state_for("capover");
+        let c = checkpoint(&d, &state, "j", &o).unwrap();
+        assert!(c.skipped.is_empty());
+        // the job adds an ignored file that sorts first and nearly fills the cap
+        fs::write(d.join(".aaa.log"), vec![b'y'; 990]).unwrap();
+        fs::write(d.join(".env"), "SECRET=changed by job").unwrap();
+        // the interrupted snapshot now cannot hold .env; the user edits it after the kill
+        fs::write(d.join(".env"), "USER EDIT, in no snapshot").unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &o).unwrap();
+        assert_eq!(fs::read_to_string(d.join(".env")).unwrap(), "USER EDIT, in no snapshot", "uncaptured bytes must never be overwritten");
+        assert!(r.not_restored.contains(&".env".to_string()), "{:?}", r.not_restored);
+        assert_eq!(fs::read(d.join(".aaa.log")).unwrap().len(), 990, "ignored files the job created stay");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The checkpoint's own skipped files are reported when they are missing or changed at rollback time.
+    #[test]
+    fn rollback_reports_files_the_checkpoint_could_not_protect() {
+        let d = temp_repo("unprot");
+        fs::write(d.join("a.log"), vec![b'a'; 600]).unwrap();
+        fs::write(d.join("b.log"), vec![b'b'; 600]).unwrap();
+        fs::write(d.join("c.log"), vec![b'c'; 10]).unwrap();
+        let o = Opts { excludes: vec![], ignored_max_bytes: 1000 };
+        let state = state_for("unprot");
+        let c = checkpoint(&d, &state, "j", &o).unwrap();
+        assert_eq!(c.skipped.len(), 1); // b.log
+        fs::remove_file(d.join("b.log")).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &o).unwrap();
+        assert_eq!(r.not_protected, ["b.log (missing now)"]);
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression: a file replaced by a folder (and other emptied folders) must not wedge the rollback.
+    #[test]
+    fn file_replaced_by_directory_can_be_rolled_back() {
+        let d = temp_repo("filedir");
+        fs::write(d.join("st.txt"), "file").unwrap();
+        let state = state_for("filedir");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        fs::remove_file(d.join("st.txt")).unwrap();
+        fs::create_dir_all(d.join("st.txt")).unwrap();
+        fs::write(d.join("st.txt").join("inner.txt"), "inner").unwrap();
+        fs::create_dir_all(d.join("deep").join("er")).unwrap();
+        fs::write(d.join("deep").join("er").join("x.txt"), "x").unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(fs::read_to_string(d.join("st.txt")).unwrap(), "file");
+        assert!(!d.join("deep").exists(), "folders emptied by the rollback are removed");
+        assert_eq!(show(&d, &r.interrupted_ref, "st.txt/inner.txt"), "inner");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -597,7 +692,7 @@ mod tests {
         fs::write(d.join(".env"), "SECRET=changed").unwrap();
         fs::remove_file(d.join(".env2")).unwrap();
         fs::write(d.join("made.log"), "log made by job").unwrap();
-        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), c.index_tree.as_deref(), &opts()).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
         assert_eq!(fs::read(d.join(".env")).unwrap(), b"SECRET=1\r\nB=2\n");
         assert_eq!(fs::read(d.join(".env2")).unwrap(), b"OTHER=1");
         assert_eq!(fs::read_to_string(d.join("made.log")).unwrap(), "log made by job", "ignored files the job created are never deleted");

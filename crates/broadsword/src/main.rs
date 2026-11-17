@@ -133,7 +133,7 @@ fn guarded(cfg: &Config, project: &str, job: impl FnOnce() -> ExitCode) -> ExitC
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build|test|check <project> | run <project> -- <command...> | recover [--list] | jobs>");
+    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build|test|check <project> | run <project> -- <command...> | recover [--list | --abandon <id>] | jobs>");
     ExitCode::from(64)
 }
 
@@ -161,6 +161,7 @@ fn main() -> ExitCode {
         [k @ ("build" | "test" | "check"), name] => Ok(guarded(&cfg, name, || job::cmd_job(&cfg, k, name))),
         ["run", name, "--", command @ ..] if !command.is_empty() => Ok(guarded(&cfg, name, || job::cmd_run(&cfg, name, command))),
         ["recover"] => Ok(recover::recover(&cfg, recover::Mode::Explicit)),
+        ["recover", "--abandon", id] => Ok(recover::abandon(&cfg, id)),
         ["recover", "--list"] | ["jobs"] => Ok(recover::cmd_list(&cfg)),
         ["hook", "pre-tool"] => Ok(cmd_hook(&cfg)),
         _ => return usage(),

@@ -20,7 +20,7 @@ use crate::git;
 use crate::job::{self, JobSpec};
 use crate::record::{self, Record};
 use crate::sys;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -97,8 +97,55 @@ impl Drop for Lock {
     }
 }
 
-/// Take `state/recover.lock` (exclusive create holding pid and creation time). A lock whose owner is
-/// gone is taken over; a live one is waited for briefly, then an error says who holds it.
+/// What happened when we tried to remove a lock we judged stale.
+#[derive(Debug, PartialEq, Eq)]
+enum Takeover {
+    /// The stale lock is gone; try to create ours.
+    Removed,
+    /// What we moved aside was not the stale lock we had judged (it was someone's fresh lock): put back.
+    PutBack,
+    /// It was someone's fresh lock and we could not put it back because another holder exists.
+    Busy,
+    /// Somebody else removed it first.
+    Gone,
+}
+
+/// Remove a lock judged stale (`seen` is the exact content we judged). The lock is first renamed to a
+/// unique name, then the moved file is re-read: only if it is exactly `seen` is it discarded. Otherwise
+/// it belongs to a racer who just took the lock, and it goes back with an exclusive create.
+fn take_over_stale(path: &Path, seen: &str, tag: &str) -> Takeover {
+    use std::io::Write;
+    let aside = path.with_extension(format!("stale-{tag}"));
+    if std::fs::rename(path, &aside).is_err() {
+        return Takeover::Gone;
+    }
+    let moved = std::fs::read_to_string(&aside).unwrap_or_default();
+    if moved == seen {
+        let _ = std::fs::remove_file(&aside);
+        return Takeover::Removed;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            let _ = f.write_all(moved.as_bytes()).and_then(|_| f.sync_all());
+            let _ = std::fs::remove_file(&aside);
+            Takeover::PutBack
+        }
+        Err(_) => Takeover::Busy, // the moved lock stays at `aside`; two holders may exist, so give up
+    }
+}
+
+/// A lock is stale when its owner is gone (exact pid and creation time), or when it holds no readable
+/// owner and is older than 60 s (a recover killed between creating and writing it).
+fn lock_is_stale(path: &Path, seen: &str) -> bool {
+    let mut lines = seen.lines();
+    match lines.next().and_then(|l| l.parse::<u32>().ok()) {
+        Some(pid) => !sys::is_alive(pid, lines.next().and_then(|l| l.parse::<u64>().ok())),
+        None => std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(60)),
+    }
+}
+
+/// Take `state/recover.lock` (exclusive create holding pid and creation time). A stale lock is taken
+/// over; a live one is waited for briefly, then an error says who holds it.
 fn acquire(cfg: &Config, wait: Duration) -> Result<Lock, String> {
     use std::io::Write;
     std::fs::create_dir_all(&cfg.state_dir).map_err(|e| format!("cannot create {}: {e}", cfg.state_dir.display()))?;
@@ -117,29 +164,20 @@ fn acquire(cfg: &Config, wait: Duration) -> Result<Lock, String> {
             Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
         }
         let seen = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut lines = seen.lines();
-        let owner = lines.next().and_then(|l| l.parse::<u32>().ok());
-        let start = lines.next().and_then(|l| l.parse::<u64>().ok());
-        if let Some(pid) = owner {
-            if !sys::is_alive(pid, start) && takeovers < 5 {
-                // Stale: move it aside (only one taker can win the rename), and put it back if what we moved was not what we saw.
-                takeovers += 1;
-                let aside = path.with_extension(format!("stale-{me}-{takeovers}"));
-                if std::fs::rename(&path, &aside).is_ok() {
-                    if std::fs::read_to_string(&aside).unwrap_or_default() == seen {
-                        let _ = std::fs::remove_file(&aside);
-                    } else if !path.exists() {
-                        let _ = std::fs::rename(&aside, &path);
-                    }
-                }
-                continue;
+        let owner = seen.lines().next().and_then(|l| l.parse::<u32>().ok());
+        let busy = || match owner {
+            Some(pid) => format!("another recover is in progress (pid {pid}); wait for it, or if it is stuck delete {}", path.display()),
+            None => format!("{} exists and cannot be read; if no recover is running, delete it", path.display()),
+        };
+        if lock_is_stale(&path, &seen) && takeovers < 10 {
+            takeovers += 1;
+            match take_over_stale(&path, &seen, &format!("{me}-{takeovers}")) {
+                Takeover::Busy => return Err(busy()),
+                _ => continue,
             }
         }
         if Instant::now() >= deadline {
-            return Err(match owner {
-                Some(pid) => format!("another recover is in progress (pid {pid}); wait for it, or if it is stuck delete {}", path.display()),
-                None => format!("{} exists and cannot be read; if no recover is running, delete it", path.display()),
-            });
+            return Err(busy());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -215,7 +253,7 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
         println!("recover: nothing to do");
     }
     if !attention.is_empty() {
-        eprintln!("broadsword: NEEDS ATTENTION: {} could not be recovered; nothing was deleted, fix the cause and run `broadsword recover` again", attention.join(", "));
+        eprintln!("broadsword: NEEDS ATTENTION: {} could not be recovered automatically (see above). Records and refs are kept and the work saved under refs/broadsword/ is intact; fix the cause and run `broadsword recover` again, or `broadsword recover --abandon <id>`", attention.join(", "));
         return ExitCode::from(1);
     }
     ExitCode::from(u8::from(resumed_failed))
@@ -236,10 +274,14 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     }
     let nonempty = |k: &str| Some(r.get(k).to_string()).filter(|t| !t.is_empty());
     let (index_tree, ign) = (nonempty("index_tree"), nonempty("checkpoint_ignored"));
-    let rb = git::rollback(&dir, &cfg.state_dir, &id, &ckpt, ign.as_deref(), index_tree.as_deref(), &git::Opts::for_project(cfg, &dir))
-        .map_err(|e| format!("rollback of {id} failed, record left as running so it can be retried (nothing was deleted): {e}"))?;
+    let lens: Vec<u64> = r.get("ignored_skipped_len").split('|').filter_map(|n| n.parse().ok()).collect();
+    let skipped: Vec<(String, u64)> = r.get("ignored_skipped").split('|').filter(|p| !p.is_empty()).zip(lens).map(|(p, n)| (p.to_string(), n)).collect();
+    let rb = git::rollback(&dir, &cfg.state_dir, &id, &ckpt, ign.as_deref(), &skipped, index_tree.as_deref(), &git::Opts::for_project(cfg, &dir))
+        .map_err(|e| format!("rollback of {id} failed, record left as running so it can be retried: {e}"))?;
     r.set("interrupted", rb.interrupted_ref.as_str());
     r.set("interrupted_ignored", rb.interrupted_ignored_ref.clone().unwrap_or_default());
+    r.set("not_restored", rb.not_restored.join("|"));
+    r.set("not_protected", rb.not_protected.join("|"));
     r.set("status", record::ROLLED_BACK);
     save(r)?;
     println!("  rolled back to the checkpoint: restored {} file(s), removed {} new file(s), restored {} ignored file(s)", rb.restored, rb.removed, rb.ignored_restored);
@@ -248,6 +290,110 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     if let Some(i) = &rb.interrupted_ignored_ref {
         println!("  interrupted ignored files, kept:    {i}");
     }
+    for p in &rb.not_restored {
+        println!("  not restored (current copy not captured, left exactly as it is): {p}");
+    }
+    for p in &rb.not_protected {
+        println!("  not protected by the checkpoint (it was over the ignored-file size cap): {p}");
+    }
     println!("  see the partial work: git -C {} diff {ckpt} {}", dir.display(), rb.interrupted_ref);
     Ok(())
+}
+
+/// `broadsword recover --abandon <id>`: give up on an interrupted job without touching any file.
+/// The record becomes `abandoned` (which lifts the per-project refusal); the record and every ref stay.
+pub fn abandon(cfg: &Config, id: &str) -> ExitCode {
+    let _lock = match acquire(cfg, Duration::from_secs(5)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("broadsword: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if id.is_empty() || record::sanitize(id) != id {
+        eprintln!("broadsword: `{id}` is not a job id (see `broadsword jobs`)");
+        return ExitCode::from(1);
+    }
+    let path = record::jobs_dir(cfg).join(format!("{id}.rec"));
+    let mut r = match record::load(&path) {
+        Ok(r) if r.id() == id => r,
+        _ => {
+            eprintln!("broadsword: no job record with the exact id `{id}` (see `broadsword jobs`)");
+            return ExitCode::from(1);
+        }
+    };
+    if r.status() != record::RUNNING {
+        eprintln!("broadsword: job {id} is `{}`, not `running`: nothing to abandon", r.status());
+        return ExitCode::from(1);
+    }
+    if broadsword_alive(&r) {
+        eprintln!("broadsword: job {id} is still running (broadsword pid {}); not abandoning it", r.get("pid"));
+        return ExitCode::from(1);
+    }
+    kill_orphan(&r);
+    r.set("status", record::ABANDONED);
+    r.set("ended", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string());
+    if let Err(e) = save(&r) {
+        eprintln!("broadsword: ERROR: {e}");
+        return ExitCode::from(1);
+    }
+    println!("job {id} abandoned: no file was changed, and the record and all refs are kept");
+    for k in ["checkpoint", "checkpoint_ignored", "interrupted", "interrupted_ignored"] {
+        if !r.get(k).is_empty() && r.get(k) != "pending" && r.get(k) != "none" {
+            println!("  {k}: {}", r.get(k));
+        }
+    }
+    println!("  see everything saved for this job: git -C <project folder> for-each-ref \"refs/broadsword/*/{id}*\"");
+    println!("  compare the files with the checkpoint: git -C <project folder> diff {}", r.get("checkpoint"));
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-lock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn takeover_discards_exactly_the_stale_lock() {
+        let d = dir("stale");
+        let lock = d.join("recover.lock");
+        std::fs::write(&lock, "4000000000\n\n").unwrap();
+        assert_eq!(take_over_stale(&lock, "4000000000\n\n", "t1"), Takeover::Removed);
+        assert!(!lock.exists());
+        assert_eq!(take_over_stale(&lock, "x", "t2"), Takeover::Gone);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression: a racer's fresh lock must never be thrown away by a taker that judged an older lock stale.
+    #[test]
+    fn takeover_puts_back_a_fresh_lock_it_moved_by_mistake() {
+        let d = dir("fresh");
+        let lock = d.join("recover.lock");
+        let fresh = format!("{}\n\n", std::process::id());
+        std::fs::write(&lock, &fresh).unwrap();
+        assert_eq!(take_over_stale(&lock, "4000000000\n\n", "t1"), Takeover::PutBack);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), fresh, "the fresh lock is back, unchanged");
+        assert!(std::fs::read_dir(&d).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("stale")), "nothing left aside");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn unreadable_locks_are_stale_only_after_60_seconds() {
+        let d = dir("old");
+        let lock = d.join("recover.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert!(!lock_is_stale(&lock, ""), "a brand-new empty lock may still be being written");
+        let f = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)).unwrap();
+        drop(f);
+        assert!(lock_is_stale(&lock, ""));
+        assert!(!lock_is_stale(&lock, &format!("{}\n\n", std::process::id())), "a live owner is never stale");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

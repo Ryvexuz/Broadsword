@@ -16,6 +16,7 @@ pub const REFUSED: &str = "refused";
 pub const KILLED_LOW_DISK: &str = "killed_low_disk";
 pub const RESUMED: &str = "resumed";
 pub const ROLLED_BACK: &str = "rolled_back";
+pub const ABANDONED: &str = "abandoned";
 
 #[derive(Debug, Clone)]
 pub struct Record {

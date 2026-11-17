@@ -504,9 +504,10 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                                 "broadsword: warning: {} ignored file(s) were NOT saved in the checkpoint (over the {} MB checkpoint_ignored_max_mb limit): {}",
                                 c.skipped.len(),
                                 cfg.checkpoint_ignored_max_mb,
-                                c.skipped.join(", ")
+                                c.skipped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ")
                             );
-                            rec.set("ignored_skipped", c.skipped.join("|"));
+                            rec.set("ignored_skipped", c.skipped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join("|"));
+                            rec.set("ignored_skipped_len", c.skipped.iter().map(|(_, n)| n.to_string()).collect::<Vec<_>>().join("|"));
                         }
                     }
                     Err(e) if kind == "run" => {

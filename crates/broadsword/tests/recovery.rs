@@ -452,3 +452,32 @@ fn resume_is_capped_by_max_resumes() {
     assert_eq!(Root::field(&rec, "status"), "failed");
     assert!(Root::field(&rec, "failure_reason").contains("max_resumes"), "{rec}");
 }
+
+/// Way out: `recover --abandon <exact id>` keeps record and refs, touches no file, and lifts the refusal.
+#[test]
+fn abandon_lifts_the_refusal_without_touching_files() {
+    let mut r = Root::new("abandon");
+    r.project("", true);
+    let p = r.project_dir();
+    let bs_pid = r.spawn(&["run", "p", "--", sleepy_change()]);
+    wait_until("partial changes", 60, || r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("new.txt").exists());
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    kill_hard(bs_pid);
+    assert_eq!(r.run(&["run", "p", "--", "echo hi"]).status.code(), Some(3), "refused while the interrupted run is unresolved");
+    // the exact id is required
+    let out = r.run(&["recover", "--abandon", &id[..id.len() - 1]]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(Root::field(&r.records()[0].1, "status"), "running");
+    let out = r.run(&["recover", "--abandon", &id]);
+    let so = text(&out.stdout);
+    println!("{so}");
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(so.contains("abandoned") && so.contains("refs/broadsword/checkpoints/"), "{so}");
+    assert!(p.join("new.txt").exists(), "abandon never touches files");
+    let recs = r.records();
+    assert_eq!(Root::field(&recs[0].1, "status"), "abandoned");
+    assert!(!git(&p, &["rev-parse", "--verify", &format!("refs/broadsword/checkpoints/{id}")]).is_empty(), "refs kept");
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+}
