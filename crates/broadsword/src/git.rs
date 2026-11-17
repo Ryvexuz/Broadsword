@@ -11,6 +11,7 @@
 //! - `refs/broadsword/checkpoints/<id>` and `refs/broadsword/checkpoints-ignored/<id>`
 //! - `refs/broadsword/interrupted/<id>/<attempt>` and `refs/broadsword/interrupted-ignored/<id>/<attempt>`
 //! - `refs/broadsword/index/<id>`: the real index at checkpoint time
+//! - `refs/broadsword/interrupted-index/<id>/<attempt>`: the real index just before a rollback replaced it
 //!
 //! Refs are only ever created (never overwritten or deleted), so no snapshot is ever lost.
 
@@ -26,6 +27,7 @@ pub const CHECKPOINT_IGNORED_REFS: &str = "refs/broadsword/checkpoints-ignored";
 pub const INTERRUPTED_REFS: &str = "refs/broadsword/interrupted";
 pub const INTERRUPTED_IGNORED_REFS: &str = "refs/broadsword/interrupted-ignored";
 pub const INDEX_REFS: &str = "refs/broadsword/index";
+pub const INTERRUPTED_INDEX_REFS: &str = "refs/broadsword/interrupted-index";
 
 /// What a snapshot leaves out of the ignored set, and how much of it it keeps.
 pub struct Opts {
@@ -256,6 +258,8 @@ pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Che
 pub struct Rollback {
     pub interrupted_ref: String,
     pub interrupted_ignored_ref: Option<String>,
+    /// The real index as it was just before rollback replaced it.
+    pub interrupted_index_ref: Option<String>,
     pub restored: usize,
     pub removed: usize,
     pub ignored_restored: usize,
@@ -489,11 +493,34 @@ pub fn rollback(
             Ok(_) => {}
         }
     }
-    match index_tree {
-        Some(t) => git_text(dir, &["read-tree", t], None)?,
-        None => git_text(dir, &["reset", "-q"], None)?,
-    };
-    Ok(Rollback { interrupted_ref: interrupted_ref.clone(), interrupted_ignored_ref: interrupted_ignored_ref.clone(), restored, removed, ignored_restored, not_restored, not_protected })
+    // The real index follows the same rule as the Guard: it is only replaced after its current content
+    // is saved. Staged content from after the kill goes to `interrupted-index/<id>/<attempt>` first; an
+    // index with unmerged entries cannot be saved, so it is left completely alone and reported.
+    let mut not_restored = not_restored;
+    let mut interrupted_index_ref = None;
+    match git_text(dir, &["write-tree"], None) {
+        Ok(tree) => {
+            let c = commit_tree(dir, &tree, parent.as_deref(), &format!("broadsword interrupted index of {id}"))?;
+            let r = format!("{INTERRUPTED_INDEX_REFS}/{id}/{attempt}");
+            create_ref(dir, &r, &c)?;
+            interrupted_index_ref = Some(r);
+            match index_tree {
+                Some(t) => git_text(dir, &["read-tree", t], None)?,
+                None => git_text(dir, &["reset", "-q"], None)?,
+            };
+        }
+        Err(e) => not_restored.push(format!("(the git index: it has unmerged entries and cannot be saved, so it was left untouched: {e})")),
+    }
+    Ok(Rollback {
+        interrupted_ref: interrupted_ref.clone(),
+        interrupted_ignored_ref: interrupted_ignored_ref.clone(),
+        interrupted_index_ref,
+        restored,
+        removed,
+        ignored_restored,
+        not_restored,
+        not_protected,
+    })
     };
     apply().map_err(|e| {
         format!("{e}. The work as it was before this attempt is saved in {interrupted_ref}; steps before the failure may already have been applied")
@@ -800,6 +827,44 @@ mod tests {
         fs::remove_file(d.join("dir").join("f.txt")).unwrap();
         assert!(g.remove_empty_dir(&d.join("dir")));
         assert_eq!(g.skipped, ["uncaptured.txt", "changed.txt", "dir"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression: content staged after the kill is saved before the real index is restored.
+    #[test]
+    fn staged_content_after_the_kill_is_saved_before_the_index_is_restored() {
+        let d = temp_repo("idx");
+        let state = state_for("idx");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        fs::write(d.join("m.rs"), "fn staged_after_the_kill() {}").unwrap();
+        git_text(&d, &["add", "m.rs"], None).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        let ir = r.interrupted_index_ref.expect("index ref");
+        assert_eq!(ir, "refs/broadsword/interrupted-index/j/1");
+        assert_eq!(show(&d, &ir, "m.rs"), "fn staged_after_the_kill() {}", "the staged blob is reachable");
+        assert!(!git_text(&d, &["ls-files", "--stage"], None).unwrap().contains("m.rs"), "index restored to the checkpoint state");
+        assert!(r.not_restored.is_empty());
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// An index with unmerged entries cannot be saved: it is left untouched and reported.
+    #[test]
+    fn unmerged_index_is_left_untouched_and_reported() {
+        let d = temp_repo("unmerged");
+        let state = state_for("unmerged");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        let blob = |b: &[u8]| String::from_utf8_lossy(&git(&d, &["hash-object", "-w", "--stdin"], None, Some(b)).unwrap()).trim().to_string();
+        let (a, b) = (blob(b"ours"), blob(b"theirs"));
+        let entries = format!("0 {z}\ttracked.txt\n100644 {a} 2\ttracked.txt\n100644 {b} 3\ttracked.txt\n", z = "0".repeat(40));
+        git(&d, &["update-index", "--index-info"], None, Some(entries.as_bytes())).unwrap();
+        assert!(git_text(&d, &["write-tree"], None).is_err(), "the index really is unmerged");
+        let before = git_text(&d, &["ls-files", "--stage"], None).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(git_text(&d, &["ls-files", "--stage"], None).unwrap(), before, "index untouched");
+        assert!(r.interrupted_index_ref.is_none());
+        assert!(r.not_restored.iter().any(|p| p.contains("git index")), "{:?}", r.not_restored);
+        let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
 

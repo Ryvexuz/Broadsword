@@ -280,6 +280,7 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
         .map_err(|e| format!("rollback of {id} failed, record left as running so it can be retried: {e}"))?;
     r.set("interrupted", rb.interrupted_ref.as_str());
     r.set("interrupted_ignored", rb.interrupted_ignored_ref.clone().unwrap_or_default());
+    r.set("interrupted_index", rb.interrupted_index_ref.clone().unwrap_or_default());
     r.set("not_restored", rb.not_restored.join("|"));
     r.set("not_protected", rb.not_protected.join("|"));
     let partial = !rb.not_restored.is_empty();
@@ -298,6 +299,9 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     println!("  interrupted (partial work, kept):   {}", rb.interrupted_ref);
     if let Some(i) = &rb.interrupted_ignored_ref {
         println!("  interrupted ignored files, kept:    {i}");
+    }
+    if let Some(i) = &rb.interrupted_index_ref {
+        println!("  index before rollback, kept:        {i}");
     }
     for p in &rb.not_restored {
         println!("  not restored (current copy not captured, left exactly as it is): {p}");
@@ -353,7 +357,7 @@ pub fn abandon(cfg: &Config, id: &str) -> ExitCode {
         return ExitCode::from(1);
     }
     println!("job {id} abandoned: no file was changed, and the record and all refs are kept");
-    for k in ["checkpoint", "checkpoint_ignored", "interrupted", "interrupted_ignored"] {
+    for k in ["checkpoint", "checkpoint_ignored", "interrupted", "interrupted_ignored", "interrupted_index"] {
         if !r.get(k).is_empty() && r.get(k) != "pending" && r.get(k) != "none" {
             println!("  {k}: {}", r.get(k));
         }
