@@ -5,6 +5,7 @@
 //! Stage 2's MCP server will list tools from `TOOLS` (`registry_json` already has the shape of
 //! `tools/list`) and call the same `handler` with the same typed `Inputs`.
 //!
+//! `broadsword mcp` (the MCP transport, see mcp.rs) is NOT a tool either: it is how tools are reached.
 //! `broadsword hook pre-tool` is NOT a tool. It is plumbing for Claude Code's PreToolUse hook: it reads
 //! the hook's JSON from stdin and answers only through its exit code. It is not a capability an AI
 //! should choose to call, so it lives in `main.rs` as a CLI command outside this table.
@@ -405,7 +406,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "tools",
         summary: "List these tools, or describe one in full.",
-        description: "Prints this registry: every tool Broadsword offers, with its inputs and flags. Give a tool name to see that tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get the registry as JSON: a bare array of tool objects in the shape of the entries of MCP's tools/list (an MCP server wraps it as {\"tools\": [...]}). Use it to discover what Broadsword can do. It only reads and returns immediately.",
+        description: "Returns this registry: every tool Broadsword offers, with its inputs, outputs, exit codes and flags. Give a tool name to get that one tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get JSON instead of text: the same tool objects an MCP client already sees in tools/list. Use it to re-check what Broadsword can do. It only reads and returns immediately.",
         params: &[
             Param { name: "name", ty: Ty::String, required: false, description: "Show only this tool, in full. Omit to list all tools. An unknown name fails with exit code 2." },
             Param { name: "json", ty: Ty::Boolean, required: false, description: "Print JSON instead of text: an array of {name, description, inputSchema, annotations, _meta}, or one such object when name is given. The array is what an MCP server puts under the `tools` key of its tools/list result. Default false." },
@@ -463,6 +464,7 @@ pub fn usage_text() -> String {
         s.push_str(&format!("  {}\n", t.cli.strip_prefix("broadsword ").unwrap_or(t.cli)));
     }
     s.push_str("  hook pre-tool   (internal: Claude Code's PreToolUse hook, not a tool)\n");
+    s.push_str("  mcp             (internal: MCP server over stdio, not a tool)\n");
     s
 }
 
@@ -762,7 +764,7 @@ fn registry_json_of(tools: &[Tool]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json::check::{parse, J};
+    use crate::json::{parse, J};
 
     fn snake(n: &str) -> bool {
         !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit() || c == '_')
