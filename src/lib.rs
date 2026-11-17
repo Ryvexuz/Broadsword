@@ -70,7 +70,7 @@ impl Config {
         let limit = max_stable_step();
         if h > limit {
             return Err(format!(
-                "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s                  (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s,                  k = {BEAM_STIFFNESS}); raise --substeps or lower --dt",
+ "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s, k = {BEAM_STIFFNESS}); raise --substeps or lower --dt",
                 (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
             ));
         }
