@@ -2,6 +2,38 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 3, milestone 1: task board
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator: spec, merge, done check, records.
+- Sonnet as coder, in a worktree, over two passes.
+- Opus as reviewer, over two passes. The first pass ran 20 minutes of stress scripts.
+
+**What went wrong and what fixed it**
+
+- **The first version failed the done check under the reviewer's attack.** Two tasks claiming `src` were running at once.
+  - The cause was the stale-lock takeover the coder reused from `recover`. It was Stage 1's "known limitation 7": "rare, no lost work". On the task board, that same race breaks the one guarantee the board exists for.
+  - **A known limitation in one place became a blocking bug when the code was reused somewhere with a stronger requirement.**
+- **The fix was a different design, not a patch:** OS file locks (`File::try_lock`), which the OS releases when a process dies. All the stale-detection code was deleted, and `recover` switched too.
+- **Project names** were compared raw. On Windows `Crash` and `crash` are the same folder but didn't conflict. Fixed with one canonicalising function used everywhere.
+- **A setting with a silent default came back** (`task_lock_wait_seconds`), the same mistake as Stage 1 m3. The rule is in `AGENTS.md`, but coders don't reliably apply it. Worth adding to the coder role file.
+- **Shared build folder:** after merging, I updated `tools.rs`'s timestamp before rebuilding, to avoid the stale-binary hazard found in the Stage 2 close-out. The rebuild was confirmed by the tool count.
+- **The worktree again started on the Stage 0 commit,** the seventh time.
+
+**Rough cost and time**
+
+- About 1 h 15 min of wall time.
+- Subagent tokens: coder about 265k, reviewer about 180k.
+
+**Git commands used, beyond a plain commit**
+
+- `git merge --no-ff`, `git worktree remove` and `git branch -d`, as before.
+
+**One lesson about AI development**
+
+Reuse carries limitations along with code. The coder correctly reused a reviewed lock, but its documented weakness was acceptable only for `recover`. Before reusing reviewed code, re-read its known limitations against the new requirement.
+
 ## Stage 2 lessons (AI Integration, closed 2026-11-17)
 
 1. **Name the hard cases in the spec, and review passes drop.**
