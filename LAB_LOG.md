@@ -2,6 +2,49 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 1, milestone 4: recovery
+
+**Models and roles**
+
+- Claude Opus 5.5 as the orchestrator: spec, five review handoffs, merge, done check, records.
+- Sonnet as the coder, in a Broadsword worktree, over five passes in one continuing agent.
+- Opus as the reviewer, over five passes in one continuing agent.
+- No test writer.
+
+**What went wrong and what fixed it**
+
+- This was the hardest milestone so far: five review passes, all on real ways to lose work, each reproduced by the reviewer in throwaway Git repos.
+  1. A retried rollback overwrote later edits.
+  2. Under `core.autocrlf=true` restored files weren't byte-exact.
+  3. `.env` (ignored) was not protected.
+  4. The ignored-file size cap could overwrite unsaved bytes, twice through different code paths.
+  5. A file turned into a folder blocked recovery.
+  6. Restoring the index dropped content staged after the kill.
+- Patching each path separately failed twice for the same class of bug. What worked was changing the structure: one `Guard` that every working-tree write and delete passes through. It allows an action only on a missing path or on bytes already in this attempt's snapshot.
+- The orchestrator also changed one design point: auto-recover no longer rolls back silently before an unrelated build. It refuses new jobs on that project until an explicit `recover` or `recover --abandon`.
+- The done check ran on real projects: a file-changing job on `crash-sim` was rolled back, and a `check broadsword` killed mid-test was resumed.
+
+**Rough cost and time**
+
+- About 45 minutes of wall time. Subagent tokens: coder about 290k (cumulative over five passes in one agent), reviewer about 220k. This was the most expensive milestone. No dollar figure was available.
+
+**Git commands used, beyond a plain commit**
+
+These are used by Broadsword's code, explained here as AGENTS.md asks:
+
+- `GIT_INDEX_FILE=<temp> git read-tree HEAD` / `update-index -z --index-info` / `write-tree` / `commit-tree`: build a commit of the exact working tree in a separate temporary index, so the real index, HEAD and branch are untouched.
+- `git hash-object -w --no-filters`: store a file's raw bytes with no line-ending conversion.
+- `git cat-file blob`: read those bytes back to restore a file exactly.
+- `git update-ref <ref> <sha> ""`: create a ref only if it doesn't exist yet. Checkpoints can't overwrite each other.
+- `git ls-tree -r`: list a snapshot's files and their blobs, to compare against what is on disk.
+- `git read-tree <tree>` (no `-u`): reset the real index to a saved tree without touching any files.
+
+Orchestrator: `git merge --no-ff`, `git worktree remove` and `git branch -d`, as in milestone 1.
+
+**One lesson about AI development**
+
+The coder fixed exactly the case the reviewer reported, each time, so the same class of bug came back through a neighbouring path. A review finding is a sample of a class, not the whole class. Asking for one function that enforces the invariant everywhere ended the loop where patching each path hadn't. The review loop was expensive but bought something real: each of the six data-loss bugs would have deleted someone's work.
+
 ## 2026-11-17 — Stage 1, milestone 3: job runner and test runner
 
 **Models and roles**
