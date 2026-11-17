@@ -1,0 +1,47 @@
+[
+  {
+    "id": "a19ee1a",
+    "kind": "silent failure",
+    "diff": "cases/a19ee1a.diff",
+    "brief": "Task: a starter crash simulator in Rust (std only). A cube of 8 nodes and 28 spring-damper beams falls under gravity, hits a ground plane at y=0 and bounces, using semi-implicit Euler at a fixed timestep with substeps. It runs headless and prints CSV to stdout (t,min_y,center_y,max_beam_strain) for a default 5 s, with flags --duration --dt --substeps --drop-height --no-tilt. Done check: it builds, runs headless and prints the cube's height over time. The diff below is the src/ folder of the first commit.",
+    "bug": "An unstable run (for example a large dt with few substeps) blows up to inf/NaN, yet the program still prints the CSV rows and exits 0. The strain max uses fold(0.0, f64::max), which drops NaN, so the strain reads 0 for a blown-up state. Nothing makes an unstable run fail loudly.",
+    "catch": "(?i)(nan|non-?finite|inf(inity)?\\b|blow[s ]?up|unstab|diverg|explod).{0,200}(exit|silent|0\\b|success|loud|detect|check|refus|report)|f64::max|fold\\(0\\.0|(exit|silent|success).{0,120}(nan|non-?finite|unstab|blow)",
+    "known_false_positives": []
+  },
+  {
+    "id": "fd98728",
+    "kind": "secrets",
+    "diff": "cases/fd98728.diff",
+    "brief": "Task: clients/openai_mcp.py, a Python standard-library bridge from OpenAI Chat Completions tool calling to Broadsword's MCP server. It spawns `broadsword.exe mcp` as a child process over stdio, offers an allow-listed set of tools to the model, forwards tool calls, and feeds results back. It reads OPENAI_API_KEY from the environment or a .env file. Requirement: the key must never be printed, logged, written anywhere, or exposed to the model; everything printed is redacted. One of the server's tools, `run`, executes arbitrary shell commands (not in the default allow-list, but can be enabled with --allow). Done check: an OpenAI model connects through the server and runs a build.",
+    "bug": "The MCP server child process is spawned without env=, so it inherits OPENAI_API_KEY. A tool that echoes the environment (e.g. `run` with `echo %OPENAI_API_KEY%`) sends the full key back into the model's context (tool results go into messages unredacted) and Broadsword writes it to its job log on disk.",
+    "catch": "(?i)(child|subprocess|popen|server|spawn).{0,160}(env|environ|inherit)|(inherit|environ).{0,160}(key|secret|openai_api_key)|env\\s*=|(tool result|messages).{0,120}(not|un)redact",
+    "known_false_positives": []
+  },
+  {
+    "id": "3ad7320",
+    "kind": "concurrency",
+    "diff": "cases/3ad7320.diff",
+    "brief": "Task: a task board for parallel agents (Rust, std only). Tasks have path claims per project; `task start` must atomically check that no running task's claims overlap, then mark the task running. A board lock (state/tasks/board.lock) guards check-and-mark; the lock code was moved from an existing recover lock into src/lock.rs and is shared by both. It uses create_new lock files holding owner pid and creation time, with stale-lock takeover (rename aside, re-read, put back). Done check: two tasks with overlapping claims never run at once, even under many concurrent `task start` processes.",
+    "bug": "The stale-lock takeover races: a waiter that judged the lock stale from an old view renames a fresh lock aside; before it can put it back a third process creates its own lock, so two processes hold the lock and two overlapping tasks run at once. The same dance also leaves ownerless locks that block starts for 60 s. (Also blocking: project names compared as raw strings, so `Crash` and `crash` do not conflict on Windows; and an optional setting with a hard-coded default.)",
+    "catch": "(?i)(two|both|multiple|double).{0,80}(holder|hold|own|acquir)|(stale|takeover|rename).{0,200}(race|toctou|fresh|another|third|concurren)|(race|toctou).{0,200}(stale|takeover|rename|put.?back)",
+    "known_false_positives": []
+  },
+  {
+    "id": "cadbb6d",
+    "kind": "data loss",
+    "diff": "cases/cadbb6d.diff",
+    "brief": "Task: one Git worktree per task (Rust, std only). `task start --worktree` creates a worktree and branch task/<id> from the project's current main tip. `task done` removes the worktree automatically, but only when it is safe: the worktree must be clean and the branch merged into main; otherwise it is kept with a warning. Rules: never delete work, history or failure evidence; never force. API keys live in a .env file that is git-ignored. Done check: worktrees are created and removed automatically and disappear after merging.",
+    "bug": "The cleanliness check uses `git status --porcelain --ignored=no`, so ignored files such as `.env` (where secrets live) or ignored notes are deleted silently along with the worktree. (Also blocking: task_done not flagged destructive; the board lock is held through `git worktree add`, locking out other agents on large repos.)",
+    "catch": "(?i)ignored.{0,200}(delet|lost|remov|silent|\\.env|destroy)|\\.env.{0,200}(delet|lost|remov|ignored)|--ignored=no",
+    "known_false_positives": []
+  },
+  {
+    "id": "36bca91",
+    "kind": "bypass",
+    "diff": "cases/36bca91.diff",
+    "brief": "Task: make builds go through Broadsword for a task's worktree, and close a stale-binary hazard in the one shared build folder. `--task <id>` runs build/test/check/run in a task's worktree. Per-package notes record which source folder last built into the shared folder; when it changes, `cargo clean -p <pkg>` runs first. A build lock (OS file lock) makes clean+build+note atomic for a job's cargo steps. `broadsword install` copies the built binary to a stable place used by a safety hook and an MCP server, and must only install the main checkout's build, never a worktree's. `run` executes an arbitrary command in the folder. Done check: a task's worktree builds through Broadsword and main afterwards gets main's own binary.",
+    "bug": "`run` takes no build lock and does not touch the notes, so `run broadsword --task <id> -- cargo build` in a worktree overwrites the shared binary with worktree code while the note still says main; `install` would then accept and install a worktree's binary.",
+    "catch": "(?i)\\brun\\b.{0,200}(cargo|bypass|lock|note|install|stale)|(install).{0,200}(worktree|run\\b|bypass)",
+    "known_false_positives": ["(?i)resum.{0,120}(lock|prepare|skip)|first_step"]
+  }
+]
