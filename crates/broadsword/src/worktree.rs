@@ -20,8 +20,10 @@
 //! - the worktree must contain NOTHING that git does not already hold safely: `git status --porcelain --ignored` empty,
 //!   so no modified, staged or untracked files AND no ignored files (`.env`, notes, ...: Broadsword cannot know they are
 //!   disposable, so it never deletes them and there is no override);
-//! - it must still be on its task branch, and every commit in the worktree's own HEAD reflog must be reachable from
-//!   some ref (a commit made on a detached HEAD and left behind would lose its last reference);
+//! - it must really be a worktree of the project (not a stray folder inside some other repo), and still be on its task
+//!   branch;
+//! - a commit in the worktree's own HEAD reflog that is reachable from no ref (amended away, rebased, or made on a
+//!   detached HEAD) is not a reason to refuse: it is saved under `refs/broadsword/kept/<task id>/<short sha>` first;
 //! - the branch must be MERGED: its tip is an ancestor of the main checkout's HEAD (`--keep-branch` skips this one rule,
 //!   because the branch, which holds the commits, is kept);
 //! - then `git worktree remove` (no `--force`), then `git branch -d` (no `-D`, so Git refuses an unmerged branch too, or
@@ -295,7 +297,7 @@ pub enum BranchFate {
 }
 
 pub enum Removal {
-    Removed { branch: BranchFate },
+    Removed { branch: BranchFate, kept_refs: Vec<String> },
     Kept { reasons: Vec<String>, advice: Vec<String> },
 }
 
@@ -320,7 +322,14 @@ pub fn remove_for(cfg: &Config, t: &Record, keep_branch: bool) -> Result<Removal
     let into = wtgit::current_branch(&dir)?.unwrap_or_else(|| "HEAD".into());
 
     let (mut reasons, mut advice) = (Vec::new(), Vec::new());
+    let mut kept_refs: Vec<String> = Vec::new();
     if exists {
+        if !wtgit::is_worktree_of(&dir, &path) {
+            return Ok(Removal::Kept {
+                reasons: vec![format!("{} is a stray folder, not a git worktree of project `{}`; left in place (git commands run there would act on an enclosing repo, so nothing in it was inspected)", path.display(), t.get("project"))],
+                advice: vec!["look at the folder yourself; if it is only leftovers, delete it by hand, then run `broadsword worktree prune`".into()],
+            });
+        }
         match wtgit::current_branch(&path) {
             Ok(Some(b)) if b == branch => {}
             Ok(Some(b)) => reasons.push(format!("the worktree is on branch `{b}`, not `{branch}`, so removing it could lose commits made there")),
@@ -344,17 +353,13 @@ pub fn remove_for(cfg: &Config, t: &Record, keep_branch: bool) -> Result<Removal
             }
             Err(e) => reasons.push(format!("its state cannot be read: {e}")),
         }
-        match wtgit::reflog_commits(&path) {
-            Ok(commits) => {
-                let orphans: Vec<&String> = commits.iter().filter(|c| !wtgit::on_some_ref(&dir, c).unwrap_or(false)).collect();
-                if !orphans.is_empty() {
-                    let shown: Vec<String> = orphans.iter().take(5).map(|c| c.chars().take(10).collect()).collect();
-                    reasons.push(format!("{} commit(s) in the worktree's own history are reachable from no branch (their last reference is the worktree's HEAD log, which removal would delete): {}", orphans.len(), shown.join(", ")));
-                    advice.push(format!("keep them with `git branch <name> <commit>` in {} (or discard them deliberately), then run `broadsword worktree remove {id}`", path.display()));
-                }
+        let orphans = match wtgit::reflog_commits(&path).and_then(|all| wtgit::on_no_ref(&dir, &all)) {
+            Ok(o) => o,
+            Err(e) => {
+                reasons.push(format!("its HEAD log cannot be read: {e}"));
+                Vec::new()
             }
-            Err(e) => reasons.push(format!("its HEAD log cannot be read: {e}")),
-        }
+        };
         if !keep_branch {
             if !branch_there {
                 reasons.push(format!("the branch `{branch}` no longer exists, so what the worktree holds cannot be checked as merged"));
@@ -367,6 +372,15 @@ pub fn remove_for(cfg: &Config, t: &Record, keep_branch: bool) -> Result<Removal
         if !reasons.is_empty() {
             return Ok(Removal::Kept { reasons, advice });
         }
+        for c in &orphans {
+            let name = format!("refs/broadsword/kept/{id}/{}", &c[..c.len().min(12)]);
+            if let Err(e) = wtgit::keep_ref(&dir, &name, c) {
+                return Ok(Removal::Kept { reasons: vec![format!("commit {} is on no branch and could not be saved under {name}: {e}", &c[..c.len().min(10)])], advice: vec!["nothing was removed; fix the cause and retry".into()] });
+            }
+            kept_refs.push(name);
+        }
+        // Documented limitation: an ignored file written into the worktree between the status check above and this call
+        // (a few milliseconds) is deleted with it; git itself only refuses for tracked or untracked changes.
         if let Err(e) = wtgit::worktree_remove(&dir, &path) {
             let locked = e.to_lowercase().contains("locked");
             let why = if locked { format!("the worktree is locked: {e}") } else { format!("git refused to remove it: {e}") };
@@ -392,29 +406,38 @@ pub fn remove_for(cfg: &Config, t: &Record, keep_branch: bool) -> Result<Removal
             Err(e) => BranchFate::Kept(format!("git refused to delete it (its commits stay on it): {e}")),
         }
     };
-    Ok(Removal::Removed { branch })
+    Ok(Removal::Removed { branch, kept_refs })
 }
 
 /// Record `worktree_removed` for a task, briefly, under the board lock, on a FRESH copy of the record. Only if the record
 /// still names the same worktree and has not been marked yet.
-fn mark_removed(cfg: &Config, id: &str, rel: &str) -> Result<(), ExitCode> {
+fn mark_removed(cfg: &Config, id: &str, rel: &str, kept_refs: &[String]) -> Result<(), ExitCode> {
     let _lock = task::board_lock(cfg)?;
     let mut t = task::load_task(cfg, id).map_err(|e| task::fail(task::EXIT_ERROR, e))?;
     if t.get("worktree") == rel && t.get("worktree_removed").is_empty() {
         t.set("worktree_removed", task::now_secs().to_string());
+        t.set("kept_refs", kept_refs.join("\n"));
         task::save(&t).map_err(|e| task::fail(task::EXIT_ERROR, format!("{e} (the worktree itself was removed)")))?;
     }
     Ok(())
 }
 
-fn say_removed(t: &Record, branch: &BranchFate) -> String {
+fn say_removed(t: &Record, branch: &BranchFate, kept_refs: &[String]) -> String {
     let b = branch_of(t);
     let fate = match branch {
         BranchFate::Deleted => format!("branch {b} deleted (it was merged)"),
         BranchFate::AlreadyGone => format!("branch {b} was already gone"),
         BranchFate::Kept(why) => format!("branch {b} kept: {why}"),
     };
-    format!("worktree removed: {}; {fate}", t.get("worktree"))
+    let mut out = format!("worktree removed: {}; {fate}", t.get("worktree"));
+    if !kept_refs.is_empty() {
+        out.push_str(&format!(
+            "\nkept {} commit(s) that were on no branch (rebased or amended away, or made on a detached HEAD) so none is lost: {}\n  inspect with `git log <ref>` in the project; delete with `git update-ref -d <ref>` when you are sure they are not needed",
+            kept_refs.len(),
+            kept_refs.join(", ")
+        ));
+    }
+    out
 }
 
 fn print_kept(reasons: &[String], advice: &[String], to_stderr: bool) {
@@ -438,11 +461,11 @@ fn print_kept(reasons: &[String], advice: &[String], to_stderr: bool) {
 /// error: the task is done either way. Returns the exit code to use (0, or the lock error if recording failed).
 pub fn after_done(cfg: &Config, t: &Record) -> ExitCode {
     match remove_for(cfg, t, false) {
-        Ok(Removal::Removed { branch }) => {
-            if let Err(c) = mark_removed(cfg, t.id(), t.get("worktree")) {
+        Ok(Removal::Removed { branch, kept_refs }) => {
+            if let Err(c) = mark_removed(cfg, t.id(), t.get("worktree"), &kept_refs) {
                 return c;
             }
-            println!("{}", say_removed(t, &branch));
+            println!("{}", say_removed(t, &branch, &kept_refs));
         }
         Ok(Removal::Kept { reasons, advice }) => {
             println!("worktree kept: {}", t.get("worktree"));
@@ -487,6 +510,7 @@ pub fn cmd_create(cfg: &Config, id: &str) -> ExitCode {
             let (path_there, branch_there) = (path.exists(), wtgit::branch_exists(&dir, &branch).unwrap_or(true));
             if path_there && branch_there {
                 let complete = wtgit::branch_tip(&dir, &branch).is_ok_and(|tip| tip == t.get("base"))
+                    && wtgit::is_worktree_of(&dir, &path)
                     && wtgit::current_branch(&path).ok().flatten().as_deref() == Some(branch.as_str())
                     && wtgit::status_porcelain(&path).is_ok_and(|s| s.is_empty());
                 if !complete {
@@ -544,11 +568,11 @@ pub fn cmd_remove(cfg: &Config, id: &str, keep_branch: bool) -> ExitCode {
         t
     }; // lock released: the git work below runs without it
     match remove_for(cfg, &t, keep_branch) {
-        Ok(Removal::Removed { branch }) => {
-            if let Err(c) = mark_removed(cfg, id, t.get("worktree")) {
+        Ok(Removal::Removed { branch, kept_refs }) => {
+            if let Err(c) = mark_removed(cfg, id, t.get("worktree"), &kept_refs) {
                 return c;
             }
-            println!("{}", say_removed(&t, &branch));
+            println!("{}", say_removed(&t, &branch, &kept_refs));
             ExitCode::SUCCESS
         }
         Ok(Removal::Kept { reasons, advice }) => {
@@ -579,12 +603,12 @@ pub fn cmd_prune(cfg: &Config) -> ExitCode {
             continue;
         }
         match remove_for(cfg, &t, false) {
-            Ok(Removal::Removed { branch }) => {
-                if mark_removed(cfg, &id, t.get("worktree")).is_err() {
+            Ok(Removal::Removed { branch, kept_refs }) => {
+                if mark_removed(cfg, &id, t.get("worktree"), &kept_refs).is_err() {
                     failed = true;
                 }
                 removed += 1;
-                println!("removed {id}: {}", say_removed(&t, &branch));
+                println!("removed {id}: {}", say_removed(&t, &branch, &kept_refs));
             }
             Ok(Removal::Kept { reasons, advice }) => {
                 kept += 1;
@@ -642,6 +666,8 @@ fn state_of(cfg: &Config, t: &Record) -> (&'static str, &'static str) {
     let (Ok(dir), Ok(path)) = (project_dir(cfg, t), abs_path(cfg, t.get("worktree"))) else { return ("unknown", "unknown") };
     let clean = if !path.exists() {
         "missing"
+    } else if !wtgit::is_worktree_of(&dir, &path) {
+        "stray"
     } else {
         match wtgit::status_porcelain(&path) {
             Ok(s) if s.is_empty() => "clean",

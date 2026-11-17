@@ -476,6 +476,9 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         println!("worktree: {}{}", t.get("worktree"), if t.get("worktree_removed").is_empty() { "" } else { " (removed)" });
         println!("branch: {}", t.get("branch"));
         println!("base: {}", t.get("base"));
+        if !t.get("kept_refs").is_empty() {
+            println!("kept refs: {}", t.get("kept_refs").replace('\n', ", "));
+        }
     }
     ExitCode::SUCCESS
 }

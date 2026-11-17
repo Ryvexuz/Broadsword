@@ -15,15 +15,28 @@ pub struct Out {
 
 /// Run `git <args>` in `dir`. `Err` only when git cannot be started; a non-zero exit is an `Out` with its code.
 fn run(dir: &Path, args: &[&str]) -> Result<Out, String> {
-    let o = Command::new("git")
+    run_with(dir, args, None)
+}
+
+/// Same, feeding `input` to git's stdin (used for long lists of commits, which would not fit on a command line).
+fn run_with(dir: &Path, args: &[&str], input: Option<String>) -> Result<Out, String> {
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .output()
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "git is not installed or not on PATH".to_string() } else { format!("cannot start git: {e}") })?;
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, data.as_bytes());
+        });
+    }
+    let o = child.wait_with_output().map_err(|e| format!("git {}: {e}", args.join(" ")))?;
     Ok(Out { code: o.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(), stderr: String::from_utf8_lossy(&o.stderr).trim().to_string() })
 }
 
@@ -109,10 +122,62 @@ pub fn reflog_commits(worktree: &Path) -> Result<Vec<String>, String> {
     Ok(v)
 }
 
-/// `git for-each-ref --contains <commit> --count=1 refs/`: is the commit reachable from at least one branch, tag or other
-/// ref (HEAD is not a ref here)? Why: a commit on no ref is lost once the worktree's HEAD log is deleted.
-pub fn on_some_ref(dir: &Path, commit: &str) -> Result<bool, String> {
-    Ok(!ok(dir, &["for-each-ref", "--contains", commit, "--count=1", "--format=%(refname)", "refs/"])?.is_empty())
+/// `git rev-list --stdin --not --all` (run in the PROJECT's repo, commits fed on stdin): of the given commits, which are
+/// reachable from no branch, tag or other ref? It is one git call for the whole list (not one per commit): rev-list walks
+/// from the given commits, hides everything reachable from any ref (`--all`, which includes the main checkout's HEAD), and
+/// prints what is left; the answer is the given commits that appear in that output. Why: a commit on no ref would be lost
+/// once the worktree's HEAD log is deleted.
+pub fn on_no_ref(dir: &Path, commits: &[String]) -> Result<Vec<String>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let o = run_with(dir, &["rev-list", "--stdin", "--not", "--all"], Some(commits.join("\n") + "\n"))?;
+    if o.code != 0 {
+        return Err(format!("git rev-list --stdin --not --all failed: {}", without_force_hints(&o.stderr)));
+    }
+    let unreachable: Vec<&str> = o.stdout.lines().map(str::trim).collect();
+    Ok(commits.iter().filter(|c| unreachable.contains(&c.as_str())).cloned().collect())
+}
+
+/// `git update-ref <ref> <commit> ""` then `git rev-parse --verify <ref>`: create a ref that must not exist yet (the empty
+/// old value means "only if absent"), and read it back. An existing ref already at `commit` counts as done. Why: gives a
+/// commit that would lose its last reference a permanent home under refs/broadsword/kept/.
+pub fn keep_ref(dir: &Path, name: &str, commit: &str) -> Result<(), String> {
+    if ok(dir, &["rev-parse", "--verify", "-q", name]).is_ok_and(|c| c == commit) {
+        return Ok(());
+    }
+    ok(dir, &["update-ref", name, commit, ""])?;
+    match ok(dir, &["rev-parse", "--verify", name]) {
+        Ok(c) if c == commit => Ok(()),
+        other => Err(format!("ref {name} did not read back as {commit}: {other:?}")),
+    }
+}
+
+/// Make a path comparable: absolute, `/` separators, no `\\?\` prefix, no trailing slash, case-folded on Windows.
+fn norm(p: &str) -> String {
+    let p = std::fs::canonicalize(p).map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string());
+    let p = p.trim_start_matches(r"\\?\").replace('\\', "/");
+    let p = p.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p
+    }
+}
+
+/// `git rev-parse --show-toplevel` and `git rev-parse --path-format=absolute --git-common-dir` in the folder, and in the
+/// project: is `path` really the root of a worktree of THIS project's repo? A plain folder (or one in some other repo)
+/// would otherwise make every later git command run in the enclosing repo. Why: never judge or touch the wrong repo.
+pub fn is_worktree_of(project_dir: &Path, path: &Path) -> bool {
+    let Ok(top) = ok(path, &["rev-parse", "--show-toplevel"]) else { return false };
+    if norm(&top) != norm(&path.to_string_lossy()) {
+        return false;
+    }
+    let common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    match (ok(path, &common), ok(project_dir, &common)) {
+        (Ok(a), Ok(b)) => norm(&a) == norm(&b),
+        _ => false,
+    }
 }
 
 /// `git merge-base --is-ancestor <commit> HEAD`: is the commit already part of the main checkout's current branch (exit 0)

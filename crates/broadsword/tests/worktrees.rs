@@ -639,8 +639,12 @@ fn done_is_flagged_destructive_and_says_it_deletes_the_worktree_and_branch() {
     assert!(o.stdout.contains("DELETES the worktree folder and the `task/<id>` branch"), "{}", o.stdout);
 }
 
+fn kept_ref(id: &str, sha: &str) -> String {
+    format!("refs/broadsword/kept/{id}/{}", &sha[..12])
+}
+
 #[test]
-fn a_commit_whose_last_reference_is_the_worktrees_head_log_blocks_removal() {
+fn a_commit_whose_last_reference_is_the_worktrees_head_log_is_saved_then_the_worktree_goes() {
     let r = Root::new("orphan");
     let id = r.started("src");
     git(&r.wt(&id), &["checkout", "-q", "--detach"]);
@@ -650,14 +654,74 @@ fn a_commit_whose_last_reference_is_the_worktrees_head_log_blocks_removal() {
     let sha = git(&r.wt(&id), &["rev-parse", "HEAD"]);
     git(&r.wt(&id), &["checkout", "-q", &format!("task/{id}")]); // back on the branch, clean, branch merged
     let o = r.run(&["task", "done", &id]);
-    assert_eq!(o.code, 0);
-    assert!(o.stdout.contains("worktree kept"), "{}", o.stdout);
-    assert!(o.stderr.contains("reachable from no branch") && o.stderr.contains(&sha[..10]), "{}", o.stderr);
-    assert!(r.wt(&id).is_dir());
-    git(&r.p(), &["branch", "rescue", &sha]); // the owner keeps the work
-    assert_eq!(r.run(&["worktree", "remove", &id]).code, 0);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("worktree removed") && o.stdout.contains(&kept_ref(&id, &sha)) && o.stdout.contains("git update-ref -d"), "{}", o.stdout);
     assert!(!r.wt(&id).exists());
-    assert_eq!(git(&r.p(), &["rev-parse", "rescue"]), sha);
+    assert_eq!(git(&r.p(), &["rev-parse", &kept_ref(&id, &sha)]), sha, "the commit is kept under a ref");
+    assert!(git(&r.p(), &["log", "--format=%s", &kept_ref(&id, &sha)]).contains("orphan work"));
+    assert!(r.show(&id, "kept refs").unwrap().contains(&kept_ref(&id, &sha)));
+}
+
+#[test]
+fn rebase_then_merge_and_amend_remove_the_worktree_and_keep_the_old_commits() {
+    let r = Root::new("rebase");
+    // rebase-then-merge, as a merge queue does
+    let id = r.started("src");
+    let old = r.commit_in_wt(&id, "b.txt");
+    fs::write(r.p().join("a.txt"), "moved on\n").unwrap();
+    git(&r.p(), &["commit", "-q", "-am", "main moved"]);
+    git(&r.wt(&id), &["rebase", "-q", "main"]);
+    let new = git(&r.wt(&id), &["rev-parse", "HEAD"]);
+    assert_ne!(old, new);
+    r.merge_into_main(&id);
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("worktree removed") && o.stdout.contains("deleted"), "{}", o.stdout);
+    assert!(!r.wt(&id).exists() && !r.branches().iter().any(|b| b.starts_with("task/")));
+    assert_eq!(git(&r.p(), &["rev-parse", &kept_ref(&id, &old)]), old, "the pre-rebase commit is kept");
+    assert!(git_out(&r.p(), &["rev-parse", "--verify", "-q", &kept_ref(&id, &new)]).code != 0, "the merged commit needs no kept ref");
+    // amended away
+    let id = r.started("docs");
+    let first = r.commit_in_wt(&id, "d.txt");
+    git(&r.wt(&id), &["commit", "-q", "--amend", "-m", "better"]);
+    r.merge_into_main(&id);
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(!r.wt(&id).exists());
+    assert_eq!(git(&r.p(), &["rev-parse", &kept_ref(&id, &first)]), first);
+    // a clean worktree whose history is all on branches gets no kept refs
+    let id = r.started("lib");
+    r.commit_in_wt(&id, "e.txt");
+    r.merge_into_main(&id);
+    assert_eq!(r.run(&["task", "done", &id]).code, 0);
+    assert!(git(&r.p(), &["for-each-ref", &format!("refs/broadsword/kept/{id}")]).is_empty());
+}
+
+#[test]
+fn a_stray_folder_at_the_worktree_path_is_never_inspected_as_a_worktree() {
+    let r = Root::new("stray");
+    let id = r.started("src");
+    assert_eq!(r.run(&["task", "fail", &id]).code, 0);
+    // the worktree vanishes (removed with git itself) and a plain folder takes its place, inside an enclosing repo
+    git(&r.p(), &["worktree", "remove", r.wt(&id).to_str().unwrap()]);
+    fs::create_dir_all(r.wt(&id)).unwrap();
+    fs::write(r.wt(&id).join("mine.txt"), "not git's\n").unwrap();
+    let o = r.run(&["worktree", "remove", &id]);
+    assert_eq!(o.code, 3, "{}", o.stderr);
+    assert!(o.stderr.contains("stray folder, not a git worktree"), "{}", o.stderr);
+    assert!(!o.stderr.contains("merged") && !o.stderr.contains("uncommitted"), "no misleading clean/merged reasons: {}", o.stderr);
+    assert!(r.run(&["worktree", "list"]).stdout.contains("stray"));
+    let o = r.run(&["worktree", "prune"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains(&format!("kept {id}")) && o.stdout.contains("stray folder, not a git worktree") && o.stdout.contains("left in place"), "{}", o.stdout);
+    assert!(r.wt(&id).join("mine.txt").is_file(), "left in place");
+    // and done on a task whose folder was swapped for a stray one only warns
+    let id2 = r.started("docs");
+    git(&r.p(), &["worktree", "remove", r.wt(&id2).to_str().unwrap()]);
+    fs::create_dir_all(r.wt(&id2)).unwrap();
+    let o = r.run(&["task", "done", &id2]);
+    assert_eq!(o.code, 0);
+    assert!(o.stderr.contains("stray folder") && r.wt(&id2).is_dir());
 }
 
 #[test]
