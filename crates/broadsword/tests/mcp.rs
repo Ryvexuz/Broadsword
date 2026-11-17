@@ -18,7 +18,7 @@ impl Root {
         let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
                     ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
                     state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-                    checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n";
+                    checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\n";
         std::fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root(dir)
     }
@@ -113,7 +113,7 @@ fn tools_list_has_every_tool_with_the_same_schemas_as_tools_json() {
     let res = r.get("result").unwrap();
     assert_eq!(res.get("nextCursor"), None);
     let Some(J::Arr(mcp_tools)) = res.get("tools") else { panic!("result.tools array") };
-    assert_eq!(mcp_tools.len(), 14);
+    assert_eq!(mcp_tools.len(), 22);
     assert_eq!(mcp_tools, &cli_tools, "tools/list must equal `tools --json` exactly");
     for t in mcp_tools {
         assert!(t.get("name").and_then(J::str).is_some());
@@ -249,7 +249,7 @@ fn responses_are_valid_for_python_if_available() {
     }
     let (out, _) = session(&[INIT, r#"{"jsonrpc":"2.0","id":"s","method":"tools/list"}"#, "garbage", r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#]);
     let mut child = Command::new("python")
-        .args(["-I", "-c", "import json,sys\nn=0\nfor l in sys.stdin.read().split('\\n'):\n  if l:\n    d=json.loads(l); assert d['jsonrpc']=='2.0'; n+=1\n    if d.get('id')=='s': assert len(d['result']['tools'])==14\nprint(n)"])
+        .args(["-I", "-c", "import json,sys\nn=0\nfor l in sys.stdin.read().split('\\n'):\n  if l:\n    d=json.loads(l); assert d['jsonrpc']=='2.0'; n+=1\n    if d.get('id')=='s': assert len(d['result']['tools'])==22\nprint(n)"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

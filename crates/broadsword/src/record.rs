@@ -81,7 +81,8 @@ impl Record {
 
     /// Write atomically: temp file in the same folder, then rename over the record.
     pub fn save(&self) -> std::io::Result<()> {
-        let tmp = self.path.with_extension("rec.tmp");
+        let ext = self.path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = self.path.with_extension(format!("{ext}.tmp"));
         {
             let mut f = std::fs::File::create(&tmp)?;
             std::io::Write::write_all(&mut f, self.render().as_bytes())?;
@@ -103,11 +104,16 @@ pub fn sanitize(s: &str) -> String {
 /// Claim a unique job id: `<base>`, `<base>-2`, ... The claim is an exclusive create of the `.rec`
 /// file, so two jobs started in the same second (even by two processes) never share an id.
 pub fn create(dir: &Path, base: &str) -> std::io::Result<Record> {
+    create_ext(dir, base, "rec")
+}
+
+/// `create` for another record kind: the file is `<id>.<ext>` (the task board uses `task`).
+pub fn create_ext(dir: &Path, base: &str, ext: &str) -> std::io::Result<Record> {
     std::fs::create_dir_all(dir)?;
     let base = sanitize(base);
     for n in 1u32.. {
         let id = if n == 1 { base.clone() } else { format!("{base}-{n}") };
-        let path = dir.join(format!("{id}.rec"));
+        let path = dir.join(format!("{id}.{ext}"));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => {
                 let mut r = Record { path, fields: BTreeMap::new() };
@@ -128,11 +134,16 @@ pub fn load(path: &Path) -> Result<Record, String> {
 
 /// Every readable record with an id, oldest first (ids start with a timestamp).
 pub fn load_all(dir: &Path) -> Vec<Record> {
+    load_all_ext(dir, "rec")
+}
+
+/// `load_all` for records with the extension `ext`.
+pub fn load_all_ext(dir: &Path, ext: &str) -> Vec<Record> {
     let mut v: Vec<Record> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "rec"))
+                .filter(|p| p.extension().is_some_and(|x| x == ext))
                 .filter_map(|p| load(&p).ok())
                 .filter(|r| !r.id().is_empty())
                 .collect()

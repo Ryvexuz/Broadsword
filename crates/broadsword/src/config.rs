@@ -81,6 +81,8 @@ pub struct Config {
     pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
     pub job_disk_poll_seconds: u64,
+    /// How long a `task` command waits for the board lock before exiting "board busy".
+    pub task_lock_wait_seconds: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -163,6 +165,7 @@ impl Config {
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
+            task_lock_wait_seconds: positive("task_lock_wait_seconds")?,
             root,
         })
     }
@@ -257,7 +260,7 @@ mod tests {
 
     #[test]
     fn install_dir_and_mcp_settings_are_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
             assert!(Config::from_text(&format!("{base}install_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "install_dir {bad}");
@@ -287,7 +290,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");

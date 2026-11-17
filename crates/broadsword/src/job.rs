@@ -43,22 +43,36 @@ pub fn list_projects(cfg: &Config) -> Vec<String> {
     names
 }
 
-/// Name -> project folder. A name is one plain folder name; `..`, separators and absolute paths are rejected.
-pub fn resolve_project(root: &Path, projects_dir: &Path, name: &str) -> Result<PathBuf, String> {
-    if name == SELF_PROJECT {
-        return Ok(root.to_path_buf());
-    }
+/// The ONE place a project name is accepted: the canonical name (the folder's real name as `list_projects` gives it,
+/// or `broadsword`), matched case-insensitively. A name is one plain folder name; `..`, separators, absolute paths
+/// and names ending in a dot or space (Windows treats `Crash.` as `Crash`) are rejected, so `Crash`, `crash` and
+/// `Crash.` can never be different projects.
+pub fn canonical_project(projects_dir: &Path, name: &str) -> Result<String, String> {
     let mut comps = Path::new(name).components();
-    let plain = matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None)) && !name.contains(['/', '\\']);
+    let plain = matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None)) && !name.contains(['/', '\\', ':']) && !name.ends_with(['.', ' ']);
     if !plain {
-        return Err(format!("invalid project name `{name}`: use a plain folder name, no path, `..` or absolute path"));
+        return Err(format!("invalid project name `{name}`: use a plain folder name, no path, `..`, absolute path, or trailing dot or space"));
     }
-    let dir = projects_dir.join(name);
-    if dir.join("Cargo.toml").is_file() {
-        Ok(dir)
-    } else {
-        Err(format!("unknown project `{name}`"))
+    let want = name.to_lowercase();
+    if want == SELF_PROJECT {
+        return Ok(SELF_PROJECT.to_string());
     }
+    let mut found: Vec<String> = std::fs::read_dir(projects_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|rd| rd.flatten())
+        .filter(|e| e.path().join("Cargo.toml").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.to_lowercase() == want)
+        .collect();
+    found.sort();
+    found.into_iter().next().ok_or_else(|| format!("unknown project `{name}`"))
+}
+
+/// Name -> project folder (see `canonical_project` for what a name may be).
+pub fn resolve_project(root: &Path, projects_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let canon = canonical_project(projects_dir, name)?;
+    Ok(if canon == SELF_PROJECT { root.to_path_buf() } else { projects_dir.join(canon) })
 }
 
 pub fn cmd_projects(cfg: &Config) -> ExitCode {
@@ -403,8 +417,8 @@ pub fn cmd_run(cfg: &Config, name: &str, command: &[&str]) -> ExitCode {
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
 /// before the first step (when the project is a Git repo), and runs the steps.
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
-    let (kind, name) = (spec.kind.as_str(), spec.name.as_str());
-    let project_dir = match resolve_project(&cfg.root, &cfg.projects_dir, name) {
+    let kind = spec.kind.as_str();
+    let project_dir = match resolve_project(&cfg.root, &cfg.projects_dir, &spec.name) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("broadsword: {e}");
@@ -412,6 +426,8 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
             return ExitCode::from(EXIT_UNKNOWN_PROJECT);
         }
     };
+    let name = canonical_project(&cfg.projects_dir, &spec.name).unwrap_or_else(|_| spec.name.clone()); // records store the canonical name
+    let name = name.as_str();
     let steps = steps_for(kind);
     let mut free_src = hooked_free_source(cfg);
     let poll = Duration::from_secs(cfg.job_disk_poll_seconds.max(1));
@@ -619,6 +635,14 @@ mod tests {
             assert!(resolve_project(&root, &projects, bad).is_err(), "{bad}");
         }
         assert!(resolve_project(&root, &projects, "..").unwrap_err().contains("invalid"));
+        // one canonical name: case and a trailing dot or space never make another project
+        for same in ["sim", "SIM", "Sim"] {
+            assert_eq!(canonical_project(&projects, same).unwrap(), "sim");
+        }
+        assert_eq!(canonical_project(&projects, "BroadSword").unwrap(), "broadsword");
+        for bad in ["sim.", "sim ", "SIM."] {
+            assert!(canonical_project(&projects, bad).unwrap_err().contains("invalid"), "{bad}");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

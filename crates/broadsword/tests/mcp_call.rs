@@ -34,7 +34,7 @@ impl Root {
             "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
              ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = {timeout_s}\nmcp_output_max_kb = {out_kb}\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n"
+             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\n"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
@@ -367,7 +367,7 @@ fn structured_content_and_output_schema_follow_the_protocol_version() {
         assert!(text(&r).ends_with("exit code: 0"), "{v}: the text form is always there");
         let list = s.rpc(3, "tools/list", "{}");
         let Some(J::Arr(tools)) = result(&list).get("tools") else { panic!() };
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 22);
         assert!(tools.iter().all(|t| t.get("outputSchema").is_some() == newer), "{v}: outputSchema");
         assert_eq!(s.finish(), 0, "{v}");
     }

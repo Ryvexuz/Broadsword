@@ -34,3 +34,6 @@ max_resumes = 3                 # an interrupted build/test/check is resumed at 
 install_dir = "build/bin"       # `broadsword install` copies the running binary here (broadsword.exe); the MCP server and the pause hook run this copy, so rebuilding never hits a locked file. Inside root; not inside scratch or state
 mcp_call_timeout_seconds = 1800 # an MCP tools/call that runs longer is killed (its whole process tree) and returns an error
 mcp_output_max_kb = 1024        # an MCP tools/call keeps at most the last N KB of stdout and of stderr, and says when it cut
+
+# Task board (broadsword task ...): claims and who runs what, in state_dir/tasks
+task_lock_wait_seconds = 10     # a task command waits at most this long for the board lock (state/tasks/board.lock), then exits 4 "board busy"

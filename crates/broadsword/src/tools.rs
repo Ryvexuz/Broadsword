@@ -11,7 +11,7 @@
 //! should choose to call, so it lives in `main.rs` as a CLI command outside this table.
 
 use crate::config::Config;
-use crate::{cleanup, install, job, json, pause, recover, sys};
+use crate::{cleanup, install, job, json, pause, recover, sys, task};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -500,7 +500,278 @@ pub static TOOLS: &[Tool] = &[
         to_args: |_| vec!["install".into()],
         handler: |cfg, _| install::cmd_install(cfg),
     },
+    Tool {
+        name: "task_add",
+        summary: "Add a task to the task board: a title, a project and the paths it will claim.",
+        description: "Adds a task to the task board as one durable record (state/tasks/<id>.task) with status `open`, naming the project it works in and the files or folders it will change (its claims). Register planned work with it; claims are what keep parallel agents from editing the same files. Adding is free: it does NOT check for conflicts, so any number of open tasks may overlap, and the check happens later in `task_start`. Claims are PATHS relative to the project's root, never patterns or globs: a file (`src/lib.rs`) or a folder (`src`, which covers everything below it, so it overlaps `src/a.rs` but not `srcx`). `/` and `\\` are the same, `.` segments and a trailing slash are ignored, repeats are dropped, and on Windows letter case is ignored. A claim of `*` alone claims the whole project. Absolute paths, drive letters, `..`, empty claims and `*` or `?` inside a path, `:`, and names ending in a dot or space are rejected (exit code 2). Claims are compared as text, lexically: 8.3 short names, junctions and symlinks are NOT resolved, so claim the real path (`src/engine`, not a link or short name that leads there). The project name is matched case-insensitively and stored under the folder's real name. It prints the new task's id, which every other task tool takes. It writes one new record and changes nothing else.",
+        params: &[TASK_PROJECT, TASK_TITLE, TASK_CLAIMS],
+        outputs: "The new task's id on one line, for example `t-20261117-120000`. Ids are unique even for tasks added in the same second.",
+        exit_codes: &[
+            E0,
+            ExitDoc { code: "2", meaning: "unknown project name (stderr lists the known ones), an empty title, or an invalid claim (stderr says which and why)" },
+            ExitDoc { code: "1", meaning: "the task record could not be created or written" },
+        ],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword task add <project> --title <text> --claim <path> [--claim <path> ...]",
+        cli_examples: &["task add p --title t --claim src --claim docs"],
+        parse: |a| parse_task(a, "add", Some("project"), &[("--title", "title", false), ("--claim", "claims", true)], &["project", "title", "claims"]),
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["task".to_string(), "add".into(), i.str("project").unwrap_or_default().into(), "--title".into(), i.str("title").unwrap_or_default().into()];
+            for c in i.list("claims") {
+                v.push("--claim".into());
+                v.push(c.into());
+            }
+            v
+        },
+        handler: |cfg, i| Ok(task::cmd_add(cfg, i.require("project")?, i.require("title")?, &i.list("claims"))),
+    },
+    Tool {
+        name: "task_start",
+        summary: "Start an open task, taking its claims, unless a running task overlaps them.",
+        description: "Moves an `open` task to `running`, which takes its claims, but only if no running task in the same project has an overlapping claim. The check and the change are one atomic step under the board lock (state/tasks/board.lock), so when several agents start overlapping tasks at the same moment, from any checkout or worktree, exactly one succeeds and the others are refused. A refusal (exit code 3) names every conflicting task with its id, owner and the pair of overlapping claims; wait until that task is done, failed or abandoned and try again, or start a task that does not overlap. Starting runs nothing: a task is a claim on files, and the agent does the work itself. The claims stay held, however long the work takes, until `task_done`, `task_fail` or `task_abandon`. Only an `open` task can be started (exit code 1 otherwise). If the lock is held by another task command for longer than the task_lock_wait_seconds setting the call exits 4 `board busy` having changed nothing, and can simply be repeated.",
+        params: &[TASK_ID, TASK_OWNER],
+        outputs: "`task <id> is running (owner <owner>)...` on success. On a refusal, stderr lists each conflicting running task as `task <id> (owner <owner>): your claim <x> overlaps its claim <y>`.",
+        exit_codes: &[
+            E0,
+            ExitDoc { code: "1", meaning: "no task with that id, or the task is not `open` (it is already running, finished or abandoned), or the record could not be read or written" },
+            ExitDoc { code: "2", meaning: "the owner is empty or has more than one line" },
+            ExitDoc { code: "3", meaning: "refused: a running task in the same project has an overlapping claim; nothing was changed" },
+            ExitDoc { code: "4", meaning: "board busy: the board lock could not be taken in time; nothing was changed, repeat the call" },
+        ],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword task start <id> --owner <name>",
+        cli_examples: &["task start t-1 --owner coder-1"],
+        parse: |a| parse_task(a, "start", Some("id"), &[("--owner", "owner", false)], &["id", "owner"]),
+        mcp_callable: true,
+        to_args: |i| vec!["task".into(), "start".into(), i.str("id").unwrap_or_default().into(), "--owner".into(), i.str("owner").unwrap_or_default().into()],
+        handler: |cfg, i| Ok(task::cmd_start(cfg, i.require("id")?, i.require("owner")?)),
+    },
+    Tool {
+        name: "task_done",
+        summary: "Mark a running task done and release its claims.",
+        description: "Marks a `running` task as `done` and releases its claims, so overlapping tasks can start. Call it when the work is finished (and reviewed or merged, as the project requires). An optional note is stored with the record. Only a running task can be finished (exit code 1 for an open, finished or abandoned task). The record is kept for good. It takes the board lock for a moment (see `task_start` for exit code 4).",
+        params: &[TASK_ID, TASK_NOTE],
+        outputs: "`task <id> is done; its claims are released`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "no task with that id, or it is not `running`, or the record could not be written" }, EXIT_BUSY_DOC],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword task done <id> [--note <text>]",
+        cli_examples: &["task done t-1", "task done t-1 --note merged"],
+        parse: |a| parse_task(a, "done", Some("id"), &[("--note", "note", false)], &["id", "note"]),
+        mcp_callable: true,
+        to_args: |i| finish_args("done", i),
+        handler: |cfg, i| Ok(task::cmd_finish(cfg, i.require("id")?, task::Action::Done, i.str("note"))),
+    },
+    Tool {
+        name: "task_fail",
+        summary: "Mark a running task failed and release its claims.",
+        description: "Marks a `running` task as `failed` and releases its claims, so overlapping tasks can start. Use it when the work could not be completed; put the reason in the note. Only a running task can be failed (exit code 1 otherwise). The record is kept for good. It takes the board lock for a moment (see `task_start` for exit code 4).",
+        params: &[TASK_ID, TASK_NOTE],
+        outputs: "`task <id> is failed; its claims are released`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "no task with that id, or it is not `running`, or the record could not be written" }, EXIT_BUSY_DOC],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword task fail <id> [--note <text>]",
+        cli_examples: &["task fail t-1", "task fail t-1 --note tests"],
+        parse: |a| parse_task(a, "fail", Some("id"), &[("--note", "note", false)], &["id", "note"]),
+        mcp_callable: true,
+        to_args: |i| finish_args("fail", i),
+        handler: |cfg, i| Ok(task::cmd_finish(cfg, i.require("id")?, task::Action::Fail, i.str("note"))),
+    },
+    Tool {
+        name: "task_abandon",
+        summary: "Give up on an open or running task and release its claims.",
+        description: "Marks a task as `abandoned` from `open` or `running` and releases its claims, so overlapping tasks can start. Use it for work that is cancelled or whose agent is gone. The record is kept. A task that is already done, failed or abandoned cannot be abandoned (exit code 1). This is about the task board only; to give up on an interrupted job (a build or run that was killed) use the `abandon` tool instead. It takes the board lock for a moment (see `task_start` for exit code 4).",
+        params: &[TASK_ID],
+        outputs: "`task <id> is abandoned; its claims are released`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "no task with that id, or it is already done, failed or abandoned, or the record could not be written" }, EXIT_BUSY_DOC],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: false,
+        cli: "broadsword task abandon <id>",
+        cli_examples: &["task abandon t-1"],
+        parse: |a| parse_task(a, "abandon", Some("id"), &[], &["id"]),
+        mcp_callable: true,
+        to_args: |i| vec!["task".into(), "abandon".into(), i.str("id").unwrap_or_default().into()],
+        handler: |cfg, i| Ok(task::cmd_finish(cfg, i.require("id")?, task::Action::Abandon, None)),
+    },
+    Tool {
+        name: "task_list",
+        summary: "List tasks on the board with their status, owner, project, title and claims.",
+        description: "Lists the tasks on the task board, oldest first, optionally only those with one status and/or in one project. Use it to see what is open, who is running what and which claims are held (the claims of `running` tasks are the held ones). It only reads and returns immediately.",
+        params: &[
+            Param { name: "status", ty: Ty::String, required: false, description: "Show only tasks with this status: open, running, done, failed or abandoned. An unknown status fails with exit code 2." },
+            Param { name: "project", ty: Ty::String, required: false, description: "Show only tasks of this project name. Not checked against the known projects: an unknown name just matches nothing." },
+        ],
+        outputs: "One tab-separated line per task: id, status, owner (`-` if none), project, title, claims separated by `, `; or `no tasks` / `no tasks match`.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable)" }, ExitDoc { code: "2", meaning: "unknown status" }],
+        read_only: true,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
+        cli: "broadsword task list [--status <s>] [--project <p>]",
+        cli_examples: &["task list", "task list --status running --project p"],
+        parse: |a| parse_task(a, "list", None, &[("--status", "status", false), ("--project", "project", false)], &["status", "project"]),
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["task".to_string(), "list".into()];
+            for (flag, name) in [("--status", "status"), ("--project", "project")] {
+                if let Some(x) = i.str(name) {
+                    v.push(flag.into());
+                    v.push(x.into());
+                }
+            }
+            v
+        },
+        handler: |cfg, i| Ok(task::cmd_list(cfg, i.str("status"), i.str("project"))),
+    },
+    Tool {
+        name: "task_show",
+        summary: "Show one task in full.",
+        description: "Shows one task from the task board in full: title, project, status, owner, claims, the times it was created, started and ended, and the note left when it finished. Use it to see why a task ended or who holds a claim. It only reads and returns immediately.",
+        params: &[TASK_ID],
+        outputs: "Lines of `key: value`: id, title, project, status, owner, claims, created, started, ended (UTC times, `-` when not yet), note.",
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "no task with that id" }],
+        read_only: true,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
+        cli: "broadsword task show <id>",
+        cli_examples: &["task show t-1"],
+        parse: |a| parse_task(a, "show", Some("id"), &[], &["id"]),
+        mcp_callable: true,
+        to_args: |i| vec!["task".into(), "show".into(), i.str("id").unwrap_or_default().into()],
+        handler: |cfg, i| Ok(task::cmd_show(cfg, i.require("id")?)),
+    },
+    Tool {
+        name: "task_check",
+        summary: "Would a task with these claims conflict with a running task right now? (read-only)",
+        description: "Answers, without changing anything, whether a would-be task in a project could start now: whether any of the given claims overlaps a claim of a task that is currently `running` in that project. Use it when planning parallel work, to pick tasks that can run together. It is only a snapshot: another agent may start a task a moment later, so the real decision is made by `task_start`, which checks again atomically. Claims are paths relative to the project root, never patterns, compared lexically (see `task_add` for the rules, including that symlinks, junctions and 8.3 names are not resolved); `*` is the whole project. It only reads and returns immediately.",
+        params: &[TASK_PROJECT, TASK_CLAIMS],
+        outputs: "`free: ...` when nothing conflicts, or `conflict:` followed by one line per conflicting running task: its id, owner and the pair of overlapping claims.",
+        exit_codes: &[
+            ExitDoc { code: "0", meaning: "free: no running task conflicts" },
+            ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable), so nothing can be said" },
+            ExitDoc { code: "2", meaning: "unknown project name or an invalid claim" },
+            ExitDoc { code: "3", meaning: "conflict: at least one running task overlaps (the output names them)" },
+        ],
+        read_only: true,
+        long_running: false,
+        changes_files: false,
+        destructive: false,
+        idempotent: true,
+        cli: "broadsword task check <project> --claim <path> [--claim <path> ...]",
+        cli_examples: &["task check p --claim src"],
+        parse: |a| parse_task(a, "check", Some("project"), &[("--claim", "claims", true)], &["project", "claims"]),
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["task".to_string(), "check".into(), i.str("project").unwrap_or_default().into()];
+            for c in i.list("claims") {
+                v.push("--claim".into());
+                v.push(c.into());
+            }
+            v
+        },
+        handler: |cfg, i| Ok(task::cmd_check(cfg, i.require("project")?, &i.list("claims"))),
+    },
 ];
+
+const TASK_PROJECT: Param = Param {
+    name: "project",
+    ty: Ty::String,
+    required: true,
+    description: "Project the task works in: `broadsword` or the name of a folder in the projects folder that contains a Cargo.toml (use the `projects` tool to list them). Matched case-insensitively and stored under the folder's real name; a trailing dot or space is rejected. Claims are relative to this project's root. Anything else fails with exit code 2.",
+};
+const TASK_TITLE: Param = Param { name: "title", ty: Ty::String, required: true, description: "A short title saying what the task does. Must not be empty; whitespace runs are collapsed to single spaces." };
+const TASK_CLAIMS: Param = Param {
+    name: "claims",
+    ty: Ty::StringArray,
+    required: true,
+    description: "The paths the task will change, each a file or folder relative to the project root (not a pattern): `src`, `src/lib.rs`, or `*` for the whole project. A folder covers everything below it. `/` and `\\` are alike, `.` segments and a trailing slash are ignored, case is ignored on Windows. Absolute paths, `..`, empty strings, `*` or `?` inside a path, `:`, and names ending in a dot or space are rejected. Compared lexically as text: 8.3 short names, junctions and symlinks are not resolved, so claim the real path. At least one. On the command line each one is its own `--claim <path>`.",
+};
+const TASK_ID: Param = Param { name: "id", ty: Ty::String, required: true, description: "The exact task id, as printed by `task_add` and shown in the first column of `task_list`." };
+const TASK_OWNER: Param = Param { name: "owner", ty: Ty::String, required: true, description: "Free text naming who runs the task, for example `coder-1`. Shown in conflict messages so others know whom to wait for. Must not be empty." };
+const TASK_NOTE: Param = Param { name: "note", ty: Ty::String, required: false, description: "A short note stored with the task, for example what was merged or why it failed. Whitespace runs are collapsed. Default: none." };
+const EXIT_BUSY_DOC: ExitDoc = ExitDoc { code: "4", meaning: "board busy: the board lock could not be taken in time; nothing was changed, repeat the call" };
+
+fn finish_args(verb: &str, i: &Inputs) -> Vec<String> {
+    let mut v = vec!["task".to_string(), verb.into(), i.str("id").unwrap_or_default().into()];
+    if let Some(n) = i.str("note") {
+        v.push("--note".into());
+        v.push(n.into());
+    }
+    v
+}
+
+/// Parse `task <sub> [<positional>] [--flag value]...` into inputs in the tool's parameter order (`order`).
+/// `flags` are (flag, input name, repeatable); a repeatable flag collects a list. Anything unknown, repeated or
+/// missing (every name in `order` before the first optional one is required) makes it `None`.
+fn parse_task(a: &[&str], sub: &str, positional: Option<&'static str>, flags: &[(&str, &'static str, bool)], order: &[&'static str]) -> Option<Inputs> {
+    let rest = match a {
+        ["task", s, rest @ ..] if *s == sub => rest,
+        _ => return None,
+    };
+    let mut pos: Option<&str> = None;
+    let mut singles: Vec<(&'static str, &str)> = Vec::new();
+    let mut lists: Vec<(&'static str, Vec<String>)> = Vec::new();
+    let mut it = rest.iter().copied();
+    while let Some(w) = it.next() {
+        if let Some((_, name, multi)) = flags.iter().find(|(f, _, _)| *f == w) {
+            let v = it.next()?;
+            if *multi {
+                match lists.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, l)) => l.push(v.into()),
+                    None => lists.push((name, vec![v.into()])),
+                }
+            } else if singles.iter().any(|(n, _)| n == name) {
+                return None;
+            } else {
+                singles.push((name, v));
+            }
+        } else if w.starts_with("--") || positional.is_none() || pos.is_some() {
+            return None;
+        } else {
+            pos = Some(w);
+        }
+    }
+    let mut inputs = Inputs::default();
+    for name in order {
+        if Some(*name) == positional {
+            inputs = inputs.with(name, Val::Str(pos?.into()));
+        } else if let Some((_, v)) = singles.iter().find(|(n, _)| n == name) {
+            inputs = inputs.with(name, Val::Str((*v).into()));
+        } else if let Some((_, l)) = lists.iter().find(|(n, _)| n == name) {
+            inputs = inputs.with(name, Val::List(l.clone()));
+        } else if required_by_shape(sub, name) {
+            return None;
+        }
+    }
+    Some(inputs)
+}
+
+/// Which inputs of each `task` subcommand must be present.
+fn required_by_shape(sub: &str, name: &str) -> bool {
+    matches!((sub, name), ("add", "title" | "claims") | ("start", "owner") | ("check", "claims"))
+}
 
 /// The exit codes shared by build, test and check.
 const JOB_EXITS: &[ExitDoc] = &[
@@ -992,6 +1263,17 @@ mod tests {
             ("run", Inputs::default().with("project", s("p")).with("command", Val::List(vec!["cargo".into(), "--version".into()]))),
             ("run", Inputs::default().with("project", s("p")).with("command", Val::List(vec!["echo".into(), "a b".into(), "--".into()]))),
             ("abandon", Inputs::default().with("id", s("20261117-120000-ab12"))),
+            ("task_add", Inputs::default().with("project", s("p")).with("title", s("do a thing")).with("claims", Val::List(vec!["src".into(), "docs\\x".into()]))),
+            ("task_start", Inputs::default().with("id", s("t-1")).with("owner", s("coder-1"))),
+            ("task_done", Inputs::default().with("id", s("t-1"))),
+            ("task_done", Inputs::default().with("id", s("t-1")).with("note", s("all merged"))),
+            ("task_fail", Inputs::default().with("id", s("t-1")).with("note", s(""))),
+            ("task_abandon", Inputs::default().with("id", s("t-1"))),
+            ("task_list", Inputs::default()),
+            ("task_list", Inputs::default().with("status", s("running"))),
+            ("task_list", Inputs::default().with("status", s("open")).with("project", s("p"))),
+            ("task_show", Inputs::default().with("id", s("t-1"))),
+            ("task_check", Inputs::default().with("project", s("p")).with("claims", Val::List(vec!["*".into()]))),
             ("tools", Inputs::default()),
             ("tools", Inputs::default().with("name", s("check"))),
             ("tools", Inputs::default().with("json", Val::Bool(true))),

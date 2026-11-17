@@ -178,10 +178,10 @@ mod tests {
 
     #[test]
     fn mcp_tools_while_paused() {
-        for ok in ["status", "tools", "projects", "jobs", "resume", "cleanup"] {
+        for ok in ["status", "tools", "projects", "jobs", "resume", "cleanup", "task_list", "task_show", "task_check"] {
             assert!(allowed_while_paused(&hook_for(&format!("mcp__broadsword__{ok}"))), "{ok}");
         }
-        for blocked in ["build", "test", "check", "run", "recover", "abandon", "watch", "install", "nope", ""] {
+        for blocked in ["build", "test", "check", "run", "recover", "abandon", "watch", "install", "task_add", "task_start", "task_done", "task_fail", "task_abandon", "nope", ""] {
             assert!(!allowed_while_paused(&hook_for(&format!("mcp__broadsword__{blocked}"))), "{blocked}");
         }
         // only this server's prefix counts
@@ -199,6 +199,6 @@ mod tests {
         let mut want: Vec<&str> = crate::tools::TOOLS.iter().filter(|t| t.read_only || t.name == "resume" || t.name == "cleanup").map(|t| t.name).collect();
         want.sort_unstable();
         assert_eq!(allowed, want);
-        assert_eq!(allowed, ["cleanup", "jobs", "projects", "resume", "status", "tools"]);
+        assert_eq!(allowed, ["cleanup", "jobs", "projects", "resume", "status", "task_check", "task_list", "task_show", "tools"]);
     }
 }
