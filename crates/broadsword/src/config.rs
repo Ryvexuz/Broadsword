@@ -71,6 +71,9 @@ pub struct Config {
     pub alert_command: String,
     pub scratch_dir: PathBuf,
     pub build_dir: PathBuf,
+    pub projects_dir: PathBuf,
+    pub job_disk_reserve_gb: u64,
+    pub job_disk_poll_seconds: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -87,6 +90,11 @@ fn get_str(m: &HashMap<String, Value>, k: &str) -> Result<String, String> {
         Some(_) => Err(format!("{k}: expected a quoted string")),
         None => Err(format!("{k}: missing from {CONFIG_FILE}")),
     }
+}
+
+/// Drop `.` parts and unify separators without touching the disk (no canonicalize: no verbatim-prefix paths).
+pub fn normalize(p: &Path) -> PathBuf {
+    p.components().collect()
 }
 
 /// A path setting must be relative and stay inside root: no absolute paths, no `..`.
@@ -111,7 +119,7 @@ impl Config {
     /// `root` and every path in the file are resolved relative to it.
     pub fn from_text(text: &str, config_dir: &Path) -> Result<Config, String> {
         let m = parse_flat(text)?;
-        let root = config_dir.join(get_str(&m, "root")?);
+        let root = normalize(&config_dir.join(get_str(&m, "root")?));
         inside_root(&m, "shared_dir", false)?;
         Ok(Config {
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
@@ -124,6 +132,9 @@ impl Config {
             alert_command: get_str(&m, "alert_command")?,
             scratch_dir: root.join(inside_root(&m, "scratch_dir", true)?),
             build_dir: root.join(inside_root(&m, "build_dir", true)?),
+            projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
+            job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
+            job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             root,
         })
     }
@@ -132,6 +143,10 @@ impl Config {
         let file = config_dir.join(CONFIG_FILE);
         let text = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
         Config::from_text(&text, config_dir)
+    }
+
+    pub fn reserve_bytes(&self) -> u64 {
+        self.job_disk_reserve_gb * GB
     }
 
     pub fn floor_bytes(&self) -> u64 {
@@ -163,13 +178,13 @@ pub fn main_checkout_root(dir: &Path) -> PathBuf {
                 // <main>/.git/worktrees/<name>: three parents up is <main>
                 if let Some(main_root) = gitdir.parent().and_then(Path::parent).and_then(Path::parent) {
                     if main_root.join(CONFIG_FILE).is_file() {
-                        return main_root.to_path_buf();
+                        return normalize(main_root);
                     }
                 }
             }
         }
     }
-    dir.to_path_buf()
+    normalize(dir)
 }
 
 pub fn load() -> Result<Config, String> {
@@ -204,6 +219,8 @@ mod tests {
         let c = Config::from_text(text, Path::new("proj")).unwrap();
         assert_eq!(c.scratch_dir, Path::new("proj").join(".").join("scratch"));
         assert!(c.disk_floor_gb > 0 && c.log_max_mb > 0);
+        assert_eq!(c.projects_dir, Path::new("proj").join(".").join("projects"));
+        assert!(c.job_disk_poll_seconds > 0);
     }
 
     #[test]
@@ -224,14 +241,18 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");
         }
         let t = format!("{base}scratch_dir = \"scratch\"\nshared_dir = \"..\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_err());
-        let t = format!("{base}scratch_dir = \"a/b\"\n");
+        for bad in ["../p", "/p", "C:/p", "."] {
+            let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"{bad}\"\n");
+            assert!(Config::from_text(&t, Path::new("p")).is_err(), "projects_dir {bad}");
+        }
+        let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
     }
 

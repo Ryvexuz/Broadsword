@@ -1,5 +1,6 @@
 mod cleanup;
 mod config;
+mod job;
 mod pause;
 mod sys;
 
@@ -118,7 +119,7 @@ fn cmd_hook(cfg: &Config) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool>");
+    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build <project> | test <project> | check <project>>");
     ExitCode::from(64)
 }
 
@@ -142,6 +143,8 @@ fn main() -> ExitCode {
         ["watch"] => cmd_watch(&cfg).map(|_| ExitCode::SUCCESS),
         ["resume"] => cmd_resume(&cfg, false),
         ["resume", "--force"] => cmd_resume(&cfg, true),
+        ["projects"] => Ok(job::cmd_projects(&cfg)),
+        [k @ ("build" | "test" | "check"), name] => Ok(job::cmd_job(&cfg, k, name)),
         ["hook", "pre-tool"] => Ok(cmd_hook(&cfg)),
         _ => return usage(),
     };
