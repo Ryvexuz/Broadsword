@@ -2,6 +2,50 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## Stage 2 lessons (AI Integration, closed 2026-11-17)
+
+1. **Name the hard cases in the spec, and review passes drop.**
+   - Every Stage 2 milestone passed review on its first or second pass. Stage 1 never passed on a first pass.
+   - The difference was the spec, which listed the risky cases up front: stdout purity, argument injection, timeout and cancel cleanup, version gating, key leakage.
+   - Specs got longer; review rounds got shorter. That's a good trade.
+2. **Secrets leak through side channels.**
+   - The redaction everyone checked held.
+   - The leak was the child process's environment, and then the same key under a different variable name.
+   - Only an adversarial reviewer actively trying to exfiltrate the key found both.
+   - Protect a secret at the boundary where it enters a process, not where it's printed.
+3. **Test a tool surface with a real model as the client.**
+   - In milestone 1, the first real client followed the server's instructions into a dead end that 22 protocol tests had missed.
+   - The description experiment then showed both models choosing well already, 16 of 16 runs.
+   - 4 runs per condition can only catch big effects. Measuring wording needs dozens of runs and harder prompts.
+
+## 2026-11-17 — Stage 2 close-out: description experiment
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator.
+- It designed and ran the experiment itself. The variant was three description sentences on a branch that was not merged, so no coder or reviewer was used.
+- Clients: `gpt-4.1-mini` and `claude-opus-5-5`, 8 runs each.
+
+**What went wrong and what fixed it**
+
+- **Ceiling effect.** The baseline already scored 8/8 on `check`, so the experiment could not show an improvement.
+- **Stale binary from the shared build folder.** After building the variant in a worktree, rebuilding `main` printed "Finished" in 0.01 s and left the variant binary in `build/debug`. Two checkouts of one package share fingerprints in the same build folder. Updating the timestamp on `main`'s `tools.rs` forced the rebuild. This is a real hazard of one shared build folder: a stale binary with no warning. Added to `IDEAS.md`.
+
+**Rough cost and time**
+
+- About 20 minutes of wall time.
+- Claude runs: about $0.43. OpenAI: about 30k tokens.
+
+**Git commands used, beyond a plain commit**
+
+- `git worktree add scratch/exp/wt -b exp/check-routing-first`: a separate checkout on a new branch for the variant, so `main` was untouched.
+- `git worktree remove`: removed that checkout afterwards. The branch is kept, to rerun the variant later.
+- `git tag -a stage-2-done`: marks the end of Stage 2.
+
+**One lesson about AI development**
+
+Measure before you fix. The tool-choice problem seen once in milestone 2 did not reproduce in 16 runs, so rewording to fix it would have been a change made on an anecdote.
+
 ## 2026-11-17 — Stage 2, milestone 3: second provider
 
 **Models and roles**
