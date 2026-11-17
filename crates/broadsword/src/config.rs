@@ -81,6 +81,8 @@ pub struct Config {
     pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
     pub job_disk_poll_seconds: u64,
+    /// How long a `task` command waits for the board lock before exiting "board busy". Optional in the file (default 10).
+    pub task_lock_wait_seconds: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -163,6 +165,7 @@ impl Config {
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
+            task_lock_wait_seconds: if m.contains_key("task_lock_wait_seconds") { positive("task_lock_wait_seconds")? } else { 10 },
             root,
         })
     }

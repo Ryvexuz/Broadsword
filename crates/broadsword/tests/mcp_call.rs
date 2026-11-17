@@ -367,7 +367,7 @@ fn structured_content_and_output_schema_follow_the_protocol_version() {
         assert!(text(&r).ends_with("exit code: 0"), "{v}: the text form is always there");
         let list = s.rpc(3, "tools/list", "{}");
         let Some(J::Arr(tools)) = result(&list).get("tools") else { panic!() };
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 22);
         assert!(tools.iter().all(|t| t.get("outputSchema").is_some() == newer), "{v}: outputSchema");
         assert_eq!(s.finish(), 0, "{v}");
     }

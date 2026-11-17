@@ -4,11 +4,13 @@ mod git;
 mod install;
 mod job;
 mod json;
+mod lock;
 mod mcp;
 mod pause;
 mod recover;
 mod record;
 mod sys;
+mod task;
 mod tools;
 
 use config::Config;
