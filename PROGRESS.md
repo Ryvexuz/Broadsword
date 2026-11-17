@@ -1,10 +1,23 @@
 # Progress
 
-Rewritten at the end of each session. Last updated 2026-11-17, after Stage 1 milestone 1.
+Rewritten at the end of each session. Last updated 2026-11-17, after Stage 1 milestone 2.
 
 ## Where things stand
 
-Stage 1 (Foundation) has started. Milestone 1, the resource monitor, has passed its done check and is merged on `main`. Stage 0 is still untagged; see Unfinished.
+Stage 1 (Foundation) is under way.
+
+- Milestone 1, the resource monitor: passed, merged on `main`.
+- Milestone 2, the starter crash sim: passed, in its own repo at `projects/crash-sim/`.
+- Stage 0 is still untagged; see Unfinished.
+
+## Starter crash sim
+
+- `projects/crash-sim/` is its own Git repo, on `main` at `9ff5289`. Broadsword ignores it.
+- A cube of 8 nodes and 28 spring-damper beams drops 2 m, bounces once to center_y 1.004 m and settles on a face.
+- `cargo run --offline` prints CSV `t,min_y,center_y,max_beam_strain` for 5 s.
+- Unstable time steps are refused with exit 1.
+- 11 tests pass. Evidence: `evidence/stage-1-m2-starter-crash-sim.md`.
+- Small leftover: a doc comment in `src/lib.rs` says ω is about 450 rad/s; the reviewer computed exactly 400.
 
 ## Working
 
@@ -33,6 +46,11 @@ Stage 1 (Foundation) has started. Milestone 1, the resource monitor, has passed 
 
 ## Next step
 
-Stage 1, milestone 2: the starter crash sim. It is a cube of nodes and beams that falls and bounces, in its own repo. Done check: it builds, runs headless and prints the cube's height over time. Decide first where its repo lives. To keep the project portable, a folder inside the project such as `projects/crash-sim/` with its own `git init` is the likely choice, ignored by the Broadsword repo. Start by writing that milestone's task spec and claim, then hand it to the coder.
+Stage 1, milestone 3: the job runner and test runner. Done check: one command builds and tests any project, starting with `projects/crash-sim`. It should also:
+
+- refuse to start a job when free space is below the floor;
+- run builds with `CARGO_TARGET_DIR` set to the main root's `build/`, which closes the worktree gap in `IDEAS.md`.
+
+Start by writing its task spec and claim: a `broadsword build <project>` / `broadsword test <project>` command in `crates/broadsword/`.
 
 Disk: 24.1 GB free against the 20 GB floor.

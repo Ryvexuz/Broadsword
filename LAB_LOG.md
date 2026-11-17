@@ -2,6 +2,32 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 1, milestone 2: starter crash sim
+
+**Models and roles**
+
+- Claude Opus 5.5 as the orchestrator. It wrote the spec, ran the done check and kept the records.
+- Sonnet as the coder, working directly in the new `projects/crash-sim` repo. The repo was new and only the coder worked in it, so no worktree was needed.
+- Opus as the reviewer, over two passes.
+- **No test writer this time.** The spec told the coder to write physics tests (free fall against h0 − ½gt², energy never rising, bounce, settle, determinism). The reviewer checked that those tests drive the real sim. This was an experiment in skipping a role; see the lesson.
+
+**What went wrong and what fixed it**
+
+- The first version passed all 7 of its tests and its done check, and the reviewer still failed it. With too large a time step the sim blew up silently: it printed `inf`/`NaN` rows, reported 0% strain (`fold(0.0, f64::max)` drops NaN) and exited 0. The coder added a per-step finiteness and strain check that exits 1, and an up-front refusal of time steps past a stability limit computed from k and m.
+- On the second pass the reviewer checked the stability bound by building the stiffness matrix. The true ω_max is 400 rad/s; the code's bound of 529 rad/s is safe.
+
+**Rough cost and time**
+
+- About 15 minutes of wall time. Subagent tokens: coder about 190k over two passes, reviewer about 180k over two passes. No dollar figure was available.
+
+**Git commands used, beyond a plain commit**
+
+- `git -C projects/crash-sim init -b main`: made the crash sim its own repository inside the project folder, as the plan asks, so it moves with the project. Broadsword's `.gitignore` excludes `projects/`.
+
+**One lesson about AI development**
+
+"Tests pass" and "the done check passes" both held for a program that would print nonsense and report success. The reviewer found it by trying inputs the coder never tried, rather than by reading the tests. Skipping the test writer cost nothing here, because the reviewer did the adversarial testing. The role that matters most is the one that tries to break the code.
+
 ## 2026-11-17 — Stage 1, milestone 1: resource monitor
 
 **Models and roles**
