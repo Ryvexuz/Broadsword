@@ -41,7 +41,7 @@ impl Project {
              checkpoint_ignored_max_mb = 50\n\
              max_resumes = 3\n\
              job_disk_reserve_gb = 2\n\
-             job_disk_poll_seconds = 5\ntask_lock_wait_seconds = 10\n"
+             job_disk_poll_seconds = 5\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\n"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Project { dir }

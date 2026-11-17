@@ -37,3 +37,6 @@ mcp_output_max_kb = 1024        # an MCP tools/call keeps at most the last N KB 
 
 # Task board (broadsword task ...): claims and who runs what, in state_dir/tasks
 task_lock_wait_seconds = 10     # a task command waits at most this long for the board lock (state/tasks/board.lock), then exits 4 "board busy"
+
+# Worktrees (broadsword task start --worktree | broadsword worktree ...): one Git worktree per task at <worktrees_dir>/<project>/<task id>, on branch task/<task id>
+worktrees_dir = "worktrees"     # inside root; not inside scratch, build or state (a worktree holds unmerged work). Git-ignored. After moving the project run `broadsword worktree repair`

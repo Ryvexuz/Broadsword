@@ -83,6 +83,8 @@ pub struct Config {
     pub job_disk_poll_seconds: u64,
     /// How long a `task` command waits for the board lock before exiting "board busy".
     pub task_lock_wait_seconds: u64,
+    /// Where each task's Git worktree lives: `<worktrees_dir>/<project>/<task id>` (broadsword worktree ...).
+    pub worktrees_dir: PathBuf,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -143,6 +145,12 @@ impl Config {
                 return Err(format!("install_dir must not be inside {name}: that folder is cleaned up or holds records, not the stable binary"));
             }
         }
+        let worktrees_dir = root.join(inside_root(&m, "worktrees_dir", true)?);
+        for (name, other) in [("scratch_dir", &scratch_dir), ("build_dir", &build_dir), ("state_dir", &state_dir)] {
+            if worktrees_dir.starts_with(other) {
+                return Err(format!("worktrees_dir must not be inside {name}: that folder is cleaned up or holds records, and a worktree holds a task's unmerged work"));
+            }
+        }
         let positive = |k: &str| get_int(&m, k).and_then(|v| if v == 0 { Err(format!("{k}: must be at least 1")) } else { Ok(v) });
         let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
         Ok(Config {
@@ -166,6 +174,7 @@ impl Config {
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             task_lock_wait_seconds: positive("task_lock_wait_seconds")?,
+            worktrees_dir,
             root,
         })
     }
@@ -256,11 +265,23 @@ mod tests {
         assert!(c.checkpoint_ignored_max_mb > 0 && c.max_resumes > 0);
         assert_eq!(c.install_dir, Path::new("proj").join(".").join("build/bin"));
         assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
+        assert_eq!(c.worktrees_dir, Path::new("proj").join(".").join("worktrees"));
+    }
+
+    #[test]
+    fn worktrees_dir_is_required_and_validated() {
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\ninstall_dir=\"build/bin\"\n";
+        assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
+        assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
+        assert!(Config::from_text(base, Path::new("p")).is_err(), "worktrees_dir is required");
+        for bad in ["../w", "/w", "C:/w", ".", "a/../../w", "scratch", "scratch/w", "build/w", "state/w", "state"] {
+            assert!(Config::from_text(&format!("{base}worktrees_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "worktrees_dir {bad}");
+        }
     }
 
     #[test]
     fn install_dir_and_mcp_settings_are_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nworktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
             assert!(Config::from_text(&format!("{base}install_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "install_dir {bad}");
@@ -290,7 +311,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nworktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");

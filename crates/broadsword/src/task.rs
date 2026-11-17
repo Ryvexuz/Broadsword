@@ -19,6 +19,7 @@ use crate::job;
 use crate::lock;
 use crate::pause;
 use crate::record::{self, Record};
+use crate::worktree;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -188,13 +189,13 @@ pub fn tasks_dir(cfg: &Config) -> PathBuf {
     cfg.state_dir.join("tasks")
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Every task. A record that cannot be read is an error (never silently skipped: `start` decides on this list);
 /// an empty file, which only exists for an instant while `add` creates a task, is skipped.
-fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
+pub fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
     let dir = tasks_dir(cfg);
     let mut v = Vec::new();
     let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(v) };
@@ -227,7 +228,7 @@ fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
     Ok(v)
 }
 
-fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
+pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     let nope = || format!("no task with the exact id `{id}` (see `broadsword task list`)");
     if id.is_empty() || record::sanitize(id) != id {
         return Err(nope());
@@ -239,12 +240,12 @@ fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     }
 }
 
-fn save(r: &Record) -> Result<(), String> {
+pub fn save(r: &Record) -> Result<(), String> {
     r.save().map_err(|e| format!("cannot write task record {}: {e}", r.path.display()))
 }
 
 /// The board lock. `Err` is already an exit code plus message.
-fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
+pub fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
     let path = tasks_dir(cfg).join("board.lock");
     let wait = cfg.task_lock_wait_seconds;
     lock::acquire(&path, Duration::from_secs(wait), &move |owner| {
@@ -257,7 +258,7 @@ fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
     })
 }
 
-fn fail(code: u8, msg: impl std::fmt::Display) -> ExitCode {
+pub fn fail(code: u8, msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("broadsword: {msg}");
     ExitCode::from(code)
 }
@@ -314,7 +315,12 @@ pub fn cmd_add(cfg: &Config, project: &str, title: &str, claims: &[&str]) -> Exi
 pub const TEST_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_TASK_START_GATE_FILE";
 
 fn wait_for_test_gate(cfg: &Config) {
-    let Ok(gate) = std::env::var(TEST_GATE_ENV) else { return };
+    wait_for_gate(cfg, TEST_GATE_ENV, "task start");
+}
+
+/// The shared test-hook body: wait for the file named by the env var `env` (scratch only, bounded, announced).
+pub fn wait_for_gate(cfg: &Config, env: &str, what: &str) {
+    let Ok(gate) = std::env::var(env) else { return };
     let gate = PathBuf::from(gate);
     let inside = match (gate.parent().and_then(|p| p.canonicalize().ok()), cfg.scratch_dir.canonicalize()) {
         (Some(p), Ok(s)) => p.starts_with(s),
@@ -323,72 +329,106 @@ fn wait_for_test_gate(cfg: &Config) {
     if !inside {
         return;
     }
-    eprintln!("broadsword: TEST HOOK ACTIVE: task start waits for {} to exist", gate.display());
+    eprintln!("broadsword: TEST HOOK ACTIVE: {what} waits for {} to exist", gate.display());
     let end = std::time::Instant::now() + Duration::from_secs(cfg.task_lock_wait_seconds * 3);
     while !gate.exists() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
 
-pub fn cmd_start(cfg: &Config, id: &str, owner: &str) -> ExitCode {
+pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCode {
     let owner = owner.trim();
     if owner.is_empty() || owner.contains(['\n', '\r']) {
         return fail(EXIT_BAD_INPUT, "the owner must be a non-empty single line, e.g. coder-1");
     }
     wait_for_test_gate(cfg);
-    let _lock = match board_lock(cfg) {
-        Ok(l) => l,
-        Err(c) => return c,
+    let plan = {
+        let _lock = match board_lock(cfg) {
+            Ok(l) => l,
+            Err(c) => return c,
+        };
+        let mut t = match load_task(cfg, id) {
+            Ok(t) => t,
+            Err(e) => return fail(EXIT_ERROR, e),
+        };
+        if let Err(e) = transition(t.status(), Action::Start) {
+            return fail(EXIT_ERROR, format!("cannot start {id}: {e}"));
+        }
+        let all = match load_tasks(cfg) {
+            Ok(a) => a,
+            Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
+        };
+        let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
+        if !conflicts.is_empty() {
+            let lines: Vec<String> = conflicts.iter().map(|c| format!("  {}", describe(c))).collect();
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: its claims overlap a running task:\n{}\nstart it after that task is done, failed or abandoned", lines.join("\n")));
+        }
+        // Every refusal a worktree can have is checked BEFORE the task is marked running (nothing to roll back then).
+        let plan = if worktree {
+            match worktree::plan(cfg, &t) {
+                Ok(p) => Some(p),
+                Err(e) => return fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {e}\ntask {id} is still `open`; nothing was changed")),
+            }
+        } else {
+            None
+        };
+        t.set("status", RUNNING);
+        t.set("owner", owner);
+        t.set("started", now_secs().to_string());
+        if let Some(p) = &plan {
+            worktree::mark_creating(&mut t, p); // claims are held from now on; the slow git step runs OUTSIDE the lock
+        }
+        if let Err(e) = save(&t) {
+            return fail(EXIT_ERROR, e);
+        }
+        if plan.is_none() {
+            println!("task {id} is running (owner {owner}); its claims are held until it is done, failed or abandoned");
+        }
+        plan
     };
-    let mut t = match load_task(cfg, id) {
-        Ok(t) => t,
-        Err(e) => return fail(EXIT_ERROR, e),
-    };
-    if let Err(e) = transition(t.status(), Action::Start) {
-        return fail(EXIT_ERROR, format!("cannot start {id}: {e}"));
+    match plan {
+        Some(p) => worktree::finish(cfg, id, p, worktree::Mode::Start { owner }),
+        None => ExitCode::SUCCESS,
     }
-    let all = match load_tasks(cfg) {
-        Ok(a) => a,
-        Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
-    };
-    let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
-    if !conflicts.is_empty() {
-        let lines: Vec<String> = conflicts.iter().map(|c| format!("  {}", describe(c))).collect();
-        return fail(EXIT_CONFLICT, format!("cannot start {id}: its claims overlap a running task:\n{}\nstart it after that task is done, failed or abandoned", lines.join("\n")));
-    }
-    t.set("status", RUNNING);
-    t.set("owner", owner);
-    t.set("started", now_secs().to_string());
-    if let Err(e) = save(&t) {
-        return fail(EXIT_ERROR, e);
-    }
-    println!("task {id} is running (owner {owner}); its claims are held until it is done, failed or abandoned");
-    ExitCode::SUCCESS
 }
 
 /// done, fail and abandon: change the status under the board lock and release the claims.
 pub fn cmd_finish(cfg: &Config, id: &str, action: Action, note: Option<&str>) -> ExitCode {
-    let _lock = match board_lock(cfg) {
-        Ok(l) => l,
-        Err(c) => return c,
-    };
-    let mut t = match load_task(cfg, id) {
-        Ok(t) => t,
-        Err(e) => return fail(EXIT_ERROR, e),
-    };
-    let to = match transition(t.status(), action) {
-        Ok(s) => s,
-        Err(e) => return fail(EXIT_ERROR, format!("cannot change {id}: {e}")),
-    };
-    t.set("status", to);
-    t.set("ended", now_secs().to_string());
-    if let Some(n) = note {
-        t.set("note", n.split_whitespace().collect::<Vec<_>>().join(" "));
+    let t = {
+        let _lock = match board_lock(cfg) {
+            Ok(l) => l,
+            Err(c) => return c,
+        };
+        let mut t = match load_task(cfg, id) {
+            Ok(t) => t,
+            Err(e) => return fail(EXIT_ERROR, e),
+        };
+        let to = match transition(t.status(), action) {
+            Ok(s) => s,
+            Err(e) => return fail(EXIT_ERROR, format!("cannot change {id}: {e}")),
+        };
+        if worktree::is_creating(&t) {
+            if action == Action::Done {
+                return fail(EXIT_ERROR, format!("cannot mark {id} done: its worktree is still being created (or the creator crashed). Wait, or run `broadsword worktree create {id}` to finish it, or `task fail|abandon {id}`"));
+            }
+            worktree::settle_creating(cfg, &mut t);
+        }
+        t.set("status", to);
+        t.set("ended", now_secs().to_string());
+        if let Some(n) = note {
+            t.set("note", n.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        if let Err(e) = save(&t) {
+            return fail(EXIT_ERROR, e);
+        }
+        println!("task {id} is {to}; its claims are released");
+        t
+    }; // lock released: removing a worktree can take a while and must not block other starts
+    // `done` cleans up the task's worktree, but only when that is safe (see worktree.rs). Either way the task is done:
+    // a kept worktree is a warning, not an error, so the exit code stays 0.
+    if action == Action::Done && worktree::has_worktree(&t) {
+        return worktree::after_done(cfg, &t);
     }
-    if let Err(e) = save(&t) {
-        return fail(EXIT_ERROR, e);
-    }
-    println!("task {id} is {to}; its claims are released");
     ExitCode::SUCCESS
 }
 
@@ -432,6 +472,14 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
     println!("started: {}", when("started"));
     println!("ended: {}", when("ended"));
     println!("note: {}", or_dash("note"));
+    if !t.get("worktree").is_empty() {
+        println!("worktree: {}{}", t.get("worktree"), if t.get("worktree_removed").is_empty() { "" } else { " (removed)" });
+        println!("branch: {}", t.get("branch"));
+        println!("base: {}", t.get("base"));
+        if !t.get("kept_refs").is_empty() {
+            println!("kept refs: {}", t.get("kept_refs").replace('\n', ", "));
+        }
+    }
     ExitCode::SUCCESS
 }
 
