@@ -73,6 +73,10 @@ pub struct Config {
     pub build_dir: PathBuf,
     pub projects_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// Where `broadsword install` puts the stable copy of the binary.
+    pub install_dir: PathBuf,
+    pub mcp_call_timeout_seconds: u64,
+    pub mcp_output_max_kb: u64,
     pub checkpoint_ignored_max_mb: u64,
     pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
@@ -131,6 +135,14 @@ impl Config {
                 return Err(format!("state_dir must not be inside {name}: cleanup would delete the job records"));
             }
         }
+        let install_dir = root.join(inside_root(&m, "install_dir", true)?);
+        for (name, other) in [("scratch_dir", &scratch_dir), ("state_dir", &state_dir)] {
+            if install_dir.starts_with(other) {
+                return Err(format!("install_dir must not be inside {name}: that folder is cleaned up or holds records, not the stable binary"));
+            }
+        }
+        let positive = |k: &str| get_int(&m, k).and_then(|v| if v == 0 { Err(format!("{k}: must be at least 1")) } else { Ok(v) });
+        let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
         Ok(Config {
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
@@ -144,6 +156,9 @@ impl Config {
             build_dir,
             projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
             state_dir,
+            install_dir,
+            mcp_call_timeout_seconds,
+            mcp_output_max_kb,
             checkpoint_ignored_max_mb: get_int(&m, "checkpoint_ignored_max_mb")?,
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
@@ -236,6 +251,22 @@ mod tests {
         assert!(c.job_disk_poll_seconds > 0);
         assert_eq!(c.state_dir, Path::new("proj").join(".").join("state"));
         assert!(c.checkpoint_ignored_max_mb > 0 && c.max_resumes > 0);
+        assert_eq!(c.install_dir, Path::new("proj").join(".").join("build/bin"));
+        assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
+    }
+
+    #[test]
+    fn install_dir_and_mcp_settings_are_validated() {
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\n";
+        assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
+        for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
+            assert!(Config::from_text(&format!("{base}install_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "install_dir {bad}");
+        }
+        assert!(Config::from_text(base, Path::new("p")).is_err(), "install_dir is required");
+        for key in ["mcp_call_timeout_seconds", "mcp_output_max_kb"] {
+            let zero = base.replace(&format!("{key}=5"), &format!("{key}=0"));
+            assert!(Config::from_text(&format!("{zero}install_dir=\"build/bin\"\n"), Path::new("p")).is_err(), "{key}=0");
+        }
     }
 
     #[test]
@@ -256,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");

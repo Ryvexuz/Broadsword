@@ -1,6 +1,7 @@
 mod cleanup;
 mod config;
 mod git;
+mod install;
 mod job;
 mod json;
 mod mcp;

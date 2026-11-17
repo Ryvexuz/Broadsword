@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --path-format=absolute --git-common-dir)/../build/debug/broadsword.exe\" hook pre-tool"
+            "command": "r=\"$(git rev-parse --path-format=absolute --git-common-dir)/..\"; b=\"$r/build/bin/broadsword.exe\"; [ -f \"$b\" ] || b=\"$r/build/debug/broadsword.exe\"; \"$b\" hook pre-tool"
           }
         ]
       }

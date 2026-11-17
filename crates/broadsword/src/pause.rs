@@ -109,10 +109,22 @@ pub fn tool_name(json: &str) -> Option<String> {
     Some(after[..after.find('"')?].to_string())
 }
 
+/// Prefix Claude Code gives the Broadsword MCP server's tools in `tool_name`.
+pub const MCP_PREFIX: &str = "mcp__broadsword__";
+
+/// An MCP tool of this server that may run while paused: every read-only registry tool (from the registry's own
+/// `read_only` flag, not a list kept here), plus `resume` and `cleanup`, which are how the pause is ended. Whatever
+/// is allowed here is still subject to the job guard inside the child process.
+pub fn mcp_tool_allowed_while_paused(tool_name: &str) -> bool {
+    let Some(name) = tool_name.strip_prefix(MCP_PREFIX) else { return false };
+    matches!(name, "resume" | "cleanup") || crate::tools::find(name).is_some_and(|t| t.read_only)
+}
+
 /// True if the hook call may proceed while paused.
 pub fn allowed_while_paused(stdin: &str) -> bool {
     match tool_name(stdin).as_deref() {
         Some("Read" | "Glob" | "Grep") => true,
+        Some(n) if n.starts_with(MCP_PREFIX) => mcp_tool_allowed_while_paused(n),
         Some("Bash" | "PowerShell") => ["broadsword status", "broadsword resume", "broadsword cleanup"].iter().any(|s| stdin.contains(s)),
         _ => false,
     }
@@ -158,5 +170,35 @@ mod tests {
         assert!(allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"broadsword cleanup"}}"#));
         assert!(!allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"dir"}}"#));
         assert!(!allowed_while_paused("garbage"));
+    }
+
+    fn hook_for(tool: &str) -> String {
+        format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#)
+    }
+
+    #[test]
+    fn mcp_tools_while_paused() {
+        for ok in ["status", "tools", "projects", "jobs", "resume", "cleanup"] {
+            assert!(allowed_while_paused(&hook_for(&format!("mcp__broadsword__{ok}"))), "{ok}");
+        }
+        for blocked in ["build", "test", "check", "run", "recover", "abandon", "watch", "install", "nope", ""] {
+            assert!(!allowed_while_paused(&hook_for(&format!("mcp__broadsword__{blocked}"))), "{blocked}");
+        }
+        // only this server's prefix counts
+        for other in ["mcp__other__status", "mcp__broadswordx__status", "broadsword__status", "mcp__broadsword_status"] {
+            assert!(!allowed_while_paused(&hook_for(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn mcp_allow_list_is_derived_from_the_registry() {
+        // Exactly the read-only tools plus resume and cleanup: a new read-only tool is allowed without touching this file,
+        // and a tool that is not read-only is never allowed by accident.
+        let mut allowed: Vec<&str> = crate::tools::TOOLS.iter().filter(|t| mcp_tool_allowed_while_paused(&format!("mcp__broadsword__{}", t.name))).map(|t| t.name).collect();
+        allowed.sort_unstable();
+        let mut want: Vec<&str> = crate::tools::TOOLS.iter().filter(|t| t.read_only || t.name == "resume" || t.name == "cleanup").map(|t| t.name).collect();
+        want.sort_unstable();
+        assert_eq!(allowed, want);
+        assert_eq!(allowed, ["cleanup", "jobs", "projects", "resume", "status", "tools"]);
     }
 }

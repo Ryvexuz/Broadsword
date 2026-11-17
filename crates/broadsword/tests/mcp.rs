@@ -5,14 +5,40 @@ use std::process::{Child, Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
 
-fn spawn() -> Child {
-    // Run from the crate dir (inside the repo) so broadsword.toml is found and the log goes to the repo's scratch/.
-    Command::new(BIN).arg("mcp").current_dir(env!("CARGO_MANIFEST_DIR")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+/// A throwaway Broadsword root under the repo's scratch folder (never the real root), removed on drop.
+struct Root(std::path::PathBuf);
+
+impl Root {
+    fn new() -> Root {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("mcp-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("scratch")).unwrap();
+        let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
+                    ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
+                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
+                    checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n";
+        std::fs::write(dir.join("broadsword.toml"), toml).unwrap();
+        Root(dir)
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn spawn() -> (Child, Root) {
+    let root = Root::new();
+    let child = Command::new(BIN).arg("mcp").current_dir(&root.0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    (child, root)
 }
 
 /// Send `lines`, close stdin, and return (stdout lines, exit code).
 fn session(lines: &[&str]) -> (Vec<String>, i32) {
-    let mut child = spawn();
+    let (mut child, _root) = spawn();
     let mut stdin = child.stdin.take().unwrap();
     for l in lines {
         writeln!(stdin, "{l}").unwrap();
@@ -77,7 +103,8 @@ fn ping_returns_an_empty_object() {
 
 #[test]
 fn tools_list_has_every_tool_with_the_same_schemas_as_tools_json() {
-    let cli = Command::new(BIN).args(["tools", "--json"]).current_dir(env!("CARGO_MANIFEST_DIR")).output().unwrap();
+    let cli_root = Root::new();
+    let cli = Command::new(BIN).args(["tools", "--json"]).current_dir(&cli_root.0).output().unwrap();
     assert!(cli.status.success());
     let J::Arr(cli_tools) = parse(&String::from_utf8(cli.stdout).unwrap()).unwrap() else { panic!("tools --json is an array") };
     let (out, code) = session(&[INIT, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
@@ -86,7 +113,7 @@ fn tools_list_has_every_tool_with_the_same_schemas_as_tools_json() {
     let res = r.get("result").unwrap();
     assert_eq!(res.get("nextCursor"), None);
     let Some(J::Arr(mcp_tools)) = res.get("tools") else { panic!("result.tools array") };
-    assert_eq!(mcp_tools.len(), 13);
+    assert_eq!(mcp_tools.len(), 14);
     assert_eq!(mcp_tools, &cli_tools, "tools/list must equal `tools --json` exactly");
     for t in mcp_tools {
         assert!(t.get("name").and_then(J::str).is_some());
@@ -98,13 +125,20 @@ fn tools_list_has_every_tool_with_the_same_schemas_as_tools_json() {
 }
 
 #[test]
-fn tools_call_is_not_yet_implemented() {
-    let (out, _) = session(&[r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}"#]);
-    let r = parse(&out[0]).unwrap();
-    let e = r.get("error").unwrap();
-    assert_eq!(num(e.get("code").unwrap()), "-32601");
-    assert!(e.get("message").and_then(J::str).unwrap().contains("milestone 2"));
-    assert_eq!(r.get("result"), None);
+fn tools_call_rejects_unknown_tools_and_malformed_calls_as_invalid_params() {
+    // (Real calls are tested in tests/mcp_call.rs; these never start a tool.)
+    let (out, _) = session(&[
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call"}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"status","arguments":[]}}"#,
+    ]);
+    assert_eq!(out.len(), 3);
+    for l in &out {
+        let r = parse(l).unwrap();
+        assert_eq!(num(r.get("error").and_then(|e| e.get("code")).unwrap()), "-32602", "{l}");
+        assert_eq!(r.get("result"), None);
+    }
+    assert!(out[0].contains("Unknown tool: no_such_tool"));
 }
 
 #[test]
@@ -145,7 +179,7 @@ fn string_and_number_ids_are_echoed_exactly() {
 #[test]
 fn several_requests_on_one_live_connection() {
     // Interactive: write one request, read its response, repeat, on the same process.
-    let mut child = spawn();
+    let (mut child, _root) = spawn();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     for (i, req) in [INIT, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#, r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#, r#"{"jsonrpc":"2.0","id":"four","method":"ping"}"#].iter().enumerate() {
@@ -176,7 +210,7 @@ fn eof_exits_zero_and_stdout_is_only_json_lines() {
 
 #[test]
 fn closing_stdout_early_exits_cleanly() {
-    let mut child = spawn();
+    let (mut child, _root) = spawn();
     let mut stdin = child.stdin.take().unwrap();
     drop(child.stdout.take()); // the client is gone
     // Keep sending a large reply's worth of requests until the server notices; it must exit 0, not crash.
@@ -191,7 +225,7 @@ fn closing_stdout_early_exits_cleanly() {
 
 #[test]
 fn oversize_line_is_refused_then_serving_continues() {
-    let mut child = spawn();
+    let (mut child, _root) = spawn();
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
         let big = vec![b'a'; 1024 * 1024 + 100];
@@ -215,7 +249,7 @@ fn responses_are_valid_for_python_if_available() {
     }
     let (out, _) = session(&[INIT, r#"{"jsonrpc":"2.0","id":"s","method":"tools/list"}"#, "garbage", r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#]);
     let mut child = Command::new("python")
-        .args(["-I", "-c", "import json,sys\nn=0\nfor l in sys.stdin.read().split('\\n'):\n  if l:\n    d=json.loads(l); assert d['jsonrpc']=='2.0'; n+=1\n    if d.get('id')=='s': assert len(d['result']['tools'])==13\nprint(n)"])
+        .args(["-I", "-c", "import json,sys\nn=0\nfor l in sys.stdin.read().split('\\n'):\n  if l:\n    d=json.loads(l); assert d['jsonrpc']=='2.0'; n+=1\n    if d.get('id')=='s': assert len(d['result']['tools'])==14\nprint(n)"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
