@@ -10,7 +10,7 @@ The API key comes from OPENAI_API_KEY or from `<main root>/.env`. It is never pr
 everything that leaves this program goes through `redact()`.
 
 Run from anywhere inside the project:
-    python -I clients/openai_mcp.py --prompt "Run check on crash-sim and report the result."
+    python -I -B clients/openai_mcp.py --prompt "Run check on crash-sim and report the result."
 
 Exit codes: 0 final answer reached; 1 error (key, network, API, server); 2 bad command line;
 3 stopped at --max-turns without a final answer; 130 interrupted.
@@ -268,6 +268,16 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
+
+
+def child_env(environ=None) -> dict:
+    """A copy of the environment without secrets: OPENAI_API_KEY and anything named *_API_KEY, *_TOKEN, *_SECRET.
+    The server (and every tool it runs, including `run`) gets this, so the model cannot read the key from it."""
+    environ = os.environ if environ is None else environ
+    return {k: v for k, v in environ.items() if k.upper() != "OPENAI_API_KEY" and not k.upper().endswith(SECRET_SUFFIXES)}
+
+
 class McpServer:
     """The server process and its JSON-RPC line protocol. Always `close()` it (or use `with`)."""
 
@@ -281,7 +291,7 @@ class McpServer:
         try:
             self.proc = subprocess.Popen(
                 [str(exe), "mcp"], cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=flags,
+                creationflags=flags, env=child_env(),
             )
         except OSError as e:
             raise Fail(f"cannot start the Broadsword server {exe}: {e.strerror or e}. Run `broadsword install` first, or pass --server.")
@@ -338,7 +348,7 @@ class McpServer:
             if left <= 0:
                 raise Fail(f"the Broadsword server did not answer `{method}` within {timeout:g} s")
             try:
-                line = self.lines.get(timeout=left)
+                line = self.lines.get(timeout=min(left, 0.5))  # short polls so Ctrl+C is seen promptly
             except queue.Empty:
                 continue
             if line is None:
@@ -459,6 +469,14 @@ def retry_delay(headers, attempt: int, base: float) -> float:
     return base * (2 ** attempt)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None  # never follow: the Authorization header must not travel to another URL
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def chat_completion(base_url: str, key: str, payload: dict, timeout: float, backoff: float, retries: int = 2) -> dict:
     """POST {base}/chat/completions. 429 and 5xx are retried at most `retries` times. Raises Fail with a clear message."""
     url = base_url.rstrip("/") + "/chat/completions"
@@ -469,7 +487,7 @@ def chat_completion(base_url: str, key: str, payload: dict, timeout: float, back
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key, "User-Agent": CLIENT_NAME},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             body = b""
@@ -487,6 +505,8 @@ def chat_completion(base_url: str, key: str, payload: dict, timeout: float, back
                 if status == 429:
                     raise Fail(f"HTTP 429: rate limit or quota reached, still failing after {retries} retries. API message: {api_message(body)}")
                 raise Fail(f"HTTP {status}: the API server failed, still failing after {retries} retries. API message: {api_message(body)}")
+            if 300 <= status < 400:
+                raise Fail(f"HTTP {status}: the API answered with a redirect, which is not followed (the key must not be sent elsewhere). Check --base-url.")
             if status == 401:
                 raise Fail("HTTP 401: the API rejected the key. Check OPENAI_API_KEY (or the line in .env): it may be wrong, revoked or for another project.")
             if status == 403:
@@ -516,6 +536,22 @@ def chat_completion(base_url: str, key: str, payload: dict, timeout: float, back
 
 
 # ---- the agent loop ---------------------------------------------------------------------------
+
+
+def clean_assistant(message: dict) -> dict:
+    """Only the fields the API accepts back: role, content and tool_calls (id, type, function name and arguments)."""
+    clean: dict = {"role": "assistant", "content": message.get("content")}
+    calls = []
+    for c in message.get("tool_calls") or []:
+        fn = c.get("function") if isinstance(c, dict) else None
+        fn = fn if isinstance(fn, dict) else {}
+        args = fn.get("arguments")
+        calls.append({"id": c.get("id") if isinstance(c, dict) else None, "type": "function",
+                      "function": {"name": fn.get("name") if isinstance(fn.get("name"), str) else "",
+                                   "arguments": args if isinstance(args, str) else json.dumps(args if args is not None else {})}})
+    if calls:
+        clean["tool_calls"] = calls
+    return clean
 
 
 class Run:
@@ -549,7 +585,7 @@ def run_agent(args, key: str, server: McpServer, offered: list[dict], run: Run, 
         response = chat_completion(args.base_url, key, payload, args.timeout, args.backoff)
         used = run.add_usage(response.get("usage"))
         message = response["choices"][0]["message"]
-        messages.append(message)
+        messages.append(clean_assistant(message))
         run.events.append({"type": "response", "turn": run.turns, "usage": used, "model": response.get("model"), "finish_reason": response["choices"][0].get("finish_reason")})
         calls = message.get("tool_calls") or []
         if not calls:
@@ -568,6 +604,8 @@ def run_tool_call(args, server: McpServer, allowed: set[str], run: Run, messages
     fn = fn if isinstance(fn, dict) else {}
     name = fn.get("name") if isinstance(fn.get("name"), str) else ""
     raw_args = fn.get("arguments")
+    if raw_args is not None and not isinstance(raw_args, str):
+        raw_args = json.dumps(raw_args)
     call_id = call.get("id") if isinstance(call, dict) else None
     event: dict = {"type": "tool_call", "turn": run.turns, "id": call_id, "name": name, "arguments": raw_args}
     out(f"[tool call] {name} {raw_args if raw_args else '{}'}")
@@ -583,7 +621,7 @@ def run_tool_call(args, server: McpServer, allowed: set[str], run: Run, messages
             arguments = json.loads(raw_args) if raw_args else {}
             if not isinstance(arguments, dict):
                 raise ValueError("not an object")
-        except ValueError:
+        except (ValueError, TypeError):
             problem = f"the arguments for `{name}` are not a valid JSON object; nothing was run. Send arguments as a JSON object."
             event["bad_arguments"] = True
 
@@ -602,6 +640,8 @@ def run_tool_call(args, server: McpServer, allowed: set[str], run: Run, messages
             out("\n".join("    " + line for line in shown.splitlines()))
     event.update({"result": text, "exit_code": code, "is_error": is_error})
     run.events.append(event)
+    text = redact(text)
+    event["result"] = text
     messages.append({"role": "tool", "tool_call_id": call_id, "content": truncate_tail(text, args.max_tool_chars)})
 
 
@@ -666,6 +706,10 @@ def main(argv: list[str] | None = None) -> int:
         tools = server.start()
         allow = [n.strip() for n in args.allow.split(",") if n.strip()] if args.allow is not None else None
         offered, warnings = select_tools(tools, allow)
+        if allow is not None:
+            unknown = [n for n in allow if n not in {t["name"] for t in tools}]
+            if unknown:
+                raise Fail(f"--allow names tools the server does not have: {', '.join(unknown)}. Known: {', '.join(t['name'] for t in tools)}", 2)
         for w in warnings:
             err("warning: " + w)
         offered_names = [t["name"] for t in offered]
@@ -677,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
         err(f"error: {error}")
         if server is not None and server.stderr_tail:
             err("server stderr (last lines): " + " | ".join(x for x in server.stderr_tail[-3:] if x))
+    except Exception as e:  # nothing may end in a traceback
+        error, code = f"unexpected {type(e).__name__}: {redact(e)}"[:500], 1
+        err(f"error: {error}")
     except KeyboardInterrupt:
         error, code = "interrupted", 130
         err("interrupted")

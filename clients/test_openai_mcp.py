@@ -1,18 +1,22 @@
 """Tests for clients/openai_mcp.py. No network: a fake OpenAI server runs on 127.0.0.1 in a thread.
 
-Run:  python -I -m unittest clients/test_openai_mcp.py
+Run:  python -I -B -m unittest discover -s clients -p "test_openai_mcp.py"
 
 The tests talk to the REAL Broadsword MCP server (the installed binary in <main root>/build/bin), but in a throwaway
 root under <main root>/scratch/ that has its own tiny git cargo project. The fake key below is not a real key.
 """
 
+import sys
+
+sys.dont_write_bytecode = True  # never write .pyc files into the repo
+
+import contextlib
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 import uuid
@@ -30,6 +34,17 @@ _spec.loader.exec_module(oc)
 FAKE_KEY = "sk-test-SECRET123"
 MAIN_ROOT = oc.find_main_root(HERE)
 MAIN_EXE = oc.default_server_path(MAIN_ROOT)
+
+
+@contextlib.contextmanager
+def scratch_tmp():
+    """A temporary folder under <main root>/scratch (never %TEMP%), removed afterwards."""
+    d = MAIN_ROOT / "scratch" / f"m3-unit-{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True)
+    try:
+        yield str(d)
+    finally:
+        rm_tree(d)
 
 
 def rm_tree(path: Path) -> None:
@@ -202,14 +217,85 @@ class EndToEnd(RootCase):
     def test_allow_list_can_widen_but_watch_stays_out(self):
         script = [tool_calls(("watch", {}), ("status", {})), final("ok")]
         with FakeOpenAI(script) as fake:
-            r = self.cli(fake.url, "--allow", "status, run, watch, nosuch")
+            r = self.cli(fake.url, "--allow", "status, run, watch")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         names = sorted(t["function"]["name"] for t in fake.requests[0]["json"]["tools"])
         self.assertEqual(names, ["run", "status"])
         self.assertIn("watch", r.stderr)
         self.assertIn("mcp_callable", r.stderr)
-        self.assertIn("nosuch", r.stderr)
         self.assertIn("not allowed", fake.tool_messages(1)[0]["content"])
+
+    def test_unknown_name_in_allow_exits_2_before_any_api_call(self):
+        with FakeOpenAI([final("x")]) as fake:
+            r = self.cli(fake.url, "--allow", "status,nosuch")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("nosuch", r.stderr)
+        self.assertEqual(fake.requests, [])
+
+    def test_key_and_secret_env_vars_never_reach_the_server_or_its_tools(self):
+        # the reviewer's case: the model asks `run` to echo the key
+        cmds = [("run", {"project": "tiny", "command": ["echo", "%OPENAI_API_KEY%"]}), ("run", {"project": "tiny", "command": ["echo", "%MY_SERVICE_TOKEN%"]})]
+        with FakeOpenAI([tool_calls(*cmds), final("done")]) as fake:
+            os.environ["MY_SERVICE_TOKEN"] = "tok-SECRETTOKEN999"
+            try:
+                log = self.root / "scratch" / "m3-env-log.json"
+                r = self.cli(fake.url, "--allow", "run", "--json-log", str(log))
+            finally:
+                os.environ.pop("MY_SERVICE_TOKEN", None)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        secrets = [FAKE_KEY.encode(), b"SECRETTOKEN999"]
+        blob = json.dumps(fake.requests).encode() + (r.stdout + r.stderr).encode()
+        for sec in secrets:
+            self.assertNotIn(sec, blob)
+        # the tool really ran, and saw the variables as unset (cmd echoes the unexpanded text)
+        self.assertIn("%OPENAI_API_KEY%", fake.tool_messages(1)[0]["content"])
+        self.assertIn("%MY_SERVICE_TOKEN%", fake.tool_messages(1)[1]["content"])
+        hits = []
+        for f in self.root.rglob("*"):
+            if f.is_file() and f.stat().st_size < 50_000_000:
+                data = f.read_bytes()
+                hits += [str(f) for sec in secrets if sec in data]
+        self.assertEqual(hits, [], "the secrets must not be in any file under the root")
+
+    def test_tool_result_text_is_redacted_before_the_model_sees_it(self):
+        with FakeOpenAI([tool_calls(("run", {"project": "tiny", "command": ["echo", "sk-leaked123456"]})), final("x")]) as fake:
+            r = self.cli(fake.url, "--allow", "run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("sk-leaked123456", fake.tool_messages(1)[0]["content"])
+        self.assertIn("[REDACTED]", fake.tool_messages(1)[0]["content"])
+
+    def test_redirect_is_not_followed_and_is_an_error(self):
+        with FakeOpenAI([final("must not be reached")]) as target:
+            with FakeOpenAI([{"status": 302, "headers": {"Location": target.url + "/chat/completions"}, "body": {}}]) as first:
+                r = self.cli(first.url)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("redirect", r.stderr)
+        self.assertEqual(target.requests, [])
+        self.assertEqual(target.auth, [])
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_non_string_arguments_are_a_tool_error_not_a_traceback(self):
+        for bad in ({"x": 1}, [1, 2], 5):
+            resp = tool_calls(("status", {}))
+            resp["body"]["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = bad
+            with FakeOpenAI([resp, final("fine")]) as fake:
+                r = self.cli(fake.url)
+            self.assertEqual(r.returncode, 0, (bad, r.stdout + r.stderr))
+            self.assertNotIn("Traceback", r.stderr)
+            c = fake.tool_messages(1)[0]["content"]
+            self.assertTrue("tool error" in c or "unknown argument" in c, c)
+
+    def test_assistant_messages_are_sent_back_with_only_known_fields(self):
+        resp = tool_calls(("status", {}))
+        resp["body"]["choices"][0]["message"].update({"refusal": None, "annotations": [], "audio": None})
+        resp["body"]["choices"][0]["message"]["tool_calls"][0]["index"] = 0
+        with FakeOpenAI([resp, final("ok")]) as fake:
+            r = self.cli(fake.url)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        am = [m for m in fake.requests[1]["json"]["messages"] if m["role"] == "assistant"][0]
+        self.assertEqual(sorted(am), ["content", "role", "tool_calls"])
+        self.assertEqual(sorted(am["tool_calls"][0]), ["function", "id", "type"])
+        self.assertEqual(sorted(am["tool_calls"][0]["function"]), ["arguments", "name"])
 
     def test_malformed_tool_arguments_become_a_tool_error(self):
         bad = tool_calls(("status", {}))
@@ -257,7 +343,7 @@ class EndToEnd(RootCase):
 
     def test_json_log_outside_scratch_or_evidence_is_refused(self):
         with FakeOpenAI([final("x")]) as fake:
-            r = self.cli(fake.url, "--json-log", str(Path(tempfile.gettempdir()) / "m3-log.json"))
+            r = self.cli(fake.url, "--json-log", str(MAIN_ROOT / "m3-outside-log.json"))
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("scratch", r.stderr)
             r = self.cli(fake.url, "--json-log", str(self.root / "projects" / "tiny" / "x.json"))
@@ -413,7 +499,7 @@ class Units(unittest.TestCase):
         self.assertEqual(oc.parse_env_text('A= 1 \nB="two"\n\'C\'=x\n# n\nexport D=\'d d\'\nE=\n  F =  "q" \n'), {"A": "1", "B": "two", "'C'": "x", "D": "d d", "E": "", "F": "q"})
 
     def test_key_loading_env_wins_over_dotenv(self):
-        with tempfile.TemporaryDirectory() as d:
+        with scratch_tmp() as d:
             root = Path(d)
             (root / ".env").write_text("OPENAI_API_KEY = 'sk-from-file-1'\n", encoding="utf-8")
             self.assertEqual(oc.load_api_key(root, {"OPENAI_API_KEY": " sk-from-env-2 "}), "sk-from-env-2")
@@ -421,7 +507,7 @@ class Units(unittest.TestCase):
             self.assertEqual(oc.load_api_key(root, {"OPENAI_API_KEY": "  "}), "sk-from-file-1")
 
     def test_missing_key_is_a_clear_error(self):
-        with tempfile.TemporaryDirectory() as d:
+        with scratch_tmp() as d:
             with self.assertRaises(oc.Fail) as cm:
                 oc.load_api_key(Path(d), {})
             self.assertIn("OPENAI_API_KEY", str(cm.exception))
@@ -454,6 +540,10 @@ class Units(unittest.TestCase):
         self.assertIn("90 lines omitted", p)
         self.assertNotIn("line50", p)
 
+    def test_child_env_drops_key_token_and_secret_variables(self):
+        env = {"OPENAI_API_KEY": "a", "openai_api_key": "b", "ANTHROPIC_API_KEY": "c", "GH_TOKEN": "d", "x_secret": "e", "PATH": "p", "HOME": "h", "KEYBOARD": "k"}
+        self.assertEqual(oc.child_env(env), {"PATH": "p", "HOME": "h", "KEYBOARD": "k"})
+
     def test_retry_delay_respects_retry_after(self):
         self.assertEqual(oc.retry_delay({"Retry-After": "7"}, 0, 1.0), 7.0)
         self.assertEqual(oc.retry_delay({"Retry-After": "9999"}, 0, 1.0), 60.0)
@@ -461,7 +551,7 @@ class Units(unittest.TestCase):
         self.assertEqual(oc.retry_delay({"Retry-After": "Wed, 21 Oct"}, 0, 1.0), 1.0)
 
     def test_main_root_follows_a_worktree_git_file(self):
-        with tempfile.TemporaryDirectory() as d:
+        with scratch_tmp() as d:
             main, wt = Path(d) / "main", Path(d) / "main" / ".claude" / "worktrees" / "a"
             (main / ".git" / "worktrees" / "a").mkdir(parents=True)
             wt.mkdir(parents=True)
@@ -484,7 +574,7 @@ class Units(unittest.TestCase):
             "    print(json.dumps({'jsonrpc':'2.0','id':999,'result':{}}))\n"
             "    print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'tools':[{'name':'zzz'}]}}), flush=True)\n"
         )
-        with tempfile.TemporaryDirectory() as d:
+        with scratch_tmp() as d:
             script = Path(d) / "fake.py"
             script.write_text(code, encoding="utf-8")
             bat = Path(d) / ("fake.cmd" if os.name == "nt" else "fake.sh")
