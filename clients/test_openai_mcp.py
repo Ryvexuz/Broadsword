@@ -144,10 +144,11 @@ class RootCase(unittest.TestCase):
         p = self.root / "scratch" / "logs" / "mcp.log"
         return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
 
-    def cli(self, base_url, *extra, key=FAKE_KEY, dotenv=None, prompt="do it"):
+    def cli(self, base_url, *extra, key=FAKE_KEY, dotenv=None, prompt="do it", env_extra=None):
         env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
         if key is not None:
             env["OPENAI_API_KEY"] = key
+        env.update(env_extra or {})
         env_file = self.root / ".env"
         env_file.unlink(missing_ok=True)
         if dotenv is not None:
@@ -256,6 +257,16 @@ class EndToEnd(RootCase):
                 data = f.read_bytes()
                 hits += [str(f) for sec in secrets if sec in data]
         self.assertEqual(hits, [], "the secrets must not be in any file under the root")
+
+    def test_variables_holding_the_key_under_any_name_are_not_passed_on(self):
+        cmds = [("run", {"project": "tiny", "command": ["echo", f"%{n}%"]}) for n in ("OPENAI_KEY", "MYVAR")]
+        with FakeOpenAI([tool_calls(*cmds), final("done")]) as fake:
+            r = self.cli(fake.url, "--allow", "run", env_extra={"OPENAI_KEY": FAKE_KEY, "MYVAR": "prefix-" + FAKE_KEY})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("%OPENAI_KEY%", fake.tool_messages(1)[0]["content"])
+        self.assertIn("%MYVAR%", fake.tool_messages(1)[1]["content"])
+        hits = [str(f) for f in self.root.rglob("*") if f.is_file() and b"SECRET123" in f.read_bytes()]
+        self.assertEqual(hits, [], "the key must not be in any file under the root")
 
     def test_tool_result_text_is_redacted_before_the_model_sees_it(self):
         with FakeOpenAI([tool_calls(("run", {"project": "tiny", "command": ["echo", "sk-leaked123456"]})), final("x")]) as fake:
@@ -539,6 +550,11 @@ class Units(unittest.TestCase):
         self.assertIn("line99", p)
         self.assertIn("90 lines omitted", p)
         self.assertNotIn("line50", p)
+
+    def test_child_env_drops_by_value_and_by_key_suffix(self):
+        oc._SECRETS.add("valuesecret-xyz")
+        env = {"MYVAR": "a valuesecret-xyz b", "OPENAI_KEY": "q", "PATH": "p"}
+        self.assertEqual(oc.child_env(env), {"PATH": "p"})
 
     def test_child_env_drops_key_token_and_secret_variables(self):
         env = {"OPENAI_API_KEY": "a", "openai_api_key": "b", "ANTHROPIC_API_KEY": "c", "GH_TOKEN": "d", "x_secret": "e", "PATH": "p", "HOME": "h", "KEYBOARD": "k"}

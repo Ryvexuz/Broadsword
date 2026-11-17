@@ -268,14 +268,18 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
+SECRET_SUFFIXES = ("_API_KEY", "_KEY", "_TOKEN", "_SECRET")
 
 
 def child_env(environ=None) -> dict:
     """A copy of the environment without secrets: OPENAI_API_KEY and anything named *_API_KEY, *_TOKEN, *_SECRET.
-    The server (and every tool it runs, including `run`) gets this, so the model cannot read the key from it."""
+    Variables whose VALUE contains a loaded secret are dropped whatever their name. The server (and every tool it runs, including `run`) gets this, so the model cannot read the key from it."""
     environ = os.environ if environ is None else environ
-    return {k: v for k, v in environ.items() if k.upper() != "OPENAI_API_KEY" and not k.upper().endswith(SECRET_SUFFIXES)}
+    secrets = [x for x in _SECRETS if x]
+    return {
+        k: v for k, v in environ.items()
+        if k.upper() != "OPENAI_API_KEY" and not k.upper().endswith(SECRET_SUFFIXES) and not any(x in v for x in secrets)
+    }
 
 
 class McpServer:
