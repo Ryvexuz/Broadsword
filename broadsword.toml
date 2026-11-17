@@ -1,0 +1,14 @@
+# broadsword.toml
+# All limits and paths live in this one file. Change a value here and every
+# agent picks it up. Nothing is hard-coded anywhere else.
+
+root = "."                 # everything is relative to this folder
+disk_floor_gb = 20         # pause and clean up below this much free space
+cleanup_every_hours = 1
+scratch_max_age_hours = 24
+max_agents = 2             # raise only after clean merges
+
+# Paths, relative to root
+scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time
+build_dir = "build"        # the one shared build folder (CARGO_TARGET_DIR)
+shared_dir = "shared"      # one shared copy of big read-only things

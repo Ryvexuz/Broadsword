@@ -1,0 +1,18 @@
+# Working areas: the folders are tracked, what's inside them is not.
+# Cleanup jobs must leave each .gitkeep in place.
+/scratch/*
+!/scratch/.gitkeep
+/build/*
+!/build/.gitkeep
+/shared/*
+!/shared/.gitkeep
+
+# Secrets
+.env
+
+# Per-machine Claude Code settings
+.claude/settings.local.json
+
+# OS noise
+Thumbs.db
+.DS_Store
