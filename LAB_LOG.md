@@ -2,6 +2,35 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-17 — Stage 2, milestone 2: headless mode
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator: spec, merge, install, done check, records.
+- Sonnet as coder, one pass, about 270k tokens and 15 minutes. This was the largest single coder pass so far.
+- Opus as reviewer, one pass, with two real-client runs and a Python protocol driver.
+- Claude Opus 5.5 as the headless client in the done check.
+
+**What went wrong and what fixed it**
+
+- **Second first-pass PASS in a row.** The spec named the hard parts up front: injection through arguments, cleanup on timeout and cancel, version gating, install while running, and the hook's MCP allow-list.
+- **The shared build folder bit again.** The coder's worktree build overwrote `build/debug/broadsword.exe` with code that needs settings `main` didn't have yet. Until the merge, the pause hook on `main` failed open (exit 1). That was low risk with 127 GB free, and it is exactly the problem `install` now solves: the hook runs the stable `build/bin/` copy.
+- **Tool choice depends on wording.** In the reviewer's run, the model used `build` then `test` rather than `check`, even when only `check` was allowed. In the done check, a prompt saying "in one job" made it pick `check` first time. Noted in `IDEAS.md` as the description experiment.
+
+**Rough cost and time**
+
+- About 30 minutes of wall time.
+- Subagent tokens: coder about 270k, reviewer about 165k.
+- Client sessions: two reviewer runs at about $0.19 each, and the done check at $0.12.
+
+**Git commands used, beyond a plain commit**
+
+- `git merge --no-ff`, `git worktree remove` and `git branch -d`, as before.
+
+**One lesson about AI development**
+
+Naming the risky edge cases in the spec, before the coder starts, has now produced two first-pass PASSes in a row after Stage 1's run of first-pass FAILs. The review still found real limits, but nothing blocking. The cost moved from review rounds into a longer spec.
+
 ## 2026-11-17 — Stage 2, milestone 1: MCP server
 
 **Models and roles**
