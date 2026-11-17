@@ -12,3 +12,10 @@ max_agents = 2             # raise only after clean merges
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time
 build_dir = "build"        # the one shared build folder (CARGO_TARGET_DIR)
 shared_dir = "shared"      # one shared copy of big read-only things
+
+# Resource monitor
+disk_check_every_seconds = 60   # how often `broadsword watch` checks free space
+log_max_mb = 50                 # *.log files in scratch are cut to their last N MB
+ram_warn_percent = 90           # status warns above this RAM use
+cpu_warn_percent = 90           # status warns above this CPU use
+alert_command = ""              # shell command run with the alert message as its argument; empty = none

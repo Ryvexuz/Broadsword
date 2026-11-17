@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --path-format=absolute --git-common-dir)/../build/debug/broadsword.exe\" hook pre-tool"
+          }
+        ]
+      }
+    ]
+  }
+}
