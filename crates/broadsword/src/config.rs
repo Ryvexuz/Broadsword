@@ -71,6 +71,9 @@ pub struct Config {
     pub alert_command: String,
     pub scratch_dir: PathBuf,
     pub build_dir: PathBuf,
+    pub projects_dir: PathBuf,
+    pub job_disk_reserve_gb: u64,
+    pub job_disk_poll_seconds: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -78,6 +81,15 @@ fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
         Some(Value::Int(i)) if *i >= 0 => Ok(*i as u64),
         Some(_) => Err(format!("{k}: expected a non-negative integer")),
         None => Err(format!("{k}: missing from {CONFIG_FILE}")),
+    }
+}
+
+/// Optional integer: `default` when the key is absent (older config files keep working).
+fn get_int_or(m: &HashMap<String, Value>, k: &str, default: u64) -> Result<u64, String> {
+    if m.contains_key(k) {
+        get_int(m, k)
+    } else {
+        Ok(default)
     }
 }
 
@@ -113,6 +125,7 @@ impl Config {
         let m = parse_flat(text)?;
         let root = config_dir.join(get_str(&m, "root")?);
         inside_root(&m, "shared_dir", false)?;
+        let projects_dir = if m.contains_key("projects_dir") { inside_root(&m, "projects_dir", true)? } else { PathBuf::from("projects") };
         Ok(Config {
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
@@ -124,6 +137,9 @@ impl Config {
             alert_command: get_str(&m, "alert_command")?,
             scratch_dir: root.join(inside_root(&m, "scratch_dir", true)?),
             build_dir: root.join(inside_root(&m, "build_dir", true)?),
+            projects_dir: root.join(projects_dir),
+            job_disk_reserve_gb: get_int_or(&m, "job_disk_reserve_gb", 2)?,
+            job_disk_poll_seconds: get_int_or(&m, "job_disk_poll_seconds", 5)?,
             root,
         })
     }
@@ -132,6 +148,10 @@ impl Config {
         let file = config_dir.join(CONFIG_FILE);
         let text = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
         Config::from_text(&text, config_dir)
+    }
+
+    pub fn reserve_bytes(&self) -> u64 {
+        self.job_disk_reserve_gb * GB
     }
 
     pub fn floor_bytes(&self) -> u64 {
@@ -204,6 +224,8 @@ mod tests {
         let c = Config::from_text(text, Path::new("proj")).unwrap();
         assert_eq!(c.scratch_dir, Path::new("proj").join(".").join("scratch"));
         assert!(c.disk_floor_gb > 0 && c.log_max_mb > 0);
+        assert_eq!(c.projects_dir, Path::new("proj").join(".").join("projects"));
+        assert!(c.job_disk_poll_seconds > 0);
     }
 
     #[test]
@@ -231,6 +253,10 @@ mod tests {
         }
         let t = format!("{base}scratch_dir = \"scratch\"\nshared_dir = \"..\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_err());
+        for bad in ["../p", "/p", "C:/p", "."] {
+            let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"{bad}\"\n");
+            assert!(Config::from_text(&t, Path::new("p")).is_err(), "projects_dir {bad}");
+        }
         let t = format!("{base}scratch_dir = \"a/b\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
     }
