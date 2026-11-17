@@ -1,11 +1,13 @@
-//! Job runner: `broadsword build | test | check <project>` and `broadsword projects`.
+//! Job runner: `broadsword build | test | check | run <project>` and `broadsword projects`.
 //!
 //! Every cargo step runs with `CARGO_TARGET_DIR` pointing at the main root's shared build
 //! folder, is guarded by the disk reserve before it starts, is watched while it runs, and is
 //! tee'd to the terminal and to `scratch/logs/jobs/`.
 
 use crate::config::Config;
+use crate::git;
 use crate::pause;
+use crate::record::{self, Record};
 use crate::sys;
 use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -198,36 +200,30 @@ fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>
 }
 
 fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        // cargo starts rustc and build scripts; /T takes the whole tree down with it.
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
+    // cargo starts rustc and build scripts, a shell starts its commands: take the whole tree down.
+    sys::kill_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// Run `cargo <sub> --offline` in `project_dir`, polling `free` every `poll`; below the floor the job is killed.
-pub fn run_cargo(
+/// Run a prepared command, polling `free` every `poll`; below the floor the job is killed.
+/// `on_spawn` gets the child's pid as soon as it exists (recorded so recovery can find an orphan).
+pub fn run_child(
     cfg: &Config,
-    project_dir: &Path,
-    sub: &str,
+    mut cmd: Command,
     log: &Log,
     free: &mut dyn FnMut() -> u64,
     poll: Duration,
+    on_spawn: &mut dyn FnMut(u32),
 ) -> Result<StepRun, String> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let start = Instant::now();
-    let mut child = Command::new(cargo)
-        .arg(sub)
-        .arg("--offline")
-        .current_dir(project_dir)
-        .env("CARGO_TARGET_DIR", &cfg.build_dir)
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot start cargo: {e}"))?;
+        .map_err(|e| format!("cannot start `{}`: {e}", cmd.get_program().to_string_lossy()))?;
+    on_spawn(child.id());
     let kept = Arc::new(Mutex::new(Vec::new()));
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let t_out = {
@@ -243,7 +239,7 @@ pub fn run_cargo(
         match child.try_wait() {
             Ok(Some(status)) => break Outcome::Exited(status.code()),
             Ok(None) => {}
-            Err(e) => return Err(format!("waiting for cargo failed: {e}")),
+            Err(e) => return Err(format!("waiting for the job failed: {e}")),
         }
         if Instant::now() >= next_poll {
             let f = free();
@@ -263,6 +259,32 @@ pub fn run_cargo(
     Ok(StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() })
 }
 
+/// `cargo <sub> --offline` in `project_dir` with the shared build folder.
+fn cargo_command(cfg: &Config, project_dir: &Path, sub: &str) -> Command {
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.arg(sub).arg("--offline").current_dir(project_dir).env("CARGO_TARGET_DIR", &cfg.build_dir);
+    c
+}
+
+/// An arbitrary command line run through the system shell in `project_dir`.
+fn shell_command(project_dir: &Path, line: &str) -> Command {
+    #[cfg(windows)]
+    let mut c = {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("cmd");
+        c.arg("/C").raw_arg(format!("\"{line}\"")); // cmd strips one outer pair of quotes
+        c
+    };
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(line);
+        c
+    };
+    c.current_dir(project_dir);
+    c
+}
+
 // ---- commands ---------------------------------------------------------------------------
 
 pub fn file_stamp(secs: u64) -> String {
@@ -279,6 +301,14 @@ pub fn step_line_build(run: &StepRun) -> (String, bool) {
         Outcome::Exited(Some(0)) => (format!("build: ok ({:.1} s)", run.secs), true),
         Outcome::Exited(c) => (format!("build: FAILED ({})", exit_text(c)), false),
         Outcome::DiskDropped(_) => ("build: KILLED (disk below floor)".into(), false),
+    }
+}
+
+pub fn step_line_run(run: &StepRun) -> (String, bool) {
+    match run.outcome {
+        Outcome::Exited(Some(0)) => (format!("run: ok ({:.1} s)", run.secs), true),
+        Outcome::Exited(c) => (format!("run: FAILED ({})", exit_text(c)), false),
+        Outcome::DiskDropped(_) => ("run: KILLED (disk below floor)".into(), false),
     }
 }
 
@@ -315,8 +345,57 @@ pub fn create_log(dir: &Path, base: &str) -> std::io::Result<(PathBuf, std::fs::
     unreachable!()
 }
 
-/// Run a job: `kind` is build, test or check.
+/// The steps of a job kind, in order. `run` is one step: the user's command.
+pub fn steps_for(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "build" => &["build"],
+        "test" => &["test"],
+        "run" => &["run"],
+        _ => &["build", "test"],
+    }
+}
+
+pub struct JobSpec {
+    pub kind: String,
+    pub name: String,
+    /// Command line, for kind `run` only.
+    pub command: Option<String>,
+    /// Index into `steps_for(kind)` to start from (recovery resumes a job at the step it was on).
+    pub first_step: usize,
+    /// Id of the interrupted job this one resumes.
+    pub resumed_from: Option<String>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn save_record(rec: &Record) {
+    if let Err(e) = rec.save() {
+        eprintln!("broadsword: warning: cannot write job record {}: {e}", rec.path.display());
+    }
+}
+
+fn finish(rec: &mut Record, status: &str) {
+    rec.set("status", status);
+    rec.set("child_pid", "");
+    rec.set("child_start", "");
+    rec.set("ended", now_secs().to_string());
+    save_record(rec);
+}
+
 pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
+    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None })
+}
+
+pub fn cmd_run(cfg: &Config, name: &str, command: &[&str]) -> ExitCode {
+    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None })
+}
+
+/// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
+/// before the first step (when the project is a Git repo), and runs the steps.
+pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
+    let (kind, name) = (spec.kind.as_str(), spec.name.as_str());
     let project_dir = match resolve_project(&cfg.root, &cfg.projects_dir, name) {
         Ok(d) => d,
         Err(e) => {
@@ -325,15 +404,11 @@ pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
             return ExitCode::from(EXIT_UNKNOWN_PROJECT);
         }
     };
-    let steps: &[&str] = match kind {
-        "build" => &["build"],
-        "test" => &["test"],
-        _ => &["build", "test"],
-    };
+    let steps = steps_for(kind);
     let mut free_src = hooked_free_source(cfg);
     let poll = Duration::from_secs(cfg.job_disk_poll_seconds.max(1));
 
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = now_secs();
     let log_dir = cfg.scratch_dir.join("logs").join("jobs");
     let log_opened = std::fs::create_dir_all(&log_dir).and_then(|_| create_log(&log_dir, &format!("{}-{name}-{kind}", file_stamp(secs))));
     let (log_path, log): (PathBuf, Log) = match log_opened {
@@ -343,23 +418,109 @@ pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
             return ExitCode::from(EXIT_FAILED);
         }
     };
-    println!("job: {kind} {name} (log: {})", log_path.display());
+
+    // The record comes first: from here on a kill at any moment leaves something to recover from.
+    let command_text = match &spec.command {
+        Some(c) => c.clone(),
+        None => steps.iter().map(|s| format!("cargo {s} --offline")).collect::<Vec<_>>().join("; "),
+    };
+    let mut rec = match record::create(&record::jobs_dir(cfg), &format!("{}-{name}-{kind}", file_stamp(secs))) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("broadsword: cannot create job record in {}: {e}", record::jobs_dir(cfg).display());
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    let me = std::process::id();
+    rec.set("project", name);
+    rec.set("kind", kind);
+    rec.set("command", command_text);
+    rec.set("status", record::RUNNING);
+    rec.set("pid", me.to_string());
+    rec.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
+    rec.set("child_pid", "");
+    rec.set("child_start", "");
+    rec.set("started", secs.to_string());
+    rec.set("step", steps.get(spec.first_step).copied().unwrap_or(steps[0]));
+    rec.set("checkpoint", "pending");
+    rec.set("log", log_path.display().to_string());
+    if let Some(old) = &spec.resumed_from {
+        rec.set("resumed_from", old.as_str());
+    }
+    if let Err(e) = rec.save() {
+        eprintln!("broadsword: cannot write job record {}: {e}", rec.path.display());
+        return ExitCode::from(EXIT_FAILED);
+    }
+    let job_id = rec.id().to_string();
+    if let Some(old) = &spec.resumed_from {
+        // Hand over before running: the old record now points at this job.
+        let path = record::jobs_dir(cfg).join(format!("{old}.rec"));
+        if let Ok(mut o) = record::load(&path) {
+            o.set("status", record::RESUMED);
+            o.set("resumed_as", job_id.as_str());
+            save_record(&o);
+        }
+    }
+    println!("job: {kind} {name} (id {job_id}, log: {})", log_path.display());
+
+    if kind == "run" && !git::is_repo(&project_dir) {
+        eprintln!("broadsword: refusing to run: project `{name}` is not a Git repository, so there is no checkpoint to roll back to (run `git init` in {} first)", project_dir.display());
+        finish(&mut rec, record::REFUSED);
+        return ExitCode::from(EXIT_REFUSED);
+    }
 
     let mut summary: Vec<String> = Vec::new();
     let mut all_ok = true;
-    for step in steps {
+    let mut exit_code: Option<i32> = None;
+    for (i, step) in steps.iter().enumerate().skip(spec.first_step) {
         let free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
             eprintln!("broadsword: refusing to start {step}: {why}");
+            finish(&mut rec, record::REFUSED);
             return ExitCode::from(EXIT_REFUSED);
         }
-        if let Ok(mut f) = log.lock() {
-            let _ = writeln!(f, "=== {step} {name}: cargo {step} --offline ({}) ===", pause::now_string());
+        if i == spec.first_step {
+            if git::is_repo(&project_dir) {
+                match git::checkpoint(&project_dir, &cfg.state_dir, &job_id) {
+                    Ok(c) => {
+                        println!("checkpoint: {} ({})", c.ref_name, &c.commit[..c.commit.len().min(10)]);
+                        rec.set("checkpoint", c.ref_name);
+                        rec.set("checkpoint_commit", c.commit);
+                        rec.set("index_tree", c.index_tree.unwrap_or_default());
+                    }
+                    Err(e) if kind == "run" => {
+                        eprintln!("broadsword: refusing to run: cannot take a checkpoint: {e}");
+                        finish(&mut rec, record::REFUSED);
+                        return ExitCode::from(EXIT_REFUSED);
+                    }
+                    Err(e) => {
+                        eprintln!("broadsword: warning: no checkpoint: {e}");
+                        rec.set("checkpoint", "none");
+                    }
+                }
+            } else {
+                rec.set("checkpoint", "none");
+            }
         }
-        let run = match run_cargo(cfg, &project_dir, step, &log, &mut *free_src, poll) {
+        rec.set("step", *step);
+        save_record(&rec);
+        if let Ok(mut f) = log.lock() {
+            let _ = writeln!(f, "=== {step} {name} ({}) ===", pause::now_string());
+        }
+        let cmd = match (&spec.command, *step) {
+            (Some(line), "run") => shell_command(&project_dir, line),
+            _ => cargo_command(cfg, &project_dir, step),
+        };
+        let mut on_spawn = |pid: u32| {
+            rec.set("child_pid", pid.to_string());
+            rec.set("child_start", sys::start_time(pid).map(|t| t.to_string()).unwrap_or_default());
+            save_record(&rec);
+        };
+        let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("broadsword: {e}");
+                finish(&mut rec, record::FAILED);
                 return ExitCode::from(EXIT_FAILED);
             }
         };
@@ -368,9 +529,17 @@ pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
             let _ = pause::write_pause(&cfg.root, f, &reason);
             pause::alert(cfg, &format!("Broadsword PAUSED: {reason}"));
             eprintln!("broadsword: {reason}");
+            finish(&mut rec, record::KILLED_LOW_DISK);
             return ExitCode::from(EXIT_DISK_DROPPED);
         }
-        let (line, ok) = if *step == "build" { step_line_build(&run) } else { step_line_test(&run) };
+        if let Outcome::Exited(c) = run.outcome {
+            exit_code = c;
+        }
+        let (line, ok) = match *step {
+            "build" => step_line_build(&run),
+            "run" => step_line_run(&run),
+            _ => step_line_test(&run),
+        };
         summary.push(line);
         if !ok {
             all_ok = false;
@@ -380,6 +549,15 @@ pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
     println!("--- summary ---");
     for l in &summary {
         println!("{l}");
+    }
+    finish(&mut rec, if all_ok { record::DONE } else { record::FAILED });
+    if kind == "run" {
+        // the command's own exit code becomes the job's (never 0 for a failure)
+        return ExitCode::from(match exit_code {
+            Some(0) => 0,
+            Some(c) if (c & 0xFF) != 0 => (c & 0xFF) as u8,
+            _ => EXIT_FAILED,
+        });
     }
     ExitCode::from(if all_ok { 0 } else { EXIT_FAILED })
 }

@@ -1,7 +1,10 @@
 mod cleanup;
 mod config;
+mod git;
 mod job;
 mod pause;
+mod recover;
+mod record;
 mod sys;
 
 use config::Config;
@@ -119,7 +122,7 @@ fn cmd_hook(cfg: &Config) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build <project> | test <project> | check <project>>");
+    eprintln!("usage: broadsword <status | cleanup | watch | resume [--force] | hook pre-tool | projects | build|test|check <project> | run <project> -- <command...> | recover [--list] | jobs>");
     ExitCode::from(64)
 }
 
@@ -144,7 +147,16 @@ fn main() -> ExitCode {
         ["resume"] => cmd_resume(&cfg, false),
         ["resume", "--force"] => cmd_resume(&cfg, true),
         ["projects"] => Ok(job::cmd_projects(&cfg)),
-        [k @ ("build" | "test" | "check"), name] => Ok(job::cmd_job(&cfg, k, name)),
+        [k @ ("build" | "test" | "check"), name] => {
+            let _ = recover::recover(&cfg); // finish or roll back anything a crash left behind first
+            Ok(job::cmd_job(&cfg, k, name))
+        }
+        ["run", name, "--", command @ ..] if !command.is_empty() => {
+            let _ = recover::recover(&cfg);
+            Ok(job::cmd_run(&cfg, name, command))
+        }
+        ["recover"] => Ok(recover::recover(&cfg)),
+        ["recover", "--list"] | ["jobs"] => Ok(recover::cmd_list(&cfg)),
         ["hook", "pre-tool"] => Ok(cmd_hook(&cfg)),
         _ => return usage(),
     };

@@ -13,9 +13,18 @@ pub struct Ram {
     pub total: u64,
 }
 
+/// What the OS says about a process id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcState {
+    /// No such process (never existed, or it has exited).
+    Gone,
+    /// Running. `start` is its creation time (100ns ticks since 1601) when it could be read.
+    Alive { start: Option<u64> },
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::{Disk, Ram};
+    use super::{Disk, ProcState, Ram};
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
@@ -38,6 +47,36 @@ mod imp {
         fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
         // FILETIME is two u32 (low, high) = one little-endian u64.
         fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(h: isize) -> i32;
+        fn GetExitCodeProcess(h: isize, code: *mut u32) -> i32;
+        fn GetProcessTimes(h: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    pub fn process_state(pid: u32) -> ProcState {
+        // SAFETY: plain handle calls; the handle is closed before returning and the out pointers are valid.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                // A process we may not open still exists: never call it dead on a guess.
+                return if GetLastError() == ERROR_ACCESS_DENIED { ProcState::Alive { start: None } } else { ProcState::Gone };
+            }
+            let mut code = 0u32;
+            let state = if GetExitCodeProcess(h, &mut code) != 0 && code != STILL_ACTIVE {
+                ProcState::Gone
+            } else {
+                let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+                let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+                ProcState::Alive { start: ok.then_some(c) }
+            };
+            CloseHandle(h);
+            state
+        }
     }
 
     pub fn disk(path: &Path) -> Result<Disk, String> {
@@ -83,8 +122,11 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{Disk, Ram};
+    use super::{Disk, ProcState, Ram};
     use std::path::Path;
+    pub fn process_state(_: u32) -> ProcState {
+        ProcState::Alive { start: None } // not implemented here: never claim a process is gone
+    }
     pub fn disk(_: &Path) -> Result<Disk, String> {
         Err("disk query not implemented on this platform".into())
     }
@@ -96,7 +138,41 @@ mod imp {
     }
 }
 
-pub use imp::{cpu_times, disk, ram};
+pub use imp::{cpu_times, disk, process_state, ram};
+
+/// Does a recorded (pid, creation time) still name the same running process? A pid that now belongs
+/// to a different process (pid reuse) has a different creation time and counts as gone.
+pub fn same_process(recorded_start: Option<u64>, actual: ProcState) -> bool {
+    match (recorded_start, actual) {
+        (_, ProcState::Gone) => false,
+        (Some(r), ProcState::Alive { start: Some(a) }) => r == a,
+        _ => true,
+    }
+}
+
+pub fn is_alive(pid: u32, recorded_start: Option<u64>) -> bool {
+    same_process(recorded_start, process_state(pid))
+}
+
+/// Creation time of a live process, if readable.
+pub fn start_time(pid: u32) -> Option<u64> {
+    match process_state(pid) {
+        ProcState::Alive { start } => start,
+        ProcState::Gone => None,
+    }
+}
+
+/// Kill a process and everything it started.
+pub fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
 
 /// CPU use in percent over `sample` (blocks for that long).
 pub fn cpu_percent(sample: std::time::Duration) -> Result<f64, String> {
@@ -123,6 +199,29 @@ mod tests {
     fn cpu_math() {
         assert_eq!(cpu_percent_from(0, 0), 0.0);
         assert_eq!(cpu_percent_from(75, 25), 25.0);
+    }
+
+    #[test]
+    fn pid_reuse_guard() {
+        let alive = |s| ProcState::Alive { start: s };
+        assert!(same_process(Some(5), alive(Some(5))));
+        assert!(!same_process(Some(5), alive(Some(6)))); // same pid, different process
+        assert!(!same_process(Some(5), ProcState::Gone));
+        assert!(same_process(None, alive(Some(6)))); // nothing recorded: trust the pid
+        assert!(same_process(Some(5), alive(None))); // start unreadable: do not call it dead
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn liveness_of_real_processes() {
+        let me = std::process::id();
+        let start = start_time(me).expect("own start time");
+        assert!(is_alive(me, Some(start)));
+        assert!(!is_alive(me, Some(start + 1)));
+        let mut c = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        assert!(!is_alive(pid, None));
     }
 
     #[cfg(windows)]

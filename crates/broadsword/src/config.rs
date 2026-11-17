@@ -72,6 +72,7 @@ pub struct Config {
     pub scratch_dir: PathBuf,
     pub build_dir: PathBuf,
     pub projects_dir: PathBuf,
+    pub state_dir: PathBuf,
     pub job_disk_reserve_gb: u64,
     pub job_disk_poll_seconds: u64,
 }
@@ -133,6 +134,7 @@ impl Config {
             scratch_dir: root.join(inside_root(&m, "scratch_dir", true)?),
             build_dir: root.join(inside_root(&m, "build_dir", true)?),
             projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
+            state_dir: root.join(inside_root(&m, "state_dir", true)?),
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             root,
@@ -221,6 +223,7 @@ mod tests {
         assert!(c.disk_floor_gb > 0 && c.log_max_mb > 0);
         assert_eq!(c.projects_dir, Path::new("proj").join(".").join("projects"));
         assert!(c.job_disk_poll_seconds > 0);
+        assert_eq!(c.state_dir, Path::new("proj").join(".").join("state"));
     }
 
     #[test]
@@ -241,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");
@@ -252,7 +255,11 @@ mod tests {
             let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "projects_dir {bad}");
         }
-        let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\n");
+        for bad in ["../s", "/s", "C:/s", "."] {
+            let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"projects\"\nstate_dir = \"{bad}\"\n");
+            assert!(Config::from_text(&t, Path::new("p")).is_err(), "state_dir {bad}");
+        }
+        let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\nstate_dir = \"state\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
     }
 
