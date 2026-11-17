@@ -88,7 +88,9 @@ Questions to settle first:
 3. **What is the planted bug?** It needs a task whose branch contains a deliberate, testable bug that the review must catch.
 4. **Which cheap reviewer model?** The reviewer model is to be chosen once Lazlo shares his OpenAI models list. He mentioned a cheap model he called "Terra 6.1"; not yet verified.
 
-**Proposed before milestone 3: a reviewer benchmark.** Replay the five first-pass commits whose real blocking bug is known:
+**Reviewer benchmark, Claude half: done.** See `evidence/reviewer-benchmark-claude.md`. Opus caught 4/5, Haiku 3/5 at about 1/30 of the cost, and Sonnet 2/5. High effort changed nothing. No model caught the silent-NaN bug from the diff alone, so the review step must run the code. The OpenAI half is still to do: it needs a small chat-completions runner, since `bench/reviewer/run.py` drives the Claude CLI. It reuses `bench/reviewer/cases.json` and `score.py`.
+
+The original proposal follows. **Proposed before milestone 3: a reviewer benchmark.** Replay the five first-pass commits whose real blocking bug is known:
 - `a19ee1a`: silent NaN;
 - `fd98728`: key leak;
 - `3ad7320`: lock with two holders;
