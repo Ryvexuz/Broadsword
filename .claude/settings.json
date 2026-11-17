@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/build/debug/broadsword.exe\" hook pre-tool"
+            "command": "\"$(git rev-parse --path-format=absolute --git-common-dir)/../build/debug/broadsword.exe\" hook pre-tool"
           }
         ]
       }

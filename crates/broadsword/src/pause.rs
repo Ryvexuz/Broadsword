@@ -64,6 +64,22 @@ pub fn resume_decision(free: u64, floor: u64, force: bool) -> Result<(), u64> {
     }
 }
 
+/// Run `cmd /C "<command> "<message>""` with the command line passed verbatim, so Rust's
+/// argument quoting cannot mangle it. cmd strips the outer quotes.
+#[cfg(windows)]
+fn run_cmd_verbatim(command: &str, msg: &str) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .arg("/C")
+        .raw_arg(format!("\"{command} \"{msg}\"\""))
+        .status()
+}
+
+#[cfg(not(windows))]
+fn run_cmd_verbatim(_: &str, _: &str) -> std::io::Result<std::process::ExitStatus> {
+    unreachable!("only used on Windows")
+}
+
 /// Alert: stderr, scratch/logs/monitor.log, and `alert_command` if set.
 pub fn alert(cfg: &Config, message: &str) {
     eprintln!("ALERT: {message}");
@@ -74,9 +90,9 @@ pub fn alert(cfg: &Config, message: &str) {
         }
     }
     if !cfg.alert_command.trim().is_empty() {
-        let msg: String = message.chars().filter(|c| !matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '%')).collect();
+        let msg: String = message.chars().filter(|c| !matches!(c, '"' | '%')).collect();
         let result = if cfg!(windows) {
-            std::process::Command::new("cmd").arg("/C").arg(&cfg.alert_command).arg(&msg).status()
+            run_cmd_verbatim(&cfg.alert_command, &msg)
         } else {
             std::process::Command::new("sh").arg("-c").arg(format!("{} \"$0\"", cfg.alert_command)).arg(&msg).status()
         };
@@ -97,7 +113,7 @@ pub fn tool_name(json: &str) -> Option<String> {
 pub fn allowed_while_paused(stdin: &str) -> bool {
     match tool_name(stdin).as_deref() {
         Some("Read" | "Glob" | "Grep") => true,
-        Some("Bash") => ["broadsword status", "broadsword resume", "broadsword cleanup"].iter().any(|s| stdin.contains(s)),
+        Some("Bash" | "PowerShell") => ["broadsword status", "broadsword resume", "broadsword cleanup"].iter().any(|s| stdin.contains(s)),
         _ => false,
     }
 }
@@ -139,6 +155,8 @@ mod tests {
         assert!(!allowed_while_paused(ok)); // exe path form has ".exe" between; plain substring rule
         assert!(allowed_while_paused(ok2));
         assert!(!allowed_while_paused(bad));
+        assert!(allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"broadsword cleanup"}}"#));
+        assert!(!allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"dir"}}"#));
         assert!(!allowed_while_paused("garbage"));
     }
 }

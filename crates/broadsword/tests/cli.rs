@@ -259,3 +259,50 @@ fn resume_when_not_paused_is_a_no_op() {
     assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
     assert!(text(&out.stdout).contains("not paused"));
 }
+
+// ---- worktrees and alert_command ---------------------------------------------
+
+#[test]
+fn hook_in_linked_worktree_honours_main_root_pause() {
+    let p = Project::new("worktree", 99999);
+    // Fake layout: main root has a .git directory; the worktree has a .git file pointing into it.
+    let gitdir = p.path(".git/worktrees/wt");
+    fs::create_dir_all(&gitdir).unwrap();
+    let wt = p.path("wt/nested");
+    fs::create_dir_all(&wt).unwrap();
+    fs::copy(p.path("broadsword.toml"), wt.join("broadsword.toml")).unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+    p.pause_via_cleanup();
+    assert!(!wt.join("broadsword.paused").exists());
+
+    let run_in_wt = |stdin: &str| {
+        let mut child = Command::new(BIN)
+            .args(["hook", "pre-tool"])
+            .current_dir(&wt)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = run_in_wt(&hook_json("Write"));
+    assert_eq!(code(&out), Some(2), "worktree hook must see the main root's pause: {}", text(&out.stderr));
+    assert_eq!(code(&run_in_wt(&hook_json("Read"))), Some(0));
+}
+
+#[test]
+fn alert_command_receives_full_message() {
+    let p = Project::new("alertcmd", 99999);
+    let toml = fs::read_to_string(p.path("broadsword.toml")).unwrap();
+    fs::write(p.path("broadsword.toml"), toml.replace("alert_command = \"\"", "alert_command = \"echo ALERTCMD\"")).unwrap();
+    let out = p.run(&["cleanup"], "");
+    assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("ALERTCMD") && stdout.contains("Broadsword PAUSED: free space") && stdout.contains("GB floor after cleanup"),
+        "alert command output missing the full message: {stdout}"
+    );
+}

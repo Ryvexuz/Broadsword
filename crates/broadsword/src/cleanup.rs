@@ -44,10 +44,10 @@ pub fn select_expired(scratch: &Path, now: SystemTime, max_age: Duration) -> Vec
     walk_files(scratch, &mut files);
     files
         .into_iter()
-        .filter(|(p, _)| p.file_name().map_or(false, |n| n != ".gitkeep"))
+        .filter(|(p, _)| p.file_name().is_some_and(|n| n != ".gitkeep"))
         .filter(|(p, _)| p.starts_with(scratch))
         .filter(|(_, md)| match md.modified() {
-            Ok(m) => now.duration_since(m).map_or(false, |age| age > max_age),
+            Ok(m) => now.duration_since(m).is_ok_and(|age| age > max_age),
             Err(_) => false,
         })
         .map(|(p, md)| (p, md.len()))
@@ -75,7 +75,7 @@ fn sweep(cfg: &Config) -> String {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_or(false, |s| s.success());
+        .is_ok_and(|s| s.success());
     if !installed {
         return "cargo-sweep not installed, skipped".to_string();
     }
@@ -107,7 +107,7 @@ pub fn cleanup_pass(cfg: &Config, now: SystemTime, free: &mut dyn FnMut() -> u64
     let mut files = Vec::new();
     walk_files(&cfg.scratch_dir, &mut files);
     for (path, _) in files {
-        if path.extension().map_or(false, |e| e == "log") {
+        if path.extension().is_some_and(|e| e == "log") {
             match cap_log(&path, cfg.log_max_mb * MB) {
                 Ok(0) => {}
                 Ok(n) => r.truncated.push((path, n)),
@@ -225,7 +225,7 @@ mod tests {
         let root = tmp("pause");
         fs::create_dir_all(root.join("scratch")).unwrap();
         let c = cfg(&root);
-        let r = cleanup_pass(&c, SystemTime::now(), &mut || 1 * crate::config::GB, false);
+        let r = cleanup_pass(&c, SystemTime::now(), &mut || crate::config::GB, false);
         assert!(r.paused_now);
         let body = pause::read_pause(&root).unwrap();
         assert!(body.contains("reason:") && body.contains("free:"));

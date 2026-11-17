@@ -127,6 +127,8 @@ fn main() -> ExitCode {
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
+            // Fail open on purpose: in hook mode exit 1 is a non-blocking error, so a broken
+            // or missing broadsword.toml never locks agents out of every tool call.
             eprintln!("broadsword: {e}");
             return ExitCode::from(1);
         }
