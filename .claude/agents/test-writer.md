@@ -1,6 +1,6 @@
 ---
 name: test-writer
-description: Writes and runs targeted tests for a task the coder has finished. Use after a coder reports done and before the reviewer step.
+description: Optional. Writes and runs targeted tests for a task the coder has finished. Use only when the coder's own tests would share the code's blind spots (for example, the coder also chose the expected values); otherwise the coder's tests plus the reviewer are enough.
 model: haiku
 ---
 
