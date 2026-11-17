@@ -503,12 +503,13 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "task_add",
         summary: "Add a task to the task board: a title, a project and the paths it will claim.",
-        description: "Adds a task to the task board as one durable record (state/tasks/<id>.task) with status `open`, naming the project it works in and the files or folders it will change (its claims). Register planned work with it; claims are what keep parallel agents from editing the same files. Adding is free: it does NOT check for conflicts, so any number of open tasks may overlap, and the check happens later in `task_start`. Claims are PATHS relative to the project's root, never patterns or globs: a file (`src/lib.rs`) or a folder (`src`, which covers everything below it, so it overlaps `src/a.rs` but not `srcx`). `/` and `\\` are the same, `.` segments and a trailing slash are ignored, repeats are dropped, and on Windows letter case is ignored. A claim of `*` alone claims the whole project. Absolute paths, drive letters, `..`, empty claims and `*` or `?` inside a path are rejected (exit code 2). It prints the new task's id, which every other task tool takes. It writes one new record and changes nothing else.",
+        description: "Adds a task to the task board as one durable record (state/tasks/<id>.task) with status `open`, naming the project it works in and the files or folders it will change (its claims). Register planned work with it; claims are what keep parallel agents from editing the same files. Adding is free: it does NOT check for conflicts, so any number of open tasks may overlap, and the check happens later in `task_start`. Claims are PATHS relative to the project's root, never patterns or globs: a file (`src/lib.rs`) or a folder (`src`, which covers everything below it, so it overlaps `src/a.rs` but not `srcx`). `/` and `\\` are the same, `.` segments and a trailing slash are ignored, repeats are dropped, and on Windows letter case is ignored. A claim of `*` alone claims the whole project. Absolute paths, drive letters, `..`, empty claims and `*` or `?` inside a path, `:`, and names ending in a dot or space are rejected (exit code 2). Claims are compared as text, lexically: 8.3 short names, junctions and symlinks are NOT resolved, so claim the real path (`src/engine`, not a link or short name that leads there). The project name is matched case-insensitively and stored under the folder's real name. It prints the new task's id, which every other task tool takes. It writes one new record and changes nothing else.",
         params: &[TASK_PROJECT, TASK_TITLE, TASK_CLAIMS],
         outputs: "The new task's id on one line, for example `t-20261117-120000`. Ids are unique even for tasks added in the same second.",
         exit_codes: &[
             E0,
             ExitDoc { code: "2", meaning: "unknown project name (stderr lists the known ones), an empty title, or an invalid claim (stderr says which and why)" },
+            ExitDoc { code: "1", meaning: "the task record could not be created or written" },
         ],
         read_only: false,
         long_running: false,
@@ -538,7 +539,7 @@ pub static TOOLS: &[Tool] = &[
         exit_codes: &[
             E0,
             ExitDoc { code: "1", meaning: "no task with that id, or the task is not `open` (it is already running, finished or abandoned), or the record could not be read or written" },
-            ExitDoc { code: "2", meaning: "the owner is empty" },
+            ExitDoc { code: "2", meaning: "the owner is empty or has more than one line" },
             ExitDoc { code: "3", meaning: "refused: a running task in the same project has an overlapping claim; nothing was changed" },
             ExitDoc { code: "4", meaning: "board busy: the board lock could not be taken in time; nothing was changed, repeat the call" },
         ],
@@ -546,7 +547,7 @@ pub static TOOLS: &[Tool] = &[
         long_running: false,
         changes_files: false,
         destructive: false,
-        idempotent: true,
+        idempotent: false,
         cli: "broadsword task start <id> --owner <name>",
         cli_examples: &["task start t-1 --owner coder-1"],
         parse: |a| parse_task(a, "start", Some("id"), &[("--owner", "owner", false)], &["id", "owner"]),
@@ -565,7 +566,7 @@ pub static TOOLS: &[Tool] = &[
         long_running: false,
         changes_files: false,
         destructive: false,
-        idempotent: true,
+        idempotent: false,
         cli: "broadsword task done <id> [--note <text>]",
         cli_examples: &["task done t-1", "task done t-1 --note merged"],
         parse: |a| parse_task(a, "done", Some("id"), &[("--note", "note", false)], &["id", "note"]),
@@ -584,7 +585,7 @@ pub static TOOLS: &[Tool] = &[
         long_running: false,
         changes_files: false,
         destructive: false,
-        idempotent: true,
+        idempotent: false,
         cli: "broadsword task fail <id> [--note <text>]",
         cli_examples: &["task fail t-1", "task fail t-1 --note tests"],
         parse: |a| parse_task(a, "fail", Some("id"), &[("--note", "note", false)], &["id", "note"]),
@@ -603,7 +604,7 @@ pub static TOOLS: &[Tool] = &[
         long_running: false,
         changes_files: false,
         destructive: false,
-        idempotent: true,
+        idempotent: false,
         cli: "broadsword task abandon <id>",
         cli_examples: &["task abandon t-1"],
         parse: |a| parse_task(a, "abandon", Some("id"), &[], &["id"]),
@@ -620,7 +621,7 @@ pub static TOOLS: &[Tool] = &[
             Param { name: "project", ty: Ty::String, required: false, description: "Show only tasks of this project name. Not checked against the known projects: an unknown name just matches nothing." },
         ],
         outputs: "One tab-separated line per task: id, status, owner (`-` if none), project, title, claims separated by `, `; or `no tasks` / `no tasks match`.",
-        exit_codes: &[E0, ExitDoc { code: "2", meaning: "unknown status" }],
+        exit_codes: &[E0, ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable)" }, ExitDoc { code: "2", meaning: "unknown status" }],
         read_only: true,
         long_running: false,
         changes_files: false,
@@ -664,11 +665,12 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "task_check",
         summary: "Would a task with these claims conflict with a running task right now? (read-only)",
-        description: "Answers, without changing anything, whether a would-be task in a project could start now: whether any of the given claims overlaps a claim of a task that is currently `running` in that project. Use it when planning parallel work, to pick tasks that can run together. It is only a snapshot: another agent may start a task a moment later, so the real decision is made by `task_start`, which checks again atomically. Claims are paths relative to the project root, never patterns (see `task_add` for the rules); `*` is the whole project. It only reads and returns immediately.",
+        description: "Answers, without changing anything, whether a would-be task in a project could start now: whether any of the given claims overlaps a claim of a task that is currently `running` in that project. Use it when planning parallel work, to pick tasks that can run together. It is only a snapshot: another agent may start a task a moment later, so the real decision is made by `task_start`, which checks again atomically. Claims are paths relative to the project root, never patterns, compared lexically (see `task_add` for the rules, including that symlinks, junctions and 8.3 names are not resolved); `*` is the whole project. It only reads and returns immediately.",
         params: &[TASK_PROJECT, TASK_CLAIMS],
         outputs: "`free: ...` when nothing conflicts, or `conflict:` followed by one line per conflicting running task: its id, owner and the pair of overlapping claims.",
         exit_codes: &[
             ExitDoc { code: "0", meaning: "free: no running task conflicts" },
+            ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable), so nothing can be said" },
             ExitDoc { code: "2", meaning: "unknown project name or an invalid claim" },
             ExitDoc { code: "3", meaning: "conflict: at least one running task overlaps (the output names them)" },
         ],
@@ -697,14 +699,14 @@ const TASK_PROJECT: Param = Param {
     name: "project",
     ty: Ty::String,
     required: true,
-    description: "Project the task works in: `broadsword` or the name of a folder in the projects folder that contains a Cargo.toml (use the `projects` tool to list them). Claims are relative to this project's root. Anything else fails with exit code 2.",
+    description: "Project the task works in: `broadsword` or the name of a folder in the projects folder that contains a Cargo.toml (use the `projects` tool to list them). Matched case-insensitively and stored under the folder's real name; a trailing dot or space is rejected. Claims are relative to this project's root. Anything else fails with exit code 2.",
 };
 const TASK_TITLE: Param = Param { name: "title", ty: Ty::String, required: true, description: "A short title saying what the task does. Must not be empty; whitespace runs are collapsed to single spaces." };
 const TASK_CLAIMS: Param = Param {
     name: "claims",
     ty: Ty::StringArray,
     required: true,
-    description: "The paths the task will change, each a file or folder relative to the project root (not a pattern): `src`, `src/lib.rs`, or `*` for the whole project. A folder covers everything below it. `/` and `\\` are alike, `.` segments and a trailing slash are ignored, case is ignored on Windows. Absolute paths, `..`, empty strings and `*` or `?` inside a path are rejected. At least one. On the command line each one is its own `--claim <path>`.",
+    description: "The paths the task will change, each a file or folder relative to the project root (not a pattern): `src`, `src/lib.rs`, or `*` for the whole project. A folder covers everything below it. `/` and `\\` are alike, `.` segments and a trailing slash are ignored, case is ignored on Windows. Absolute paths, `..`, empty strings, `*` or `?` inside a path, `:`, and names ending in a dot or space are rejected. Compared lexically as text: 8.3 short names, junctions and symlinks are not resolved, so claim the real path. At least one. On the command line each one is its own `--claim <path>`.",
 };
 const TASK_ID: Param = Param { name: "id", ty: Ty::String, required: true, description: "The exact task id, as printed by `task_add` and shown in the first column of `task_list`." };
 const TASK_OWNER: Param = Param { name: "owner", ty: Ty::String, required: true, description: "Free text naming who runs the task, for example `coder-1`. Shown in conflict messages so others know whom to wait for. Must not be empty." };

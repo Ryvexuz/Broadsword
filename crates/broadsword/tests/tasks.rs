@@ -42,14 +42,13 @@ impl Root {
             fs::create_dir_all(dir.join("projects").join(p)).unwrap();
             fs::write(dir.join("projects").join(p).join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         }
-        let mut toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
+        let toml = format!(
+            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
              ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n"
-            .to_string();
-        if let Some(w) = wait {
-            toml.push_str(&format!("task_lock_wait_seconds = {w}\n"));
-        }
+             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = {}\n",
+            wait.unwrap_or(10)
+        );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
@@ -131,7 +130,7 @@ fn full_lifecycle() {
     assert_eq!(r.run(&["task", "abandon", &id]).code, 1, "a done task cannot be abandoned");
     assert_eq!(r.run(&["task", "start", &id, "--owner", "x"]).code, 1, "a done task cannot restart");
     assert!(r.dir.join("state/tasks").join(format!("{id}.task")).is_file(), "records are kept");
-    assert!(!r.dir.join("state/tasks/board.lock").exists(), "the board lock is released");
+    assert!(hold_is_free(&r), "the board lock is released (the file itself stays)");
 }
 
 #[test]
@@ -288,29 +287,133 @@ fn worktrees_share_the_main_roots_board() {
     assert_eq!(from_wt(&["task", "start", &id, "--owner", "wt-agent"]).0, 0);
     assert_eq!(r.start(&b, "main-agent").code, 3, "main sees the worktree's running task");
 }
+fn lock_path(r: &Root) -> PathBuf {
+    r.dir.join("state/tasks/board.lock")
+}
+
+/// Hold the board lock the way another process would: an OS lock on an open handle.
+fn hold(r: &Root) -> fs::File {
+    fs::create_dir_all(r.dir.join("state/tasks")).unwrap();
+    let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path(r)).unwrap();
+    f.lock().unwrap();
+    f
+}
 
 #[test]
-fn a_stale_board_lock_is_taken_over_and_a_live_one_means_board_busy() {
+fn garbage_in_the_lock_file_is_ignored_and_a_live_holder_means_board_busy() {
     let r = Root::with_wait("lock", Some(1));
     let a = r.add("p", "a", &["src"]);
-    let lock = r.dir.join("state/tasks/board.lock");
-    // owner pid that cannot exist
-    fs::write(&lock, "4000000000\n\n").unwrap();
-    assert_eq!(r.start(&a, "x").code, 0, "a dead owner's lock is taken over");
-    assert!(!lock.exists(), "and released afterwards");
-    // a live owner (this test process) holds it: the start waits task_lock_wait_seconds, then exits 4 and changes nothing
+    // whatever the file says, only a real OS lock counts: no stale detection exists
+    for junk in ["4000000000\n\n", "", "garbage", &format!("{}\n\n", std::process::id())] {
+        fs::write(lock_path(&r), junk).unwrap();
+        assert_eq!(r.run(&["task", "show", &a]).code, 0);
+    }
+    fs::write(lock_path(&r), "4000000000\n\n").unwrap();
+    assert_eq!(r.start(&a, "x").code, 0, "a garbage lock file does not block");
+    assert!(lock_path(&r).exists(), "the lock file is never deleted");
     let b = r.add("p", "b", &["lib"]);
-    fs::write(&lock, format!("{}\n\n", std::process::id())).unwrap();
+    let held = hold(&r);
     let t = Instant::now();
     let o = r.start(&b, "y");
     assert_eq!(o.code, 4, "{}", o.stderr);
-    assert!(o.stderr.contains("board busy") && o.stderr.contains(&std::process::id().to_string()), "{}", o.stderr);
+    assert!(o.stderr.contains("board busy") && !o.stderr.contains("delete"), "{}", o.stderr);
     assert!(t.elapsed() >= Duration::from_millis(900), "it waited for the lock");
-    assert!(lock.exists(), "a live owner's lock is left alone");
-    fs::remove_file(&lock).unwrap();
-    assert_eq!(r.status_of(&b), "open");
+    assert_eq!(r.status_of(&b), "open", "nothing changed");
+    drop(held);
     assert_eq!(r.start(&b, "y").code, 0);
 }
+
+/// The test binary doubles as the lock holder for the kill test: with the env var set, this "test" takes the board lock,
+/// announces it with a marker file and sleeps until killed. Without the env var it does nothing.
+#[test]
+fn lock_holder_helper() {
+    let Ok(dir) = std::env::var("BROADSWORD_TEST_HOLD_LOCK_ROOT") else { return };
+    let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(Path::new(&dir).join("state/tasks/board.lock")).unwrap();
+    f.lock().unwrap();
+    fs::write(Path::new(&dir).join("scratch/held"), "x").unwrap();
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+#[test]
+fn a_killed_lock_holder_frees_the_board_at_once() {
+    let r = Root::with_wait("kill", Some(2));
+    let a = r.add("p", "a", &["src"]);
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "lock_holder_helper", "--nocapture"])
+        .env("BROADSWORD_TEST_HOLD_LOCK_ROOT", &r.dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while !r.dir.join("scratch/held").exists() {
+        assert!(Instant::now() < end, "the holder never took the lock");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(r.start(&a, "x").code, 4, "a live holder blocks");
+    let k = Command::new("taskkill").args(["/F", "/PID", &holder.id().to_string()]).output().unwrap();
+    assert!(k.status.success(), "taskkill: {}", String::from_utf8_lossy(&k.stderr));
+    let _ = holder.wait();
+    let t = Instant::now();
+    let o = r.start(&a, "x");
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(t.elapsed() < Duration::from_secs(2), "no stale timeout after a kill: took {:?}", t.elapsed());
+}
+
+#[test]
+fn project_names_are_canonical_whatever_the_case_or_trailing_dot() {
+    let r = Root::new("canon");
+    fs::create_dir_all(r.dir.join("projects/Crash")).unwrap();
+    fs::write(r.dir.join("projects/Crash/Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let a = r.add("crash", "a", &["src"]);
+    let b = r.add("CRASH", "b", &["src/a.rs"]);
+    let c = r.add("Crash", "c", &["src"]);
+    for id in [&a, &b, &c] {
+        assert!(r.run(&["task", "show", id]).stdout.contains("project: Crash"), "stored under the folder's real name");
+    }
+    assert_eq!(r.start(&a, "one").code, 0);
+    assert_eq!(r.start(&b, "two").code, 3, "`CRASH` and `crash` are the same project");
+    assert_eq!(r.start(&c, "three").code, 3);
+    for bad in ["Crash.", "crash ", "Crash..", "crash. "] {
+        assert_eq!(r.run(&["task", "add", bad, "--title", "t", "--claim", "src"]).code, 2, "`{bad}`");
+        assert_eq!(r.run(&["task", "check", bad, "--claim", "src"]).code, 2, "`{bad}`");
+    }
+    assert_eq!(r.run(&["task", "check", "cRaSh", "--claim", "src/x"]).code, 3);
+    assert_eq!(r.list(&["--project", "CRASH"]).len(), 3);
+}
+
+#[test]
+fn sixteen_gated_starts_with_a_garbage_lock_and_a_big_board_never_give_two_running() {
+    // The reviewer's repro: a garbage lock file, 16 simultaneous starts all claiming `src`, and thousands of records so the
+    // critical section is slow. Exactly one runs every round and no start is left blocked (no exit 4).
+    const ROUNDS: usize = 8;
+    const FILLER: usize = 3000;
+    let r = Root::with_wait("race16", Some(30));
+    let dir = r.dir.join("state/tasks");
+    fs::create_dir_all(&dir).unwrap();
+    for i in 0..FILLER {
+        fs::write(dir.join(format!("filler-{i}.task")), format!("id = filler-{i}\nproject = p\nstatus = done\nclaims = src\ncreated = {i}\ntitle = filler\n")).unwrap();
+    }
+    let t0 = Instant::now();
+    let mut blocked = 0;
+    for round in 0..ROUNDS {
+        fs::write(lock_path(&r), "4000000000\n\n").unwrap(); // stale-looking garbage
+        let ids: Vec<String> = (0..16).map(|i| r.add("p", &format!("t{i}"), &["src", &format!("own/f{i}")])).collect();
+        let who: Vec<(&str, String)> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), format!("agent-{i}"))).collect();
+        let res = start_together(&r, &who, round);
+        let codes: Vec<i32> = res.iter().map(|x| x.0).collect();
+        blocked += codes.iter().filter(|c| **c == 4).count();
+        assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "round {round}: exactly one runs: {codes:?}");
+        assert_eq!(codes.iter().filter(|c| **c == 3).count(), 15, "round {round}: fifteen refused with exit 3: {codes:?}");
+        assert_eq!(r.list(&["--status", "running"]).len(), 1, "round {round}: running must be exactly 1");
+        for id in &ids {
+            fs::remove_file(dir.join(format!("{id}.task"))).unwrap();
+        }
+    }
+    assert_eq!(blocked, 0, "no start may be left blocked");
+    eprintln!("race16: {ROUNDS} rounds x 16 gated starts, {FILLER} filler records, garbage lock file each round: exactly one running every round, {blocked} blocked starts, {:.1} s", t0.elapsed().as_secs_f64());
+}
+
 
 // ---- MCP ---------------------------------------------------------------------------------
 
@@ -461,4 +564,10 @@ fn non_overlapping_starts_in_a_race_all_run() {
     let res = start_together(&r, &who, 0);
     assert!(res.iter().all(|x| x.0 == 0), "disjoint claims must all start: {res:?}");
     assert_eq!(r.list(&["--status", "running"]).len(), 6);
+}
+
+/// True if nobody holds the board lock right now.
+fn hold_is_free(r: &Root) -> bool {
+    let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path(r)).unwrap();
+    f.try_lock().is_ok()
 }

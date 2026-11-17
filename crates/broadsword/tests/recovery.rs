@@ -66,7 +66,7 @@ impl Root {
         let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\n\
                     disk_check_every_seconds = 60\nlog_max_mb = 50\nram_warn_percent = 90\ncpu_warn_percent = 90\n\
                     alert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\n";
+                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\n";
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir, children: Vec::new() }
     }
@@ -394,18 +394,20 @@ fn auto_recover_does_not_roll_back_and_refuses_new_jobs_on_that_project() {
 /// Item 4: a live lock stops a second recover; a stale lock is taken over.
 #[test]
 fn recover_lock_blocks_a_second_recover_and_stale_locks_are_taken_over() {
-    let mut r = Root::new("lock");
-    let holder = r.sleeper();
+    // Changed with the move to OS file locks (the old test planted lock files with a live or dead pid in them and
+    // relied on stale-lock takeover; contents now mean nothing): a real holder blocks, garbage content does not.
+    let r = Root::new("lock");
     fs::create_dir_all(r.dir.join("state")).unwrap();
-    fs::write(r.dir.join("state/recover.lock"), format!("{holder}\n\n")).unwrap();
+    let held = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(r.dir.join("state/recover.lock")).unwrap();
+    held.lock().unwrap();
     let out = r.run(&["recover"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("another recover is in progress"), "{}", text(&out.stderr));
-    assert!(r.dir.join("state/recover.lock").exists(), "a live owner's lock is left in place");
-    fs::write(r.dir.join("state/recover.lock"), format!("{}\n\n", dead_pid())).unwrap();
+    assert!(!text(&out.stderr).contains("delete"), "never tells anyone to delete the lock: {}", text(&out.stderr));
+    drop(held);
+    fs::write(r.dir.join("state/recover.lock"), format!("{}\n\n", dead_pid())).unwrap(); // stale-looking junk is just junk
     let out = r.run(&["recover"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert!(!r.dir.join("state/recover.lock").exists(), "lock released afterwards");
 }
 
 /// Item 5: an orphan is killed only when its creation time matches exactly.

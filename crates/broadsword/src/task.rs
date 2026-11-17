@@ -246,11 +246,10 @@ fn save(r: &Record) -> Result<(), String> {
 /// The board lock. `Err` is already an exit code plus message.
 fn board_lock(cfg: &Config) -> Result<lock::Lock, ExitCode> {
     let path = tasks_dir(cfg).join("board.lock");
-    let shown = path.clone();
     let wait = cfg.task_lock_wait_seconds;
-    lock::acquire(&path, Duration::from_secs(wait), &move |owner| match owner {
-        Some(pid) => format!("board busy: another task command (pid {pid}) held {} for {wait} s; try again in a moment, or if it is stuck delete the file", shown.display()),
-        None => format!("board busy: {} exists but names no owner; try again in a moment, or if no task command is running delete it", shown.display()),
+    lock::acquire(&path, Duration::from_secs(wait), &move |owner| {
+        let who = owner.map(|p| format!(" (pid {p})")).unwrap_or_default();
+        format!("board busy: another task command{who} held the board for {wait} s; nothing was changed, try again in a moment (the lock frees itself when its holder ends)")
     })
     .map_err(|e| {
         eprintln!("broadsword: {e}");
@@ -263,9 +262,11 @@ fn fail(code: u8, msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::from(code)
 }
 
-fn check_project(cfg: &Config, project: &str) -> Result<(), ExitCode> {
-    match job::resolve_project(&cfg.root, &cfg.projects_dir, project) {
-        Ok(_) => Ok(()),
+/// The canonical project name (job::canonical_project, the one place names are accepted); everything stored or
+/// compared uses it, so `Crash`, `crash` and `Crash.` can never be different projects.
+fn check_project(cfg: &Config, project: &str) -> Result<String, ExitCode> {
+    match job::canonical_project(&cfg.projects_dir, project) {
+        Ok(c) => Ok(c),
         Err(e) => Err(fail(EXIT_BAD_INPUT, format!("{e}; known projects: {}", job::list_projects(cfg).join(", ")))),
     }
 }
@@ -277,10 +278,11 @@ fn describe(c: &Conflict) -> String {
 // ---- commands ---------------------------------------------------------------------------
 
 pub fn cmd_add(cfg: &Config, project: &str, title: &str, claims: &[&str]) -> ExitCode {
-    if let Err(c) = check_project(cfg, project) {
-        return c;
-    }
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let project = &match check_project(cfg, project) {
+        Ok(p) => p,
+        Err(c) => return c,
+    };
+    let title =title.split_whitespace().collect::<Vec<_>>().join(" ");
     if title.is_empty() {
         return fail(EXIT_BAD_INPUT, "the title must not be empty");
     }
@@ -304,15 +306,26 @@ pub fn cmd_add(cfg: &Config, project: &str, title: &str, claims: &[&str]) -> Exi
     ExitCode::SUCCESS
 }
 
-/// Test-only hook, like `job::TEST_FREE_HOOK_ENV`: when set to a file path, `start` waits (at most 30 s) until that
-/// file exists before it touches the board, so a race test can start many processes and release them together.
-/// The long name is deliberate: it cannot be set by accident.
+/// Test-only hook, like `job::TEST_FREE_HOOK_ENV`: when set to a file path inside this root's scratch folder, `start`
+/// waits until that file exists before it touches the board, so a race test can start many processes and release them
+/// together. It waits at most 3 x task_lock_wait_seconds (derived from that setting, so no separate limit exists), is
+/// ignored for any path outside scratch, and announces itself on stderr. The long name is deliberate: it cannot be
+/// set by accident.
 pub const TEST_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_TASK_START_GATE_FILE";
 
-fn wait_for_test_gate() {
+fn wait_for_test_gate(cfg: &Config) {
     let Ok(gate) = std::env::var(TEST_GATE_ENV) else { return };
-    let end = std::time::Instant::now() + Duration::from_secs(30);
-    while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < end {
+    let gate = PathBuf::from(gate);
+    let inside = match (gate.parent().and_then(|p| p.canonicalize().ok()), cfg.scratch_dir.canonicalize()) {
+        (Some(p), Ok(s)) => p.starts_with(s),
+        _ => false,
+    };
+    if !inside {
+        return;
+    }
+    eprintln!("broadsword: TEST HOOK ACTIVE: task start waits for {} to exist", gate.display());
+    let end = std::time::Instant::now() + Duration::from_secs(cfg.task_lock_wait_seconds * 3);
+    while !gate.exists() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -322,7 +335,7 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str) -> ExitCode {
     if owner.is_empty() || owner.contains(['\n', '\r']) {
         return fail(EXIT_BAD_INPUT, "the owner must be a non-empty single line, e.g. coder-1");
     }
-    wait_for_test_gate();
+    wait_for_test_gate(cfg);
     let _lock = match board_lock(cfg) {
         Ok(l) => l,
         Err(c) => return c,
@@ -389,7 +402,9 @@ pub fn cmd_list(cfg: &Config, status: Option<&str>, project: Option<&str>) -> Ex
         Ok(a) => a,
         Err(e) => return fail(EXIT_ERROR, e),
     };
-    let shown: Vec<&Record> = all.iter().filter(|t| status.is_none_or(|s| t.status() == s) && project.is_none_or(|p| t.get("project") == p)).collect();
+    // the filter is canonicalised like every project name; an unknown name just matches nothing
+    let project = project.map(|p| job::canonical_project(&cfg.projects_dir, p).unwrap_or_else(|_| p.to_string()));
+    let shown: Vec<&Record> = all.iter().filter(|t| status.is_none_or(|s| t.status() == s) && project.as_deref().is_none_or(|p| t.get("project") == p)).collect();
     if shown.is_empty() {
         println!("no tasks{}", if status.is_some() || project.is_some() { " match" } else { "" });
     }
@@ -422,9 +437,10 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
 
 /// Read-only: would a task with these claims conflict with a running task right now?
 pub fn cmd_check(cfg: &Config, project: &str, claims: &[&str]) -> ExitCode {
-    if let Err(c) = check_project(cfg, project) {
-        return c;
-    }
+    let project = &match check_project(cfg, project) {
+        Ok(p) => p,
+        Err(c) => return c,
+    };
     let claims = match normalize_claims(claims) {
         Ok(c) => c,
         Err(e) => return fail(EXIT_BAD_INPUT, e),

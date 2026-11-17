@@ -21,10 +21,6 @@ use crate::job::{self, JobSpec};
 use crate::lock::{self, Lock};
 use crate::record::{self, Record};
 use crate::sys;
-#[cfg(test)]
-use crate::lock::{lock_is_stale, take_over_stale, Takeover};
-#[cfg(test)]
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -88,14 +84,13 @@ fn save(r: &Record) -> Result<(), String> {
     r.save().map_err(|e| format!("cannot write job record {}: {e}", r.path.display()))
 }
 
-/// Take `state/recover.lock` (see lock.rs). A stale lock is taken over; a live one is waited for briefly, then an
-/// error says who holds it.
+/// Take `state/recover.lock` (an OS file lock, see lock.rs): waited for briefly, then an error says another recover
+/// is in progress. The lock frees itself when its holder ends, so the message never suggests deleting anything.
 fn acquire(cfg: &Config, wait: Duration) -> Result<Lock, String> {
     let path = cfg.state_dir.join("recover.lock");
-    let shown = path.clone();
-    lock::acquire(&path, wait, &move |owner| match owner {
-        Some(pid) => format!("another recover is in progress (pid {pid}); wait for it, or if it is stuck delete {}", shown.display()),
-        None => format!("{} exists and cannot be read; if no recover is running, delete it", shown.display()),
+    lock::acquire(&path, wait, &|owner| match owner {
+        Some(pid) => format!("another recover is in progress (pid {pid}); wait for it to finish (the lock is released when it ends)"),
+        None => "another recover is in progress; wait for it to finish (the lock is released when it ends)".to_string(),
     })
 }
 
@@ -281,54 +276,4 @@ pub fn abandon(cfg: &Config, id: &str) -> ExitCode {
     println!("  see everything saved for this job: git -C <project folder> for-each-ref \"refs/broadsword/*/{id}*\"");
     println!("  compare the files with the checkpoint: git -C <project folder> diff {}", r.get("checkpoint"));
     ExitCode::SUCCESS
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dir(tag: &str) -> PathBuf {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-lock-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn takeover_discards_exactly_the_stale_lock() {
-        let d = dir("stale");
-        let lock = d.join("recover.lock");
-        std::fs::write(&lock, "4000000000\n\n").unwrap();
-        assert_eq!(take_over_stale(&lock, "4000000000\n\n", "t1"), Takeover::Removed);
-        assert!(!lock.exists());
-        assert_eq!(take_over_stale(&lock, "x", "t2"), Takeover::Gone);
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    /// Regression: a racer's fresh lock must never be thrown away by a taker that judged an older lock stale.
-    #[test]
-    fn takeover_puts_back_a_fresh_lock_it_moved_by_mistake() {
-        let d = dir("fresh");
-        let lock = d.join("recover.lock");
-        let fresh = format!("{}\n\n", std::process::id());
-        std::fs::write(&lock, &fresh).unwrap();
-        assert_eq!(take_over_stale(&lock, "4000000000\n\n", "t1"), Takeover::PutBack);
-        assert_eq!(std::fs::read_to_string(&lock).unwrap(), fresh, "the fresh lock is back, unchanged");
-        assert!(std::fs::read_dir(&d).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("stale")), "nothing left aside");
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn unreadable_locks_are_stale_only_after_60_seconds() {
-        let d = dir("old");
-        let lock = d.join("recover.lock");
-        std::fs::write(&lock, "").unwrap();
-        assert!(!lock_is_stale(&lock, ""), "a brand-new empty lock may still be being written");
-        let f = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
-        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)).unwrap();
-        drop(f);
-        assert!(lock_is_stale(&lock, ""));
-        assert!(!lock_is_stale(&lock, &format!("{}\n\n", std::process::id())), "a live owner is never stale");
-        std::fs::remove_dir_all(&d).unwrap();
-    }
 }
