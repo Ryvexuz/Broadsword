@@ -5,6 +5,7 @@
 //! Stage 2's MCP server will list tools from `TOOLS` (`registry_json` already has the shape of
 //! `tools/list`) and call the same `handler` with the same typed `Inputs`.
 //!
+//! `broadsword mcp` (the MCP transport, see mcp.rs) is NOT a tool either: it is how tools are reached.
 //! `broadsword hook pre-tool` is NOT a tool. It is plumbing for Claude Code's PreToolUse hook: it reads
 //! the hook's JSON from stdin and answers only through its exit code. It is not a capability an AI
 //! should choose to call, so it lives in `main.rs` as a CLI command outside this table.
@@ -463,6 +464,7 @@ pub fn usage_text() -> String {
         s.push_str(&format!("  {}\n", t.cli.strip_prefix("broadsword ").unwrap_or(t.cli)));
     }
     s.push_str("  hook pre-tool   (internal: Claude Code's PreToolUse hook, not a tool)\n");
+    s.push_str("  mcp             (internal: MCP server over stdio, not a tool)\n");
     s
 }
 
@@ -762,7 +764,7 @@ fn registry_json_of(tools: &[Tool]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json::check::{parse, J};
+    use crate::json::{parse, J};
 
     fn snake(n: &str) -> bool {
         !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit() || c == '_')

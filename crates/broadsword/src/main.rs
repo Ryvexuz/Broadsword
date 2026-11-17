@@ -3,6 +3,7 @@ mod config;
 mod git;
 mod job;
 mod json;
+mod mcp;
 mod pause;
 mod recover;
 mod record;
@@ -36,6 +37,11 @@ fn usage() -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `broadsword mcp`: the MCP transport, not a registry tool (see mcp.rs). It must serve even when the config is
+    // broken (the config only decides where the log goes), and it must never write to stdout except protocol messages.
+    if args.len() == 1 && args[0] == "mcp" {
+        return mcp::run(config::load().ok().as_ref());
+    }
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
