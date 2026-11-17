@@ -20,10 +20,19 @@ impl Root {
             "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
              ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
              state_dir = \"state\"\ninstall_dir = \"{install_dir}\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\n"
+             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10
+"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
-        Root { dir }
+        let r = Root { dir };
+        r.set_note(".");
+        r
+    }
+
+    /// The note `build`, `test` and `check` keep: which source folder last built the broadsword package.
+    fn set_note(&self, source: &str) {
+        fs::create_dir_all(self.dir.join("state/build-sources")).unwrap();
+        fs::write(self.dir.join("state/build-sources/broadsword"), format!("{source}\n")).unwrap();
     }
 
     fn bin_dir(&self) -> PathBuf {
@@ -124,6 +133,37 @@ fn a_running_copy_is_renamed_aside_and_cleaned_up_by_a_later_install() {
     }
     assert!(r.old_copies().is_empty(), "old copy not cleaned up: {:?}\n{last}", r.old_copies());
     assert_eq!(fs::read(r.target()).unwrap(), fs::read(BIN).unwrap());
+}
+
+#[test]
+fn install_refuses_a_binary_last_built_from_a_worktree_and_a_missing_record() {
+    let r = Root::new("worktree-built", "build/bin");
+    r.set_note("worktrees/broadsword/t-20261117-000000");
+    let o = r.run(BIN, &["install"]);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("refusing to install") && err.contains("worktrees/broadsword/t-20261117-000000") && err.contains("main checkout"), "{err}");
+    assert!(err.contains("build broadsword"), "it says what to do instead: {err}");
+    assert!(!r.target().exists(), "nothing was copied");
+    assert!(!r.bin_dir().exists() || fs::read_dir(r.bin_dir()).unwrap().count() == 0, "no temp file either");
+    // another folder is no better than a worktree
+    r.set_note("projects/broadsword");
+    assert_eq!(r.run(BIN, &["install"]).status.code(), Some(1));
+    // no note at all: nothing proves it was main's
+    fs::remove_file(r.dir.join("state/build-sources/broadsword")).unwrap();
+    let o = r.run(BIN, &["install"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no record"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!r.target().exists());
+    // main's note: installs
+    r.set_note(".");
+    assert_eq!(r.run(BIN, &["install"]).status.code(), Some(0));
+    assert!(r.target().is_file());
+    // the installed copy itself is exempt from the check (it is a no-op)
+    r.set_note("worktrees/broadsword/t-1");
+    let o = r.run(r.target().to_str().unwrap(), &["install"]);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stdout(&o).starts_with("already installed"));
 }
 
 #[test]

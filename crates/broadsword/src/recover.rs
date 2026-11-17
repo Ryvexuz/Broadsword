@@ -151,10 +151,25 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
                 attention.push(id);
                 continue;
             }
+            let task = Some(r.get("task").to_string()).filter(|t| !t.is_empty());
+            if let Some(t) = &task {
+                // A job that ran in a task's worktree resumes there or not at all (never in the main checkout instead).
+                if let Err((_, why)) = job::job_folder(cfg, &project, Some(t)) {
+                    let why = format!("it ran in the worktree of task {t}, which can no longer be used: {why}");
+                    println!("  {why}");
+                    r.set("status", record::FAILED);
+                    r.set("failure_reason", why);
+                    if let Err(e) = save(&r) {
+                        eprintln!("  {e}");
+                    }
+                    attention.push(id);
+                    continue;
+                }
+            }
             let steps = job::steps_for(&kind);
             let first = steps.iter().position(|s| *s == r.get("step")).unwrap_or(0);
             println!("  read-only job: resuming `{kind} {project}` from step `{}`", steps[first]);
-            let c = job::run_job(cfg, JobSpec { kind, name: project, command: None, first_step: first, resumed_from: Some(id), resume_count: count + 1 });
+            let c = job::run_job(cfg, JobSpec { kind, name: project, command: None, first_step: first, resumed_from: Some(id), resume_count: count + 1, task });
             if c != ExitCode::SUCCESS {
                 resumed_failed = true;
             }
@@ -172,7 +187,9 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
 
 fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), String> {
     let id = r.id().to_string();
-    let dir = job::resolve_project(&cfg.root, &cfg.projects_dir, project).map_err(|e| format!("cannot roll back {id}: {e}; record left as running"))?;
+    let task = Some(r.get("task").to_string()).filter(|t| !t.is_empty());
+    // A run that ran in a task's worktree is rolled back THERE: its checkpoint is of that folder, never of the main checkout.
+    let dir = job::job_folder(cfg, project, task.as_deref()).map_err(|(_, e)| format!("cannot roll back {id}: {e}; record left as running"))?;
     let ckpt = r.get("checkpoint").to_string();
     if ckpt == "pending" {
         // killed before the checkpoint existed, which is before the command could start: nothing changed

@@ -113,6 +113,47 @@ fn branch_of(t: &Record) -> String {
     }
 }
 
+// ---- jobs in a task's worktree ----------------------------------------------------------
+
+/// Why `job_dir` said no. `Unknown` = no such task (exit 2 like an unknown project); `Refused` = the task exists but a job
+/// must not run in its folder (exit 3); the text says why and what to do.
+pub enum JobDirError {
+    Unknown(String),
+    Refused(String),
+}
+
+/// The folder a build/test/check/run job of `project` runs in for `--task <id>`: the task's own worktree, and only if the
+/// task is `running`, belongs to `project` (matched by canonical name), has a recorded, finished worktree inside
+/// worktrees_dir, and that folder is a real directory that really is a git worktree of the project (`wtgit::is_worktree_of`,
+/// the same check removal uses: a stray folder or a junction is refused, so a job never runs in, or checkpoints, a
+/// repository that is not the task's).
+pub fn job_dir(cfg: &Config, task_id: &str, project: &str) -> Result<PathBuf, JobDirError> {
+    let t = task::load_task(cfg, task_id).map_err(JobDirError::Unknown)?;
+    let refuse = |why: String| JobDirError::Refused(format!("cannot use task {task_id}: {why}"));
+    let canon = job::canonical_project(&cfg.projects_dir, project).map_err(JobDirError::Refused)?;
+    if t.get("project") != canon {
+        return Err(refuse(format!("it belongs to project `{}`, not `{canon}`", t.get("project"))));
+    }
+    if t.status() != task::RUNNING {
+        return Err(refuse(format!("it is `{}`, and only a `running` task has a worktree to build in (start it with `broadsword task start {task_id} --owner <name> --worktree`)", t.status())));
+    }
+    if is_creating(&t) {
+        return Err(refuse(format!("its worktree is still being made (or its creation was interrupted); run `broadsword worktree create {task_id}` to finish it")));
+    }
+    if !has_worktree(&t) {
+        return Err(refuse(format!("it has no worktree; start it with `--worktree`, or run `broadsword worktree create {task_id}`")));
+    }
+    let path = abs_path(cfg, t.get("worktree")).map_err(refuse)?;
+    let dir = project_dir(cfg, &t).map_err(refuse)?;
+    if !path.exists() {
+        return Err(refuse(format!("its worktree folder {} is gone; nothing was built (`broadsword worktree repair` may help if the project was moved)", path.display())));
+    }
+    if !is_real_dir(&path) || !wtgit::is_worktree_of(&dir, &path) {
+        return Err(refuse(format!("{} is not a git worktree of project `{canon}` (a stray folder, a link, or another repository); nothing was built there", path.display())));
+    }
+    Ok(path)
+}
+
 // ---- creation ---------------------------------------------------------------------------
 
 pub struct Plan {

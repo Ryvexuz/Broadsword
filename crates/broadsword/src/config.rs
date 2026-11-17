@@ -83,6 +83,8 @@ pub struct Config {
     pub job_disk_poll_seconds: u64,
     /// How long a `task` command waits for the board lock before exiting "board busy".
     pub task_lock_wait_seconds: u64,
+    /// How long a build, test or check job waits for the build lock (state/build.lock) before it is refused.
+    pub build_lock_wait_seconds: u64,
     /// Where each task's Git worktree lives: `<worktrees_dir>/<project>/<task id>` (broadsword worktree ...).
     pub worktrees_dir: PathBuf,
 }
@@ -174,6 +176,7 @@ impl Config {
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
             task_lock_wait_seconds: positive("task_lock_wait_seconds")?,
+            build_lock_wait_seconds: positive("build_lock_wait_seconds")?,
             worktrees_dir,
             root,
         })
@@ -266,11 +269,13 @@ mod tests {
         assert_eq!(c.install_dir, Path::new("proj").join(".").join("build/bin"));
         assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
         assert_eq!(c.worktrees_dir, Path::new("proj").join(".").join("worktrees"));
+        assert!(c.build_lock_wait_seconds > 0);
     }
 
     #[test]
     fn worktrees_dir_is_required_and_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\ninstall_dir=\"build/bin\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(base, Path::new("p")).is_err(), "worktrees_dir is required");
@@ -280,8 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn build_lock_wait_seconds_is_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        assert!(Config::from_text(text, Path::new("p")).is_ok());
+        let without: String = text.lines().filter(|l| !l.trim_start().starts_with("build_lock_wait_seconds")).collect::<Vec<_>>().join("\n");
+        let e = Config::from_text(&without, Path::new("p")).unwrap_err();
+        assert!(e.contains("build_lock_wait_seconds"), "{e}");
+        let zero: String = text.lines().map(|l| if l.trim_start().starts_with("build_lock_wait_seconds") { "build_lock_wait_seconds = 0" } else { l }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&zero, Path::new("p")).is_err(), "0 would never wait");
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nworktrees_dir = \"worktrees\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
             assert!(Config::from_text(&format!("{base}install_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "install_dir {bad}");
@@ -311,7 +328,8 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nworktrees_dir = \"worktrees\"\n";
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");

@@ -4,11 +4,13 @@
 //! folder, is guarded by the disk reserve before it starts, is watched while it runs, and is
 //! tee'd to the terminal and to `scratch/logs/jobs/`.
 
+use crate::buildsrc;
 use crate::config::Config;
 use crate::git;
 use crate::pause;
 use crate::record::{self, Record};
 use crate::sys;
+use crate::worktree::{self, JobDirError};
 use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -380,6 +382,8 @@ pub struct JobSpec {
     pub resumed_from: Option<String>,
     /// How many resumes lie behind this job (0 for a job started by the user).
     pub resume_count: u64,
+    /// `--task <id>`: run in that task's worktree instead of the project's main checkout.
+    pub task: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -406,24 +410,43 @@ fn end(rec: &mut Record, status: &str, code: ExitCode) -> ExitCode {
     }
 }
 
-pub fn cmd_job(cfg: &Config, kind: &str, name: &str) -> ExitCode {
-    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None, resume_count: 0 })
+pub fn cmd_job(cfg: &Config, kind: &str, name: &str, task: Option<&str>) -> ExitCode {
+    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
 }
 
-pub fn cmd_run(cfg: &Config, name: &str, command: &[&str]) -> ExitCode {
-    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None, resume_count: 0 })
+pub fn cmd_run(cfg: &Config, name: &str, task: Option<&str>, command: &[&str]) -> ExitCode {
+    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
+}
+
+/// The folder a job runs in: the project's main checkout, or (`--task`) the task's worktree. `Err` is the exit code and the
+/// message to print: 2 for an unknown project or task, 3 for a task whose worktree may not be used.
+pub fn job_folder(cfg: &Config, name: &str, task: Option<&str>) -> Result<PathBuf, (u8, String)> {
+    let main = resolve_project(&cfg.root, &cfg.projects_dir, name).map_err(|e| (EXIT_UNKNOWN_PROJECT, format!("{e}\nknown projects: {}", list_projects(cfg).join(", "))))?;
+    match task {
+        None => Ok(main),
+        Some(id) => worktree::job_dir(cfg, id, name).map_err(|e| match e {
+            JobDirError::Unknown(m) => (EXIT_UNKNOWN_PROJECT, m),
+            JobDirError::Refused(m) => (EXIT_REFUSED, m),
+        }),
+    }
 }
 
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
 /// before the first step (when the project is a Git repo), and runs the steps.
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     let kind = spec.kind.as_str();
-    let project_dir = match resolve_project(&cfg.root, &cfg.projects_dir, &spec.name) {
+    let project_dir = match job_folder(cfg, &spec.name, spec.task.as_deref()) {
         Ok(d) => d,
+        Err((code, msg)) => {
+            eprintln!("broadsword: {msg}");
+            return ExitCode::from(code);
+        }
+    };
+    let source = match buildsrc::rel_source(cfg, &project_dir) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("broadsword: {e}");
-            eprintln!("known projects: {}", list_projects(cfg).join(", "));
-            return ExitCode::from(EXIT_UNKNOWN_PROJECT);
+            return ExitCode::from(EXIT_FAILED);
         }
     };
     let name = canonical_project(&cfg.projects_dir, &spec.name).unwrap_or_else(|_| spec.name.clone()); // records store the canonical name
@@ -458,6 +481,8 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     let me = std::process::id();
     rec.set("project", name);
     rec.set("kind", kind);
+    rec.set("source", source.as_str());
+    rec.set("task", spec.task.as_deref().unwrap_or(""));
     rec.set("command", command_text);
     rec.set("status", record::RUNNING);
     rec.set("pid", me.to_string());
@@ -491,6 +516,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         }
     }
     println!("job: {kind} {name} (id {job_id}, log: {})", log_path.display());
+    println!("source: {source}{}", spec.task.as_deref().map(|t| format!(" (task {t})")).unwrap_or_default());
 
     if kind == "run" && !git::is_repo(&project_dir) {
         eprintln!("broadsword: refusing to run: project `{name}` is not a Git repository, so there is no checkpoint to roll back to (run `git init` in {} first)", project_dir.display());
@@ -500,6 +526,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     let mut summary: Vec<String> = Vec::new();
     let mut all_ok = true;
     let mut exit_code: Option<i32> = None;
+    let mut _build_lock: Option<crate::lock::Lock> = None; // held (when taken) until this function returns
     for (i, step) in steps.iter().enumerate().skip(spec.first_step) {
         let free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
@@ -537,6 +564,32 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                 }
             } else {
                 rec.set("checkpoint", "none");
+            }
+        }
+        if i == spec.first_step && kind != "run" {
+            // Clean, record and build are one step across processes: take the build lock now and keep it until this job
+            // ends (every cargo step below, tests included, runs the binaries the shared folder holds). `run` runs a
+            // shell command, not a cargo step of ours, so it neither takes the lock nor changes the notes.
+            match buildsrc::lock(cfg) {
+                Ok(l) => _build_lock = Some(l),
+                Err((code, msg)) => {
+                    eprintln!("broadsword: {msg}");
+                    return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, ExitCode::from(code));
+                }
+            }
+            match buildsrc::prepare(cfg, &project_dir, &source) {
+                Ok(p) => {
+                    for l in &p.lines {
+                        println!("{l}");
+                        if let Ok(mut f) = log.lock() {
+                            let _ = writeln!(f, "{l}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("broadsword: {e}");
+                    return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+                }
             }
         }
         rec.set("step", *step);

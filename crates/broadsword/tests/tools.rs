@@ -20,7 +20,8 @@ impl Root {
         let toml = format!(
             "root = \".\"\ndisk_floor_gb = {floor_gb}\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
              ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 2\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\n"
+             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 2\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10
+"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
@@ -90,7 +91,7 @@ fn usage_lists_every_tool_and_exits_64() {
     let o = r.run(&["bogus"]);
     assert_eq!(code(&o), 64);
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
-    for w in ["status", "cleanup", "watch", "resume [--force]", "projects", "build <project>", "test <project>", "check <project>", "run <project> -- <command...>", "recover", "recover --abandon <id>", "jobs", "tools", "hook pre-tool"] {
+    for w in ["status", "cleanup", "watch", "resume [--force]", "projects", "build <project> [--task <id>]", "test <project> [--task <id>]", "check <project> [--task <id>]", "run <project> [--task <id>] -- <command...>", "recover", "recover --abandon <id>", "jobs", "tools", "hook pre-tool"] {
         assert!(err.contains(w), "usage lacks `{w}`:\n{err}");
     }
 }

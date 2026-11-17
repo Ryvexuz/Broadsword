@@ -1,3 +1,4 @@
+mod buildsrc;
 mod cleanup;
 mod config;
 mod git;
