@@ -1,49 +1,44 @@
 # Progress
 
-Rewritten at the end of each session. Last updated 2026-11-17, after Stage 1 milestone 4.
+Rewritten at the end of each session. Last updated 2026-11-17, at the end of Stage 1.
 
 ## Where things stand
 
-Stage 1 (Foundation) is four milestones in, out of five:
+**Stage 1 (Foundation) is done** and tagged `stage-1-done`. All five milestones passed their done checks:
 
-| Milestone | Status | Evidence |
-| --- | --- | --- |
-| 1. Resource monitor | passed, merged | `evidence/stage-1-m1-resource-monitor.md` |
-| 2. Starter crash sim | passed, own repo `projects/crash-sim/` at `9ff5289` | `evidence/stage-1-m2-starter-crash-sim.md` |
-| 3. Job runner and test runner | passed, merged | `evidence/stage-1-m3-job-runner.md` |
-| 4. Recovery (Git checkpoints) | passed, merged at `fde0798` | `evidence/stage-1-m4-recovery.md` |
-| 5. Tool registry | not started | |
+| Milestone | Evidence |
+| --- | --- |
+| 1. Resource monitor | `evidence/stage-1-m1-resource-monitor.md` |
+| 2. Starter crash sim (own repo `projects/crash-sim/`) | `evidence/stage-1-m2-starter-crash-sim.md` |
+| 3. Job runner and test runner | `evidence/stage-1-m3-job-runner.md` |
+| 4. Recovery (Git checkpoints) | `evidence/stage-1-m4-recovery.md` |
+| 5. Tool registry | `evidence/stage-1-m5-tool-registry.md` |
 
 Stage 0 is still untagged; see Unfinished.
 
 ## Working
 
-The `broadsword` binary is in `crates/broadsword/` and uses only the standard library. Build it with `cargo build --offline`; it lands in `build/debug/broadsword.exe`.
-
-- **Monitor:** `status`, `cleanup`, `watch`, `resume [--force]`, plus `hook pre-tool`, which blocks agent tools while paused.
-- **Jobs:** `projects`, and `build`, `test` and `check <project>`. Each job has a disk guard, a disk watch during the job, and a log in `scratch/logs/jobs/`. Builds always go to the shared `build/`.
-- **Risky jobs:** `run <project> -- <command>` runs a command that may change files.
-- **Recovery:**
-  - Every job writes a durable record to `state/jobs/` (git-ignored, never cleaned).
-  - Before every job, Broadsword takes a byte-exact Git checkpoint in `refs/broadsword/checkpoints/<id>`. It covers tracked, untracked and ignored files up to 50 MB, and does not touch the working tree, HEAD or index.
-  - `recover` resumes interrupted read-only jobs, up to `max_resumes` times. It rolls back interrupted `run` jobs after saving their partial work, index included.
-  - `recover --abandon <id>` gives up on a job without changing anything.
-  - `jobs` lists all records.
-
-There are 84 Broadsword tests (46 unit, 15 CLI, 10 jobs, 13 recovery) and 11 crash-sim tests, all passing.
+- **`broadsword tools`** lists the 13 tools: `status`, `cleanup`, `watch`, `resume`, `projects`, `build`, `test`, `check`, `run`, `recover`, `abandon`, `jobs` and `tools`. `tools <name>` describes one in full, and `tools --json` gives MCP-shaped JSON.
+- **Dispatch and the hook:** the command line dispatches from that same table. `hook pre-tool` sits outside the table and blocks agent tools while paused.
+- **Tests:** 108 Broadsword tests and 11 crash-sim tests, all passing.
+- **Building:** `cargo build --offline` at the root builds `build/debug/broadsword.exe`.
 
 ## Unfinished
 
 - **Stage 0 close-out.** Confirm in a new session started from the app that task-router no longer loads, then tag `stage-0-done`.
+- **Proposed `AGENTS.md` changes** from the Stage 1 checkpoint. They are not applied yet, because `AGENTS.md` is a copy of Lazlo's Development Instructions doc and the two should stay in step. They need Lazlo's OK:
+  1. Build and test only through `broadsword build|test|check`, never plain `cargo`, so worktrees use the shared build folder.
+  2. Every milestone gets at least two review passes. When a finding is about an invariant, the fix enforces it in one place.
+  3. Tool descriptions are part of the done check: an AI reading only the description must get the behaviour right.
+- **Agent cap and roles:** keep `max_agents = 2`. Stage 1 never ran two coders at once, so there is no evidence yet for raising it; that is Stage 3's job. Keep the reviewer on Opus. The test writer added little once the coder wrote real tests, so consider making it optional in the role list.
 - **Not running yet:** nothing starts `broadsword watch` automatically. That needs Lazlo's OK.
 - **Waiting on the network:** phone alerts and `cargo-sweep`. Both need network access and Lazlo's OK.
 - **`IDEAS.md` items:**
+  - the worktree tool branching from an old commit (happened three times);
   - plain `cargo` in a worktree;
-  - the hook binary being relinked by `build broadsword`;
-  - the worktree tool branching from old commits;
+  - `build broadsword` relinking the hook binary;
   - pruning recovery refs;
   - faster ignored-file capture.
-- **Recovery known limitations:** listed in its evidence file.
 
 ## Failed
 
@@ -55,13 +50,8 @@ There are 84 Broadsword tests (46 unit, 15 CLI, 10 jobs, 13 recovery) and 11 cra
 
 ## Next step
 
-Stage 1, milestone 5: the tool registry. Every capability becomes a named tool with inputs and outputs. Done check: list all tools from the command line. This is what Stage 2's MCP server will expose.
+Stage 2: AI Integration. Milestone 1 is an MCP server that exposes the tool registry. Done check: Claude Code connects and lists the tools. The registry's `tools --json` is already in MCP `tools/list` shape, and each tool's handler can be called from the table.
 
-Start by writing its task spec and claim in `crates/broadsword/`. It should be a `broadsword tools` command, listing each tool's name, description and input/output schema, generated from the same table the commands dispatch from. That way the list can't drift from what actually runs.
+Decide first how the server talks. Probably stdio JSON-RPC, which is what Claude Code uses for local MCP servers, as `broadsword mcp`. Still std only, so it needs a small hand-written JSON parser for requests. Then write the task spec and claim, and hand it to the coder.
 
-After milestone 5, Stage 1 is done. Do the end-of-stage checkpoint from `DEVELOPMENT_PLAN.md`:
-
-- three lessons at the top of `LAB_LOG.md`;
-- adjust `AGENTS.md`, for example the rule to build through `broadsword`, and budgeting for a second review pass;
-- review the agent cap and roles;
-- tag `stage-1-done`.
+Adding the server to Claude Code's MCP config changes this project's settings, so ask Lazlo before doing it.

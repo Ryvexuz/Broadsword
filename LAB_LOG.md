@@ -2,6 +2,63 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## Stage 1 lessons (Foundation, closed 2026-11-17)
+
+1. **An independent reviewer on a strong model is the role that pays for itself.**
+   - It failed every Stage 1 milestone on its first pass, 12 review passes in all.
+   - Every failure was a real defect the coder's own tests had passed:
+     - the pause was ignored in worktrees;
+     - the sim failed silently;
+     - a test override could switch off the disk guard;
+     - six ways recovery could lose work;
+     - descriptions an AI would misread;
+     - a test that could never fail.
+   - Skipping the test writer in milestones 2–5 cost nothing visible; skipping the reviewer would have shipped every one of these.
+   - Plan for at least two review passes per milestone.
+2. **A review finding is a sample of a class, so fix the class.**
+   - When the coder patched only the reported case, the same bug came back through a neighbouring path (recovery's size cap, twice).
+   - Asking for one structural guard that every write and delete passes through ended the loop.
+   - When a finding is about an invariant, the fix should enforce the invariant in one place.
+3. **"Passes its tests" and "is what an AI caller needs" are different bars.**
+   - The crash sim printed NaN and exited 0.
+   - The registry's descriptions were accurate to the author but wrong to a reader acting on them literally.
+   - Done checks that run the real thing on real inputs found what unit tests didn't: the 5 GB disk fill, killing Broadsword mid-job on real repos, piping `--json` into Python.
+
+## 2026-11-17 — Stage 1, milestone 5: tool registry
+
+**Models and roles**
+
+- Claude Opus 5.5 as orchestrator.
+- Sonnet as coder (worktree, three passes).
+- Opus as reviewer (three passes).
+- No test writer.
+
+**What went wrong and what fixed it**
+
+- The first pass's code and dispatch were sound, but four descriptions would have misled an AI caller:
+  - `run`'s exit 3 meant either "refused" or the command's own 3;
+  - `cleanup` claimed it ran `cargo sweep`;
+  - "changes files" was undefined;
+  - and the exit-code test searched its own source for its needles, so it couldn't fail.
+- The second pass still had two wrong output texts. Both were fixed on the third pass, which also added a test that a command can't fake Broadsword's verdict line.
+- The coder's worktree again started on the Stage 0 commit and had to fast-forward to `main`. This is the third time; see `IDEAS.md`.
+- Eleven test folders were left in `scratch/` by an interrupted test run. A fresh run cleans up, so this is not a bug. They were deleted.
+
+**Rough cost and time**
+
+- About 20 minutes of wall time.
+- Subagent tokens: coder about 190k, reviewer about 145k (cumulative per agent).
+- No dollar figure was available.
+
+**Git commands used, beyond a plain commit**
+
+- `git merge --no-ff`, `git worktree remove` and `git branch -d`, as in earlier milestones.
+- `git tag stage-1-done`: marks the commit where Stage 1's done checks passed, as the plan's checkpoint asks.
+
+**One lesson about AI development**
+
+Tool descriptions are a contract with a reader who acts on them literally and can't ask what you meant. The reviewer caught them by asking "what would an AI do with exit 3?", not by checking the code.
+
 ## 2026-11-17 — Stage 1, milestone 4: recovery
 
 **Models and roles**
