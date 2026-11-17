@@ -29,3 +29,8 @@ job_disk_poll_seconds = 5       # while a job runs, free space is checked this o
 # Recovery (broadsword run | recover): checkpoints are refs/broadsword/checkpoints/<job id>; records live in state_dir
 checkpoint_ignored_max_mb = 50  # a checkpoint also saves git-ignored files (e.g. .env) up to this many MB; the rest are listed as skipped (build, scratch, state and `target` folders are never saved)
 max_resumes = 3                 # an interrupted build/test/check is resumed at most this many times in a row, then marked failed
+
+# Stable binary and MCP (broadsword install | broadsword mcp)
+install_dir = "build/bin"       # `broadsword install` copies the running binary here (broadsword.exe); the MCP server and the pause hook run this copy, so rebuilding never hits a locked file. Inside root; not inside scratch or state
+mcp_call_timeout_seconds = 1800 # an MCP tools/call that runs longer is killed (its whole process tree) and returns an error
+mcp_output_max_kb = 1024        # an MCP tools/call keeps at most the last N KB of stdout and of stderr, and says when it cut

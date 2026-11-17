@@ -11,7 +11,7 @@
 //! should choose to call, so it lives in `main.rs` as a CLI command outside this table.
 
 use crate::config::Config;
-use crate::{cleanup, job, json, pause, recover, sys};
+use crate::{cleanup, install, job, json, pause, recover, sys};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -74,6 +74,11 @@ pub struct Tool {
     pub cli_examples:&'static [&'static str],
     /// Match the full argument list (command word included) and extract typed inputs.
     pub parse: fn(&[&str]) -> Option<Inputs>,
+    /// The inverse of `parse`: command-line arguments (without the program name) that parse back to these inputs.
+    /// The MCP server runs a call as `broadsword <to_args>` in a child process.
+    pub to_args: fn(&Inputs) -> Vec<String>,
+    /// False for a tool that never ends (`watch`): the MCP server refuses it.
+    pub mcp_callable: bool,
     /// Do the work. `Err` is printed as `broadsword: <message>` and exits 1.
     pub handler: fn(&Config, &Inputs) -> Result<ExitCode, String>,
 }
@@ -92,8 +97,13 @@ pub enum Val {
 pub struct Inputs(Vec<(&'static str, Val)>);
 
 impl Inputs {
-    fn with(mut self, name: &'static str, v: Val) -> Inputs {
+    pub fn with(mut self, name: &'static str, v: Val) -> Inputs {
         self.0.push((name, v));
+        self
+    }
+    /// The form `parse` produces: a boolean that is false is the same as absent.
+    pub fn canonical(mut self) -> Inputs {
+        self.0.retain(|(_, v)| *v != Val::Bool(false));
         self
     }
     fn get(&self, name: &str) -> Option<&Val> {
@@ -149,6 +159,8 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword status",
         cli_examples: &["status"],
         parse: |a| (a == ["status"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["status".into()],
         handler: |cfg, _| cmd_status(cfg).map(|_| ExitCode::SUCCESS),
     },
     Tool {
@@ -166,6 +178,8 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword cleanup",
         cli_examples: &["cleanup"],
         parse: |a| (a == ["cleanup"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["cleanup".into()],
         handler: |cfg, _| {
             run_cleanup(cfg);
             Ok(ExitCode::SUCCESS)
@@ -174,10 +188,10 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "watch",
         summary: "Keep watching free disk and clean up on a schedule (runs until stopped).",
-        description: "Runs the resource monitor in the foreground and never finishes on its own: it cleans up once at start, then checks free disk every disk_check_every_seconds, cleans up immediately when space falls below the floor, and cleans up every cleanup_every_hours. Each cleanup is the same pass as the `cleanup` tool, so it deletes expired scratch files and may pause Broadsword. Use it only to leave a monitor running in the background for a long session; it must be started as a background process and stopped by killing it, because it never returns. Do not call it expecting a result.",
+        description: "Runs the resource monitor in the foreground and never finishes on its own: it cleans up once at start, then checks free disk every disk_check_every_seconds, cleans up immediately when space falls below the floor, and cleans up every cleanup_every_hours. Each cleanup is the same pass as the `cleanup` tool, so it deletes expired scratch files and may pause Broadsword. Use it only to leave a monitor running in the background for a long session; it must be started as a background process and stopped by killing it, because it never returns. NOT AVAILABLE OVER MCP: a call here is refused at once (isError true, nothing runs), because a tool call must end; this tool's `_meta.broadsword.mcp_callable` is false, so check that flag instead of trying it. Start it yourself from a terminal as a background process.",
         params: &[],
         outputs: "A start line, then one line per check that triggers a cleanup, each followed by the cleanup report. Never ends normally.",
-        exit_codes: &[ExitDoc { code: "1", meaning: "the monitor could not run (it has no success exit: it only ends when killed)" }],
+        exit_codes: &[ExitDoc { code: "1", meaning: "the monitor could not run (it has no success exit: it only ends when killed). Over MCP no exit code is ever produced: the call is refused with isError true" }],
         read_only: false,
         long_running: true,
         changes_files: false,
@@ -186,6 +200,8 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword watch",
         cli_examples: &["watch"],
         parse: |a| (a == ["watch"]).then(Inputs::default),
+        mcp_callable: false,
+        to_args: |_| vec!["watch".into()],
         handler: |cfg, _| cmd_watch(cfg).map(|_| ExitCode::SUCCESS),
     },
     Tool {
@@ -215,6 +231,14 @@ pub static TOOLS: &[Tool] = &[
             ["resume", "--force"] => Some(Inputs::default().with("force", Val::Bool(true))),
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["resume".to_string()];
+            if i.bool("force") {
+                v.push("--force".into());
+            }
+            v
+        },
         handler: |cfg, i| cmd_resume(cfg, i.bool("force")),
     },
     Tool {
@@ -232,12 +256,14 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword projects",
         cli_examples: &["projects"],
         parse: |a| (a == ["projects"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["projects".into()],
         handler: |cfg, _| Ok(job::cmd_projects(cfg)),
     },
     Tool {
         name: "build",
         summary: "Run `cargo build` on a project, with the disk guard and a Git checkpoint.",
-        description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes, so give it a long timeout or run it in the background. Use it to compile a project; use `check` to build and test in one go.",
+        description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it to compile a project; use `check` to build and test in one go.",
         params: &[PROJECT],
         outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Cargo's full output is printed as it runs (compiler output on stderr) and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
@@ -252,12 +278,14 @@ pub static TOOLS: &[Tool] = &[
             ["build", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| vec!["build".into(), i.str("project").unwrap_or_default().into()],
         handler: |cfg, i| job_tool(cfg, "build", i),
     },
     Tool {
         name: "test",
         summary: "Run `cargo test` on a project, with the disk guard and a Git checkpoint.",
-        description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes, so give it a long timeout or run it in the background. Use it when only the test result matters; use `check` for build then test.",
+        description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it when only the test result matters; use `check` for build then test.",
         params: &[PROJECT],
         outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
@@ -272,12 +300,14 @@ pub static TOOLS: &[Tool] = &[
             ["test", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| vec!["test".into(), i.str("project").unwrap_or_default().into()],
         handler: |cfg, i| job_tool(cfg, "test", i),
     },
     Tool {
         name: "check",
         summary: "Build, then test, a project in one job (stops at the first failure).",
-        description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes, so give it a long timeout or run it in the background. Use it as the default way to verify a change.",
+        description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it as the default way to verify a change.",
         params: &[PROJECT],
         outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
@@ -292,12 +322,14 @@ pub static TOOLS: &[Tool] = &[
             ["check", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| vec!["check".into(), i.str("project").unwrap_or_default().into()],
         handler: |cfg, i| job_tool(cfg, "check", i),
     },
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those.",
         params: &[
             PROJECT,
             Param {
@@ -329,6 +361,12 @@ pub static TOOLS: &[Tool] = &[
             }
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["run".to_string(), i.str("project").unwrap_or_default().into(), "--".into()];
+            v.extend(i.list("command").into_iter().map(String::from));
+            v
+        },
         handler: |cfg, i| {
             let project = i.require("project")?;
             let command = i.list("command");
@@ -356,6 +394,8 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword recover",
         cli_examples: &["recover"],
         parse: |a| (a == ["recover"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["recover".into()],
         handler: |cfg, _| Ok(recover::recover(cfg, recover::Mode::Explicit)),
     },
     Tool {
@@ -384,6 +424,8 @@ pub static TOOLS: &[Tool] = &[
             ["recover", "--abandon", id] => Some(Inputs::default().with("id", Val::Str((*id).into()))),
             _ => None,
         },
+        mcp_callable: true,
+        to_args: |i| vec!["recover".into(), "--abandon".into(), i.str("id").unwrap_or_default().into()],
         handler: |cfg, i| Ok(recover::abandon(cfg, i.require("id")?)),
     },
     Tool {
@@ -401,6 +443,8 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword jobs  (alias: broadsword recover --list)",
         cli_examples: &["jobs", "recover --list"],
         parse: |a| (a == ["jobs"] || a == ["recover", "--list"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["jobs".into()],
         handler: |cfg, _| Ok(recover::cmd_list(cfg)),
     },
     Tool {
@@ -421,7 +465,40 @@ pub static TOOLS: &[Tool] = &[
         cli: "broadsword tools [<name>] [--json]",
         cli_examples: &["tools", "tools check", "tools --json", "tools check --json"],
         parse: parse_tools,
+        mcp_callable: true,
+        to_args: |i| {
+            let mut v = vec!["tools".to_string()];
+            if let Some(n) = i.str("name") {
+                v.push(n.into());
+            }
+            if i.bool("json") {
+                v.push("--json".into());
+            }
+            v
+        },
         handler: |_, i| Ok(cmd_tools(i.str("name"), i.bool("json"))),
+    },
+    Tool {
+        name: "install",
+        summary: "Copy this binary to the stable install location that the MCP server and the pause hook run.",
+        description: "Copies the broadsword binary that is running this command to <install_dir>/broadsword.exe (install_dir is a setting, build/bin as shipped), so the MCP server and Claude Code's pause hook run a file that rebuilding the project never has to overwrite. The copy is atomic (written under a temporary name, then renamed into place). If the installed copy is currently running, which locks it on Windows, it is renamed to broadsword.old-<stamp>.exe first and deleted by a later install once nothing runs it; leftovers that are no longer in use are deleted each time. Run it after `build broadsword` as `build/debug/broadsword.exe install`; a binary that is already the installed one reports `already installed` and does nothing, so over MCP (where the server normally runs the installed copy) it is only useful when the server was started from another binary. It does not touch any project file, job record or setting.",
+        params: &[],
+        outputs: "`installed: <path> (N bytes)`, then a line for each old copy renamed aside, removed or still in use; or `already installed: ...` when nothing was to be done.",
+        exit_codes: &[
+            E0,
+            ExitDoc { code: "1", meaning: "the copy or the rename failed (the previous installed binary is left in place), or the install folder could not be created" },
+        ],
+        read_only: false,
+        long_running: false,
+        changes_files: false,
+        destructive: true,
+        idempotent: true,
+        cli: "broadsword install",
+        cli_examples: &["install"],
+        parse: |a| (a == ["install"]).then(Inputs::default),
+        mcp_callable: true,
+        to_args: |_| vec!["install".into()],
+        handler: |cfg, _| install::cmd_install(cfg),
     },
 ];
 
@@ -611,7 +688,7 @@ fn cmd_tools(name: Option<&str>, as_json: bool) -> ExitCode {
 // ---- text output ------------------------------------------------------------------------
 
 fn flags_text(t: &Tool) -> String {
-    let f: Vec<&str> = [(t.read_only, "read-only"), (t.long_running, "long-running"), (t.changes_files, "changes-files")]
+    let f: Vec<&str> = [(t.read_only, "read-only"), (t.long_running, "long-running"), (t.changes_files, "changes-files"), (!t.mcp_callable, "not-callable-over-mcp")]
         .iter()
         .filter(|(on, _)| *on)
         .map(|(_, n)| *n)
@@ -699,7 +776,11 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
         .params
         .iter()
         .map(|p| {
-            let items = if p.ty == Ty::StringArray { ", \"items\": {\"type\": \"string\"}" } else { "" };
+            let items = match (p.ty, p.required) {
+                (Ty::StringArray, true) => ", \"items\": {\"type\": \"string\"}, \"minItems\": 1",
+                (Ty::StringArray, false) => ", \"items\": {\"type\": \"string\"}",
+                _ => "",
+            };
             format!("{i3}{}: {{\"type\": {}{items}, \"description\": {}}}", json::string(p.name), json::string(json_type(p.ty)), json::string(p.description))
         })
         .collect();
@@ -713,10 +794,13 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
          {i1}\"inputSchema\": {{\n\
          {i2}\"type\": \"object\",\n\
          {i2}\"properties\": {props},\n\
-         {i2}\"required\": [{}]\n\
+         {i2}\"required\": [{}],\n\
+         {i2}\"additionalProperties\": false\n\
          {i1}}},\n\
+         {i1}\"outputSchema\": {OUTPUT_SCHEMA},\n\
          {i1}\"annotations\": {{\"readOnlyHint\": {}, \"destructiveHint\": {}, \"idempotentHint\": {}}},\n\
          {i1}\"_meta\": {{\"broadsword\": {{\n\
+         {i2}\"mcp_callable\": {},\n\
          {i2}\"cli\": {},\n\
          {i2}\"outputs\": {},\n\
          {i2}\"exit_codes\": [{}],\n\
@@ -732,6 +816,7 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
         t.read_only,
         t.destructive,
         t.idempotent,
+        t.mcp_callable,
         json::string(t.cli),
         json::string(t.outputs),
         codes.join(", "),
@@ -742,8 +827,18 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
     )
 }
 
+/// The `outputSchema` of every tool: what an MCP `tools/call` returns as `structuredContent` (MCP 2025-06-18 and
+/// later; the server leaves it out of tools/list for older protocol versions). `exit_code` is -1 when the call
+/// was killed on timeout and so has no exit code.
+pub const OUTPUT_SCHEMA: &str = "{\"type\": \"object\", \"properties\": {\
+\"exit_code\": {\"type\": \"integer\", \"description\": \"The tool's exit code, as documented under exit codes; -1 if the call was killed on timeout and so has none.\"}, \
+\"stdout\": {\"type\": \"string\", \"description\": \"The tool's standard output (the last mcp_output_max_kb KB if it was cut).\"}, \
+\"stderr\": {\"type\": \"string\", \"description\": \"The tool's standard error (the last mcp_output_max_kb KB if it was cut).\"}, \
+\"truncated\": {\"type\": \"boolean\", \"description\": \"True if stdout or stderr was cut to its last mcp_output_max_kb KB.\"}}, \
+\"required\": [\"exit_code\", \"stdout\", \"stderr\", \"truncated\"]}";
+
 pub const READ_ONLY_MEANS: &str = "read_only: makes no change anywhere (writes no files, deletes nothing).";
-pub const LONG_RUNNING_MEANS: &str = "long_running: can run for minutes or indefinitely; give it a long timeout or run it in the background.";
+pub const LONG_RUNNING_MEANS: &str = "long_running: can run for minutes or indefinitely. Over MCP a call blocks until it ends (one call at a time) and is killed at the mcp_call_timeout_seconds limit; elsewhere give it a long timeout or run it in the background.";
 pub const CHANGES_FILES_MEANS: &str = "changes_files: modifies the project's working tree (its source files). Build output, logs, job records and Git refs do not count.";
 
 fn flag_meanings_json() -> String {
@@ -853,6 +948,68 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_has_the_output_schema_and_closed_input_schema() {
+        let out = parse(OUTPUT_SCHEMA).expect("OUTPUT_SCHEMA must be valid JSON");
+        let J::Arr(items) = parse(&registry_json()).unwrap() else { panic!() };
+        for j in &items {
+            assert_eq!(j.get("outputSchema"), Some(&out));
+            assert_eq!(j.get("inputSchema").and_then(|s| s.get("additionalProperties")), Some(&J::Bool(false)));
+            let m = j.get("_meta").and_then(|m| m.get("broadsword")).and_then(|b| b.get("mcp_callable"));
+            assert_eq!(m, Some(&J::Bool(j.get("name").and_then(J::str) != Some("watch"))));
+        }
+        let Some(J::Arr(req)) = out.get("required") else { panic!() };
+        assert_eq!(req.len(), 4);
+        let run = items.iter().find(|j| j.get("name").and_then(J::str) == Some("run")).unwrap();
+        let cmd = run.get("inputSchema").unwrap().get("properties").unwrap().get("command").unwrap();
+        assert_eq!(cmd.get("minItems"), Some(&J::Num("1".into())));
+    }
+
+    #[test]
+    fn only_watch_is_not_callable_over_mcp_and_says_so() {
+        let no: Vec<&str> = TOOLS.iter().filter(|t| !t.mcp_callable).map(|t| t.name).collect();
+        assert_eq!(no, ["watch"]);
+        let w = find("watch").unwrap();
+        assert!(w.description.contains("NOT AVAILABLE OVER MCP") && w.description.contains("mcp_callable"));
+        assert!(flags_text(w).contains("not-callable-over-mcp"));
+    }
+
+    #[test]
+    fn to_args_round_trips_through_parse_for_every_tool() {
+        let s = |x: &str| Val::Str(x.into());
+        let samples: Vec<(&str, Inputs)> = vec![
+            ("status", Inputs::default()),
+            ("cleanup", Inputs::default()),
+            ("watch", Inputs::default()),
+            ("projects", Inputs::default()),
+            ("recover", Inputs::default()),
+            ("jobs", Inputs::default()),
+            ("install", Inputs::default()),
+            ("resume", Inputs::default()),
+            ("resume", Inputs::default().with("force", Val::Bool(true))),
+            ("build", Inputs::default().with("project", s("broadsword"))),
+            ("test", Inputs::default().with("project", s("crash-sim"))),
+            ("check", Inputs::default().with("project", s("p"))),
+            ("run", Inputs::default().with("project", s("p")).with("command", Val::List(vec!["cargo".into(), "--version".into()]))),
+            ("run", Inputs::default().with("project", s("p")).with("command", Val::List(vec!["echo".into(), "a b".into(), "--".into()]))),
+            ("abandon", Inputs::default().with("id", s("20261117-120000-ab12"))),
+            ("tools", Inputs::default()),
+            ("tools", Inputs::default().with("name", s("check"))),
+            ("tools", Inputs::default().with("json", Val::Bool(true))),
+            ("tools", Inputs::default().with("name", s("check")).with("json", Val::Bool(true))),
+        ];
+        for (name, inputs) in &samples {
+            let t = find(name).unwrap();
+            let args = (t.to_args)(inputs);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (hit, parsed) = resolve(&refs).unwrap_or_else(|| panic!("{name}: {args:?} resolves to no tool"));
+            assert_eq!((hit.name, &parsed), (*name, inputs), "{name}: {args:?}");
+        }
+        for t in TOOLS {
+            assert!(samples.iter().any(|(n, _)| *n == t.name), "no round-trip sample for {}", t.name);
+        }
+    }
+
+    #[test]
     fn single_tool_json_is_valid() {
         let j = parse(&tool_json(find("run").unwrap(), "")).unwrap();
         assert_eq!(j.get("name").and_then(J::str), Some("run"));
@@ -875,6 +1032,8 @@ mod tests {
             cli: "broadsword odd \"x\"",
             cli_examples: &[],
             parse: |_| None,
+            to_args: |_| Vec::new(),
+            mcp_callable: true,
             handler: |_, _| Ok(ExitCode::SUCCESS),
         };
         let text = registry_json_of(std::slice::from_ref(&ODD));
@@ -928,7 +1087,7 @@ mod tests {
         // Every form the CLI accepted before the registry existed, plus the new `tools`; `hook` is the one exception.
         let forms = [
             "status", "cleanup", "watch", "resume", "resume --force", "projects", "build p", "test p", "check p", "run p -- cmd a b", "recover", "recover --abandon id",
-            "recover --list", "jobs", "tools", "tools x", "tools --json",
+            "recover --list", "jobs", "tools", "tools x", "tools --json", "install",
         ];
         for f in forms {
             let args: Vec<&str> = f.split(' ').collect();
