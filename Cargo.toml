@@ -1,0 +1,10 @@
+[package]
+name = "crash-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Starter crash sim: a node-beam cube that falls and bounces, headless, CSV output"
+
+[dependencies]
+
+# Own workspace so Cargo does not attach this crate to the Broadsword workspace above it.
+[workspace]
