@@ -315,7 +315,12 @@ pub fn cmd_add(cfg: &Config, project: &str, title: &str, claims: &[&str]) -> Exi
 pub const TEST_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_TASK_START_GATE_FILE";
 
 fn wait_for_test_gate(cfg: &Config) {
-    let Ok(gate) = std::env::var(TEST_GATE_ENV) else { return };
+    wait_for_gate(cfg, TEST_GATE_ENV, "task start");
+}
+
+/// The shared test-hook body: wait for the file named by the env var `env` (scratch only, bounded, announced).
+pub fn wait_for_gate(cfg: &Config, env: &str, what: &str) {
+    let Ok(gate) = std::env::var(env) else { return };
     let gate = PathBuf::from(gate);
     let inside = match (gate.parent().and_then(|p| p.canonicalize().ok()), cfg.scratch_dir.canonicalize()) {
         (Some(p), Ok(s)) => p.starts_with(s),
@@ -324,7 +329,7 @@ fn wait_for_test_gate(cfg: &Config) {
     if !inside {
         return;
     }
-    eprintln!("broadsword: TEST HOOK ACTIVE: task start waits for {} to exist", gate.display());
+    eprintln!("broadsword: TEST HOOK ACTIVE: {what} waits for {} to exist", gate.display());
     let end = std::time::Instant::now() + Duration::from_secs(cfg.task_lock_wait_seconds * 3);
     while !gate.exists() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
@@ -337,97 +342,92 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
         return fail(EXIT_BAD_INPUT, "the owner must be a non-empty single line, e.g. coder-1");
     }
     wait_for_test_gate(cfg);
-    let _lock = match board_lock(cfg) {
-        Ok(l) => l,
-        Err(c) => return c,
-    };
-    let mut t = match load_task(cfg, id) {
-        Ok(t) => t,
-        Err(e) => return fail(EXIT_ERROR, e),
-    };
-    if let Err(e) = transition(t.status(), Action::Start) {
-        return fail(EXIT_ERROR, format!("cannot start {id}: {e}"));
-    }
-    let all = match load_tasks(cfg) {
-        Ok(a) => a,
-        Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
-    };
-    let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
-    if !conflicts.is_empty() {
-        let lines: Vec<String> = conflicts.iter().map(|c| format!("  {}", describe(c))).collect();
-        return fail(EXIT_CONFLICT, format!("cannot start {id}: its claims overlap a running task:\n{}\nstart it after that task is done, failed or abandoned", lines.join("\n")));
-    }
-    t.set("status", RUNNING);
-    t.set("owner", owner);
-    t.set("started", now_secs().to_string());
-    if let Err(e) = save(&t) {
-        return fail(EXIT_ERROR, e);
-    }
-    println!("task {id} is running (owner {owner}); its claims are held until it is done, failed or abandoned");
-    if !worktree {
-        return ExitCode::SUCCESS;
-    }
-    // Still under the board lock: nobody can see the task as running until its worktree exists, or it is open again.
-    match worktree::create_for(cfg, &mut t) {
-        Ok(c) => match save(&t) {
-            Ok(()) => {
-                println!("{}", worktree::describe_created(&c));
-                ExitCode::SUCCESS
+    let plan = {
+        let _lock = match board_lock(cfg) {
+            Ok(l) => l,
+            Err(c) => return c,
+        };
+        let mut t = match load_task(cfg, id) {
+            Ok(t) => t,
+            Err(e) => return fail(EXIT_ERROR, e),
+        };
+        if let Err(e) = transition(t.status(), Action::Start) {
+            return fail(EXIT_ERROR, format!("cannot start {id}: {e}"));
+        }
+        let all = match load_tasks(cfg) {
+            Ok(a) => a,
+            Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
+        };
+        let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
+        if !conflicts.is_empty() {
+            let lines: Vec<String> = conflicts.iter().map(|c| format!("  {}", describe(c))).collect();
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: its claims overlap a running task:\n{}\nstart it after that task is done, failed or abandoned", lines.join("\n")));
+        }
+        // Every refusal a worktree can have is checked BEFORE the task is marked running (nothing to roll back then).
+        let plan = if worktree {
+            match worktree::plan(cfg, &t) {
+                Ok(p) => Some(p),
+                Err(e) => return fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {e}\ntask {id} is still `open`; nothing was changed")),
             }
-            Err(e) => {
-                let left = worktree::undo_create(cfg, &t, &c).map(|l| format!(" The new worktree could not be removed again: {l}")).unwrap_or_default();
-                roll_back_start(&mut t, &format!("{e}.{left}"))
-            }
-        },
-        Err(e) => roll_back_start(&mut t, &e),
-    }
-}
-
-/// The task was marked running but its worktree could not be made: put it back to `open` (owner and start time cleared),
-/// so a task is never left running without the worktree that was asked for.
-fn roll_back_start(t: &mut Record, why: &str) -> ExitCode {
-    let id = t.id().to_string();
-    for k in ["worktree", "branch", "base", "worktree_removed"] {
-        t.set(k, "");
-    }
-    t.set("status", OPEN);
-    t.set("owner", "");
-    t.set("started", "");
-    match save(t) {
-        Ok(()) => fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\ntask {id} was rolled back to `open` (claims not held, nothing half-made); fix the cause and start it again")),
-        Err(e) => fail(EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\nAND the rollback failed: {e}. Task {id} may still say `running` with no worktree: run `broadsword task abandon {id}` or fix its record")),
+        } else {
+            None
+        };
+        t.set("status", RUNNING);
+        t.set("owner", owner);
+        t.set("started", now_secs().to_string());
+        if let Some(p) = &plan {
+            worktree::mark_creating(&mut t, p); // claims are held from now on; the slow git step runs OUTSIDE the lock
+        }
+        if let Err(e) = save(&t) {
+            return fail(EXIT_ERROR, e);
+        }
+        if plan.is_none() {
+            println!("task {id} is running (owner {owner}); its claims are held until it is done, failed or abandoned");
+        }
+        plan
+    };
+    match plan {
+        Some(p) => worktree::finish(cfg, id, p, worktree::Mode::Start { owner }),
+        None => ExitCode::SUCCESS,
     }
 }
 
 /// done, fail and abandon: change the status under the board lock and release the claims.
 pub fn cmd_finish(cfg: &Config, id: &str, action: Action, note: Option<&str>) -> ExitCode {
-    let _lock = match board_lock(cfg) {
-        Ok(l) => l,
-        Err(c) => return c,
-    };
-    let mut t = match load_task(cfg, id) {
-        Ok(t) => t,
-        Err(e) => return fail(EXIT_ERROR, e),
-    };
-    let to = match transition(t.status(), action) {
-        Ok(s) => s,
-        Err(e) => return fail(EXIT_ERROR, format!("cannot change {id}: {e}")),
-    };
-    t.set("status", to);
-    t.set("ended", now_secs().to_string());
-    if let Some(n) = note {
-        t.set("note", n.split_whitespace().collect::<Vec<_>>().join(" "));
-    }
-    if let Err(e) = save(&t) {
-        return fail(EXIT_ERROR, e);
-    }
-    println!("task {id} is {to}; its claims are released");
+    let t = {
+        let _lock = match board_lock(cfg) {
+            Ok(l) => l,
+            Err(c) => return c,
+        };
+        let mut t = match load_task(cfg, id) {
+            Ok(t) => t,
+            Err(e) => return fail(EXIT_ERROR, e),
+        };
+        let to = match transition(t.status(), action) {
+            Ok(s) => s,
+            Err(e) => return fail(EXIT_ERROR, format!("cannot change {id}: {e}")),
+        };
+        if worktree::is_creating(&t) {
+            if action == Action::Done {
+                return fail(EXIT_ERROR, format!("cannot mark {id} done: its worktree is still being created (or the creator crashed). Wait, or run `broadsword worktree create {id}` to finish it, or `task fail|abandon {id}`"));
+            }
+            worktree::settle_creating(cfg, &mut t);
+        }
+        t.set("status", to);
+        t.set("ended", now_secs().to_string());
+        if let Some(n) = note {
+            t.set("note", n.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        if let Err(e) = save(&t) {
+            return fail(EXIT_ERROR, e);
+        }
+        println!("task {id} is {to}; its claims are released");
+        t
+    }; // lock released: removing a worktree can take a while and must not block other starts
     // `done` cleans up the task's worktree, but only when that is safe (see worktree.rs). Either way the task is done:
     // a kept worktree is a warning, not an error, so the exit code stays 0.
-    if action == Action::Done && worktree::has_worktree(&t) && worktree::after_done(cfg, &mut t) {
-        if let Err(e) = save(&t) {
-            return fail(EXIT_ERROR, format!("{e} (the worktree itself was removed)"));
-        }
+    if action == Action::Done && worktree::has_worktree(&t) {
+        return worktree::after_done(cfg, &t);
     }
     ExitCode::SUCCESS
 }

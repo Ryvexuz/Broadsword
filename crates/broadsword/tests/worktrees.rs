@@ -178,7 +178,7 @@ fn a_failed_worktree_rolls_the_task_back_to_open_with_no_half_state() {
     git(&r.p(), &["branch", &format!("task/{id}")]);
     let o = r.run(&["task", "start", &id, "--owner", "coder-1", "--worktree"]);
     assert_eq!(o.code, 1, "{}", o.stdout);
-    assert!(o.stderr.contains("already exists") && o.stderr.contains("rolled back to `open`"), "{}", o.stderr);
+    assert!(o.stderr.contains("already exists") && o.stderr.contains("is still `open`"), "{}", o.stderr);
     assert_eq!(r.status_of(&id), "open");
     assert_eq!(r.show(&id, "owner").unwrap(), "-");
     assert_eq!(r.show(&id, "started").unwrap(), "-");
@@ -197,7 +197,7 @@ fn a_failed_worktree_rolls_the_task_back_to_open_with_no_half_state() {
     let q = r.add("q", "src");
     let o = r.run(&["task", "start", &q, "--owner", "c", "--worktree"]);
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("not a Git repo") && o.stderr.contains("rolled back"), "{}", o.stderr);
+    assert!(o.stderr.contains("not a Git repo") && o.stderr.contains("is still `open`"), "{}", o.stderr);
     assert_eq!(r.status_of(&q), "open");
 
     // 3. the main checkout is on a detached HEAD
@@ -285,17 +285,6 @@ fn uncommitted_or_untracked_changes_keep_the_worktree_even_when_merged() {
     git(&r.wt(&c), &["add", "s.txt"]);
     assert_eq!(r.run(&["task", "done", &c]).code, 0);
     assert!(r.wt(&c).join("s.txt").is_file());
-    // an ignored file does not count (build output): clean up the others first, then check this one
-    let d = r.started("tests");
-    fs::write(r.p().join(".gitignore"), "ignored.bin\n").unwrap();
-    git(&r.p(), &["add", ".gitignore"]);
-    git(&r.p(), &["commit", "-q", "-m", "ignore"]);
-    git(&r.wt(&d), &["merge", "-q", "main"]); // pick up .gitignore in the worktree
-    r.merge_into_main(&d);
-    fs::write(r.wt(&d).join("ignored.bin"), "x\n").unwrap();
-    let o = r.run(&["task", "done", &d]);
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(o.stdout.contains("worktree removed"), "ignored files are disposable: {}{}", o.stdout, o.stderr);
     // nothing of the three kept ones was lost, and `remove` agrees they are not removable
     for id in [&a, &b, &c] {
         let o = r.run(&["worktree", "remove", id]);
@@ -486,6 +475,241 @@ fn repair_fixes_the_links_after_the_root_moves() {
     assert!(!r.wt(&id).exists());
     // repair again is harmless
     assert_eq!(r.run(&["worktree", "repair"]).code, 0);
+}
+
+// ---- review fixes ------------------------------------------------------------------------
+
+const ADD_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_WORKTREE_ADD_GATE_FILE";
+
+/// Start `task start <id> --owner a --worktree` with `git worktree add` parked on a gate file (scratch only), and wait until
+/// the task shows `running` (step 1 done, lock released). Returns the child and the gate path.
+#[allow(clippy::zombie_processes)] // the caller waits on (or kills and waits on) the returned child
+fn parked_start(r: &Root, id: &str, tag: &str) -> (std::process::Child, PathBuf) {
+    let gate = r.dir.join("scratch").join(format!("gate-{tag}"));
+    let child = Command::new(BIN)
+        .args(["task", "start", id, "--owner", "a", "--worktree"])
+        .env(ADD_GATE_ENV, &gate)
+        .current_dir(&r.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..2000 {
+        if r.status_of(id) == "running" {
+            return (child, gate);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the parked start never reached running");
+}
+
+#[test]
+fn a_slow_worktree_creation_does_not_hold_the_board_lock() {
+    let r = Root::new("slow");
+    let id = r.add("p", "src");
+    let (child, gate) = parked_start(&r, &id, "slow");
+    // creation is parked in `git worktree add`; the board is free:
+    let other = r.add("p", "docs");
+    let o = r.run(&["task", "start", &other, "--owner", "b"]);
+    assert_eq!(o.code, 0, "another start must not get exit 4 board busy: {}", o.stderr);
+    // the claims are held from the first step
+    let clash = r.add("p", "src/x.rs");
+    assert_eq!(r.run(&["task", "start", &clash, "--owner", "c"]).code, 3, "claims of the creating task are held");
+    // done refuses while the worktree is being created; remove and prune leave it alone
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("still being created"), "{}", o.stderr);
+    assert_eq!(r.status_of(&id), "running");
+    assert_eq!(r.run(&["worktree", "remove", &id]).code, 1);
+    assert_eq!(r.run(&["worktree", "prune"]).code, 0);
+    assert!(r.run(&["worktree", "list"]).stdout.contains("creating"));
+    // release: the start finishes and records the worktree
+    fs::write(&gate, "go").unwrap();
+    let o = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(o.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("is running") && out.contains(&format!("branch: task/{id}")), "{out}");
+    assert!(r.wt(&id).join("a.txt").is_file());
+    assert_eq!(r.show(&id, "worktree").unwrap(), format!("worktrees/p/{id}"));
+    assert_eq!(r.run(&["task", "done", &id]).code, 0);
+    assert!(!r.wt(&id).exists());
+}
+
+#[test]
+fn a_creation_that_fails_after_the_lock_was_released_rolls_back_and_never_says_running() {
+    let r = Root::new("latefail");
+    let id = r.add("p", "src");
+    let (child, gate) = parked_start(&r, &id, "late");
+    git(&r.p(), &["branch", &format!("task/{id}")]); // someone takes the branch while the add is parked
+    fs::write(&gate, "go").unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert_eq!(o.status.code(), Some(1), "{out}{err}");
+    assert!(err.contains("rolled back to `open`"), "{err}");
+    assert!(!out.contains("is running"), "stdout must not claim running: {out}");
+    assert_eq!(r.status_of(&id), "open");
+    assert_eq!(r.show(&id, "owner").unwrap(), "-");
+    assert!(r.show(&id, "worktree").is_none() && !r.dir.join("worktrees/p").exists());
+    assert!(r.branches().contains(&format!("task/{id}")), "the other party's branch is not ours to delete");
+    // a plain refusal (before running) also never prints running
+    let id2 = r.add("p", "docs");
+    git(&r.p(), &["branch", &format!("task/{id2}")]);
+    let o = r.run(&["task", "start", &id2, "--owner", "a", "--worktree"]);
+    assert_eq!(o.code, 1);
+    assert!(!o.stdout.contains("running"), "{}", o.stdout);
+}
+
+#[test]
+fn a_stale_creating_state_is_recovered_by_worktree_create_or_ended_by_abandon() {
+    let r = Root::new("stale");
+    let id = r.add("p", "src");
+    let (mut child, _gate) = parked_start(&r, &id, "stale");
+    child.kill().unwrap(); // the creator dies between step 1 and step 2
+    let _ = child.wait();
+    assert_eq!(r.status_of(&id), "running");
+    assert_eq!(r.run(&["task", "done", &id]).code, 1, "done refuses while the state is stale");
+    assert_eq!(r.run(&["task", "start", &r.add("p", "src"), "--owner", "x"]).code, 3, "its claims stay held");
+    // nothing was made: `worktree create` starts afresh and finishes the job
+    let o = r.run(&["worktree", "create", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(r.wt(&id).join("a.txt").is_file() && r.show(&id, "worktree").is_some());
+    assert_eq!(r.run(&["task", "done", &id]).code, 0);
+    assert!(!r.wt(&id).exists());
+
+    // the creator died AFTER `git worktree add` but before recording: the complete worktree is adopted
+    let id = r.add("p", "docs");
+    assert_eq!(r.run(&["task", "start", &id, "--owner", "a"]).code, 0);
+    let base = git(&r.p(), &["rev-parse", "HEAD"]);
+    git(&r.p(), &["worktree", "add", "-q", "-b", &format!("task/{id}"), r.wt(&id).to_str().unwrap(), &base]);
+    let rec = r.dir.join("state/tasks").join(format!("{id}.task"));
+    let text = fs::read_to_string(&rec).unwrap();
+    fs::write(&rec, format!("{}\nworktree_creating = 1-1\nbranch = task/{id}\nbase = {base}\n", text.trim_end())).unwrap();
+    let o = r.run(&["worktree", "create", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("adopted"), "{}", o.stdout);
+    assert_eq!(r.show(&id, "worktree").unwrap(), format!("worktrees/p/{id}"));
+    assert_eq!(r.run(&["task", "done", &id]).code, 0);
+    assert!(!r.wt(&id).exists());
+
+    // abandon clears the state and keeps any folder, recorded so prune manages it
+    let id = r.add("p", "lib");
+    let (mut child, _g) = parked_start(&r, &id, "stale2");
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert_eq!(r.run(&["task", "abandon", &id]).code, 0);
+    assert_eq!(r.status_of(&id), "abandoned");
+    assert!(r.run(&["worktree", "list"]).stdout.contains("no worktrees"));
+}
+
+#[test]
+fn ignored_files_block_removal_and_are_never_deleted() {
+    let r = Root::new("ignored");
+    fs::write(r.p().join(".gitignore"), ".env\nnotes/\n").unwrap();
+    git(&r.p(), &["add", ".gitignore"]);
+    git(&r.p(), &["commit", "-q", "-m", "ignore"]);
+    let id = r.started("src"); // merged: no commits of its own
+    fs::write(r.wt(&id).join(".env"), "KEY=secret\n").unwrap();
+    fs::create_dir_all(r.wt(&id).join("notes")).unwrap();
+    fs::write(r.wt(&id).join("notes/n.md"), "my notes\n").unwrap();
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0);
+    assert!(o.stdout.contains("worktree kept"), "{}", o.stdout);
+    assert!(o.stderr.contains("ignored files") && o.stderr.contains(".env") && o.stderr.contains("notes"), "{}", o.stderr);
+    assert!(!o.stderr.contains("--force"), "{}", o.stderr);
+    assert_eq!(fs::read_to_string(r.wt(&id).join(".env")).unwrap().trim(), "KEY=secret");
+    assert!(r.wt(&id).join("notes/n.md").is_file() && r.branches().contains(&format!("task/{id}")));
+    assert!(r.run(&["worktree", "list"]).stdout.contains("dirty"));
+    let o = r.run(&["worktree", "remove", &id, "--keep-branch"]);
+    assert_eq!(o.code, 3, "no override, not even --keep-branch: {}", o.stderr);
+    assert_eq!(r.run(&["worktree", "prune"]).code, 0);
+    assert!(r.wt(&id).join(".env").is_file());
+    // the owner deletes them deliberately, then it works
+    fs::remove_file(r.wt(&id).join(".env")).unwrap();
+    fs::remove_dir_all(r.wt(&id).join("notes")).unwrap();
+    assert_eq!(r.run(&["worktree", "remove", &id]).code, 0);
+    assert!(!r.wt(&id).exists());
+}
+
+#[test]
+fn done_is_flagged_destructive_and_says_it_deletes_the_worktree_and_branch() {
+    let r = Root::new("destructive");
+    let o = r.run(&["tools", "task_done", "--json"]);
+    assert!(o.stdout.contains("\"destructiveHint\": true"), "{}", o.stdout);
+    assert!(o.stdout.contains("DELETES the worktree folder and the `task/<id>` branch"), "{}", o.stdout);
+}
+
+#[test]
+fn a_commit_whose_last_reference_is_the_worktrees_head_log_blocks_removal() {
+    let r = Root::new("orphan");
+    let id = r.started("src");
+    git(&r.wt(&id), &["checkout", "-q", "--detach"]);
+    fs::write(r.wt(&id).join("c.txt"), "x\n").unwrap();
+    git(&r.wt(&id), &["add", "c.txt"]);
+    git(&r.wt(&id), &["commit", "-q", "-m", "orphan work"]);
+    let sha = git(&r.wt(&id), &["rev-parse", "HEAD"]);
+    git(&r.wt(&id), &["checkout", "-q", &format!("task/{id}")]); // back on the branch, clean, branch merged
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0);
+    assert!(o.stdout.contains("worktree kept"), "{}", o.stdout);
+    assert!(o.stderr.contains("reachable from no branch") && o.stderr.contains(&sha[..10]), "{}", o.stderr);
+    assert!(r.wt(&id).is_dir());
+    git(&r.p(), &["branch", "rescue", &sha]); // the owner keeps the work
+    assert_eq!(r.run(&["worktree", "remove", &id]).code, 0);
+    assert!(!r.wt(&id).exists());
+    assert_eq!(git(&r.p(), &["rev-parse", "rescue"]), sha);
+}
+
+#[test]
+fn a_locked_worktree_is_refused_without_suggesting_force() {
+    let r = Root::new("locked");
+    let id = r.started("src");
+    git(&r.p(), &["worktree", "lock", r.wt(&id).to_str().unwrap()]);
+    assert_eq!(r.run(&["task", "fail", &id]).code, 0);
+    let o = r.run(&["worktree", "remove", &id]);
+    assert_eq!(o.code, 3, "{}", o.stderr);
+    assert!(o.stderr.contains("locked") && o.stderr.contains("unlock"), "{}", o.stderr);
+    for bad in ["-f", "--force", "-D"] {
+        assert!(!o.stderr.split_whitespace().any(|w| w.trim_matches(|c| c == '\'' || c == '`') == bad), "no force hint `{bad}`: {}", o.stderr);
+    }
+    assert!(r.wt(&id).is_dir());
+    git(&r.p(), &["worktree", "unlock", r.wt(&id).to_str().unwrap()]);
+    assert_eq!(r.run(&["worktree", "remove", &id]).code, 0);
+}
+
+#[test]
+fn a_branch_checked_out_in_two_places_keeps_its_commits_and_the_record_says_kept() {
+    let r = Root::new("twoplaces");
+    let id = r.started("src");
+    let other = r.dir.join("scratch").join("second-checkout");
+    git(&r.p(), &["worktree", "add", "-q", "-f", other.to_str().unwrap(), &format!("task/{id}")]); // the test's own force, to set up
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("worktree removed") && o.stdout.contains(&format!("branch task/{id} kept")), "{}", o.stdout);
+    assert!(r.branches().contains(&format!("task/{id}")), "git refuses -d for a branch checked out elsewhere");
+    assert!(other.join("a.txt").is_file(), "the other checkout is untouched");
+    assert_eq!(git(&r.p(), &["rev-parse", &format!("task/{id}")]), git(&r.p(), &["rev-parse", "main"]));
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_parent_cleanup_never_removes_a_junction() {
+    let r = Root::new("junction");
+    let ext = r.dir.join("scratch").join("elsewhere");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("keep.txt"), "mine\n").unwrap();
+    fs::create_dir_all(r.dir.join("worktrees")).unwrap();
+    let link = r.dir.join("worktrees/p");
+    let (l, e) = (link.to_string_lossy().replace('/', "\\"), ext.to_string_lossy().replace('/', "\\"));
+    let o = Command::new("cmd").args(["/C", "mklink", "/J", &l, &e]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    let id = r.started("src");
+    assert_eq!(r.run(&["task", "done", &id]).code, 0);
+    assert!(!ext.join(&id).exists(), "the worktree was removed");
+    assert!(link.exists(), "the junction itself must stay");
+    assert_eq!(fs::read_to_string(ext.join("keep.txt")).unwrap().trim(), "mine");
+    // remove the link by hand so the root's own cleanup never walks through it
+    fs::remove_dir(&link).unwrap();
 }
 
 // ---- MCP ---------------------------------------------------------------------------------

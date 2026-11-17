@@ -27,13 +27,22 @@ fn run(dir: &Path, args: &[&str]) -> Result<Out, String> {
     Ok(Out { code: o.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(), stderr: String::from_utf8_lossy(&o.stderr).trim().to_string() })
 }
 
+/// Git's own hints about forcing (`use 'remove -f -f'`, `use -D to force deletion`) are dropped from its messages:
+/// Broadsword never forces, and must not suggest it.
+fn without_force_hints(msg: &str) -> String {
+    msg.lines()
+        .filter(|l| !l.split_whitespace().any(|w| matches!(w.trim_matches(|c: char| c == '\'' || c == '"' || c == ',' || c == '.'), "-f" | "-ff" | "--force" | "-D")) && !l.to_lowercase().contains("force"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Exit code 0 -> trimmed stdout; anything else -> an error naming the command and git's own message.
 fn ok(dir: &Path, args: &[&str]) -> Result<String, String> {
     let o = run(dir, args)?;
     if o.code == 0 {
         Ok(o.stdout)
     } else {
-        Err(format!("git {} failed: {}", args.join(" "), o.stderr))
+        Err(format!("git {} failed: {}", args.join(" "), without_force_hints(&o.stderr)))
     }
 }
 
@@ -73,11 +82,37 @@ pub fn worktree_add(dir: &Path, branch: &str, path: &Path, base: &str) -> Result
     ok(dir, &["worktree", "add", "-b", branch, &p, base]).map(|_| ())
 }
 
-/// `git status --porcelain --ignored=no`: one line per modified, staged or untracked file; empty output = clean. Ignored
-/// files (build output, caches the project's own .gitignore names) are deliberately not listed: they are regenerable by
-/// definition and never hold a task's work. Why: removal must never throw away uncommitted or untracked work.
+/// `git status --porcelain --ignored`: one line per modified, staged, untracked (`??`) or IGNORED (`!!`) path; empty output =
+/// the worktree holds nothing git does not already have. Ignored files are listed on purpose: `.env` files and notes are
+/// ignored too and Broadsword cannot tell them from build output, so any of them blocks removal. Why: removal must never
+/// throw away uncommitted, untracked or ignored files.
 pub fn status_porcelain(worktree: &Path) -> Result<String, String> {
-    ok(worktree, &["status", "--porcelain", "--ignored=no"])
+    ok(worktree, &["status", "--porcelain", "--ignored"])
+}
+
+/// `git rev-parse --verify refs/heads/<branch>`: the commit a local branch points at. Why: tell whether a branch is still
+/// at its base (empty), and finish or undo an interrupted creation.
+pub fn branch_tip(dir: &Path, branch: &str) -> Result<String, String> {
+    ok(dir, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+}
+
+/// `git log -g --format=%H HEAD`: every commit the worktree's own HEAD has pointed at (its reflog, which dies with the
+/// worktree). Why: a commit made on a detached HEAD and left behind would lose its last reference on removal.
+pub fn reflog_commits(worktree: &Path) -> Result<Vec<String>, String> {
+    let out = ok(worktree, &["log", "-g", "--format=%H", "HEAD"])?;
+    let mut v: Vec<String> = Vec::new();
+    for l in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !v.iter().any(|x| x == l) {
+            v.push(l.to_string());
+        }
+    }
+    Ok(v)
+}
+
+/// `git for-each-ref --contains <commit> --count=1 refs/`: is the commit reachable from at least one branch, tag or other
+/// ref (HEAD is not a ref here)? Why: a commit on no ref is lost once the worktree's HEAD log is deleted.
+pub fn on_some_ref(dir: &Path, commit: &str) -> Result<bool, String> {
+    Ok(!ok(dir, &["for-each-ref", "--contains", commit, "--count=1", "--format=%(refname)", "refs/"])?.is_empty())
 }
 
 /// `git merge-base --is-ancestor <commit> HEAD`: is the commit already part of the main checkout's current branch (exit 0)
