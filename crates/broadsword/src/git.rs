@@ -298,21 +298,99 @@ fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
     Ok(v)
 }
 
-fn write_blob(dir: &Path, c: &Change) -> Result<(), String> {
-    let rel = safe_rel(&c.path)?;
-    let full = dir.join(&rel);
-    let bytes = git(dir, &["cat-file", "blob", &c.sha], None, None)?;
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+/// path -> blob id of every file in a tree.
+fn tree_blobs(dir: &Path, tree: &str) -> Result<HashMap<String, String>, String> {
+    let out = git(dir, &["ls-tree", "-r", "-z", tree], None, None)?;
+    let mut m = HashMap::new();
+    for entry in String::from_utf8_lossy(&out).split('\0').filter(|e| !e.is_empty()) {
+        if let Some((meta, path)) = entry.split_once('\t') {
+            if let Some(sha) = meta.split(' ').nth(2) {
+                m.insert(path.to_string(), sha.to_string());
+            }
+        }
     }
-    std::fs::write(&full, bytes).map_err(|e| format!("cannot write {}: {e}", full.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if c.mode == "100755" { 0o755 } else { 0o644 };
-        let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode));
+    Ok(m)
+}
+
+/// The ONE place where rollback changes the working tree. Every file write, file delete and folder
+/// delete goes through it. Before acting on a path it checks this attempt's snapshots (tracked,
+/// untracked and ignored together): the action is allowed only if the path does not exist on disk, or
+/// the file's bytes right now (hashed raw) equal the snapshot's blob for that path, so nothing whose
+/// bytes are in no ref is ever overwritten or deleted. Folders are only removed when empty.
+/// Anything else is skipped and listed in `skipped`.
+struct Guard<'a> {
+    dir: &'a Path,
+    snapshot: HashMap<String, String>,
+    skipped: Vec<String>,
+}
+
+impl Guard<'_> {
+    /// May the path be changed? Err = could not tell (never treated as "yes").
+    fn may_change(&self, rel: &str) -> Result<bool, String> {
+        let full = self.dir.join(safe_rel(rel)?);
+        match std::fs::symlink_metadata(&full) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(format!("cannot inspect {}: {e}", full.display())),
+            Ok(m) if m.is_file() => {
+                let now = git_text(self.dir, &["hash-object", "--no-filters", "--", rel], None)?;
+                Ok(self.snapshot.get(rel) == Some(&now))
+            }
+            Ok(_) => Ok(false), // a folder or something else we never captured
+        }
     }
-    Ok(())
+
+    fn skip(&mut self, rel: &str) {
+        if !self.skipped.iter().any(|s| s == rel) {
+            self.skipped.push(rel.to_string());
+        }
+    }
+
+    /// Write the blob of `c` to its path. Ok(true) = written, Ok(false) = skipped.
+    fn write(&mut self, c: &Change) -> Result<bool, String> {
+        if !self.may_change(&c.path)? {
+            self.skip(&c.path);
+            return Ok(false);
+        }
+        let full = self.dir.join(safe_rel(&c.path)?);
+        let bytes = git(self.dir, &["cat-file", "blob", &c.sha], None, None)?;
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&full, bytes).map_err(|e| format!("cannot write {}: {e}", full.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if c.mode == "100755" { 0o755 } else { 0o644 };
+            let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode));
+        }
+        Ok(true)
+    }
+
+    /// Delete a file the job added (its bytes are in the snapshot), then the folders that leaves empty.
+    fn remove(&mut self, rel: &str) -> Result<bool, String> {
+        let full = self.dir.join(safe_rel(rel)?);
+        if full.symlink_metadata().is_err() {
+            return Ok(false); // already gone
+        }
+        if !self.may_change(rel)? {
+            self.skip(rel);
+            return Ok(false);
+        }
+        std::fs::remove_file(&full).map_err(|e| format!("cannot remove {}: {e}", full.display()))?;
+        let mut parent = full.parent();
+        while let Some(d) = parent {
+            if d == self.dir || !self.remove_empty_dir(d) {
+                break;
+            }
+            parent = d.parent();
+        }
+        Ok(true)
+    }
+
+    /// Remove a folder only if it is empty (never recursive).
+    fn remove_empty_dir(&self, d: &Path) -> bool {
+        std::fs::read_dir(d).map(|mut e| e.next().is_none()).unwrap_or(false) && std::fs::remove_dir(d).is_ok()
+    }
 }
 
 /// Roll a project's working tree back to its checkpoint.
@@ -386,40 +464,23 @@ pub fn rollback(
         safe_rel(&c.path)?; // validate everything before touching a single file
     }
 
-    let mut removed = 0;
+    // Every change goes through the Guard; see its documentation.
+    let mut snapshot = tree_blobs(dir, &cap.tree)?;
+    if let Some(t) = &cap.ignored_tree {
+        snapshot.extend(tree_blobs(dir, t)?);
+    }
+    let mut guard = Guard { dir, snapshot, skipped: Vec::new() };
+    let (mut removed, mut restored, mut ignored_restored) = (0, 0, 0);
     for c in main.iter().filter(|c| c.status == 'D') {
-        let full = dir.join(safe_rel(&c.path)?);
-        match std::fs::remove_file(&full) {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", full.display())),
-        }
-        // Folders the removal left empty go too (deepest first, never recursive: `remove_dir` only
-        // succeeds on an empty folder), so a file the checkpoint had can take the place of a folder.
-        let mut parent = full.parent();
-        while let Some(d) = parent {
-            if d == dir || std::fs::remove_dir(d).is_err() {
-                break;
-            }
-            parent = d.parent();
-        }
+        removed += usize::from(guard.remove(&c.path)?);
     }
-    let mut restored = 0;
     for c in main.iter().filter(|c| c.status != 'D') {
-        write_blob(dir, c)?;
-        restored += 1;
+        restored += usize::from(guard.write(c)?);
     }
-    // Never write over a path whose current bytes are not in THIS attempt's snapshot (the size cap can leave one out).
-    let uncaptured: std::collections::HashSet<&str> = cap.skipped.iter().map(|(p, _)| p.as_str()).collect();
-    let (mut ignored_restored, mut not_restored) = (0, Vec::new());
     for c in ignored.iter().filter(|c| c.status != 'D') {
-        if uncaptured.contains(c.path.as_str()) {
-            not_restored.push(c.path.clone());
-            continue;
-        }
-        write_blob(dir, c)?;
-        ignored_restored += 1;
+        ignored_restored += usize::from(guard.write(c)?);
     }
+    let not_restored = std::mem::take(&mut guard.skipped);
     let mut not_protected = Vec::new();
     for (p, len) in checkpoint_skipped {
         match std::fs::metadata(dir.join(p)) {
@@ -678,6 +739,67 @@ mod tests {
         assert!(!d.join("deep").exists(), "folders emptied by the rollback are removed");
         assert_eq!(show(&d, &r.interrupted_ref, "st.txt/inner.txt"), "inner");
         let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Regression (reviewer's repro): a tracked/untracked file that the job turned into an ignored one,
+    /// pushed over the cap by a big ignored file, must not be overwritten by the restore.
+    #[test]
+    fn untracked_file_made_ignored_by_the_job_is_not_overwritten() {
+        let d = temp_repo("notes");
+        fs::write(d.join("notes.txt"), "orig notes").unwrap(); // untracked, in the checkpoint's main tree
+        let o = Opts { excludes: vec![], ignored_max_bytes: MB };
+        let state = state_for("notes");
+        let c = checkpoint(&d, &state, "j", &o).unwrap();
+        // the job ignores notes.txt and writes a ~1 MB ignored file that sorts before it
+        let gi = fs::read_to_string(d.join(".gitignore")).unwrap();
+        fs::write(d.join(".gitignore"), format!("{gi}notes.txt\n")).unwrap();
+        fs::write(d.join("-dump.log"), vec![b'd'; 1_048_570]).unwrap();
+        fs::write(d.join("notes.txt"), "USER EDIT after the kill").unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &o).unwrap();
+        assert_eq!(fs::read_to_string(d.join("notes.txt")).unwrap(), "USER EDIT after the kill", "bytes in no ref are never overwritten");
+        assert_eq!(r.not_restored, ["notes.txt"]);
+        assert_eq!(fs::read_to_string(d.join(".gitignore")).unwrap(), gi, "captured files are still restored");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The chokepoint itself: every write and delete is checked against this attempt's snapshot.
+    #[test]
+    fn guard_allows_only_missing_or_snapshotted_paths() {
+        let d = temp_repo("guard");
+        let blob = |bytes: &[u8]| String::from_utf8_lossy(&git(&d, &["hash-object", "-w", "--no-filters", "--stdin"], None, Some(bytes)).unwrap()).trim().to_string();
+        let change = |p: &str, sha: &str| Change { status: 'M', mode: "100644".into(), sha: sha.into(), path: p.into() };
+        let target = blob(b"checkpoint bytes");
+        fs::write(d.join("uncaptured.txt"), "in no snapshot").unwrap();
+        fs::write(d.join("captured.txt"), "as snapshotted").unwrap();
+        fs::write(d.join("changed.txt"), "edited after the snapshot").unwrap();
+        fs::create_dir_all(d.join("dir")).unwrap();
+        fs::write(d.join("dir").join("f.txt"), "x").unwrap();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("captured.txt".to_string(), blob(b"as snapshotted"));
+        snapshot.insert("changed.txt".to_string(), blob(b"as it was at snapshot time"));
+        let mut g = Guard { dir: &d, snapshot, skipped: Vec::new() };
+        // refuses an existing path that is not in the snapshot
+        assert!(!g.write(&change("uncaptured.txt", &target)).unwrap());
+        assert!(!g.remove("uncaptured.txt").unwrap());
+        assert_eq!(fs::read_to_string(d.join("uncaptured.txt")).unwrap(), "in no snapshot");
+        // allows a path that does not exist
+        assert!(g.write(&change("missing/new.txt", &target)).unwrap());
+        assert_eq!(fs::read_to_string(d.join("missing").join("new.txt")).unwrap(), "checkpoint bytes");
+        // allows a snapshotted path whose bytes still match
+        assert!(g.write(&change("captured.txt", &target)).unwrap());
+        assert_eq!(fs::read_to_string(d.join("captured.txt")).unwrap(), "checkpoint bytes");
+        // refuses a snapshotted path whose bytes changed since the snapshot (edit between snapshot and restore)
+        assert!(!g.write(&change("changed.txt", &target)).unwrap());
+        assert!(!g.remove("changed.txt").unwrap());
+        assert_eq!(fs::read_to_string(d.join("changed.txt")).unwrap(), "edited after the snapshot");
+        // never writes onto a folder, and only removes empty folders
+        assert!(!g.write(&change("dir", &target)).unwrap());
+        assert!(!g.remove_empty_dir(&d.join("dir")), "non-empty folder");
+        fs::remove_file(d.join("dir").join("f.txt")).unwrap();
+        assert!(g.remove_empty_dir(&d.join("dir")));
+        assert_eq!(g.skipped, ["uncaptured.txt", "changed.txt", "dir"]);
         fs::remove_dir_all(&d).unwrap();
     }
 

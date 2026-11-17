@@ -126,7 +126,7 @@ fn cmd_hook(cfg: &Config) -> ExitCode {
 fn guarded(cfg: &Config, project: &str, job: impl FnOnce() -> ExitCode) -> ExitCode {
     let _ = recover::recover(cfg, recover::Mode::Auto); // kills orphans, resumes read-only jobs; never rolls back
     if let Some(id) = recover::blocked_by_interrupted_run(cfg, project) {
-        eprintln!("broadsword: refusing to start: job {id} (run {project}) was interrupted and may have changed files; run `broadsword recover` first");
+        eprintln!("broadsword: refusing to start: job {id} (run {project}) was interrupted and may have changed files; run `broadsword recover` first (or `broadsword recover --abandon <id>` to give up on it)");
         return ExitCode::from(job::EXIT_REFUSED);
     }
     job()

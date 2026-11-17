@@ -215,7 +215,7 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
         let project = r.get("project").to_string();
         if kind == "run" {
             if mode == Mode::Auto {
-                println!("  this run job may have changed files: run `broadsword recover` to roll it back (new jobs on `{project}` are refused until then)");
+                println!("  this run job may have changed files: run `broadsword recover` to roll it back, or `broadsword recover --abandon {id}` (new jobs on `{project}` are refused until then)");
                 continue;
             }
             for entry in std::fs::read_dir(&cfg.state_dir).into_iter().flatten().flatten() {
@@ -282,9 +282,18 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     r.set("interrupted_ignored", rb.interrupted_ignored_ref.clone().unwrap_or_default());
     r.set("not_restored", rb.not_restored.join("|"));
     r.set("not_protected", rb.not_protected.join("|"));
-    r.set("status", record::ROLLED_BACK);
+    let partial = !rb.not_restored.is_empty();
+    if !partial {
+        r.set("status", record::ROLLED_BACK);
+    }
     save(r)?;
-    println!("  rolled back to the checkpoint: restored {} file(s), removed {} new file(s), restored {} ignored file(s)", rb.restored, rb.removed, rb.ignored_restored);
+    println!(
+        "  {}: restored {} file(s), removed {} new file(s), restored {} ignored file(s)",
+        if partial { "PARTIAL rollback" } else { "rolled back to the checkpoint" },
+        rb.restored,
+        rb.removed,
+        rb.ignored_restored
+    );
     println!("  checkpoint (state before the job):  {ckpt}");
     println!("  interrupted (partial work, kept):   {}", rb.interrupted_ref);
     if let Some(i) = &rb.interrupted_ignored_ref {
@@ -297,6 +306,12 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
         println!("  not protected by the checkpoint (it was over the ignored-file size cap): {p}");
     }
     println!("  see the partial work: git -C {} diff {ckpt} {}", dir.display(), rb.interrupted_ref);
+    if partial {
+        return Err(format!(
+            "rollback of {id} is PARTIAL: {} file(s) were left untouched because their current bytes are in no snapshot (listed above); the record stays `running`. Save or move those files, then run `broadsword recover` again, or run `broadsword recover --abandon {id}` to give up on this rollback",
+            rb.not_restored.len()
+        ));
+    }
     Ok(())
 }
 
