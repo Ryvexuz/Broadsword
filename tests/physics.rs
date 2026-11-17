@@ -1,4 +1,9 @@
-use crash_sim::{run, to_csv, Config, Sample, Sim, BEAM_STIFFNESS, GRAVITY, NODE_MASS};
+use crash_sim::vec3::Vec3;
+use crash_sim::{
+    max_stable_step, max_strain, run, run_checked, to_csv, Config, Sample, Sim, BEAM_STIFFNESS, GRAVITY,
+    NODE_MASS,
+};
+use std::process::Command;
 
 fn default_run() -> Vec<Sample> {
     run(&Config::default())
@@ -90,6 +95,15 @@ fn bounces_lose_energy_and_cube_settles() {
         sim.advance();
     }
     assert!(sim.max_speed() < 0.05, "still moving: {} m/s", sim.max_speed());
+    // Resting on a face: 4 nodes on the ground, 4 at one edge length up.
+    let mut ys: Vec<f64> = sim.pos.iter().map(|p| p.y).collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    for y in &ys[..4] {
+        assert!(y.abs() < 0.01, "bottom node not on ground: {ys:?}");
+    }
+    for y in &ys[4..] {
+        assert!((y - cfg.edge).abs() < 0.02, "top node not one edge up: {ys:?}");
+    }
 }
 
 #[test]
@@ -112,8 +126,8 @@ fn total_energy_never_exceeds_initial() {
     let e0 = energy(&sim);
     for _ in 0..(cfg.duration / cfg.dt).round() as usize {
         sim.advance();
-        // 1% slack for symplectic Euler's bounded energy ripple
-        assert!(energy(&sim) <= e0 * 1.01, "energy grew: {} > {}", energy(&sim), e0);
+        // 0.1% slack for symplectic Euler's bounded energy ripple (measured max E/E0 is ~0.99998)
+        assert!(energy(&sim) <= e0 * 1.001, "energy grew: {} > {}", energy(&sim), e0);
     }
 }
 
@@ -136,4 +150,59 @@ fn deterministic_output() {
     assert_eq!(a, b);
     assert!(a.starts_with("t,min_y,center_y,max_beam_strain\n"));
     assert_eq!(a.lines().count(), 502); // header + t = 0..5 s at 0.01
+}
+
+#[test]
+fn nan_state_is_not_hidden_by_strain() {
+    let sim = Sim::new(Config::default());
+    let mut pos = sim.pos.clone();
+    pos[3] = Vec3::new(f64::NAN, f64::NAN, f64::NAN);
+    assert!(max_strain(&sim.beams, &pos).is_nan());
+    let mut bad = Sim::new(Config::default());
+    bad.pos[0].y = f64::INFINITY;
+    assert!(bad.check().is_err());
+    let mut bad = Sim::new(Config::default());
+    bad.vel[2].x = f64::NAN;
+    assert!(bad.check().is_err());
+    let mut bad = Sim::new(Config::default());
+    bad.pos[0].x += 0.9; // stretches beams far beyond the strain limit
+    assert!(bad.check().unwrap_err().contains("strain"));
+    assert!(Sim::new(Config::default()).check().is_ok());
+}
+
+#[test]
+fn unstable_step_is_refused_up_front() {
+    let limit = max_stable_step();
+    assert!(limit > 0.001 && limit < 0.005, "limit {limit}");
+    let (rows, res) = run_checked(&Config { dt: 0.02, substeps: 1, ..Config::default() });
+    assert!(rows.is_empty());
+    assert!(res.unwrap_err().contains("stable limit"));
+    // just under the limit is accepted
+    let ok = Config { dt: limit * 0.99, substeps: 1, duration: 0.1, ..Config::default() };
+    assert!(ok.validate().is_ok());
+}
+
+#[test]
+fn binary_fails_loudly_on_harsh_flags() {
+    let exe = env!("CARGO_BIN_EXE_crash-sim");
+    let out = Command::new(exe)
+        .args(["--drop-height", "10", "--substeps", "1", "--dt", "0.02"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("exceeds the stable limit"), "stderr: {err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("NaN") && !stdout.contains("inf"));
+
+    // Default flags still exit 0.
+    let ok = Command::new(exe).output().unwrap();
+    assert!(ok.status.success());
+}
+
+#[test]
+fn non_dividing_dt_ends_at_nearest_whole_step() {
+    let s = run(&Config { dt: 0.006, ..Config::default() });
+    let last = s.last().unwrap().t;
+    assert!((last - 5.0).abs() <= 0.003 + 1e-9, "last t {last}");
 }

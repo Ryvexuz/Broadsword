@@ -23,8 +23,20 @@ pub const FRICTION_RATE: f64 = 5.0;
 /// Impact speeds below this (m/s) are treated as resting contact (no bounce),
 /// otherwise gravity's per-substep velocity would keep re-bouncing forever.
 pub const REST_SPEED: f64 = 0.2;
+/// Strain above this means the run has blown up (or the cube is crushed); the sim aborts.
+pub const MAX_STRAIN_LIMIT: f64 = 0.5;
 /// Initial tilt in degrees about x and z when tilt is on.
 pub const TILT_DEG: f64 = 5.0;
+
+/// Largest physics step (s) that keeps symplectic Euler stable for the constants above.
+///
+/// Each node has 7 beams, so by Gershgorin the stiffness matrix has largest
+/// eigenvalue <= 2 * 7 * k / m, i.e. omega_max <= sqrt(14 k / m) (about 529 rad/s;
+/// the real cube mode is about 450). Symplectic Euler is stable for omega * h < 2.
+/// This is a conservative bound, no extra margin needed.
+pub fn max_stable_step() -> f64 {
+    2.0 / (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -42,6 +54,27 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config { duration: 5.0, dt: 0.01, substeps: 10, drop_height: 2.0, tilt: true, edge: 1.0 }
+    }
+}
+
+impl Config {
+    /// Reject settings that cannot give a valid run, including unstable physics steps.
+    pub fn validate(&self) -> Result<(), String> {
+        let ok = self.dt.is_finite() && self.dt > 0.0;
+        if !(ok && self.duration.is_finite() && self.duration >= 0.0 && self.substeps >= 1
+            && self.drop_height.is_finite() && self.drop_height >= 0.0)
+        {
+            return Err("dt must be > 0, duration >= 0, substeps >= 1, drop-height >= 0 (all finite)".into());
+        }
+        let h = self.dt / self.substeps as f64;
+        let limit = max_stable_step();
+        if h > limit {
+            return Err(format!(
+                "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s                  (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s,                  k = {BEAM_STIFFNESS}); raise --substeps or lower --dt",
+                (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -139,12 +172,24 @@ impl Sim {
     pub fn sample(&self) -> Sample {
         let min_y = self.pos.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
         let center_y = self.pos.iter().map(|p| p.y).sum::<f64>() / self.pos.len() as f64;
-        let max_beam_strain = self
-            .beams
-            .iter()
-            .map(|b| ((self.pos[b.a] - self.pos[b.b]).length() - b.rest).abs() / b.rest)
-            .fold(0.0, f64::max);
+        let max_beam_strain = max_strain(&self.beams, &self.pos);
         Sample { t: self.step as f64 * self.cfg.dt, min_y, center_y, max_beam_strain }
+    }
+
+    /// Fail if any node position/velocity is non-finite or strain is NaN or above the limit.
+    pub fn check(&self) -> Result<(), String> {
+        let finite = |v: &Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        if let Some(i) = self.pos.iter().position(|p| !finite(p)) {
+            return Err(format!("node {i} position is not finite"));
+        }
+        if let Some(i) = self.vel.iter().position(|v| !finite(v)) {
+            return Err(format!("node {i} velocity is not finite"));
+        }
+        let strain = max_strain(&self.beams, &self.pos);
+        if strain.is_nan() || strain > MAX_STRAIN_LIMIT {
+            return Err(format!("max beam strain {strain} exceeds limit {MAX_STRAIN_LIMIT}"));
+        }
+        Ok(())
     }
 
     /// Largest node speed, m/s.
@@ -162,17 +207,46 @@ impl Sim {
     }
 }
 
-/// Run the whole sim; returns samples for t = 0, dt, 2dt, ... duration.
-pub fn run(cfg: &Config) -> Vec<Sample> {
+/// Largest |length - rest| / rest. NaN-propagating: a blown-up state never reads as 0.
+pub fn max_strain(beams: &[Beam], pos: &[Vec3]) -> f64 {
+    let mut m = 0.0_f64;
+    for b in beams {
+        let s = ((pos[b.a] - pos[b.b]).length() - b.rest).abs() / b.rest;
+        if s.is_nan() {
+            return f64::NAN;
+        }
+        m = m.max(s);
+    }
+    m
+}
+
+/// Run the sim. Returns the samples of all good steps (t = 0, dt, 2dt, ...) and,
+/// if the config was refused or the state blew up, the reason (with the time).
+/// The step count is `round(duration / dt)`, so the last row can differ from
+/// `duration` by up to dt/2 when dt does not divide it.
+pub fn run_checked(cfg: &Config) -> (Vec<Sample>, Result<(), String>) {
+    if let Err(e) = cfg.validate() {
+        return (Vec::new(), Err(e));
+    }
     let steps = (cfg.duration / cfg.dt).round() as u64;
     let mut sim = Sim::new(cfg.clone());
     let mut out = Vec::with_capacity(steps as usize + 1);
     out.push(sim.sample());
     for _ in 0..steps {
         sim.advance();
+        if let Err(e) = sim.check() {
+            return (out, Err(format!("unstable at t = {:.4} s: {e}", sim.sample().t)));
+        }
         out.push(sim.sample());
     }
-    out
+    (out, Ok(()))
+}
+
+/// Run the whole sim; panics if the config is refused or the sim blows up.
+pub fn run(cfg: &Config) -> Vec<Sample> {
+    let (samples, res) = run_checked(cfg);
+    res.expect("simulation failed");
+    samples
 }
 
 pub const CSV_HEADER: &str = "t,min_y,center_y,max_beam_strain";

@@ -28,3 +28,14 @@ corner (2), `--no-tilt` (default start has a 5 degree tilt about x and z).
 
 Constants (stiffness, damping, restitution, friction) are at the top of
 `src/lib.rs` with the reasoning for each.
+
+## Behaviour notes
+
+- The run aborts with a message on stderr and exit code 1 if a node goes
+  non-finite or max strain passes 50%. Rows already computed are still printed.
+- A physics step `dt / substeps` above the stable limit (about 3.8 ms, derived
+  from the beam stiffness and node mass in `max_stable_step()`) is refused up front.
+- The step count is `round(duration / dt)`, so with a `--dt` that does not divide
+  the duration the last row can end up to dt/2 away from it (`--dt 0.006` ends at 4.998).
+- Ground friction is a linear drag on horizontal speed (starter simplification,
+  not Coulomb friction).

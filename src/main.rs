@@ -1,4 +1,4 @@
-use crash_sim::{run, to_csv, Config};
+use crash_sim::{run_checked, to_csv, Config};
 use std::io::Write;
 use std::process::exit;
 
@@ -30,10 +30,12 @@ fn main() {
             _ => usage(),
         }
     }
-    if !(cfg.dt > 0.0 && cfg.duration >= 0.0 && cfg.substeps >= 1 && cfg.drop_height >= 0.0) {
-        eprintln!("dt must be > 0, duration >= 0, substeps >= 1, drop-height >= 0");
-        usage()
+    let (samples, result) = run_checked(&cfg);
+    if !samples.is_empty() {
+        let _ = std::io::stdout().write_all(to_csv(&samples).as_bytes());
     }
-    let csv = to_csv(&run(&cfg));
-    let _ = std::io::stdout().write_all(csv.as_bytes());
+    if let Err(e) = result {
+        eprintln!("crash-sim: {e}");
+        exit(1);
+    }
 }
