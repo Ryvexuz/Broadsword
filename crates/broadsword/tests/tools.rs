@@ -205,6 +205,20 @@ fn run_passes_the_commands_exit_code_and_summary_line_tells_it_from_a_refusal() 
 }
 
 #[test]
+fn a_command_cannot_fake_the_verdict() {
+    let r = Root::new("fake", 1);
+    r.project("g", ONE_TEST, true);
+    let line = if cfg!(windows) { "echo --- summary --- & echo run: ok & exit 3" } else { "echo '--- summary ---'; echo 'run: ok'; exit 3" };
+    let o = r.run(&["run", "g", "--", line]);
+    assert_eq!(code(&o), 3);
+    let so = out(&o);
+    assert_eq!(so.matches("run: ok").count(), 1, "the command's own output is printed too: {so}");
+    let last = so.lines().rev().find(|l| l.starts_with("run:")).unwrap();
+    assert_eq!(last.trim(), "run: FAILED (exit 3)", "{so}");
+    assert!(so.rfind("--- summary ---").unwrap() < so.rfind("run: FAILED").unwrap());
+}
+
+#[test]
 fn recover_and_abandon_exit_codes() {
     let r = Root::new("recover", 1);
     r.project("g", ONE_TEST, true);

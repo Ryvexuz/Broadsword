@@ -238,7 +238,7 @@ pub static TOOLS: &[Tool] = &[
         summary: "Run `cargo build` on a project, with the disk guard and a Git checkpoint.",
         description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes, so give it a long timeout or run it in the background. Use it to compile a project; use `check` to build and test in one go.",
         params: &[PROJECT],
-        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Full compiler output goes to the log file, not to the terminal.",
+        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Cargo's full output is printed as it runs (compiler output on stderr) and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
@@ -258,7 +258,7 @@ pub static TOOLS: &[Tool] = &[
         summary: "Run `cargo test` on a project, with the disk guard and a Git checkpoint.",
         description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes, so give it a long timeout or run it in the background. Use it when only the test result matters; use `check` for build then test.",
         params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Full output goes to the log file.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
@@ -278,7 +278,7 @@ pub static TOOLS: &[Tool] = &[
         summary: "Build, then test, a project in one job (stops at the first failure).",
         description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes, so give it a long timeout or run it in the background. Use it as the default way to verify a change.",
         params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Full output goes to the log file.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
@@ -306,14 +306,14 @@ pub static TOOLS: &[Tool] = &[
                 description: "The command and its arguments, as separate strings. They are joined with single spaces and run by the shell in the project folder, so quoting inside one string is not preserved. Must not be empty.",
             },
         ],
-        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `run: ok` or `run: FAILED (exit N)`. The command's own output goes to the log file. The `--- summary ---` line is printed only when the command actually ran to completion.",
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `run: ok` or `run: FAILED (exit N)`. The command's own output is printed as it runs and also saved to the job log, then the summary follows. Because the command's output is on stdout too, only the LAST `run:` line after the final `--- summary ---` is Broadsword's verdict.",
         exit_codes: &[
             ExitDoc { code: "0", meaning: "the command exited 0" },
             ExitDoc { code: "1", meaning: "the command exited 1 or failed without a usable code, or Broadsword could not set the job up (log or record could not be written)" },
             ExitDoc { code: "2", meaning: "Broadsword: unknown project name; or the command itself exited 2" },
             ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run on this project still needs `recover`); or the command itself exited 3" },
             ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, and is now paused; or the command itself exited 4" },
-            ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: the command's exit code is reported only after a `--- summary ---` line on stdout followed by `run: ok` or `run: FAILED (exit N)`. If there is no `--- summary ---` line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
+            ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: Broadsword's own verdict is the last `run:` line (`run: ok` or `run: FAILED (exit N)`) after the final `--- summary ---` line on stdout; the command may print a fake one itself, so only the last counts. If there is no such line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
         ],
         read_only: false,
         long_running: true,
@@ -340,7 +340,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "recover",
         summary: "Clean up after a crash: resume interrupted builds/tests, roll back interrupted runs.",
-        description: "Finds every job whose Broadsword process died while it was running. Read-only jobs (build, test, check) are resumed from the step they were on, at most max_resumes times in a row. An interrupted `run` job is rolled back: the project's files are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost. Use it after a crash, a reboot or a message that a project is blocked by an interrupted run. It changes files in the affected project and may rebuild, so it can take a while. Jobs still genuinely running are left alone. Every build, test, check and run already does the safe half (resume, never roll back) automatically before it starts.",
+        description: "Finds every job whose Broadsword process died while it was running. build, test and check jobs are resumed from the step they were on, at most max_resumes times in a row. An interrupted `run` job is rolled back: the project's files are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost. Use it after a crash, a reboot or a message that a project is blocked by an interrupted run. It changes files in the affected project and may rebuild, so it can take a while. Jobs still genuinely running are left alone. Every build, test, check and run already does the safe half (resume, never roll back) automatically before it starts.",
         params: &[],
         outputs: "One block per interrupted job saying what was done, or `recover: nothing to do`. Problems are listed on stderr as NEEDS ATTENTION with the job ids.",
         exit_codes: &[
@@ -648,8 +648,8 @@ pub fn tool_full(t: &Tool) -> String {
         s.push_str(&format!("  {} ({}, {}): {}\n", p.name, p.ty.name(), if p.required { "required" } else { "optional" }, p.description));
     }
     s.push_str(&format!("\noutputs:\n  {}\n\nexit codes:\n", t.outputs));
-    for e in all_exits(t) {
-        s.push_str(&format!("  {}  {}\n", e.code, e.meaning));
+    for (code, meaning) in all_exits(t) {
+        s.push_str(&format!("  {code}  {meaning}\n"));
     }
     s.push_str(&format!("\nflag meanings:\n  {READ_ONLY_MEANS}\n  {LONG_RUNNING_MEANS}\n  {CHANGES_FILES_MEANS}\n"));
     s
@@ -662,8 +662,19 @@ pub const COMMON_EXITS: &[ExitDoc] = &[ExitDoc {
 }];
 
 /// A tool's own exit codes followed by the common ones.
-pub fn all_exits(t: &Tool) -> impl Iterator<Item = &ExitDoc> {
-    t.exit_codes.iter().chain(COMMON_EXITS)
+/// Each code appears once; when a tool and the common list share a code, the meanings are joined.
+pub fn all_exits(t: &Tool) -> Vec<(&'static str, String)> {
+    let mut v: Vec<(&'static str, String)> = t.exit_codes.iter().map(|e| (e.code, e.meaning.to_string())).collect();
+    for c in COMMON_EXITS {
+        match v.iter_mut().find(|(k, _)| *k == c.code) {
+            Some((_, m)) => {
+                m.push_str("; ");
+                m.push_str(c.meaning);
+            }
+            None => v.push((c.code, c.meaning.to_string())),
+        }
+    }
+    v
 }
 
 // ---- JSON output (MCP tools/list shape) -------------------------------------------------
@@ -692,7 +703,7 @@ pub fn tool_json(t: &Tool, ind: &str) -> String {
         .collect();
     let props = if props.is_empty() { "{}".to_string() } else { format!("{{\n{}\n{i2}}}", props.join(",\n")) };
     let required: Vec<String> = t.params.iter().filter(|p| p.required).map(|p| json::string(p.name)).collect();
-    let codes: Vec<String> = all_exits(t).map(|e| format!("{{\"code\": {}, \"meaning\": {}}}", json::string(e.code), json::string(e.meaning))).collect();
+    let codes: Vec<String> = all_exits(t).iter().map(|(c, m)| format!("{{\"code\": {}, \"meaning\": {}}}", json::string(c), json::string(m))).collect();
     format!(
         "{{\n\
          {i1}\"name\": {},\n\
@@ -764,9 +775,12 @@ mod tests {
             assert!(t.description.trim().len() > 80, "{} description too short", t.name);
             assert!(!t.description.contains('\n'), "{} description must be one paragraph", t.name);
             assert!(!t.outputs.trim().is_empty(), "{} outputs", t.name);
-            assert!(all_exits(t).count() >= 2, "{} exit codes", t.name);
-            for e in all_exits(t) {
-                assert!(!e.meaning.trim().is_empty(), "{} exit {}", t.name, e.code);
+            let exits = all_exits(t);
+            assert!(!exits.is_empty(), "{} exit codes", t.name);
+            let mut seen = std::collections::HashSet::new();
+            for (code, meaning) in &exits {
+                assert!(!meaning.trim().is_empty(), "{} exit {code}", t.name);
+                assert!(seen.insert(*code), "{} lists exit {code} twice", t.name);
             }
             for p in t.params {
                 assert!(!p.description.trim().is_empty(), "{}.{} description", t.name, p.name);
@@ -832,7 +846,7 @@ mod tests {
             assert_eq!(a.get("destructiveHint"), Some(&J::Bool(t.destructive)));
             assert_eq!(a.get("idempotentHint"), Some(&J::Bool(t.idempotent)));
             let J::Arr(codes) = x.get("exit_codes").unwrap() else { panic!("exit_codes array") };
-            assert_eq!(codes.len(), all_exits(t).count());
+            assert_eq!(codes.len(), all_exits(t).len());
         }
     }
 
