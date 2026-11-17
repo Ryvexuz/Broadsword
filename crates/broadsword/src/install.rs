@@ -115,6 +115,7 @@ pub fn cmd_install(cfg: &Config) -> Result<ExitCode, String> {
     let is_installed_copy = matches!((src.canonicalize(), cfg.install_dir.join(exe_name()).canonicalize()), (Ok(a), Ok(b)) if a == b);
     if !is_installed_copy {
         crate::buildsrc::check_installable(cfg)?;
+        crate::buildsrc::check_running_binary(cfg, &src)?;
     }
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_secs(), d.subsec_millis())).unwrap_or((0, 0));
     let stamp = format!("{}{:03}-{}", crate::job::file_stamp(secs.0), secs.1, std::process::id());

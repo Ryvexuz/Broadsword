@@ -433,6 +433,21 @@ pub fn job_folder(cfg: &Config, name: &str, task: Option<&str>) -> Result<PathBu
 
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
 /// before the first step (when the project is a Git repo), and runs the steps.
+/// The build lock, held until the job function returns. For `run`, dropping it first marks the notes of the folder's
+/// packages unknown (the command may have built anything), so the next build, test or check cleans and `install` refuses.
+struct BuildHold {
+    forget: Option<(Config, PathBuf)>,
+    _lock: crate::lock::Lock, // dropped after the Drop body below: the notes change while the lock is still held
+}
+
+impl Drop for BuildHold {
+    fn drop(&mut self) {
+        if let Some((cfg, dir)) = &self.forget {
+            buildsrc::forget_notes(cfg, dir);
+        }
+    }
+}
+
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     let kind = spec.kind.as_str();
     let project_dir = match job_folder(cfg, &spec.name, spec.task.as_deref()) {
@@ -526,7 +541,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     let mut summary: Vec<String> = Vec::new();
     let mut all_ok = true;
     let mut exit_code: Option<i32> = None;
-    let mut _build_lock: Option<crate::lock::Lock> = None; // held (when taken) until this function returns
+    let mut build_hold: Option<BuildHold> = None; // held (when taken) until this function returns
     for (i, step) in steps.iter().enumerate().skip(spec.first_step) {
         let free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
@@ -566,20 +581,29 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                 rec.set("checkpoint", "none");
             }
         }
-        if i == spec.first_step && kind != "run" {
-            // Clean, record and build are one step across processes: take the build lock now and keep it until this job
-            // ends (every cargo step below, tests included, runs the binaries the shared folder holds). `run` runs a
-            // shell command, not a cargo step of ours, so it neither takes the lock nor changes the notes.
-            match buildsrc::lock(cfg) {
-                Ok(l) => _build_lock = Some(l),
+        if build_hold.is_none() {
+            // The first step this job EXECUTES (whatever step a resumed job starts at: `skip(first_step)` above), so the
+            // lock and the prepare below are never skipped. Clean, record and build are one step across processes: take
+            // the build lock now and keep it until this job ends (every cargo step below, tests included, runs the
+            // binaries the shared folder holds). `run` runs a shell command that may call cargo itself, so it takes the
+            // lock too and, instead of preparing, forgets the notes of the folder's packages (before the command, so a
+            // crash cannot leave a stale note, and again after it).
+            let lock = match buildsrc::lock(cfg) {
+                Ok(l) => l,
                 Err((code, msg)) => {
                     eprintln!("broadsword: {msg}");
                     return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, ExitCode::from(code));
                 }
-            }
-            match buildsrc::prepare(cfg, &project_dir, &source) {
-                Ok(p) => {
-                    for l in &p.lines {
+            };
+            build_hold = Some(BuildHold { forget: (kind == "run").then(|| (cfg.clone(), project_dir.clone())), _lock: lock });
+            let outcome = if kind == "run" {
+                Ok(buildsrc::forget_notes(cfg, &project_dir))
+            } else {
+                buildsrc::prepare(cfg, &project_dir, &source).map(|p| p.lines)
+            };
+            match outcome {
+                Ok(lines) => {
+                    for l in &lines {
                         println!("{l}");
                         if let Ok(mut f) = log.lock() {
                             let _ = writeln!(f, "{l}");

@@ -222,7 +222,86 @@ fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     assert!(rec.contains(&format!("task = {t1}")) && rec.contains("checkpoint = refs/broadsword/checkpoints/"), "{rec}");
     let o = r.ok(&["run", "proj", "--", list]);
     assert!(!o.stdout.contains("only-here.txt"), "without --task it ran in the main checkout: {}", o.stdout);
-    assert_eq!(r.note(), None, "`run` never touches the build notes");
+    assert_eq!(r.note(), None, "`run` leaves no note: nothing vouches for the build folder");
+}
+
+/// Blocker 2: `run <project> -- cargo build` in a worktree puts the worktree's binary in the shared folder. `run` does not
+/// parse the command; it forgets the notes of the folder's packages, so `install` (which needs the note `.`/main) refuses
+/// and the next build cleans and records the main checkout. Without this the note kept saying main.
+#[test]
+fn run_that_builds_in_a_worktree_makes_the_note_unknown_so_the_next_build_cleans() {
+    let r = Root::new("runbuild", 120);
+    let t1 = r.task("a", "MARK-t1");
+    r.ok(&["build", "proj"]);
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+    set_marker(&r.worktree(&t1), "MARK-t1"); // newer than main's build, so cargo rebuilds for the worktree
+    let target = r.dir.join("build").to_string_lossy().replace('\\', "/");
+    let o = r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--offline", "--target-dir", &target]);
+    assert_eq!(r.probe(), "MARK-t1", "the run command really did put the worktree's binary in the shared folder:
+{}{}", o.stdout, o.stderr);
+    assert_eq!(r.note(), None, "the note no longer vouches for main (the install rule refuses a missing note)");
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("no record"), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-main");
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+}
+
+/// `run` holds the build lock for its whole command.
+#[test]
+fn run_holds_the_build_lock_while_it_runs() {
+    let r = Root::new("runlock", 1);
+    let flag = r.scratch("run-started.txt");
+    let flag_s = flag.to_string_lossy().replace('\\', "/");
+    let cmd: Vec<&str> = if cfg!(windows) { vec!["echo", "x>", &flag_s, "&&", "ping", "-n", "8", "127.0.0.1", ">nul"] } else { vec!["echo x >", &flag_s, "; sleep 8"] };
+    let mut args = vec!["run", "proj", "--"];
+    args.extend(cmd);
+    let j = r.cmd(&args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(wait_for(&flag, "x", 60), "the run command never started");
+    let o = r.run(&["build", "proj"]);
+    assert_eq!(o.code, 3, "{}", o.stderr);
+    assert!(o.stderr.contains("build folder busy"), "{}", o.stderr);
+    finish(j, 60);
+    r.ok(&["build", "proj"]);
+}
+
+fn dead_pid() -> u32 {
+    let mut c = if cfg!(windows) { Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap() } else { Command::new("true").spawn().unwrap() };
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+/// Blocker 1: a `check` killed during its test step resumes at `test`. The resumed job must still take the build lock and
+/// prepare (clean + note), or another checkout's build in between leaves the wrong binary under cargo's fresh fingerprint.
+#[test]
+fn a_check_resumed_at_the_test_step_prepares_the_build_folder_first() {
+    let r = Root::new("resume", 120);
+    let t1 = r.task("a", "MARK-t1");
+    r.ok(&["check", "proj", "--task", &t1]); // t1's fingerprints are fresh
+    r.ok(&["build", "proj"]); // another checkout builds in between: main's binary, note main
+    assert_eq!(r.probe(), "MARK-main");
+    let dead = dead_pid().to_string();
+    let dir = r.dir.join("state/jobs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("20260101-000001-proj-check.rec"),
+        format!("id = 20260101-000001-proj-check
+project = proj
+kind = check
+status = running
+pid = {dead}
+step = test
+task = {t1}
+"),
+    )
+    .unwrap();
+    let o = r.ok(&["recover"]);
+    let out = format!("{}{}", o.stdout, o.stderr);
+    assert!(out.contains("resuming `check proj` from step `test`"), "{out}");
+    assert!(o.stdout.contains("cleaned `markprobe`"), "the resumed job prepared the folder: {out}");
+    assert!(o.stdout.contains("test: ok"), "the resumed test ran against its own source: {out}");
+    assert_eq!(r.probe(), "MARK-t1");
+    assert_eq!(r.note().as_deref(), Some(format!("worktrees/proj/{t1}").as_str()));
 }
 
 // ---- refusals ---------------------------------------------------------------------------

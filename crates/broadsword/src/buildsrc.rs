@@ -18,6 +18,9 @@
 //! all of its cargo steps. Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
 //! own source over the folder before job 2's cargo step runs.
 //!
+//! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
+//! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
+//!
 //! Deleting: `cargo clean -p` is the ONLY deletion here. It is built in one function (`clean_command`) that always passes
 //! `-p <package>` (a bare `cargo clean` would wipe the whole folder), always points cargo at `build_dir` through both
 //! `--target-dir` and `CARGO_TARGET_DIR`, and refuses if `build_dir` is not strictly inside root or the source folder is
@@ -155,6 +158,22 @@ pub fn packages_of(dir: &Path) -> Result<Vec<String>, String> {
 
 // ---- cleaning ---------------------------------------------------------------------------
 
+#[cfg(windows)]
+fn is_reparse_point(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT: symlinks and junctions
+}
+#[cfg(not(windows))]
+fn is_reparse_point(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The first of `p` and its parents (up to the root of the drive) that is a symlink, junction or reparse point. Missing
+/// parts are fine (nothing to follow).
+fn link_in_path(p: &Path) -> Option<PathBuf> {
+    p.ancestors().find(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink() || is_reparse_point(&m))).map(Path::to_path_buf)
+}
+
 /// The one and only place a `cargo clean` is made. Always `-p <package>`, always aimed at `build_dir`. Refuses (Err, nothing
 /// run) if the package name is not a plain cargo name, `build_dir` is not strictly inside root, or the source folder lies
 /// inside `build_dir` (cleaning would then be pointed at, or beside, sources).
@@ -166,12 +185,31 @@ pub fn clean_command(cfg: &Config, dir: &Path, package: &str) -> Result<Command,
     if !b.starts_with(&cfg.root) || *b == cfg.root || !b.components().all(|c| !matches!(c, Component::ParentDir)) {
         return Err(format!("refusing to clean: the build folder {} is not strictly inside root", b.display()));
     }
+    if let Some(l) = link_in_path(b) {
+        return Err(format!("refusing to clean: {} is a symlink, junction or reparse point (on the way to the build folder {}), so cleaning could reach somewhere that is not ours", l.display(), b.display()));
+    }
     if dir.starts_with(b) {
         return Err(format!("refusing to clean: the source folder {} is inside the build folder {}", dir.display(), b.display()));
     }
     let mut c = cargo();
     c.arg("clean").arg("-p").arg(package).arg("--offline").arg("--target-dir").arg(b).current_dir(dir).env("CARGO_TARGET_DIR", b).stdin(Stdio::null());
     Ok(c)
+}
+
+/// Mark every package of `dir` as "built by someone unknown" by deleting its note (a missing note means unknown, so the
+/// next build/test/check cleans it and `install` refuses). Used after a `run` job, whose command may have run cargo.
+/// Best effort and never fatal: cargo metadata failing (not a cargo folder) means there is nothing to name. Returns lines
+/// for the job's output.
+pub fn forget_notes(cfg: &Config, dir: &Path) -> Vec<String> {
+    let Ok(packages) = packages_of(dir) else { return Vec::new() };
+    let mut lines = Vec::new();
+    for p in packages.iter().filter(|p| valid_package(p)) {
+        let path = notes_dir(cfg).join(p);
+        if path.exists() && std::fs::remove_file(&path).is_ok() {
+            lines.push(format!("build-source note of `{p}` cleared: a `run` command may have built it, so the next build/test/check will clean it and `install` will refuse until a `broadsword build`"));
+        }
+    }
+    lines
 }
 
 /// What `prepare` did, one line each, for the job's output and log.
@@ -220,6 +258,40 @@ pub fn check_installable(cfg: &Config) -> Result<(), String> {
             "refusing to install: there is no record of which checkout built the `{pkg}` binary in the build folder ({} is missing), so it could be a worktree's. Build the main checkout through Broadsword first (`broadsword build {pkg}`, with no --task), then run `install` from the binary it built",
             notes_dir(cfg).join(pkg).display()
         )),
+    }
+}
+
+/// The note says what built the binary in the build folder; `install` copies the RUNNING binary. They are the same file only
+/// if the running one is exactly the main root's `<build_dir>/debug/broadsword.exe`. Both paths are normalised (resolved
+/// when they exist, lexically otherwise) and compared without regard to case on Windows.
+pub fn check_running_binary(cfg: &Config, running: &Path) -> Result<(), String> {
+    let exe = format!("{}{}", env!("CARGO_PKG_NAME"), std::env::consts::EXE_SUFFIX);
+    let expected = cfg.build_dir.join("debug").join(&exe);
+    let norm = |p: &Path| -> String {
+        let p = p.canonicalize().unwrap_or_else(|_| {
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other),
+                }
+            }
+            crate::config::normalize(&out)
+        });
+        let t = p.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/");
+        if cfg!(windows) { t.to_lowercase() } else { t }
+    };
+    if norm(running) == norm(&expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to install: the running binary is {}, but the build-source note vouches only for {} (what the main checkout builds). Installing would copy a binary nobody has vouched for. Run `install` from {}",
+            running.display(),
+            expected.display(),
+            expected.display()
+        ))
     }
 }
 
@@ -321,6 +393,44 @@ mod tests {
         let code = src.split("#[cfg(test)]").next().unwrap();
         assert_eq!(code.matches(".arg(\"clean\")").count(), 1);
         assert_eq!(code.matches("\"clean\"").count(), 1);
+    }
+
+    #[test]
+    fn install_requires_the_main_roots_own_binary() {
+        let cfg = cfg_at(Path::new("r"));
+        let exe = format!("broadsword{}", std::env::consts::EXE_SUFFIX);
+        assert!(check_running_binary(&cfg, &cfg.build_dir.join("debug").join(&exe)).is_ok());
+        assert!(check_running_binary(&cfg, &cfg.build_dir.join("debug").join("..").join("debug").join(&exe)).is_ok(), "normalised");
+        let e = check_running_binary(&cfg, &cfg.worktrees_dir.join("p").join("t").join("build").join("debug").join(&exe)).unwrap_err();
+        assert!(e.contains("running binary is") && e.contains("vouches only for"), "{e}");
+        assert!(check_running_binary(&cfg, &cfg.build_dir.join("release").join(&exe)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_refuses_a_build_folder_that_is_a_junction() {
+        let d = tmp("junction");
+        let d = PathBuf::from(d.canonicalize().unwrap().to_string_lossy().trim_start_matches(r"\?\"));
+        let mut cfg = cfg_at(&d);
+        let real = d.join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        let parent = d.join("b");
+        std::fs::create_dir_all(&parent).unwrap();
+        let link = parent.join("link");
+        let ok = {
+            use std::os::windows::process::CommandExt;
+            Command::new("cmd").arg("/C").raw_arg(format!("mklink /J \"{}\" \"{}\"", link.display(), real.display())).output().unwrap().status.success()
+        };
+        assert!(ok, "mklink /J failed");
+        cfg.build_dir = link.join("build"); // a parent of the build folder is a junction
+        let e = clean_command(&cfg, &d, "p").unwrap_err();
+        assert!(e.contains("junction"), "{e}");
+        cfg.build_dir = link.clone();
+        assert!(clean_command(&cfg, &d, "p").is_err(), "the build folder itself");
+        cfg.build_dir = parent;
+        assert!(clean_command(&cfg, &d, "p").is_ok());
+        let _ = std::fs::remove_dir(&link);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
