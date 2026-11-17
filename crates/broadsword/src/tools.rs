@@ -138,6 +138,20 @@ const PROJECT: Param = Param {
     description: "Project name. Must be `broadsword` (this repository) or the name of a folder in the projects folder that contains a Cargo.toml; use the `projects` tool to list them. A plain folder name only: paths, `..` and absolute paths are rejected. Anything else fails with exit code 2.",
 };
 
+const TASK: Param = Param {
+    name: "task",
+    ty: Ty::String,
+    required: false,
+    description: "The id of a task (see `task_list`) to run in that task's own worktree instead of the project's main checkout. The task must be `running`, belong to `project` and have a worktree (`task_start` with `worktree`) that really is a git worktree of the project. Omit it to use the main checkout. An unknown task id fails with exit code 2; a task that may not be used fails with exit code 3 and nothing runs.",
+};
+
+/// The paragraph about `task` and the shared build folder that `build`, `test` and `check` all end with.
+macro_rules! TASK_AND_CLEAN {
+    () => {
+        " WITH `task` (the id of a `running` task that has a worktree, see `task_start`) the job runs in that task's worktree folder instead of the project's main checkout, so an agent working in a worktree builds and tests its own code; `project` must be the task's project. Everything else is the same: disk guard, checkpoint (of the worktree), recovery, log, job record and the one shared build folder; the `source:` output line and the job record name the folder that was built. SHARED BUILD FOLDER, DELETES ITS OWN OLD ARTIFACTS: checkouts of one package share one build folder, and cargo cannot tell their binaries apart (it can print `Finished` and leave another checkout's binary in place), so Broadsword notes in state/build-sources/<package> which folder last built each package. When the folder about to be built differs from the note, or there is no note, it first runs `cargo clean -p <package> --offline` for each such package, which DELETES that package's own artifacts in the shared build folder (its binary included; never its dependencies, never source files, never anything outside the build folder) so they are rebuilt from the right source; a package with no note yet is cleaned and rebuilt once. The clean, the note and all the job's cargo steps (tests included) happen under the build lock (state/build.lock), held for the whole job: seconds to many minutes. A second build, test or check job waits up to the build_lock_wait_seconds setting (900 s as shipped) and is then refused with exit code 3 `build folder busy`, having built, cleaned and recorded nothing; repeat it later. That exit 3 comes after the wait even when the holder is a long but legitimate job (a big test run can hold the lock for many minutes), so a waiter may need to repeat the call. WORKSPACE MEMBERS ONLY: the packages cleaned are those of the folder's own workspace (`cargo metadata --no-deps`); a path dependency outside the workspace is neither noted nor cleaned, so a stale copy of it is not covered. The clean only removes regenerable build artifacts, which is why these tools are not marked destructive. On Windows a running binary cannot be deleted: if the clean fails the job stops with exit code 1 before building, and says so (run the installed copy under install_dir, not the one in the build folder)."
+    };
+}
+
 const E0: ExitDoc = ExitDoc { code: "0", meaning: "success" };
 
 pub static TOOLS: &[Tool] = &[
@@ -263,75 +277,79 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "build",
         summary: "Run `cargo build` on a project, with the disk guard and a Git checkpoint.",
-        description: "Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it to compile a project; use `check` to build and test in one go.",
-        params: &[PROJECT],
-        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Cargo's full output is printed as it runs (compiler output on stderr) and also saved to the job log, then the summary follows.",
+        description: concat!("Builds a project with `cargo build --offline` as a recorded job. Before starting it recovers any interrupted earlier jobs, checks the disk guard (it refuses to start if Broadsword is paused or if free space minus job_disk_reserve_gb would be below the floor) and, if the project is a Git repository, takes a Git checkpoint of it (a failed checkpoint only prints a warning and the job runs without one; a project that is not a Git repository is simply run without one). While it runs, free space is polled; if it falls below the floor the job is killed and Broadsword is paused. It does not edit source files. It writes build output to the shared build folder, a log in scratch, a job record in state, the checkpoint refs under refs/broadsword/ in the project's Git data, and cargo may update the project's Cargo.lock. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it to compile a project; use `check` to build and test in one go.", TASK_AND_CLEAN!()),
+        params: &[PROJECT, TASK],
+        outputs: "A `job:` line with the job id and log path, the checkpoint ref, then `--- summary ---` and `build: ok (N s)` or `build: FAILED (exit N)`. Cargo's full output is printed as it runs (compiler output on stderr) and also saved to the job log, then the summary follows. A `source:` line follows the `job:` line (the folder built, relative to root, and the task if any) and a `build source:` line lists the packages; a `cleaned ...` line says which packages had their artifacts deleted from the shared build folder first.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
         changes_files: false,
         destructive: false,
         idempotent: false,
-        cli: "broadsword build <project>",
-        cli_examples: &["build broadsword", "build nope"],
+        cli: "broadsword build <project> [--task <id>]",
+        cli_examples: &["build broadsword", "build nope", "build broadsword --task t-1"],
         parse: |a| match a {
             ["build", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
+            ["build", p, "--task", t] => Some(Inputs::default().with("project", Val::Str((*p).into())).with("task", Val::Str((*t).into()))),
             _ => None,
         },
         mcp_callable: true,
-        to_args: |i| vec!["build".into(), i.str("project").unwrap_or_default().into()],
+        to_args: |i| job_args("build", i),
         handler: |cfg, i| job_tool(cfg, "build", i),
     },
     Tool {
         name: "test",
         summary: "Run `cargo test` on a project, with the disk guard and a Git checkpoint.",
-        description: "Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it when only the test result matters; use `check` for build then test.",
-        params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
+        description: concat!("Runs a project's tests with `cargo test --offline` as a recorded job, with the same recovery, disk guard (refuses when paused or when free space minus the reserve would be below the floor), Git checkpoint (only if the project is a Git repository; otherwise it runs without one) and low-disk kill as `build`. It does not run a separate build first beyond what cargo test itself compiles. It does not edit source files; it writes build output, a log, a job record and checkpoint refs, and cargo may update Cargo.lock. Tests the project runs may of course write their own files. It can run for minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it when only the test result matters; use `check` for build then test.", TASK_AND_CLEAN!()),
+        params: &[PROJECT, TASK],
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and `test: ok — N passed, N failed` or `test: FAILED (exit N) — N passed, N failed`. Cargo's full output is printed as it runs and also saved to the job log, then the summary follows. A `source:` line follows the `job:` line (the folder built, relative to root, and the task if any) and a `build source:` line lists the packages; a `cleaned ...` line says which packages had their artifacts deleted from the shared build folder first.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
         changes_files: false,
         destructive: false,
         idempotent: false,
-        cli: "broadsword test <project>",
-        cli_examples: &["test broadsword", "test nope"],
+        cli: "broadsword test <project> [--task <id>]",
+        cli_examples: &["test broadsword", "test nope", "test broadsword --task t-1"],
         parse: |a| match a {
             ["test", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
+            ["test", p, "--task", t] => Some(Inputs::default().with("project", Val::Str((*p).into())).with("task", Val::Str((*t).into()))),
             _ => None,
         },
         mcp_callable: true,
-        to_args: |i| vec!["test".into(), i.str("project").unwrap_or_default().into()],
+        to_args: |i| job_args("test", i),
         handler: |cfg, i| job_tool(cfg, "test", i),
     },
     Tool {
         name: "check",
         summary: "Build, then test, a project in one job (stops at the first failure).",
-        description: "The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it as the default way to verify a change.",
-        params: &[PROJECT],
-        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Cargo's full output is printed as it runs and also saved to the job log, then the summary follows.",
+        description: concat!("The one command that answers whether a project works: runs `cargo build --offline` and then `cargo test --offline` as a single recorded job, and never tests a build that failed. It has the same recovery, disk guard, Git checkpoint (if a Git repository) and low-disk kill as `build`, and the disk guard is re-checked before each step. It does not edit source files; it writes build output, a log, a job record and checkpoint refs (when the project is a Git repository), and cargo may update Cargo.lock. It can run for many minutes; over MCP the call blocks until it ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code, and the killed job is then left interrupted for `recover` (or the next job's automatic recovery) to resume. Use it as the default way to verify a change.", TASK_AND_CLEAN!()),
+        params: &[PROJECT, TASK],
+        outputs: "A `job:` line, the checkpoint ref, then `--- summary ---` and one line per step (`build: ok (N s)`, `test: ok — N passed, N failed`, or the failure). Cargo's full output is printed as it runs and also saved to the job log, then the summary follows. A `source:` line follows the `job:` line (the folder built, relative to root, and the task if any) and a `build source:` line lists the packages; a `cleaned ...` line says which packages had their artifacts deleted from the shared build folder first.",
         exit_codes: JOB_EXITS,
         read_only: false,
         long_running: true,
         changes_files: false,
         destructive: false,
         idempotent: false,
-        cli: "broadsword check <project>",
-        cli_examples: &["check broadsword", "check nope"],
+        cli: "broadsword check <project> [--task <id>]",
+        cli_examples: &["check broadsword", "check nope", "check broadsword --task t-1"],
         parse: |a| match a {
             ["check", p] => Some(Inputs::default().with("project", Val::Str((*p).into()))),
+            ["check", p, "--task", t] => Some(Inputs::default().with("project", Val::Str((*p).into())).with("task", Val::Str((*t).into()))),
             _ => None,
         },
         mcp_callable: true,
-        to_args: |i| vec!["check".into(), i.str("project").unwrap_or_default().into()],
+        to_args: |i| job_args("check", i),
         handler: |cfg, i| job_tool(cfg, "check", i),
     },
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
         params: &[
             PROJECT,
+            TASK,
             Param {
                 name: "command",
                 ty: Ty::StringArray,
@@ -343,8 +361,8 @@ pub static TOOLS: &[Tool] = &[
         exit_codes: &[
             ExitDoc { code: "0", meaning: "the command exited 0" },
             ExitDoc { code: "1", meaning: "the command exited 1 or failed without a usable code, or Broadsword could not set the job up (log or record could not be written)" },
-            ExitDoc { code: "2", meaning: "Broadsword: unknown project name; or the command itself exited 2" },
-            ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run on this project still needs `recover`); or the command itself exited 3" },
+            ExitDoc { code: "2", meaning: "Broadsword: unknown project name, or with `task` no task with that id; or the command itself exited 2" },
+            ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run on this project still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project); or the command itself exited 3" },
             ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, and is now paused; or the command itself exited 4" },
             ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: Broadsword's own verdict is the last `run:` line (`run: ok` or `run: FAILED (exit N)`) after the final `--- summary ---` line on stdout; the command may print a fake one itself, so only the last counts. If there is no such line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
         ],
@@ -353,17 +371,25 @@ pub static TOOLS: &[Tool] = &[
         changes_files: true,
         destructive: true,
         idempotent: false,
-        cli: "broadsword run <project> -- <command...>",
-        cli_examples: &["run broadsword -- cargo --version", "run nope -- x"],
+        cli: "broadsword run <project> [--task <id>] -- <command...>",
+        cli_examples: &["run broadsword -- cargo --version", "run nope -- x", "run broadsword --task t-1 -- cargo --version"],
         parse: |a| match a {
             ["run", p, "--", cmd @ ..] if !cmd.is_empty() => {
                 Some(Inputs::default().with("project", Val::Str((*p).into())).with("command", Val::List(cmd.iter().map(|s| (*s).into()).collect())))
             }
+            ["run", p, "--task", t, "--", cmd @ ..] if !cmd.is_empty() => Some(
+                Inputs::default().with("project", Val::Str((*p).into())).with("task", Val::Str((*t).into())).with("command", Val::List(cmd.iter().map(|s| (*s).into()).collect())),
+            ),
             _ => None,
         },
         mcp_callable: true,
         to_args: |i| {
-            let mut v = vec!["run".to_string(), i.str("project").unwrap_or_default().into(), "--".into()];
+            let mut v = vec!["run".to_string(), i.str("project").unwrap_or_default().into()];
+            if let Some(t) = i.str("task") {
+                v.push("--task".into());
+                v.push(t.into());
+            }
+            v.push("--".into());
             v.extend(i.list("command").into_iter().map(String::from));
             v
         },
@@ -373,7 +399,7 @@ pub static TOOLS: &[Tool] = &[
             if command.is_empty() {
                 return Err("missing required input `command`".into());
             }
-            Ok(guarded(cfg, project, || job::cmd_run(cfg, project, &command)))
+            Ok(guarded(cfg, project, || job::cmd_run(cfg, project, i.str("task"), &command)))
         },
     },
     Tool {
@@ -481,12 +507,12 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "install",
         summary: "Copy this binary to the stable install location that the MCP server and the pause hook run.",
-        description: "Copies the broadsword binary that is running this command to <install_dir>/broadsword.exe (install_dir is a setting, build/bin as shipped), so the MCP server and Claude Code's pause hook run a file that rebuilding the project never has to overwrite. The copy is atomic (written under a temporary name, then renamed into place). If the installed copy is currently running, which locks it on Windows, it is renamed to broadsword.old-<stamp>.exe first and deleted by a later install once nothing runs it; leftovers that are no longer in use are deleted each time. Run it after `build broadsword` as `build/debug/broadsword.exe install`; a binary that is already the installed one reports `already installed` and does nothing, so over MCP (where the server normally runs the installed copy) it is only useful when the server was started from another binary. It does not touch any project file, job record or setting.",
+        description: "Copies the broadsword binary that is running this command to <install_dir>/broadsword.exe (install_dir is a setting, build/bin as shipped), so the MCP server and Claude Code's pause hook run a file that rebuilding the project never has to overwrite. The copy is atomic (written under a temporary name, then renamed into place). If the installed copy is currently running, which locks it on Windows, it is renamed to broadsword.old-<stamp>.exe first and deleted by a later install once nothing runs it; leftovers that are no longer in use are deleted each time. Run it after `build broadsword` as `build/debug/broadsword.exe install`; a binary that is already the installed one reports `already installed` and does nothing, so over MCP (where the server normally runs the installed copy) it is only useful when the server was started from another binary. It REFUSES (exit code 1, nothing copied) unless the broadsword binary in the build folder was last built from the main checkout of Broadsword: it reads state/build-sources/broadsword, the note every build, test or check keeps, and refuses when the note names a task's worktree (or any folder but the main checkout) or is missing, because the installed copy runs the pause hook and the MCP server for everyone and must never be a worktree's experiment; the message names the folder and says to run `build broadsword` without `task` first. A binary that already is the installed one is exempt. It does not touch any project file, job record or setting.",
         params: &[],
         outputs: "`installed: <path> (N bytes)`, then a line for each old copy renamed aside, removed or still in use; or `already installed: ...` when nothing was to be done.",
         exit_codes: &[
             E0,
-            ExitDoc { code: "1", meaning: "the copy or the rename failed (the previous installed binary is left in place), or the install folder could not be created" },
+            ExitDoc { code: "1", meaning: "refused because the binary in the build folder was not built from the main checkout (or there is no record of what built it): nothing was copied, build the main checkout first; or the copy or the rename failed (the previous installed binary is left in place), or the install folder could not be created" },
         ],
         read_only: false,
         long_running: false,
@@ -940,9 +966,9 @@ fn required_by_shape(sub: &str, name: &str) -> bool {
 /// The exit codes shared by build, test and check.
 const JOB_EXITS: &[ExitDoc] = &[
     ExitDoc { code: "0", meaning: "every step succeeded" },
-    ExitDoc { code: "1", meaning: "a step failed (see the log), or the job could not be set up (log or record could not be written)" },
-    ExitDoc { code: "2", meaning: "unknown project name; stderr lists the known projects" },
-    ExitDoc { code: "3", meaning: "refused: Broadsword is paused, free disk minus the reserve is below the floor, or an earlier interrupted run on this project still needs `recover`" },
+    ExitDoc { code: "1", meaning: "a step failed (see the log), or the job could not be set up (log or record could not be written; or `cargo metadata` or `cargo clean -p` failed, so the shared build folder could not be made safe and nothing was built)" },
+    ExitDoc { code: "2", meaning: "unknown project name (stderr lists the known projects), or with `task` no task with that id" },
+    ExitDoc { code: "3", meaning: "refused, nothing built or cleaned: Broadsword is paused, free disk minus the reserve is below the floor, an earlier interrupted run on this project still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project; or the build lock was not free within build_lock_wait_seconds (`build folder busy`: repeat later)" },
     ExitDoc { code: "4", meaning: "killed: free disk fell below the floor while the job ran, and Broadsword is now paused" },
 ];
 
@@ -1090,7 +1116,17 @@ fn guarded(cfg: &Config, project: &str, job: impl FnOnce() -> ExitCode) -> ExitC
 
 fn job_tool(cfg: &Config, kind: &str, i: &Inputs) -> Result<ExitCode, String> {
     let project = i.require("project")?;
-    Ok(guarded(cfg, project, || job::cmd_job(cfg, kind, project)))
+    Ok(guarded(cfg, project, || job::cmd_job(cfg, kind, project, i.str("task"))))
+}
+
+/// The command line of a build, test or check call: `<kind> <project> [--task <id>]`.
+fn job_args(kind: &str, i: &Inputs) -> Vec<String> {
+    let mut v = vec![kind.to_string(), i.str("project").unwrap_or_default().into()];
+    if let Some(t) = i.str("task") {
+        v.push("--task".into());
+        v.push(t.into());
+    }
+    v
 }
 
 fn cmd_tools(name: Option<&str>, as_json: bool) -> ExitCode {

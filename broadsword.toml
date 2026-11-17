@@ -40,3 +40,6 @@ task_lock_wait_seconds = 10     # a task command waits at most this long for the
 
 # Worktrees (broadsword task start --worktree | broadsword worktree ...): one Git worktree per task at <worktrees_dir>/<project>/<task id>, on branch task/<task id>
 worktrees_dir = "worktrees"     # inside root; not inside scratch, build or state (a worktree holds unmerged work). Git-ignored. After moving the project run `broadsword worktree repair`
+
+# Shared build folder (build|test|check --task): state/build-sources/<package> notes which checkout last built each package into build_dir; state/build.lock makes "clean the package, record the source, build" one step across processes
+build_lock_wait_seconds = 900   # a build/test/check job holds the build lock for all its cargo steps (minutes); a second job waits at most this long, then is refused with exit 3 "build folder busy" having built and cleaned nothing. Sized to outlast one long `check`
