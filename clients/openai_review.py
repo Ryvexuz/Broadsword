@@ -12,7 +12,8 @@ the queue's scrub drops only secret-named variables, so they survive.
 
 The key comes from the OPENAI_API_KEY environment variable, else the main root's `.env` (the loader in openai_mcp.py).
 Optional environment: OPENAI_BASE_URL (tests point it at a local fake server), OPENAI_PRICE_INPUT_PER_MTOK and
-OPENAI_PRICE_OUTPUT_PER_MTOK (USD per million tokens; both needed for a cost), OPENAI_REVIEW_TIMEOUT (seconds, default 600).
+OPENAI_PRICE_OUTPUT_PER_MTOK (USD per million tokens; both needed for a cost), OPENAI_REVIEW_TIMEOUT (seconds, ONE deadline for the whole call,
+default 240, inside the queue's 300 s shadow limit; codex gets at most 60% of it, the API fallback the rest).
 """
 
 import sys
@@ -26,6 +27,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,47 +75,94 @@ def find_codex(environ):
 
 
 def timeout_of(environ) -> float:
+    """The ONE deadline for the whole call (codex plus the API fallback). The default sits inside the queue's
+    shadow_reviewer_timeout_seconds (300 in broadsword.toml): the queue passes no timeout to this wrapper, it only kills it at that
+    limit, so the wrapper must finish and print its JSON before then."""
     try:
-        return float(environ.get("OPENAI_REVIEW_TIMEOUT", "600"))
+        return float(environ.get("OPENAI_REVIEW_TIMEOUT", "240"))
     except ValueError:
-        return 600.0
+        return 240.0
 
 
-def review_codex(args, prompt: str, environ) -> dict:
+# Codex may use at most this share of the overall deadline, so a hung codex still leaves the API fallback real time to answer.
+CODEX_SHARE = 0.6
+# The API fallback needs at least this many seconds; with less it fails with a clear error instead of starting a doomed call.
+MIN_API_SECONDS = 5.0
+
+
+def kill_tree(p) -> None:
+    """Kill the process and everything it started. On Windows codex is a codex.cmd, so killing only the pid leaves the node
+    grandchild alive, still holding the output pipes."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, timeout=20)
+        else:
+            os.killpg(p.pid, 9)  # started with start_new_session=True, so the pid is the group id
+    except Exception:
+        pass
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def run_with_deadline(cmd, text_in: str, work: str, environ, budget: float):
+    """Run cmd with a hard time limit that really holds: returns (returncode, stdout, stderr), or raises oc.Fail on timeout/start error."""
+    kw = {} if os.name == "nt" else {"start_new_session": True}
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=work, env=dict(environ), **kw)
+    except OSError as e:
+        raise oc.Fail(f"codex could not start: {type(e).__name__}")
+    try:
+        out, err = p.communicate(input=text_in, timeout=max(budget, 0.1))
+    except subprocess.TimeoutExpired:
+        kill_tree(p)
+        try:
+            p.communicate(timeout=5)
+        except Exception:  # still blocked on a pipe: give up on its output
+            for f in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if f:
+                        f.close()
+                except Exception:
+                    pass
+        raise oc.Fail(f"codex timed out after {budget:.0f} s")
+    return p.returncode, out, err
+
+
+def review_codex(args, prompt: str, environ, deadline: float) -> dict:
     """Answer through the Codex CLI (the ChatGPT plan). Raises oc.Fail with a short reason when it cannot."""
     exe = find_codex(environ)
     if exe is None:
         raise oc.Fail("codex executable not found")
     text_in = (f"=== SYSTEM INSTRUCTIONS ===\n{args.system_prompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n" if args.system_prompt else "") + prompt
+    budget = min(timeout_of(environ) * CODEX_SHARE, deadline - time.monotonic())
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
         cmd = [exe, "exec", "-m", args.model, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", str(answer), "-"]
-        try:
-            p = subprocess.run(cmd, input=text_in, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=work, env=dict(environ), timeout=timeout_of(environ))
-        except subprocess.TimeoutExpired:
-            raise oc.Fail("codex timed out")
-        except OSError as e:
-            raise oc.Fail(f"codex could not start: {type(e).__name__}")
-        if p.returncode != 0:
-            raise oc.Fail(f"codex exited with code {p.returncode}: {(p.stderr or '').strip()[-200:]}")
+        code, stdout, stderr = run_with_deadline(cmd, text_in, work, environ, budget)
+        if code != 0:
+            raise oc.Fail(f"codex exited with code {code}: {(stderr or '').strip()[-200:]}")
         text = answer.read_text(encoding="utf-8", errors="replace") if answer.is_file() else ""
     if not text.strip():
         raise oc.Fail("codex answer is empty")
-    usage = {}
-    for line in (p.stdout or "").splitlines():
+    usage = None
+    for line in (stdout or "").splitlines():
         try:
             ev = json.loads(line)
         except ValueError:
             continue
         if isinstance(ev, dict) and ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
             usage = ev["usage"]
+    if not usage:  # never report zero usage as real data
+        raise oc.Fail("codex output has no parseable turn.completed event with usage")
     tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
     return {
         "type": "result",
         "is_error": False,
         "result": oc.redact(text),
         "total_cost_usd": None,
-        "usage": dict(usage) if usage else {"input_tokens": 0, "output_tokens": 0},
+        "usage": dict(usage),
         "modelUsage": {args.model: {"inputTokens": tin, "outputTokens": tout}},
         "model_reported": False,
         "backend": "codex",
@@ -121,12 +170,13 @@ def review_codex(args, prompt: str, environ) -> dict:
 
 
 def review(args, prompt: str, environ) -> dict:
+    deadline = time.monotonic() + timeout_of(environ)
     try:
-        return review_codex(args, prompt, environ)
+        return review_codex(args, prompt, environ, deadline)
     except Exception as e:  # any codex failure falls back, and is recorded
         codex_error = oc.redact(f"{type(e).__name__}: {e}" if not isinstance(e, oc.Fail) else str(e))[:400]
     try:
-        result = review_api(args, prompt, environ)
+        result = review_api(args, prompt, environ, deadline - time.monotonic())
     except oc.Fail as e:
         result = error_result(str(e))
     except Exception as e:
@@ -136,16 +186,19 @@ def review(args, prompt: str, environ) -> dict:
     return result
 
 
-def review_api(args, prompt: str, environ) -> dict:
+def review_api(args, prompt: str, environ, remaining: float) -> dict:
+    """The API fallback, given what is left of the one overall deadline. No retries: a retry could run past the deadline."""
+    if remaining < MIN_API_SECONDS:
+        raise oc.Fail(f"only {max(remaining, 0):.1f} s of the {timeout_of(environ):.0f} s deadline remain, under the {MIN_API_SECONDS:.0f} s the API needs")
     root = oc.find_main_root(HERE)
     key = oc.load_api_key(root, environ)
     base = environ.get("OPENAI_BASE_URL") or oc.DEFAULT_BASE_URL
-    timeout = timeout_of(environ)
+    timeout = remaining
     messages = []
     if args.system_prompt:
         messages.append({"role": "system", "content": args.system_prompt})
     messages.append({"role": "user", "content": prompt})
-    resp = oc.chat_completion(base, key, {"model": args.model, "messages": messages}, timeout, 1.0)
+    resp = oc.chat_completion(base, key, {"model": args.model, "messages": messages}, timeout, 1.0, retries=0)
     choice = resp["choices"][0]
     text = choice["message"].get("content")
     text = text if isinstance(text, str) else ""

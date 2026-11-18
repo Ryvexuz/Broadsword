@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,8 +53,16 @@ json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd()}, open(os.path.join(
 sys.stderr.write("unrelated MCP connection error\n")
 if mode == "fail":
     sys.exit(1)
+if mode == "hang":
+    import subprocess, time
+    # a grandchild that inherits the output pipes and outlives the timeout, like node behind codex.cmd
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(25)"], stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+    time.sleep(60)
 out = args[args.index("-o") + 1]
 open(out, "w", encoding="utf-8").write("" if mode == "empty" else "VERDICT: FAIL\nBLOCKING: add is wrong\nMINOR: none")
+if mode == "garbage":
+    print("this is not json")
+    sys.exit(0)
 print(json.dumps({"type": "thread.started"}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 7, "reasoning_output_tokens": 3}}))
 '''
@@ -197,6 +206,36 @@ class ReviewTests(unittest.TestCase):
                 self.assertIn(needle, j["codex_error"])
                 self.assertFalse(j["is_error"])
                 self.assertEqual(len(Fake.seen), 1)
+
+    def test_garbage_codex_output_falls_back_and_records_why(self):
+        p = self.run_script(codex="garbage")
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(j["backend"], "api")
+        self.assertIn("turn.completed", j["codex_error"])
+        self.assertEqual(len(Fake.seen), 1)
+
+    def test_hung_codex_with_a_grandchild_times_out_and_falls_back_within_one_deadline(self):
+        t0 = time.monotonic()
+        p = self.run_script(codex="hang", env={"OPENAI_REVIEW_TIMEOUT": "20"})
+        elapsed = time.monotonic() - t0
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(j["backend"], "api")
+        self.assertIn("timed out", j["codex_error"])
+        self.assertEqual(len(Fake.seen), 1)
+        self.assertLess(elapsed, 22, "codex timeout plus API fallback stay inside the one 20 s deadline (plus start-up)")
+
+    def test_api_fallback_fails_clearly_when_under_five_seconds_remain(self):
+        t0 = time.monotonic()
+        p = self.run_script(codex="hang", env={"OPENAI_REVIEW_TIMEOUT": "6"})  # codex gets 3.6 s, 2.4 s remain
+        elapsed = time.monotonic() - t0
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertTrue(j["is_error"] and "remain" in j["result"], j)
+        self.assertIn("timed out", j["codex_error"])
+        self.assertEqual(Fake.seen, [], "the API was not called")
+        self.assertLess(elapsed, 8)
 
     def test_both_failing_is_an_error_that_records_both(self):
         Fake.status = 401
