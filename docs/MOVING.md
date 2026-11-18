@@ -38,7 +38,7 @@ Broadsword is portable by design: every path is relative to the project root, an
 
 ## The 128 GB unified-memory PC
 
-That PC's 128 GB is shared between the CPU and the GPU, and the split (for example 64/64) is set in that PC's BIOS (the UMA frame buffer or GPU memory size setting). It is quick to change, so pick the split that fits the work at the time. Windows only reports the CPU's share as RAM.
+That PC's 128 GB is shared between the CPU and the GPU, and the split (for example 64/64) is set in that PC's BIOS (the UMA frame buffer or GPU memory size setting). It is quick to change, so pick the split that fits the work at the time. It may be on an auto mode. Usually that means the GPU gets a small fixed share, and Windows lends it more system RAM on demand, so most of the 128 GB shows up as system RAM. Task Manager shows this as a small "dedicated" and a large "shared" GPU memory. If so, the RAM gate already counts what the GPU borrows, because it measures used RAM. Confirm on the PC before relying on it. Windows only reports the CPU's share as RAM.
 
 1. **Check the split.** Task Manager → Performance: Memory shows the system share and GPU shows the dedicated share. Or run `systeminfo | findstr Memory`.
 2. **What Broadsword needs:** coders, cargo builds and test runs use system RAM. The GPU share only matters for local models (Stage 2's optional local model) and later GPU rendering. With no local model planned yet, a system-heavy split such as 96/32 runs more agents. Keep a big GPU share only if a local model is coming soon. Lazlo decides.
