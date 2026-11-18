@@ -288,14 +288,75 @@ fn a_second_run_in_the_same_folder_cleans_nothing_and_the_built_file_survives() 
     assert!(!o.stdout.contains("cleaned"), "no clean in the same folder: {}", o.stdout);
     assert!(exe.is_file(), "the program built by the first run is still there");
     assert_eq!(r.note().as_deref(), Some("run:projects/proj"));
-    // a build in the same folder afterwards needs no clean either, and its note is plain (vouched) again
+    // the first plain build in the same folder afterwards cleans once (a run may have replaced the exe), and its note is plain again
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("a `run` in this folder"), "{}", o.stdout);
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+    assert_eq!(r.probe(), "MARK-main");
+    // a second plain build needs no clean
     let o = r.ok(&["build", "proj"]);
     assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
-    assert_eq!(r.note().as_deref(), Some("projects/proj"));
     // and a run after that goes back to a `run:` note without a clean
     let o = r.ok(&["run", "proj", "--", &check]);
     assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
     assert_eq!(r.note().as_deref(), Some("run:projects/proj"));
+}
+
+/// A `run` may replace the built exe while cargo's fingerprint stays fresh. The first plain build afterwards must rebuild it.
+#[test]
+fn the_first_plain_build_after_a_run_rebuilds_an_exe_the_run_replaced() {
+    let r = Root::new("runreplace", 120);
+    let t1 = r.task("a", "MARK-t1");
+    r.ok(&["build", "proj", "--task", &t1]);
+    assert_eq!(r.probe(), "MARK-t1");
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let saved = r.scratch("t1-exe");
+    fs::copy(&exe, &saved).unwrap(); // a different, working markprobe
+    r.ok(&["build", "proj"]);
+    assert_eq!(r.probe(), "MARK-main");
+    let copy = if cfg!(windows) { format!("copy /Y \"{}\" \"{}\"", saved.display(), exe.display()) } else { format!("cp '{}' '{}'", saved.display(), exe.display()) };
+    r.ok(&["run", "proj", "--", &copy]);
+    assert_eq!(r.probe(), "MARK-t1", "the run really replaced the exe");
+    assert_eq!(r.note().as_deref(), Some("run:projects/proj"));
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-main", "the exe was rebuilt, not the one the run left");
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+}
+
+/// If `cargo metadata` fails before a `run` (a broken Cargo.toml) the run still marks the folder, and what it builds is
+/// never installable: a package name it can read gets a `run:` note; otherwise a folder marker that the next plain build clears.
+#[test]
+fn a_run_in_a_folder_whose_packages_cannot_be_listed_still_marks_it() {
+    for (broken, expect_note) in [("[package]
+name = \"markprobe\"
+version = 
+", true), ("this is not toml at all
+", false)] {
+        let r = Root::new("runbroken", 120);
+        r.ok(&["build", "proj"]);
+        assert_eq!(r.note().as_deref(), Some("projects/proj"));
+        let proj = r.dir.join("projects/proj");
+        let good = r.scratch("Cargo.good");
+        fs::copy(proj.join("Cargo.toml"), &good).unwrap();
+        fs::write(proj.join("Cargo.toml"), broken).unwrap();
+        let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml && cargo build --offline", good.display()) } else { format!("cp '{}' Cargo.toml && cargo build --offline", good.display()) };
+        let o = r.ok(&["run", "proj", "--", &fix]);
+        assert!(o.stdout.contains("not checked"), "{}", o.stdout);
+        let marker = r.dir.join("state/build-sources/unlisted-run.marker");
+        if expect_note {
+            assert_eq!(r.note().as_deref(), Some("run:projects/proj"), "{}", o.stdout);
+            assert!(!marker.exists());
+        } else {
+            assert!(marker.is_file(), "no name could be found, so the folder is marked: {}", o.stdout);
+        }
+        // a plain build clears whatever the run left and vouches again
+        let o = r.ok(&["build", "proj"]);
+        assert!(o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+        assert!(!marker.exists());
+        assert_eq!(r.note().as_deref(), Some("projects/proj"));
+        assert_eq!(r.probe(), "MARK-main");
+    }
 }
 
 /// `run` holds the build lock for its whole command.

@@ -308,15 +308,18 @@ fn a_kill_when_already_paused_does_not_blame_the_disk() {
     r.project("slow", TWO_TESTS, Some("fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }
 "));
     let hook = r.dir.join("scratch/free.txt");
-    // the pause appears while the job runs (the guard at the start saw none): write it from the hook's first huge sample on
-    fs::write(&hook, "99999999999999 0 0 99999999999999").unwrap();
+    // Deterministic order: the hook says "plenty free" until the pause file is in place; only THEN is it rewritten to "0",
+    // so no poll can see a low disk before the pause exists (the hook file is re-read on every poll).
+    fs::write(&hook, "99999999999999").unwrap();
     let mut child = r.cmd(&["build", "slow"]).env(HOOK, &hook).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let end = Instant::now() + Duration::from_secs(50);
-    while Instant::now() < end && child.try_wait().unwrap().is_none() && !r.dir.join("broadsword.paused").exists() {
-        // wait until the job started its cargo child (the build folder exists), then pause by hand
+    while Instant::now() < end && child.try_wait().unwrap().is_none() {
+        // wait until the job started its cargo child (the build folder exists), then pause by hand, then drop the free space
         if r.dir.join("build").exists() {
             fs::write(r.dir.join("broadsword.paused"), "reason: paused by hand
 ").unwrap();
+            fs::write(&hook, "0").unwrap();
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }

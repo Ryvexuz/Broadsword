@@ -16,7 +16,9 @@
 //!
 //! A `run` job (arbitrary command, may build anything) writes the note `run:<folder>` instead: the same folder part, so a
 //! later job in that folder needs no clean, but never exactly `.`, so `install` refuses it. A build, test or check in the
-//! same folder turns the note back into the plain folder (cargo then rebuilds what is out of date and vouches for it).
+//! same folder first runs `cargo clean -p` once for a package with a `run:` note (the run may have replaced the built exe
+//! while cargo's fingerprint stays fresh), then writes the plain folder note. A `run` whose packages cannot be listed notes
+//! the `[package] name` it can read, else leaves a folder marker that `install` refuses and the next plain build clears.
 //!
 //! Clean, note and build are one step across processes: the job holds `state/build.lock` (an OS file lock, lock.rs) for
 //! all of its cargo steps. Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
@@ -234,13 +236,70 @@ pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, Strin
 pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
     match packages_of(dir) {
         Ok(packages) => Ok(prepare_packages(cfg, dir, source, packages, true)?.lines),
-        Err(e) => Ok(vec![format!("build source: not checked (the stale-binary protection is skipped for this run): {e}")]),
+        Err(e) => {
+            // The packages cannot be listed (a broken Cargo.toml the command may be there to repair), but whatever the command
+            // builds must still never be installable: note every package name still findable, else mark the whole folder.
+            let wanted = format!("{RUN_NOTE_PREFIX}{source}");
+            let names = manifest_package_names(dir);
+            let how = if names.is_empty() {
+                write_unlisted_marker(cfg, source)?;
+                "no package name found, so the folder is marked (`install` refuses until a plain build)".to_string()
+            } else {
+                for n in &names {
+                    write_note(cfg, n, &wanted)?;
+                }
+                format!("noted `{wanted}` for {}", names.join(", "))
+            };
+            Ok(vec![format!("build source: not checked (the stale-binary protection is skipped for this run; {how}): {e}")])
+        }
     }
+}
+
+/// File name of the folder-level marker a `run` leaves when its packages could not be listed and none could be named.
+pub const UNLISTED_MARKER: &str = "unlisted-run.marker";
+
+fn write_unlisted_marker(cfg: &Config, source: &str) -> Result<(), String> {
+    let dir = notes_dir(cfg);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(UNLISTED_MARKER);
+    std::fs::write(&path, format!("{RUN_NOTE_PREFIX}{source}\n")).map_err(|e| format!("cannot write the build-source marker {}: {e}", path.display()))
+}
+
+/// The `[package] name` of `dir/Cargo.toml`, read line by line (the file may be too broken for cargo). Empty if none.
+fn manifest_package_names(dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else { return Vec::new() };
+    let mut in_package = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_package = l.starts_with("[package]");
+        } else if in_package {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "name" {
+                    let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if valid_package(v) {
+                        return vec![v.to_string()];
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>, as_run: bool) -> Result<Prepared, String> {
     let notes: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).collect();
-    let stale: Vec<(String, Option<String>)> = notes.iter().filter(|(_, n)| n.as_deref().map(note_folder) != Some(source)).cloned().collect();
+    // A plain build also cleans a package whose note is `run:<this folder>` (the run may have replaced the built exe while
+    // cargo's fingerprint stays fresh), and every package when a run left a folder-level marker.
+    let marker = notes_dir(cfg).join(UNLISTED_MARKER);
+    let marked = !as_run && marker.exists();
+    let stale: Vec<(String, Option<String>)> = notes
+        .iter()
+        .filter(|(_, n)| {
+            n.as_deref().map(note_folder) != Some(source) || (!as_run && (marked || n.as_deref().is_some_and(|x| x.starts_with(RUN_NOTE_PREFIX))))
+        })
+        .cloned()
+        .collect();
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
@@ -256,9 +315,13 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
         }
         write_note(cfg, p, &wanted)?;
         lines.push(match was {
+            Some(w) if w.starts_with(RUN_NOTE_PREFIX) && note_folder(w) == source => format!("cleaned `{p}` in the shared build folder (a `run` in this folder may have replaced its binary); its dependencies were kept"),
             Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {}); its other packages and all dependencies were kept", note_folder(w)),
             None => format!("cleaned `{p}` in the shared build folder (no record of what built it); its dependencies were kept"),
         });
+    }
+    if marked {
+        std::fs::remove_file(&marker).map_err(|e| format!("cannot remove the build-source marker {}: {e}", marker.display()))?;
     }
     // same folder: no clean; only the note's kind may change (run -> vouched by a build step, or a build -> run)
     for (p, was) in &notes {
@@ -275,6 +338,12 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
 /// pause hook and the MCP server for everyone. Reads the same note. Err = the message to print (exit 1).
 pub fn check_installable(cfg: &Config) -> Result<(), String> {
     let pkg = env!("CARGO_PKG_NAME");
+    if notes_dir(cfg).join(UNLISTED_MARKER).exists() {
+        return Err(format!(
+            "refusing to install: a `run` whose packages could not be listed left a folder-level marker ({}), so the `{pkg}` binary in the build folder may be its. Build the main checkout first (`broadsword build {pkg}`, with no --task), then run `install` from the binary it built",
+            notes_dir(cfg).join(UNLISTED_MARKER).display()
+        ));
+    }
     match read_note(cfg, pkg) {
         Some(s) if s == MAIN_SOURCE => Ok(()),
         Some(run) if run.starts_with(RUN_NOTE_PREFIX) => Err(format!(

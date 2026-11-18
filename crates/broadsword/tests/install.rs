@@ -223,3 +223,47 @@ fn install_refuses_a_running_binary_that_is_not_the_main_roots_build_output() {
     assert!(err.contains("running binary is") && err.contains("vouches only for"), "{err}");
     assert!(!r.target().exists());
 }
+
+/// A `run` whose packages cannot be listed (a broken Cargo.toml it repairs) must still leave a mark that `install` refuses,
+/// both when a package name can be read (a `run:` note) and when none can (a folder marker).
+#[test]
+fn install_is_refused_after_a_run_whose_packages_could_not_be_listed() {
+    for (broken, want) in [("[package]
+name = \"broadsword\"
+version = 
+", "a `run`"), ("not toml
+", "marker")] {
+        let r = Root::new("runbroken", "build/bin");
+        let p = r.dir.clone(); // the project `broadsword` is the root itself
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join(".gitignore"), "scratch
+build
+state
+target
+").unwrap();
+        let good = "[package]
+name = \"broadsword\"
+version = \"0.0.0\"
+edition = \"2021\"
+
+[workspace]
+";
+        fs::write(r.dir.join("scratch/Cargo.good"), good).unwrap();
+        fs::write(p.join("src/main.rs"), "fn main() {}
+").unwrap();
+        fs::write(p.join("Cargo.toml"), broken).unwrap();
+        for args in [&["init", "-q"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["config", "core.autocrlf", "false"], &["add", "-A"], &["commit", "-q", "-m", "init"]] {
+            assert!(Command::new("git").args(args).current_dir(&p).output().unwrap().status.success(), "git {args:?}");
+        }
+        let exe = r.exe(); // note is "." (vouched) before the run
+        let good_path = PathBuf::from(fs::canonicalize(r.dir.join("scratch/Cargo.good")).unwrap().to_string_lossy().trim_start_matches(r"\?\"));
+        let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml", good_path.display()) } else { format!("cp '{}' Cargo.toml", good_path.display()) };
+        let o = r.run(&exe, &["run", "broadsword", "--", &fix]);
+        assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+        let o = r.run(&exe, &["install"]);
+        assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(err.contains("refusing to install") && err.contains(want), "{err}");
+        assert!(!r.target().exists(), "nothing was copied");
+    }
+}

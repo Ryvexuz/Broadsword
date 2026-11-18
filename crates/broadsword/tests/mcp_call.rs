@@ -221,6 +221,26 @@ fn status_runs_through_mcp() {
     assert_eq!(s.finish(), 0);
 }
 
+/// A real child launch for free-text values: a title that starts with `-` and spans two lines goes through the MCP server,
+/// the real command line (Windows quoting included) and the child `broadsword task add`, and lands in the board record with
+/// whitespace collapsed the way the board does it.
+#[test]
+fn task_add_through_a_real_server_keeps_a_dash_and_two_line_title_intact() {
+    let root = Root::new("freetext", 600, 1024);
+    root.project("alpha", PASSING, false);
+    let tasks = root.dir.join("state/tasks");
+    let mut s = Server::start(root);
+    s.init("2025-06-18");
+    let r = s.tool(2, "task_add", r#"{"project":"alpha","title":"- fix \"x\"\n  - and   y","claims":["src"]}"#);
+    assert!(!is_error(&r), "{}", r.to_json());
+    assert_eq!(exit_code(&r), "0", "{}", r.to_json());
+    let id = structured(&r).get("stdout").and_then(J::str).unwrap().trim().to_string();
+    assert!(id.starts_with("t-"), "{id}");
+    let rec = fs::read_to_string(tasks.join(format!("{id}.task"))).unwrap();
+    assert!(rec.lines().any(|l| l == "title = - fix \"x\" - and y"), "title arrived intact, whitespace collapsed:\n{rec}");
+    assert_eq!(s.finish(), 0);
+}
+
 #[test]
 fn projects_runs_in_the_main_root() {
     let root = Root::new("projects", 600, 1024);
