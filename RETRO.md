@@ -93,6 +93,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 | Shadow second reviewer (gpt-5.6-sol), recorded only | Learn whether a GPT reviewer catches what Claude misses, at what cost and time | `scripts/shadow_report.py` agreement and unique findings | Shadow time making entries stale (Opus minor); OpenAI spend | open |
 | S4 | Blind re-labelling for benchmark scores (anonymised, shuffled lines) | Fair scores despite wording differences | Score changes vs the pattern scorer (gpt-6.2-sol 5 → 9) | The labeller is a Claude model, so a contestant (it was blinded) | helped |
 | S4 | Codex CLI first for OpenAI calls (ChatGPT weekly allowance), API as fallback | No API spend for shadow reviews and benchmarks | `backend` field in shadow results | Codex's ~18.5k-token prompt overhead per call; plan rate limits | open |
+| S4 | Adjudicate every shadow-only finding (independent judge, recorded verdict), Lazlo's rule | Know how right the shadow is, and catch bugs the gating reviewer missed | Shadow precision and gating misses from `shadow_report.py` | Judge time per merge; verdicts by a Claude judge favouring Claude | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
