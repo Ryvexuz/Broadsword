@@ -31,3 +31,9 @@ Ideas outside the current stage go here, not into code. Each one names the stage
   - An old record whose `ignored_skipped` names `.env` still reports it as not restored.
   - `secret_skipped` is `|`-joined, so a file name containing `|` or a newline corrupts the record (as `ignored_skipped` already can).
 - **Audit follow-up:** tests that create scratch roots must remove them. Leftovers block worktree removal; this has happened twice now. Move this up.
+- **Audit follow-up (Opus minors on `6214267`):**
+  - If `cargo metadata` fails before a `run` (for example a broken Cargo.toml), no `run:` note is written. The command may fix it and build, leaving main's `.` note over a worktree binary, which `install` would then accept. Write a `run:` note for the folder even when the packages can't be listed.
+  - A `run:` note becomes plain after a same-folder build with no clean, so a file a `run` copied over the built exe could become installable. Either force a clean on the first plain build after a `run:` note, or soften the description.
+  - `a_kill_when_already_paused_does_not_blame_the_disk` races the 1 s disk poll.
+  - The free-text MCP test only round-trips in-process. Add one real child launch with a multi-line title.
+
