@@ -1,0 +1,81 @@
+# Crash sim physics
+
+This describes the model in `src/lib.rs`, which is the source of truth. Units are SI (metres, kilograms, seconds, newtons). Everything is deterministic: no random numbers, fixed update order.
+
+## The cube: 8 nodes, 28 beams
+
+Each node is a point mass of `NODE_MASS` = 1.0 kg. Node `i` (0 to 7) sits at a corner of a cube of side `edge` (default 1.0 m), centred on the origin. Bit 0 of `i` picks the x side, bit 1 the y side, bit 2 the z side.
+
+Every pair of nodes is joined by a beam: 8 * 7 / 2 = 28. They group by how many bits the two node indices differ in:
+
+| Bits differing | Kind | Count | Rest length |
+|---|---|---|---|
+| 1 | cube edge | 12 | `edge` |
+| 2 | face diagonal | 12 | `edge` * sqrt(2) |
+| 3 | body diagonal | 4 | `edge` * sqrt(3) |
+
+A beam's rest length is the distance between its nodes at the start (after tilt and drop placement; rotation does not change distances). Each node has 7 beams.
+
+Start state: if `tilt` is on (default), the cube is rotated `TILT_DEG` = 5 degrees about x, then 5 degrees about z. It is then moved up so the lowest node is exactly `drop_height` (default 2.0 m) above the ground. All velocities start at zero.
+
+## Beam force
+
+For a beam from node a to node b, let `d = pos_b - pos_a`, `len = |d|`, `dir = d / len`, and `rel_v = (vel_b - vel_a) . dir` (speed at which the ends separate). The force magnitude is
+
+    mag = BEAM_STIFFNESS * (len - rest) + BEAM_DAMPING * rel_v
+
+with `BEAM_STIFFNESS` = 20000 N/m and `BEAM_DAMPING` = 20 N*s/m. The first term is a spring (Hooke's law); the second is a damper that resists the ends moving apart or together. The force `dir * mag` is added to node a and its negative to node b, so a stretched beam pulls its ends together. A beam shorter than 1e-12 m is skipped to avoid dividing by zero.
+
+## Gravity
+
+Each node gets a downward force of `gravity * NODE_MASS`. The default `gravity` is `GRAVITY` = 9.81 m/s^2; it is a config value (the code comments mention Moon 1.62 and Mars 3.71).
+
+## Ground contact
+
+The ground is the plane y = 0. After a node's position is updated, if `y < 0`:
+
+1. The node is put back at y = 0.
+2. If it is moving down with speed `vy`: when `-vy > REST_SPEED` (0.2 m/s) its vertical velocity becomes `-vy * RESTITUTION` (`RESTITUTION` = 0.5, so it keeps half its downward speed, now upward). Otherwise the vertical velocity is set to 0 (resting contact, no bounce).
+3. Horizontal velocity (x and z) is multiplied by `max(0, 1 - FRICTION_RATE * h)`, where `FRICTION_RATE` = 5.0 per second and `h` is the substep. This is a simple speed-loss rate, not Coulomb friction: it does not depend on how hard the node presses on the ground.
+
+Contact only triggers when a node ends a substep below the ground. Beams are never in contact with the ground, only nodes.
+
+## Integrator: symplectic Euler with substeps
+
+One output step of `dt` (default 0.01 s) is split into `substeps` (default 10) physics substeps of `h = dt / substeps` (default 1 ms). In each substep:
+
+1. Compute all forces (gravity and beams) from the current state.
+2. `vel += force * (h / NODE_MASS)`.
+3. `pos += vel * h`, using the new velocity (this ordering is what "symplectic" or semi-implicit means; it keeps oscillation energy from growing the way plain Euler does).
+4. Apply ground contact as above.
+
+### Why the step limit is what it is
+
+A spring with angular frequency `omega` = sqrt(k/m) is stable under symplectic Euler only if `omega * h < 2`. The stiffest vibration of the cube bounds this. With 7 beams per node, Gershgorin's circle theorem gives a largest eigenvalue of the stiffness matrix of at most `2 * 7 * k / m`, so
+
+    omega_max <= sqrt(14 * BEAM_STIFFNESS / NODE_MASS) = sqrt(280000) = about 529 rad/s
+    max_stable_step() = 2 / omega_max = about 0.00378 s
+
+`Config::validate()` refuses to run when `dt / substeps` is larger than `max_stable_step()`, and tells you to raise `--substeps` or lower `--dt`. It also rejects non-finite values, `dt <= 0`, `duration < 0`, `substeps < 1`, `drop_height < 0`, and `gravity <= 0`. The default 1 ms substep is about a quarter of the limit. The damper is separately stable as long as `BEAM_DAMPING * h / NODE_MASS` stays well below about 1; at the default it is 0.02. This damping condition is only described in a code comment, not checked by `validate()`.
+
+## CSV output
+
+`run` returns one sample at t = 0 and one after each output step. The step count is `round(duration / dt)`, so the last row can differ from `duration` by up to `dt / 2`. `to_csv` writes the header `t,min_y,center_y,max_beam_strain` (`CSV_HEADER`) and one row per sample:
+
+| Column | Meaning | Decimals |
+|---|---|---|
+| `t` | time in seconds (step number * `dt`) | 4 |
+| `min_y` | height of the lowest node, metres | 6 |
+| `center_y` | mean y of all 8 nodes, metres | 6 |
+| `max_beam_strain` | largest beam strain over all 28 beams | 6 |
+
+Strain of a beam is `|len - rest| / rest`, so 0.01 means 1% off its rest length.
+
+## Safety checks
+
+After every output step (not every substep), `Sim::check()` fails the run if:
+
+- any node position or velocity component is NaN or infinite;
+- the max strain is NaN, or exceeds `MAX_STRAIN_LIMIT` = 0.5 (50%). The strain calculation propagates NaN, so a blown-up state can never read as 0.
+
+`run_checked` then stops and returns the good samples so far plus an error reading `unstable at t = ... s: ...`. A config refused by `validate()` returns no samples and the validation error. `run` is the same but panics on any error.
