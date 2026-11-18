@@ -396,7 +396,7 @@ fn save_record(rec: &Record) -> Result<(), String> {
 
 /// Record the final status and return `code`. A record that cannot be written is an error: the job
 /// then exits `EXIT_FAILED` so nobody is told it succeeded while its record says `running`.
-fn end(rec: &mut Record, status: &str, code: ExitCode) -> ExitCode {
+fn end(rec: &mut Record, status: &str, code: u8) -> u8 {
     rec.set("status", status);
     rec.set("child_pid", "");
     rec.set("child_start", "");
@@ -405,7 +405,7 @@ fn end(rec: &mut Record, status: &str, code: ExitCode) -> ExitCode {
         Ok(()) => code,
         Err(e) => {
             eprintln!("broadsword: ERROR: {e}; the job's real status is `{status}`");
-            ExitCode::from(EXIT_FAILED)
+            EXIT_FAILED
         }
     }
 }
@@ -448,20 +448,36 @@ impl Drop for BuildHold {
     }
 }
 
+/// What a finished job tells its caller besides the exit code (the merge queue reads it; the command line ignores it).
+#[derive(Default, Debug, Clone)]
+pub struct JobInfo {
+    /// The job record's id, once the record exists (a job refused before that has none).
+    pub id: Option<String>,
+    /// The job's log file (every cargo line, stdout and stderr), once it exists.
+    pub log: Option<PathBuf>,
+    /// The `--- summary ---` lines (`build: ok (..)`, `test: FAILED ...`); empty when the job never reached its steps.
+    pub summary: Vec<String>,
+}
+
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
+    ExitCode::from(run_job_info(cfg, spec, &mut JobInfo::default()))
+}
+
+/// `run_job` returning the exit code as a number and filling `info`. The code is the one documented for build, test and check.
+pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     let kind = spec.kind.as_str();
     let project_dir = match job_folder(cfg, &spec.name, spec.task.as_deref()) {
         Ok(d) => d,
         Err((code, msg)) => {
             eprintln!("broadsword: {msg}");
-            return ExitCode::from(code);
+            return code;
         }
     };
     let source = match buildsrc::rel_source(cfg, &project_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("broadsword: {e}");
-            return ExitCode::from(EXIT_FAILED);
+            return EXIT_FAILED;
         }
     };
     let name = canonical_project(&cfg.projects_dir, &spec.name).unwrap_or_else(|_| spec.name.clone()); // records store the canonical name
@@ -477,7 +493,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         Ok((p, f)) => (p, Arc::new(Mutex::new(f))),
         Err(e) => {
             eprintln!("broadsword: cannot create job log in {}: {e}", log_dir.display());
-            return ExitCode::from(EXIT_FAILED);
+            return EXIT_FAILED;
         }
     };
 
@@ -490,7 +506,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("broadsword: cannot create job record in {}: {e}", record::jobs_dir(cfg).display());
-            return ExitCode::from(EXIT_FAILED);
+            return EXIT_FAILED;
         }
     };
     let me = std::process::id();
@@ -514,9 +530,11 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     }
     if let Err(e) = save_record(&rec) {
         eprintln!("broadsword: {e}");
-        return ExitCode::from(EXIT_FAILED);
+        return EXIT_FAILED;
     }
     let job_id = rec.id().to_string();
+    info.id = Some(job_id.clone());
+    info.log = Some(log_path.clone());
     if let Some(old) = &spec.resumed_from {
         // Hand over before running: the old record now points at this job.
         let path = record::jobs_dir(cfg).join(format!("{old}.rec"));
@@ -527,7 +545,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         });
         if let Err(e) = handed {
             eprintln!("broadsword: ERROR: cannot mark {old} as resumed: {e}");
-            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+            return end(&mut rec, record::FAILED, EXIT_FAILED);
         }
     }
     println!("job: {kind} {name} (id {job_id}, log: {})", log_path.display());
@@ -535,7 +553,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
 
     if kind == "run" && !git::is_repo(&project_dir) {
         eprintln!("broadsword: refusing to run: project `{name}` is not a Git repository, so there is no checkpoint to roll back to (run `git init` in {} first)", project_dir.display());
-        return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
+        return end(&mut rec, record::REFUSED, EXIT_REFUSED);
     }
 
     let mut summary: Vec<String> = Vec::new();
@@ -546,7 +564,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
         let free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
             eprintln!("broadsword: refusing to start {step}: {why}");
-            return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
+            return end(&mut rec, record::REFUSED, EXIT_REFUSED);
         }
         if i == spec.first_step {
             if git::is_repo(&project_dir) {
@@ -570,7 +588,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                     }
                     Err(e) if kind == "run" => {
                         eprintln!("broadsword: refusing to run: cannot take a checkpoint: {e}");
-                        return end(&mut rec, record::REFUSED, ExitCode::from(EXIT_REFUSED));
+                        return end(&mut rec, record::REFUSED, EXIT_REFUSED);
                     }
                     Err(e) => {
                         eprintln!("broadsword: warning: no checkpoint: {e}");
@@ -592,7 +610,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                 Ok(l) => l,
                 Err((code, msg)) => {
                     eprintln!("broadsword: {msg}");
-                    return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, ExitCode::from(code));
+                    return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, code);
                 }
             };
             build_hold = Some(BuildHold { forget: (kind == "run").then(|| (cfg.clone(), project_dir.clone())), _lock: lock });
@@ -612,14 +630,14 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("broadsword: {e}");
-                    return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+                    return end(&mut rec, record::FAILED, EXIT_FAILED);
                 }
             }
         }
         rec.set("step", *step);
         if let Err(e) = save_record(&rec) {
             eprintln!("broadsword: {e}");
-            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+            return end(&mut rec, record::FAILED, EXIT_FAILED);
         }
         if let Ok(mut f) = log.lock() {
             let _ = writeln!(f, "=== {step} {name} ({}) ===", pause::now_string());
@@ -640,19 +658,19 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("broadsword: {e}");
-                return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+                return end(&mut rec, record::FAILED, EXIT_FAILED);
             }
         };
         if let Some(e) = spawn_err {
             eprintln!("broadsword: ERROR: {e}");
-            return end(&mut rec, record::FAILED, ExitCode::from(EXIT_FAILED));
+            return end(&mut rec, record::FAILED, EXIT_FAILED);
         }
         if let Outcome::DiskDropped(f) = run.outcome {
             let reason = format!("free space {} fell below the {} GB floor during `{kind} {name}`; job killed", pause::gb(f), cfg.disk_floor_gb);
             let _ = pause::write_pause(&cfg.root, f, &reason);
             pause::alert(cfg, &format!("Broadsword PAUSED: {reason}"));
             eprintln!("broadsword: {reason}");
-            return end(&mut rec, record::KILLED_LOW_DISK, ExitCode::from(EXIT_DISK_DROPPED));
+            return end(&mut rec, record::KILLED_LOW_DISK, EXIT_DISK_DROPPED);
         }
         if let Outcome::Exited(c) = run.outcome {
             exit_code = c;
@@ -668,6 +686,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
             break; // check never tests a failed build
         }
     }
+    info.summary = summary.clone();
     println!("--- summary ---");
     for l in &summary {
         println!("{l}");
@@ -684,7 +703,7 @@ pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     } else {
         EXIT_FAILED
     };
-    end(&mut rec, if all_ok { record::DONE } else { record::FAILED }, ExitCode::from(code))
+    end(&mut rec, if all_ok { record::DONE } else { record::FAILED }, code)
 }
 
 #[cfg(test)]

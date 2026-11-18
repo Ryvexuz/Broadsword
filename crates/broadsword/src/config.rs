@@ -87,6 +87,23 @@ pub struct Config {
     pub build_lock_wait_seconds: u64,
     /// Where each task's Git worktree lives: `<worktrees_dir>/<project>/<task id>` (broadsword worktree ...).
     pub worktrees_dir: PathBuf,
+    /// Which reviewer backend `queue run` calls. Only `claude` (the Claude Code CLI, headless) exists today.
+    pub reviewer_backend: String,
+    /// The reviewer CLI program (resolved on PATH). The env var BROADSWORD_REVIEWER_CLI overrides it with a machine-specific path.
+    pub reviewer_cli: String,
+    /// The reviewer model for a `--risk low` / `--risk high` queue entry.
+    pub reviewer_model_low: String,
+    pub reviewer_model_high: String,
+    /// A reviewer call that runs longer than this is killed (no verdict, the entry is `blocked`).
+    pub reviewer_timeout_seconds: u64,
+    /// A diff bigger than this is never sent to a reviewer (the entry is `blocked`: split the task).
+    pub reviewer_diff_max_kb: u64,
+    /// A brief file bigger than this is refused by `queue add`.
+    pub reviewer_brief_max_kb: u64,
+    /// How much of the end of the check output goes into the review prompt.
+    pub reviewer_check_tail_kb: u64,
+    /// How long a `queue` command waits for a queue lock before it exits 4 "queue busy".
+    pub queue_lock_wait_seconds: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -103,6 +120,12 @@ fn get_str(m: &HashMap<String, Value>, k: &str) -> Result<String, String> {
         Some(_) => Err(format!("{k}: expected a quoted string")),
         None => Err(format!("{k}: missing from {CONFIG_FILE}")),
     }
+}
+
+/// A model name goes onto a command line: letters, digits and `.` `_` `-` `:` `[` `]` only, never starting with `-`
+/// (it could otherwise be read as a flag).
+pub fn valid_model_name(m: &str) -> bool {
+    !m.is_empty() && !m.starts_with('-') && m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']'))
 }
 
 /// Drop `.` parts and unify separators without touching the disk (no canonicalize: no verbatim-prefix paths).
@@ -155,7 +178,32 @@ impl Config {
         }
         let positive = |k: &str| get_int(&m, k).and_then(|v| if v == 0 { Err(format!("{k}: must be at least 1")) } else { Ok(v) });
         let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
+        let reviewer_backend = get_str(&m, "reviewer_backend")?;
+        if reviewer_backend != "claude" {
+            return Err(format!("reviewer_backend = \"{reviewer_backend}\": only \"claude\" is supported"));
+        }
+        let reviewer_cli = get_str(&m, "reviewer_cli")?;
+        if reviewer_cli.trim().is_empty() || reviewer_cli.contains(['\n', '\r']) {
+            return Err("reviewer_cli: must be a non-empty program name (resolved on PATH)".into());
+        }
+        let model = |k: &str| {
+            let v = get_str(&m, k)?;
+            if valid_model_name(&v) {
+                Ok(v)
+            } else {
+                Err(format!("{k} = \"{v}\": a model name uses letters, digits and . _ - : [ ] only, and does not start with `-`"))
+            }
+        };
         Ok(Config {
+            reviewer_backend,
+            reviewer_cli,
+            reviewer_model_low: model("reviewer_model_low")?,
+            reviewer_model_high: model("reviewer_model_high")?,
+            reviewer_timeout_seconds: positive("reviewer_timeout_seconds")?,
+            reviewer_diff_max_kb: positive("reviewer_diff_max_kb")?,
+            reviewer_brief_max_kb: positive("reviewer_brief_max_kb")?,
+            reviewer_check_tail_kb: positive("reviewer_check_tail_kb")?,
+            queue_lock_wait_seconds: positive("queue_lock_wait_seconds")?,
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
             scratch_max_age_hours: get_int(&m, "scratch_max_age_hours")?,
@@ -274,7 +322,7 @@ mod tests {
 
     #[test]
     fn worktrees_dir_is_required_and_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -296,8 +344,32 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn reviewer_and_queue_settings_are_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
+        for key in [
+            "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
+            "queue_lock_wait_seconds",
+        ] {
+            let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
+");
+            let e = Config::from_text(&without, Path::new("p")).unwrap_err();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        let with = |from: &str, to: &str| text.lines().map(|l| if l.trim_start().starts_with(from) { to.to_string() } else { l.to_string() }).collect::<Vec<_>>().join("
+");
+        assert!(Config::from_text(&with("reviewer_backend", "reviewer_backend = \"openai\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("reviewer_model_low", "reviewer_model_low = \"--evil\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("reviewer_model_high", "reviewer_model_high = \"a b\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("reviewer_timeout_seconds", "reviewer_timeout_seconds = 0"), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("reviewer_cli", "reviewer_cli = \"\""), Path::new("p")).is_err());
+        assert!(valid_model_name("claude-haiku-4-5") && valid_model_name("opus[1m]") && !valid_model_name("") && !valid_model_name("-x"));
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -328,7 +400,7 @@ worktrees_dir = \"worktrees\"\n";
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+
+# A stand-in for the `claude` CLI that only the tests use (BROADSWORD_REVIEWER_CLI points at it); it never calls a model.
+[[bin]]
+name = "fake_claude"
+path = "tests/support/fake_claude.rs"
+test = false
+doc = false

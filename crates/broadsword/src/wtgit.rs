@@ -224,3 +224,103 @@ pub fn worktree_repair(dir: &Path, worktrees: &[&Path]) -> Result<String, String
         Err(format!("git {} failed: {}", args.join(" "), o.stderr))
     }
 }
+
+// ---- reviewer step and merge queue (queue.rs) -------------------------------------------------------------------------
+//
+// Same hard rules as above: no `--force`, no `-D`, no `reset --hard`, no `push`. The two commands that move a branch are
+// `rebase` (only ever inside a task's own worktree, and always aborted on any failure) and `merge --ff-only` (only ever in
+// the main checkout, and it can only move HEAD forward along a line it already contains). Neither can drop a commit
+// without it staying reachable: queue.rs saves the pre-rebase tip under refs/broadsword/queue/ first.
+
+/// `git status --porcelain` (NO `--ignored`): one line per modified, staged or untracked path; empty = clean. Why: the MAIN
+/// checkout must be clean before a merge; unlike a worktree about to be deleted, ignored files there (build folders,
+/// `.env`) are normal and not at risk.
+pub fn status_porcelain_plain(dir: &Path) -> Result<String, String> {
+    ok(dir, &["status", "--porcelain"])
+}
+
+/// `git rev-list --count <range>`: how many commits a range holds, e.g. `<base>..<branch>` = commits on the branch that
+/// the base does not have. Why: "at least one commit beyond its base" and "nothing left to merge".
+pub fn rev_count(dir: &Path, range: &str) -> Result<u64, String> {
+    let out = ok(dir, &["rev-list", "--count", range])?;
+    out.trim().parse::<u64>().map_err(|_| format!("git rev-list --count {range} printed `{out}`, not a number"))
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>`: is the first commit part of the history of the second (exit 0)
+/// or not (exit 1)? Why: "the branch already contains main's HEAD" (skip the rebase) and "the rebase really landed on it".
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let o = run(dir, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match o.code {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(format!("git merge-base --is-ancestor {ancestor} {descendant} failed: {}", o.stderr)),
+    }
+}
+
+/// `git diff --no-color --no-ext-diff <base>...<tip>`: the changes on `tip` since it split from `base` (three dots = from
+/// their merge base), nothing excluded. Why: exactly what a merge would bring in is what the reviewer reads.
+pub fn diff_since(dir: &Path, base: &str, tip: &str) -> Result<String, String> {
+    ok(dir, &["diff", "--no-color", "--no-ext-diff", &format!("{base}...{tip}")])
+}
+
+/// `git rev-parse --path-format=absolute --git-path rebase-merge` (and `rebase-apply`), then does that folder exist? Git
+/// keeps the state of a rebase that is stopped or was killed there. Why: a crashed `queue run` may have left a worktree
+/// in the middle of a rebase, which must be aborted before anything else touches it.
+pub fn rebase_in_progress(worktree: &Path) -> Result<bool, String> {
+    for name in ["rebase-merge", "rebase-apply"] {
+        let p = ok(worktree, &["rev-parse", "--path-format=absolute", "--git-path", name])?;
+        if Path::new(&p).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `git rebase --abort`: stop a rebase and put the branch back exactly where it was before it began. Why: a conflict (or
+/// any failure) must leave the branch as it was.
+pub fn rebase_abort(worktree: &Path) -> Result<(), String> {
+    ok(worktree, &["rebase", "--abort"]).map(|_| ())
+}
+
+/// `git diff --name-only --diff-filter=U`: the paths with unresolved conflicts. Why: the entry names them for the coder.
+fn unmerged_files(worktree: &Path) -> Result<Vec<String>, String> {
+    Ok(ok(worktree, &["diff", "--name-only", "--diff-filter=U"])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+pub enum Rebase {
+    /// The branch now sits on top of `onto`.
+    Done,
+    /// Conflicts: the rebase was aborted, the branch is as it was; these are the conflicting files.
+    Conflict(Vec<String>),
+    /// Git failed for another reason; any half-done rebase was aborted (the text says whether that worked).
+    Failed(String),
+}
+
+/// `git rebase <onto>` in the task's worktree (its branch is checked out there): replay the branch's own commits on top of
+/// `onto`. On ANY failure it then runs `git rebase --abort` (a rebase that stopped is never left behind), so the branch is
+/// back where it started; the caller still verifies the tip. Why: the merge into main must be a pure fast-forward.
+pub fn rebase(worktree: &Path, onto: &str) -> Result<Rebase, String> {
+    let o = run(worktree, &["rebase", onto])?;
+    if o.code == 0 {
+        return Ok(Rebase::Done);
+    }
+    let files = unmerged_files(worktree).unwrap_or_default();
+    let msg = without_force_hints(if o.stderr.is_empty() { &o.stdout } else { &o.stderr });
+    let aborted = match rebase_in_progress(worktree) {
+        Ok(true) => rebase_abort(worktree).map(|_| "the rebase was aborted".to_string()),
+        Ok(false) => Ok("no rebase was left running".to_string()),
+        Err(e) => Err(e),
+    };
+    Ok(match (files.is_empty(), aborted) {
+        (false, Ok(_)) => Rebase::Conflict(files),
+        (_, Ok(a)) => Rebase::Failed(format!("git rebase {onto} failed ({a}): {msg}")),
+        (_, Err(e)) => Rebase::Failed(format!("git rebase {onto} failed AND it could not be aborted: {e}; look at the worktree: {msg}")),
+    })
+}
+
+/// `git merge --ff-only <commit>` in the main checkout: move the current branch forward to `commit`, only if that is a pure
+/// fast-forward (the branch tip is an ancestor of it); never a merge commit, git refuses otherwise. Why: the one way task
+/// work enters main, and it cannot rewrite or lose anything main already has.
+pub fn merge_ff_only(main_dir: &Path, commit: &str) -> Result<(), String> {
+    ok(main_dir, &["merge", "--ff-only", commit]).map(|_| ())
+}

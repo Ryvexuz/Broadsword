@@ -57,7 +57,7 @@ fn rel_path(cfg: &Config, project: &str, id: &str) -> String {
 
 /// The record's relative path as a real path, refused unless it is inside the configured worktrees_dir (a hand-edited
 /// record must never point removal at some other folder).
-fn abs_path(cfg: &Config, rel: &str) -> Result<PathBuf, String> {
+pub fn abs_path(cfg: &Config, rel: &str) -> Result<PathBuf, String> {
     let p = crate::config::normalize(&cfg.root.join(rel));
     if p.starts_with(&cfg.worktrees_dir) && p != cfg.worktrees_dir && !rel.split(['/', '\\']).any(|s| s == "..") {
         Ok(p)
@@ -66,7 +66,7 @@ fn abs_path(cfg: &Config, rel: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn project_dir(cfg: &Config, t: &Record) -> Result<PathBuf, String> {
+pub fn project_dir(cfg: &Config, t: &Record) -> Result<PathBuf, String> {
     job::resolve_project(&cfg.root, &cfg.projects_dir, t.get("project"))
 }
 
@@ -105,7 +105,7 @@ pub fn is_creating(t: &Record) -> bool {
     !t.get("worktree_creating").is_empty()
 }
 
-fn branch_of(t: &Record) -> String {
+pub fn branch_of(t: &Record) -> String {
     if t.get("branch").is_empty() {
         format!("task/{}", t.id())
     } else {
