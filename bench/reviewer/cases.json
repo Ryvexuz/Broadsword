@@ -43,5 +43,172 @@
     "bug": "`run` takes no build lock and does not touch the notes, so `run broadsword --task <id> -- cargo build` in a worktree overwrites the shared binary with worktree code while the note still says main; `install` would then accept and install a worktree's binary.",
     "catch": "(?i)\\brun\\b.{0,200}(cargo|bypass|lock|note|install|stale)|(install).{0,200}(worktree|run\\b|bypass)",
     "known_false_positives": ["(?i)resum.{0,120}(lock|prepare|skip)|first_step"]
+  },
+  {
+    "id": "hard1",
+    "kind": "many subtle bugs",
+    "diff": "cases/hard1.diff",
+    "brief": "Task: add `jobq`, a small file-backed job queue library in Rust (std only). Each job is one record file in a queue folder; a job id may contain `/` to group jobs in sub-folders. Settings come from a `key = value` text file (queue_dir, api_token, max_attempts from 1 to 10, base_delay_ms, max_delay_ms, lease_secs, max_payload_bytes). `enqueue` refuses a duplicate id and a payload above max_payload_bytes. A worker claims a job for lease_secs seconds; a job whose lease has run out can be claimed again, a job with a live lease cannot, and a finished job never. `ack` marks a claimed job done. Only one claim or ack may change the store at a time. `claim_next` takes the first free job in id order and, while the store is busy, retries with exponential backoff (base_delay_ms doubled per attempt, never above max_delay_ms) up to max_attempts. Operations are logged to an in-memory log that can also append to a file. Done check: the crate builds, its unit tests pass, and enqueue, claim, lease expiry and ack work as described. The diff below is the src/ folder of the first commit.",
+    "bug": "12 planted bugs and 3 decoys; see `bugs` and `decoys`. Proven by hard/prove.sh. Scored with score_hard.py.",
+    "catch": "(?:(?i)(max_attempts|config\\.rs:6\\d).{0,200}(1\\.\\.10|exclusive|off-by-one|inclusive|upper bound|boundary|\\b10\\b.{0,60}(reject|refus|invalid|fail|error))|(1\\.\\.10|exclusive range).{0,200}(max_attempts|\\b10\\b))|(?:(?i)(toctou|race|exists\\(\\)|check.{0,25}(then|before).{0,25}(write|creat)|create_new|not atomic|concurrent|two (threads|callers|puts|workers)).{0,250}(put|duplicate|exist|overwrit|same id|enqueue)|(put|duplicate|enqueue).{0,250}(toctou|race|exists\\(\\)|create_new|concurrent|overwrit|not atomic))|(?:(?i)path traversal|directory traversal|(\\.\\.|parent ?dir|dotdot).{0,200}(first component|only (the )?first|first only|components\\(\\)\\.next|middle|mid-?path|a/\\.\\./|escape|outside (the )?(root|queue))|(first component|components\\(\\)\\.next).{0,200}(\\.\\.|parent|escape|traversal))|(?:(?i)(token|secret|credential).{0,200}(log|debug|print|leak|expos|redact|plaintext)|(derive\\([^)]*debug|\\{:\\?\\}).{0,200}(token|secret|log|leak))|(?:(?i)^(?!.*log\\.rs).*(let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b))|(?:(?i)as u16|\\bu16\\b|65,?53[56]|(truncat|wrap)\\w*.{0,150}payload|payload.{0,150}(truncat|wrap))|(?:(?i)(from_millis|milli\\w*|\\bms\\b).{0,200}(lease|secs\\b|seconds)|(lease|lease_secs).{0,200}(from_millis|milli\\w*|\\bms\\b|wrong unit|unit))|(?:(?i)(now > rec\\.lease_until|inverted|reversed|backwards?|flipped|wrong (direction|comparison)).{0,250}(lease|claim)|(claim|lease).{0,250}(inverted|reversed|backwards?|flipped|steal|live lease|unexpired|(expired|stale).{0,40}(refus|reject)|(refus|reject).{0,40}expired|comparison|\\bnow >))|(?:(?i)mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|remain|(on|when|after) (an? )?(error|failure|failed)|guard)|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget))|(?:(?i)(backoff_stays_within_cap|10\\.\\.cfg\\.max_attempts|retry\\.rs:7\\d).{0,250}(empty|never|vacuous|zero|no iteration|nothing|always pass|useless|range)|(vacuous|never (fail|run|iterate|execut)|empty range|zero iterations|no iterations|always passes?|asserts? nothing).{0,250}(backoff|cap|retry\\.rs))|(?:(?i)(doc\\w*|comment).{0,200}(ignored|rejected?|unknown key|contradict|mismatch|says|claims)|unknown keys?.{0,200}(ignored|doc|comment|contradict|claims))|(?:(?i)(wrapping_shl|checked_shl|shift|overflow|wrap\\w*).{0,250}(backoff|attempt|delay|\\b64\\b|factor)|(backoff|attempt >= ?64|attempt 64).{0,250}(wrapping_shl|wrap\\w*|overflow|shift|resets?|drops?))",
+    "known_false_positives": [
+      "(?i)first\\.unwrap|peek.{0,150}(unwrap|panic)|lib\\.rs:4\\d.{0,200}(unwrap|panic)",
+      "(?i)(config\\.rs:(29|3[0-4])|parse_u32|as u32|u32::MAX).{0,200}(truncat|overflow|cast|unchecked|lossy|wrap)|(truncat|overflow|lossy)\\w*.{0,150}(parse_u32|as u32)",
+      "(?i)log\\.rs.{0,250}(let _|ignor|swallow|discard|silent|drop|writeln|error)|(let _ = writeln|writeln!).{0,200}(ignor|swallow|discard|silent)"
+    ],
+    "bugs": [
+      {
+        "id": "b01",
+        "kind": "off-by-one at a boundary",
+        "file": "src/config.rs",
+        "lines": [
+          63,
+          63
+        ],
+        "catch": "(?i)(max_attempts|config\\.rs:6\\d).{0,200}(1\\.\\.10|exclusive|off-by-one|inclusive|upper bound|boundary|\\b10\\b.{0,60}(reject|refus|invalid|fail|error))|(1\\.\\.10|exclusive range).{0,200}(max_attempts|\\b10\\b)"
+      },
+      {
+        "id": "b02",
+        "kind": "race on a file (check, then write)",
+        "file": "src/store.rs",
+        "lines": [
+          142,
+          145
+        ],
+        "catch": "(?i)(toctou|race|exists\\(\\)|check.{0,25}(then|before).{0,25}(write|creat)|create_new|not atomic|concurrent|two (threads|callers|puts|workers)).{0,250}(put|duplicate|exist|overwrit|same id|enqueue)|(put|duplicate|enqueue).{0,250}(toctou|race|exists\\(\\)|create_new|concurrent|overwrit|not atomic)"
+      },
+      {
+        "id": "b03",
+        "kind": "path traversal",
+        "file": "src/paths.rs",
+        "lines": [
+          27,
+          29
+        ],
+        "catch": "(?i)path traversal|directory traversal|(\\.\\.|parent ?dir|dotdot).{0,200}(first component|only (the )?first|first only|components\\(\\)\\.next|middle|mid-?path|a/\\.\\./|escape|outside (the )?(root|queue))|(first component|components\\(\\)\\.next).{0,200}(\\.\\.|parent|escape|traversal)"
+      },
+      {
+        "id": "b04",
+        "kind": "secret written to a log",
+        "file": "src/config.rs",
+        "lines": [
+          14,
+          14
+        ],
+        "catch": "(?i)(token|secret|credential).{0,200}(log|debug|print|leak|expos|redact|plaintext)|(derive\\([^)]*debug|\\{:\\?\\}).{0,200}(token|secret|log|leak)"
+      },
+      {
+        "id": "b05",
+        "kind": "error swallowed where it matters",
+        "file": "src/store.rs",
+        "lines": [
+          182,
+          183
+        ],
+        "catch": "(?i)^(?!.*log\\.rs).*(let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b)"
+      },
+      {
+        "id": "b06",
+        "kind": "integer truncation of a size",
+        "file": "src/store.rs",
+        "lines": [
+          78,
+          78
+        ],
+        "catch": "(?i)as u16|\\bu16\\b|65,?53[56]|(truncat|wrap)\\w*.{0,150}payload|payload.{0,150}(truncat|wrap)"
+      },
+      {
+        "id": "b07",
+        "kind": "wrong unit",
+        "file": "src/config.rs",
+        "lines": [
+          83,
+          83
+        ],
+        "catch": "(?i)(from_millis|milli\\w*|\\bms\\b).{0,200}(lease|secs\\b|seconds)|(lease|lease_secs).{0,200}(from_millis|milli\\w*|\\bms\\b|wrong unit|unit)"
+      },
+      {
+        "id": "b08",
+        "kind": "inverted guard",
+        "file": "src/store.rs",
+        "lines": [
+          162,
+          162
+        ],
+        "catch": "(?i)(now > rec\\.lease_until|inverted|reversed|backwards?|flipped|wrong (direction|comparison)).{0,250}(lease|claim)|(claim|lease).{0,250}(inverted|reversed|backwards?|flipped|steal|live lease|unexpired|(expired|stale).{0,40}(refus|reject)|(refus|reject).{0,40}expired|comparison|\\bnow >)"
+      },
+      {
+        "id": "b09",
+        "kind": "lock left behind on early return",
+        "file": "src/store.rs",
+        "lines": [
+          157,
+          169
+        ],
+        "catch": "(?i)mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|remain|(on|when|after) (an? )?(error|failure|failed)|guard)|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget)"
+      },
+      {
+        "id": "b10",
+        "kind": "test that can never fail",
+        "file": "src/retry.rs",
+        "lines": [
+          74,
+          79
+        ],
+        "catch": "(?i)(backoff_stays_within_cap|10\\.\\.cfg\\.max_attempts|retry\\.rs:7\\d).{0,250}(empty|never|vacuous|zero|no iteration|nothing|always pass|useless|range)|(vacuous|never (fail|run|iterate|execut)|empty range|zero iterations|no iterations|always passes?|asserts? nothing).{0,250}(backoff|cap|retry\\.rs)"
+      },
+      {
+        "id": "b11",
+        "kind": "documentation contradicts the code",
+        "file": "src/config.rs",
+        "lines": [
+          39,
+          39
+        ],
+        "catch": "(?i)(doc\\w*|comment).{0,200}(ignored|rejected?|unknown key|contradict|mismatch|says|claims)|unknown keys?.{0,200}(ignored|doc|comment|contradict|claims)"
+      },
+      {
+        "id": "b12",
+        "kind": "wrong backoff",
+        "file": "src/retry.rs",
+        "lines": [
+          23,
+          23
+        ],
+        "catch": "(?i)(wrapping_shl|checked_shl|shift|overflow|wrap\\w*).{0,250}(backoff|attempt|delay|\\b64\\b|factor)|(backoff|attempt >= ?64|attempt 64).{0,250}(wrapping_shl|wrap\\w*|overflow|shift|resets?|drops?)"
+      }
+    ],
+    "decoys": [
+      {
+        "id": "d1",
+        "kind": "unwrap on a value just checked",
+        "file": "src/lib.rs",
+        "lines": [
+          40,
+          47
+        ],
+        "catch": "(?i)first\\.unwrap|peek.{0,150}(unwrap|panic)|lib\\.rs:4\\d.{0,200}(unwrap|panic)"
+      },
+      {
+        "id": "d2",
+        "kind": "range-checked cast",
+        "file": "src/config.rs",
+        "lines": [
+          30,
+          34
+        ],
+        "catch": "(?i)(config\\.rs:(29|3[0-4])|parse_u32|as u32|u32::MAX).{0,200}(truncat|overflow|cast|unchecked|lossy|wrap)|(truncat|overflow|lossy)\\w*.{0,150}(parse_u32|as u32)"
+      },
+      {
+        "id": "d3",
+        "kind": "documented ignored write error in the logger",
+        "file": "src/log.rs",
+        "lines": [
+          37,
+          41
+        ],
+        "catch": "(?i)log\\.rs.{0,250}(let _|ignor|swallow|discard|silent|drop|writeln|error)|(let _ = writeln|writeln!).{0,200}(ignor|swallow|discard|silent)"
+      }
+    ]
   }
 ]
