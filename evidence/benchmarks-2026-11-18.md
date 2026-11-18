@@ -69,6 +69,8 @@ Columns: caught as BLOCKING; MINOR only; known false positives; other BLOCKING l
 
 ```
 model   effort   caught   minor-only  known FP  other blk  cost $   avg secs errors
+chat-latest default  0/0      0           0         0          0.000    -        5
+claude-opus-4-5 default  1/2      0           0         0          0.336    53       0
 fable   default  4/5      1           0         3          2.024    57       0
 fable   high     4/5      1           0         1          2.228    114      0
 gpt-4.1 default  0/5      0           0         0          0.000    1        0
@@ -78,13 +80,17 @@ gpt-4o-mini default  0/5      1           0         2          0.000    2       
 gpt-5   default  1/5      0           0         0          0.000    113      0
 gpt-5-mini default  0/5      0           0         2          0.000    61       0
 gpt-5-nano default  0/5      0           0         2          0.000    78       0
+gpt-5-pro default  0/0      0           0         0          0.000    -        5
 gpt-5.1 default  0/5      0           0         11         0.000    5        0
 gpt-5.2 default  2/5      0           0         6          0.000    5        0
+gpt-5.2-pro default  0/0      0           0         0          0.000    -        5
 gpt-5.3-codex default  0/0      0           0         0          0.000    -        5
 gpt-5.4 default  2/5      0           0         5          0.000    5        0
 gpt-5.4-mini default  1/5      0           0         11         0.000    3        0
 gpt-5.4-nano default  1/5      1           0         11         0.000    4        0
+gpt-5.4-pro default  0/0      0           0         0          0.000    -        5
 gpt-5.5 default  4/5      0           0         3          0.000    61       0
+gpt-5.5-pro default  0/0      0           0         0          0.000    -        5
 gpt-5.6-luna default  2/5      0           0         5          0.000    20       0
 gpt-5.6-sol default  4/5      0           0         4          0.000    41       0
 gpt-5.6-terra default  4/5      0           0         2          0.000    33       0
@@ -93,7 +99,8 @@ gpt-6-luna default  3/5      0           0         3          0.000    32       
 gpt-6-sol default  4/5      0           0         8          0.000    18       0
 gpt-6.1-sol default  4/5      1           0         7          0.000    24       0
 gpt-6.1-terra default  5/5      0           0         17         0.000    55       0
-gpt-6.2-astra default  1/1      0           0         2          0.000    21       0
+gpt-6.2-astra default  5/5      0           0         20         0.000    24       0
+gpt-6.2-sol default  4/4      0           0         18         0.000    25       1
 haiku   default  3/5      0           0         5          0.013    25       0
 o3      default  1/5      0           0         2          0.000    29       0
 opus    default  4/5      1           0         3          0.314    31       0
@@ -102,11 +109,37 @@ sonnet  default  2/5      0           0         3          0.095    16       0
 sonnet  high     2/5      3           0         1          0.272    42       0
 
 errored runs (excluded from caught x/n):
+  36bca91 chat-latest default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  36bca91 gpt-5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  36bca91 gpt-5.2-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
   36bca91 gpt-5.3-codex default: HTTP 404: the API refused the request; if it is the model name, check --model. API message: This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead.
+  36bca91 gpt-5.4-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  36bca91 gpt-5.5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  36bca91 gpt-6.2-sol default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  3ad7320 chat-latest default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  3ad7320 gpt-5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  3ad7320 gpt-5.2-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
   3ad7320 gpt-5.3-codex default: HTTP 404: the API refused the request; if it is the model name, check --model. API message: This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead.
+  3ad7320 gpt-5.4-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  3ad7320 gpt-5.5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  a19ee1a chat-latest default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  a19ee1a gpt-5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  a19ee1a gpt-5.2-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
   a19ee1a gpt-5.3-codex default: HTTP 404: the API refused the request; if it is the model name, check --model. API message: This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead.
+  a19ee1a gpt-5.4-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  a19ee1a gpt-5.5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  cadbb6d chat-latest default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  cadbb6d gpt-5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  cadbb6d gpt-5.2-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
   cadbb6d gpt-5.3-codex default: HTTP 404: the API refused the request; if it is the model name, check --model. API message: This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead.
+  cadbb6d gpt-5.4-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  cadbb6d gpt-5.5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  fd98728 chat-latest default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  fd98728 gpt-5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  fd98728 gpt-5.2-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
   fd98728 gpt-5.3-codex default: HTTP 404: the API refused the request; if it is the model name, check --model. API message: This model is not supported in the v1/chat/completions endpoint. Use the v1/responses endpoint instead.
+  fd98728 gpt-5.4-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+  fd98728 gpt-5.5-pro default: HTTP 429: rate limit or quota reached, still failing after 2 retries. API message: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
 ```
 
 ## 3. Coding benchmark (6 graded Rust tasks, 97 hidden tests, one-shot, no tools)
