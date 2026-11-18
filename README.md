@@ -18,7 +18,9 @@ Build and test it only through Broadsword: `broadsword test render`.
   `project(world, width, height)`, and `fly(&FlyInput, dt)`, a pure function with no clock or window.
   Yaw 0 looks down -Z; positive yaw turns toward +X.
 - `draw_line_3d` clips each line against the near and far planes before projecting, so a line passing behind
-  the camera draws correctly. `draw_point_3d` draws a point if it is in the depth range.
+  the camera draws correctly. A line whose screen ends are beyond about 1e9 pixels is then clipped in 2D
+  (Liang-Barsky, along the line, so its slope is kept). `Framebuffer::line` skips straight to the on-screen part,
+  so even `line(i32::MIN, 0, i32::MAX, 0, c)` is instant and draws the same pixels as the full walk. `draw_point_3d` draws a point if it is in the depth range.
 - `wire_cube(center, size, rotation_y)`: the 12 edges of a cube.
 - Screen coordinate `s` lights pixel `round(s)`, so the image centre of a 160 pixel wide image is x = 80.0.
 
