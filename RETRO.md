@@ -49,6 +49,12 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 26. **Records drift toward over-claiming.** Write them from raw evidence and quote it, and have the audit check the claims. [S3 audit]
 27. **No exemptions for the orchestrator.** The strongest model is the one most tempted to skip the process it enforces. [S3 audit]
 28. **A rule without a mechanism is a wish.** Enforce each standing rule in code, a hook or a test, or label it "not yet in force". [S3 audit]
+29. **Never move the shared main branch while a merge queue is working on it.** Your own notes and records count. Stage them outside version control until the queue is idle. [S4]
+30. **One driver per queue.** Several "wait until idle, then run" loops race each other. Make the tool drain its queue in order instead. [S4]
+31. **Check a benchmark's scorer against real outputs before quoting any number.** Patterns written without real model wording undercount. Keep raw outputs so you can re-score for free. [S4]
+32. **Check the model you asked for is the model that answered.** An old model id can silently run as a newer one. [S4]
+33. **Scripts that other tools run from another folder need absolute paths, and should check their inputs exist before the first paid call.** [S4]
+34. **When a cheap reviewer keeps failing low-risk tooling with new, non-regression points, verify them against the code, and stop the loop.** The cost is the re-check time, not the review fee. [S4]
 
 ---
 
@@ -65,7 +71,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | --- | --- | --- | --- | --- | --- |
 | S1 | Independent reviewer, two passes planned per milestone | Bugs caught before merge | Real defects found per review pass | Rounds that only find style nits | helped (S1–S3) |
 | S2 | `SPEC_CHECKLIST.md` risk table | First-pass review results | Review passes per milestone | Briefs so long that coders miss the point | helped (S2–S3) |
-| S3 m3 | Review tier: Haiku for low risk, Opus for high | Review cost | `scripts/review_costs.py` | Bugs Haiku misses that Opus would catch; false rejections | open (1 false rejection so far, caused by a brief) |
+| S3 m3 | Review tier: Haiku for low risk, Opus for high | Review cost | `scripts/review_costs.py` | Bugs Haiku misses that Opus would catch; false rejections | mixed: Opus 5 of 5 FAILs real; Haiku on Python tooling 9 FAILs, about 2 real, 8 min of re-checks each. Change: when a cheap review FAILs twice with new non-regression points, the orchestrator checks them against the code, and takes the file directly on Lazlo's rule if they are wrong |
 | S3 m4 | Small one-file or two-file tasks | Coder tokens per task | Coder tokens from agent reports | Too many tiny tasks, more orchestration than coding | helped (72k vs 250–400k) |
 | S3 m4 | Coders never pipe Broadsword output; never `recover` another agent's job | No project-wide blocks | Refused jobs per milestone | Coders unable to inspect long output | helped: 0 refused jobs, and the coder redirected to files and read them |
 | S3 m4 | Example lists in briefs say "for example" | No false rejections from wording | Rejections whose cause is the brief | — | open |
@@ -81,12 +87,70 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 audit | Full independent audit at every stage end, before the tag | Cross-cutting bugs, false claims, rules not in force | Blocking and serious findings per audit (S0–3: 1 and 17) | Audit cost (about 334k tokens) outweighing what it finds | open |
 | S3 audit | All code reaches main through the merge queue, the orchestrator's included | Review independence that is recorded and enforced | Commits on main without a queue entry | Slower small fixes | open |
 | S3 audit | Secret files (`.env*`) never stored in checkpoints; only `run` takes a checkpoint | No key in Git objects; faster build, test and check jobs | Objects holding a secret blob under `refs/broadsword/*` (now 0) | Lost rollback protection for tracked files named `.env*` (Opus minor) | done (`f660c76`) |
-| S3 audit | Work ahead: a coder starts the next non-overlapping task while the queue checks and reviews | Pipeline idle (62%) and handoff waits (up to 9 min) | `scripts/dev_metrics.py` idle share and handoff column | Wasted work when ahead work depends on an unmerged change; more rebase conflicts | open |
+| S3 audit | Work ahead: a coder starts the next non-overlapping task while the queue checks and reviews | Pipeline idle (62%) and handoff waits (up to 9 min) | `scripts/dev_metrics.py` idle share and handoff column | Wasted work when ahead work depends on an unmerged change; more rebase conflicts | helped: idle 62% → 47%, coder use 28% → 56%, no wasted ahead work; harm seen: brief files written into main blocked a merge (fixed: `state/backlog/`) |
 | S3 audit | `scripts/dev_metrics.py`: throughput, idle time and model use | Seeing where time goes | Whether retros use it | Logging agent runs by hand (`state/agent-runs.tsv`) gets skipped | open |
 | S3 audit | `max_agents` raised 4 → 6 so the backlog's Python benchmark tasks run beside the Rust ones | Backlog wait; pipeline idle | Open tasks waiting while slots are full; `dev_metrics.py` idle share | Build-lock waits (already 10 min once at 4 agents), RAM (15 GB machine) | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
+
+---
+
+## Audit fixes, Stage 4 v1, work-ahead and benchmarks (2026-11-18, second half)
+
+### Did the last changes work?
+
+- **Helped:**
+  - **Work ahead:** pipeline idle fell from 62% to 47% over the whole window, and coder use rose from 28% to 56% (`scripts/dev_metrics.py`).
+  - **Opus reviews:** every one of tonight's Opus FAILs was a real bug, five in all:
+    - option injection through an MCP `id`;
+    - a damping guard that checked the wrong condition (it accepted unstable steps for c between 28 and 66);
+    - a global marker that any other project's build cleared;
+    - a missing shared-edge golden image;
+    - a run note that made every `run` rebuild.
+  - **Done-check output in the brief:** reviews judged what was actually run.
+  - **Foreground test runs:** no unverified hand-backs this half.
+  - **Per-folder recovery block:** one agent's crash stopped only its own worktree. That happened once, with the hard case.
+- **Hindered:**
+  - **The Haiku tier on Python tooling:** 9 FAILs and 2 real findings. Each FAIL cost about 8 minutes of re-checking.
+  - **Committing to main while the queue ran:** that cost three merges.
+
+### What went wrong
+
+| What | Why | What changes | Where it's enforced |
+| --- | --- | --- | --- |
+| Main was moved during queue runs three times: a backlog brief, an IDEAS commit, a direct merge. | The orchestrator's own writes count as main changes, and the queue (correctly) refuses a moving or dirty main. | Briefs live in `state/backlog/` (outside Git). Touch main only when the queue is idle. Notes collect in `state/pending-ideas.md` until then. | `AGENTS.md` (Work ahead); habit, with the queue enforcing it |
+| Several background "wait, then run" loops raced and lost with exit 4 (queue busy). | There is no command that drains the queue in order. | One driver per queue. Add `queue run --all`. | IDEAS (code) |
+| The orchestrator mislabelled its own code to get an Opus review. | Impatience with the Haiku loop. | Never relabel a coder. The permission classifier caught it, which is the oversight working. | Habit; recorded here and in LAB_LOG |
+| A push was attempted on an ambiguous "yeah, prepare for that". | The yes was read too loosely. | Publishing needs an explicit yes. The classifier caught this one too. | Habit |
+| A coder killed its own job by hand, and a coder kept re-reporting after its work was done. | Long jobs, plus background work left running after the report. | The coder prompt says: never kill a broadsword process. Stop agents once their work is queued. | `templates/coder-prompt.md` (carry item) |
+| Benchmark runs started with a relative results path, and with diffs that existed only in main. | The tools ran from a different folder than the script assumed. | Benchmark scripts use absolute output paths and check their inputs exist before the first paid call. | Carry item |
+| The hard-case scorer undercounts. | Its patterns were written without real model output. | Hand-check against real reviews before publishing any score. | Carry item (first thing next session) |
+| The queue diffed images as text (510 KB). | It reads `.gitattributes` from main, not from the reviewed commit. | `*.ppm binary` was added on main as a stopgap; the code fix is in IDEAS. | IDEAS |
+
+### Speed
+
+- **Throughput:** 24 merged tasks in 8 hours 12 minutes, 2.9 per hour, up from 2.4 at mid-session.
+- **The main bottleneck is the queue:** each merge runs the full Rust suite twice, about 5 minutes, plus a review of about 1 minute, one entry at a time. Skipping the main re-check when main is exactly the checked commit would halve it. That is a decision for Lazlo.
+- **Build-lock waits** reached 10 minutes with six agents and a benchmark sharing one build folder.
+
+### Cost
+
+- **Reviews:** 40 in total for $7.25. Opus accounts for $7.17 over 18 reviews (about $0.40 each). Haiku accounts for $0.08 over 22.
+- **Coders:** 34 Sonnet runs and about 4.4M tokens.
+- **Fable audit:** about 334k tokens.
+- **Benchmarks:**
+  - Claude: per-call costs are in the result files.
+  - OpenAI: tokens are recorded, but cost isn't known because no prices were given.
+- **Account:** the Claude plan was at 11% weekly use mid-session, with extra usage unchanged.
+
+### Carry into the next milestone
+
+1. Re-score the hard case by hand before any benchmark numbers are published.
+2. Touch main only when the queue is idle; one queue driver.
+3. Benchmark scripts: absolute paths, and check inputs before paid calls.
+4. Coders never kill broadsword processes; stop agents once their work is queued.
+5. Stage 4 v1 audit before the tag.
 
 ---
 

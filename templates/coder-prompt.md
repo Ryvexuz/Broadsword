@@ -5,7 +5,7 @@ Your task id is <TASK>. Its Git worktree is already made: <ROOT>/worktrees/<PROJ
 Build and test ONLY through Broadsword, never plain cargo:
   <ROOT>/build/bin/broadsword.exe test <PROJECT> --task <TASK>
   <ROOT>/build/bin/broadsword.exe run <PROJECT> --task <TASK> -- <command>
-Never pipe a broadsword command into head, tail, grep or anything else; redirect long output to a file under <ROOT>/scratch/. If a job is refused because another job was interrupted, stop and report it; do not run `recover`.
+Never pipe a broadsword command into head, tail, grep or anything else; redirect long output to a file under <ROOT>/scratch/. If a job is refused because another job was interrupted, stop and report it; do not run `recover`. Never kill a broadsword process (taskkill or similar): an interrupted job blocks its folder until a human recovers it. If a job runs long, wait for it.
 
 Run the full suite in the FOREGROUND (your shell tool's timeout allows 600000 ms; the Broadsword suite takes about 3 minutes) and read its result before you report. A subagent cannot wait for its own background job: if you end your turn while it runs, nobody sees the result. Run targeted tests first (`broadsword run <PROJECT> --task <TASK> -- cargo test --offline --test <name> <filter>`), then the full suite once. Never hand back with the done check unrun unless you are blocked; then say exactly which line is unrun.
 

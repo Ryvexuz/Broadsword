@@ -2,6 +2,35 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Audit fixes, Stage 4 v1, work-ahead backlog, model benchmarks
+
+**Models and roles**
+- Opus 5.5 as orchestrator.
+- About 20 Sonnet coder runs this half (34 all session, about 4.4M tokens).
+- Reviewers in the queue: Opus (18 reviews all session, $7.17) and Haiku (22, $0.08).
+- Fable 5.2 at high effort for the full audit.
+- Benchmark subjects: 10 Claude configurations and 30 OpenAI models.
+
+**What went wrong and what fixed it**
+- Every serious audit code finding is fixed and merged through the queue.
+- Opus caught 5 real bugs on first passes, each fixed in a fresh-coder round. See RETRO.md for the list, and for the orchestrator's own mistakes: moving main during queue runs, racing wait loops, a mislabelled coder and an ambiguous push, the last two denied by the permission classifier.
+- A coder killed its own job. The per-folder recovery block contained it to that worktree, and Lazlo approved `recover --abandon`.
+
+**Git commands used, beyond a plain commit**
+- `git rebase main` (in task worktrees, before a direct merge): replays the task's commits on top of current main.
+- `git merge --ff-only task/<id>` (twice: dev_metrics and the OpenAI runner, both on Lazlo's "take the file" rule after refuted Haiku FAILs): moves main to the task's commit without a merge commit.
+- `git push origin main refs/tags/stage-*` and `git -C projects/<p> push <origin url> <branch>:refs/heads/<name>` (with Lazlo's explicit OK): backs up Broadsword, and crash-sim and render as branches of the private repo.
+- `git -C projects/render commit .gitattributes` (outside the queue): `*.ppm binary`, so the queue's diff of golden images stays small.
+
+**Rough cost and time**
+- About 8 hours 12 minutes of pipeline window, with 24 merged tasks.
+- Reviews $7.25.
+- Benchmark costs are in `state/bench-results/`. OpenAI cost is not computed, because no prices were given.
+
+**One lesson about AI development**
+
+Throughput came from keeping a coder working ahead, not from faster coders. The coders were never the slow part. The queue's double test run and the orchestrator's own serial steps were. Measure where the waiting is before optimising anything.
+
 ## 2026-11-18 — Audit fix B1: secrets out of checkpoints
 
 **Models and roles**
