@@ -6,7 +6,7 @@ root = "."                 # everything is relative to this folder
 disk_floor_gb = 20         # pause and clean up below this much free space
 cleanup_every_hours = 1
 scratch_max_age_hours = 24
-max_agents = 4             # the most tasks running on the board at once (task start refuses at the cap); raise only after clean merges
+max_agents = 6             # the most tasks running on the board at once (task start refuses at the cap); raise only after clean merges
 
 # Paths, relative to root
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time
