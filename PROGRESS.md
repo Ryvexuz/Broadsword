@@ -142,5 +142,10 @@ Process items:
    - the tp8 price comparison. It only informs Lazlo; Claude fast mode stays off regardless.
 
    Then the benchmark follow-ups: the credit-blocked OpenAI rows through Codex, Responses API models, per-model token caps, 5x consistency on the gpt-6.2 models, an instruction-following test, a drift test, and labelling the extra single-bug lines.
+   **Then move work to GPT** (Lazlo, 2026-11-18): this keeps the Claude plan for orchestration. Once the shadow verdicts and the benchmark re-runs show which GPT models to trust:
+   - add a `codex` coder route: `codex exec` with write access inside the task's own worktree only, on the ChatGPT allowance;
+   - trial it on one real low-risk task, with Claude as the gating reviewer;
+   - compare it with a Sonnet coder on quality, review rounds, time and Claude tokens saved;
+   - widen it if the trial holds up. Record it in the RETRO ledger.
 2. **Stage 4 v1:** the stage-end audit, its blockers fixed, then the tag (and the pending Stage 0 tag).
 3. **Then onward through the stages** in `DEVELOPMENT_PLAN.md`, with the crash sim as the first workload. Each stage gets its done check written before work starts.

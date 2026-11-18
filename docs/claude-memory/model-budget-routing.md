@@ -15,3 +15,5 @@ He was explicit (2026-11-17) that this is **a note, not a fixed rule**: "whateve
 He also mentioned a cheap OpenAI model, "Terra 6.1", described as slightly worse than Sonnet at about a fifth of the price. The model id is unverified: check it against his OpenAI models list before use.
 
 Related: [[broadsword-source-docs]]
+
+**Direction, 2026-11-18:** "once we get the gpt ones tested, we can outsource a lot more to gpt and that way we can keep you as the orchestrator for longer as well." Once the benchmarks and shadow verdicts show which GPT models are trustworthy, move routine coding, reviewing and records work to GPT through Codex, on the ChatGPT allowance ([[openai-weekly-before-api]]). That saves the Claude plan for orchestration. Evidence comes first: the shadow verdicts ([[adjudicate-shadow-findings]]) and a GPT coder trial on a real task, reviewed by Claude.
