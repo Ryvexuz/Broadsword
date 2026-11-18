@@ -152,5 +152,5 @@ Process items:
    - trial it on one real low-risk task, with Claude as the gating reviewer;
    - compare it with a Sonnet coder on quality, review rounds, time and Claude tokens saved;
    - widen it if the trial holds up. Record it in the RETRO ledger.
-2. **Stage 4 v1:** the stage-end audit, its blockers fixed, then the tag (and the pending Stage 0 tag).
+2. **Stage 4 v1:** a trial of gpt-6.2-astra as a second whole-project sweep (Lazlo, 2026-11-18). It runs through Codex on the plan, beside the Claude auditor that didn't build the code, on the same snapshot. Every finding from either gets an independent verdict. Compare real finds, false alarms, unique finds, tokens and time, and run astra twice to see whether it's consistent. If it holds up, it becomes a standing part of every full sweep. Then the stage-end audit, its blockers fixed, then the tag (and the pending Stage 0 tag).
 3. **Then onward through the stages** in `DEVELOPMENT_PLAN.md`, with the crash sim as the first workload. Each stage gets its done check written before work starts.
