@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+
+# A stand-in for the `claude` CLI that only the tests use (each test copies it into its throwaway root's scratch folder and points BROADSWORD_REVIEWER_CLI at the copy: the only place inside a root an override may point at; build/ is refused); it never calls a model.
+[[bin]]
+name = "fake_claude"
+path = "tests/support/fake_claude.rs"
+test = false
+doc = false

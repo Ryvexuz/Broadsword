@@ -199,6 +199,6 @@ mod tests {
         let mut want: Vec<&str> = crate::tools::TOOLS.iter().filter(|t| t.read_only || t.name == "resume" || t.name == "cleanup").map(|t| t.name).collect();
         want.sort_unstable();
         assert_eq!(allowed, want);
-        assert_eq!(allowed, ["cleanup", "jobs", "projects", "resume", "status", "task_check", "task_list", "task_show", "tools", "worktree_list"]);
+        assert_eq!(allowed, ["cleanup", "jobs", "projects", "queue_list", "queue_show", "resume", "status", "task_check", "task_list", "task_show", "tools", "worktree_list"]);
     }
 }
