@@ -4,6 +4,7 @@
 use crate::camera::FlyInput;
 use crate::framebuffer::Framebuffer;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 type Hwnd = isize;
@@ -103,6 +104,7 @@ extern "system" {
     fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn GetForegroundWindow() -> Hwnd;
+    fn IsIconic(hwnd: Hwnd) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -142,10 +144,15 @@ const WS_SYSMENU: u32 = 0x0008_0000;
 const WS_MINIMIZEBOX: u32 = 0x0002_0000;
 const ERROR_CLASS_ALREADY_EXISTS: i32 = 1410;
 const SRCCOPY: u32 = 0x00CC_0020;
-const OFFSCREEN: i32 = -32000;
+/// Where an `OffScreen` window is placed: far outside every monitor. Windows itself parks minimised windows
+/// at -32000, so this is the conventional "not on any screen" position. A placement value, not a limit.
+const OFFSCREEN_POSITION: i32 = -32000;
+/// CreateWindowExW's "let Windows choose" for a position (the constant CW_USEDEFAULT is 0x80000000).
+const CW_USEDEFAULT: i32 = i32::MIN;
 
 pub const VK_ESCAPE: i32 = 0x1B;
 pub const VK_LEFT: i32 = 0x25;
+pub const VK_SPACE: i32 = 0x20;
 pub const VK_UP: i32 = 0x26;
 pub const VK_RIGHT: i32 = 0x27;
 pub const VK_DOWN: i32 = 0x28;
@@ -177,11 +184,16 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// A Win32 window. It is deliberately not `Send` (nor `Sync`): Win32 delivers a window's messages only to the
+/// thread that created it, so `pump` and the destroy in `Drop` would silently stop working on any other
+/// thread. Keep a `Window` on the thread that opened it.
 pub struct Window {
     hwnd: Hwnd,
     width: usize,
     height: usize,
     close_requested: Box<AtomicBool>,
+    /// Raw pointers are neither `Send` nor `Sync`; this marker makes the whole struct the same.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Window {
@@ -217,9 +229,8 @@ impl Window {
             let mut rect = Rect { left: 0, top: 0, right: width as i32, bottom: height as i32 };
             AdjustWindowRect(&mut rect, style, 0);
             let (x, y) = match placement {
-                Placement::OffScreen => (OFFSCREEN, OFFSCREEN),
-                // CW_USEDEFAULT
-                _ => (i32::MIN, i32::MIN),
+                Placement::OffScreen => (OFFSCREEN_POSITION, OFFSCREEN_POSITION),
+                _ => (CW_USEDEFAULT, CW_USEDEFAULT),
             };
             let title_w = wide(title);
             let hwnd = CreateWindowExW(
@@ -249,7 +260,7 @@ impl Window {
                     Placement::Minimised => SW_SHOWMINNOACTIVE,
                 },
             );
-            Ok(Window { hwnd, width, height, close_requested })
+            Ok(Window { hwnd, width, height, close_requested, _not_send: PhantomData })
         }
     }
 
@@ -297,6 +308,10 @@ impl Window {
                 self.width,
                 self.height
             ));
+        }
+        // A minimised window has no client area to draw into, so there is nothing to blit: not an error.
+        if unsafe { IsIconic(self.hwnd) } != 0 {
+            return Ok(());
         }
         let info = BitmapInfo {
             header: BitmapInfoHeader {

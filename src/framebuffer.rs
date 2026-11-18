@@ -79,25 +79,73 @@ impl Framebuffer {
     }
 
     /// Bresenham line, both endpoints included. Exact integer maths; the pixels it covers do not depend on
-    /// how much of the line is on screen, and anything outside the buffer is skipped.
+    /// how much of the line is on screen. The part outside the buffer is never walked: the first and last
+    /// on-screen steps are found directly, and the error term is computed in closed form for the first, so
+    /// a line with huge coordinates costs only as much as its on-screen part.
     pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
         let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
-        // Trivial reject: both ends beyond the same edge.
         let (w, h) = (self.width as i64, self.height as i64);
-        if (x0 < 0 && x1 < 0) || (y0 < 0 && y1 < 0) || (x0 >= w && x1 >= w) || (y0 >= h && y1 >= h) {
+        let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
+        let (sx, sy) = (if x0 < x1 { 1i64 } else { -1 }, if y0 < y1 { 1i64 } else { -1 });
+        let color = color & 0x00FF_FFFF;
+        if dx == 0 && dy == 0 {
+            self.set_i64(x0, y0, color);
             return;
         }
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        let (mut x, mut y) = (x0, y0);
-        loop {
-            if x >= 0 && y >= 0 && x < w && y < h {
-                self.pixels[(y * w + x) as usize] = color & 0x00FF_FFFF;
+        // The walk advances one pixel per step along the major axis (x if dx >= dy, else y). After k steps
+        // the minor axis has advanced `minor_steps(k)` pixels; both are monotone in k.
+        let x_major = dx >= dy;
+        let (d_major, d_minor) = if x_major { (dx, dy) } else { (dy, dx) };
+        let (a0, s_a, a_len) = if x_major { (x0, sx, w) } else { (y0, sy, h) };
+        let (b0, s_b, b_len) = if x_major { (y0, sy, h) } else { (x0, sx, w) };
+        // Steps k in 0..=d_major whose major coordinate is in the buffer.
+        let (mut k_lo, mut k_hi) = if s_a > 0 { (-a0, a_len - 1 - a0) } else { (a0 - (a_len - 1), a0) };
+        k_lo = k_lo.max(0);
+        k_hi = k_hi.min(d_major);
+        // Minor-axis advance that keeps the minor coordinate in the buffer.
+        let (m_lo, m_hi) = if s_b > 0 { (-b0, b_len - 1 - b0) } else { (b0 - (b_len - 1), b0) };
+        if k_lo > k_hi || m_hi < 0 || m_lo > d_minor {
+            return;
+        }
+        // m(k) = floor((2*d_minor*k + d_major) / (2*d_major)): what the error-term walk below produces.
+        let minor_steps = |k: i64| -> i64 { ((2 * d_minor as i128 * k as i128 + d_major as i128) / (2 * d_major as i128)) as i64 };
+        // Smallest k in [k_lo, k_hi] with m(k) >= m_lo, and largest with m(k) <= m_hi (binary searches).
+        if minor_steps(k_hi) < m_lo || minor_steps(k_lo) > m_hi {
+            return;
+        }
+        let (mut lo, mut hi) = (k_lo, k_hi);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if minor_steps(mid) >= m_lo {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
-            if x == x1 && y == y1 {
+        }
+        let k_first = lo;
+        let (mut lo, mut hi) = (k_first, k_hi);
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if minor_steps(mid) <= m_hi {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let k_last = lo;
+        // State of the classic error-term walk (err = dx + dy with dy negative) after k_first steps.
+        let m = minor_steps(k_first) as i128;
+        let (dmaj, dmin, k) = (d_major as i128, d_minor as i128, k_first as i128);
+        let mut err: i128 = if x_major { dmaj - dmin - dmin * k + dmaj * m } else { dmin - dmaj + dmin * k - dmaj * m };
+        let (mut x, mut y) = if x_major {
+            (x0 + sx * k_first, y0 + sy * m as i64)
+        } else {
+            (x0 + sx * m as i64, y0 + sy * k_first)
+        };
+        let (dx, dy) = (dx as i128, -(dy as i128));
+        for step in 0..=(k_last - k_first) {
+            self.set_i64(x, y, color);
+            if step == k_last - k_first {
                 break;
             }
             let e2 = 2 * err;
@@ -109,6 +157,12 @@ impl Framebuffer {
                 err += dx;
                 y += sy;
             }
+        }
+    }
+
+    fn set_i64(&mut self, x: i64, y: i64, color: u32) {
+        if x >= 0 && y >= 0 && x < self.width as i64 && y < self.height as i64 {
+            self.pixels[y as usize * self.width + x as usize] = color;
         }
     }
 

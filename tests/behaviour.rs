@@ -209,8 +209,9 @@ fn front_cube_corners_are_lit_where_the_maths_says() {
         }
     }
     // Looking straight on, the front and back faces are nested squares joined by 4 diagonals, so the whole
-    // image is 2 squares (53 per side -> 4*52 = 208 pixels) + (35 -> 4*34 = 136) + 4 connectors.
-    assert!(lit(&fb).len() > 208 + 136, "lit {}", lit(&fb).len());
+    // image is 2 squares (53 per side -> 4*52 = 208 pixels) + (35 -> 4*34 = 136) + 4 connectors of 8 new
+    // pixels each (the 4 corners of each square are already counted): 208 + 136 + 32 = 376.
+    assert_eq!(lit(&fb).len(), 208 + 136 + 32);
 }
 
 #[test]
@@ -331,4 +332,170 @@ fn view_proj_maps_near_and_far_to_clip_extremes() {
     assert!((n[2] / n[3] + 1.0).abs() < 1e-4, "near ndc z {}", n[2] / n[3]);
     assert!((f[2] / f[3] - 1.0).abs() < 1e-3, "far ndc z {}", f[2] / f[3]);
     assert_eq!(Mat4::IDENTITY.mul(&Mat4::IDENTITY), Mat4::IDENTITY);
+}
+
+// ---- review minors from part A: clipping of very long lines
+
+#[test]
+fn line_with_extreme_coordinates_finishes_at_once_and_draws_the_full_row() {
+    let mut fb = fresh(16, 16);
+    let start = std::time::Instant::now();
+    fb.line(i32::MIN, 5, i32::MAX, 5, FG);
+    fb.line(7, i32::MIN, 7, i32::MAX, FG);
+    fb.line(i32::MIN, i32::MIN, i32::MAX, i32::MAX, FG);
+    fb.line(i32::MAX, i32::MIN, i32::MIN, i32::MAX, FG);
+    assert!(start.elapsed().as_secs_f64() < 1.0, "took {:?}", start.elapsed());
+    let l = lit(&fb);
+    for x in 0..16 {
+        assert_eq!(fb.get(x, 5), Some(FG), "row 5 at x={x}");
+    }
+    for y in 0..16 {
+        assert_eq!(fb.get(7, y), Some(FG), "column 7 at y={y}");
+    }
+    // The diagonal from (MIN, MIN) to (MAX, MAX) is exactly y = x, so it lights (0,0) to (15,15).
+    for i in 0..16 {
+        assert_eq!(fb.get(i, i), Some(FG), "diagonal at {i}");
+    }
+    assert!(!l.is_empty());
+    // One-sided extremes and a line that misses the buffer entirely.
+    let mut fb = fresh(16, 16);
+    fb.line(3, 3, i32::MAX, 3, FG);
+    assert_eq!(lit(&fb).len(), 13); // x = 3..=15
+    let mut fb = fresh(16, 16);
+    fb.line(i32::MIN, 100, i32::MAX, 100, FG);
+    fb.line(-5, i32::MIN, -5, i32::MAX, FG);
+    assert!(lit(&fb).is_empty());
+}
+
+/// The textbook walk from the first endpoint to the last, with no clipping: the reference for `line`.
+fn reference_line(fb: &mut Framebuffer, x0: i32, y0: i32, x1: i32, y1: i32, c: u32) {
+    let (mut x, mut y) = (x0, y0);
+    let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+    let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+    let mut err = dx + dy;
+    loop {
+        fb.set(x, y, c);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+#[test]
+fn clipped_line_covers_exactly_the_pixels_of_the_unclipped_walk() {
+    // Every pair of endpoints on a grid reaching well outside a 9x6 buffer, in every direction, including
+    // the ties of 45 degree and half-pixel slopes: the fast clipped `line` must equal the plain walk.
+    let (mut checked, mut lit_total) = (0u32, 0usize);
+    for x0 in -6..=14 {
+        for y0 in -5..=10 {
+            for x1 in -6..=14 {
+                for y1 in -5..=10 {
+                    let (mut a, mut b) = (fresh(9, 6), fresh(9, 6));
+                    a.line(x0, y0, x1, y1, FG);
+                    reference_line(&mut b, x0, y0, x1, y1, FG);
+                    assert_eq!(a, b, "line ({x0},{y0}) -> ({x1},{y1})");
+                    checked += 1;
+                    lit_total += lit(&a).len();
+                }
+            }
+        }
+    }
+    assert!(checked > 50_000 && lit_total > 100_000, "{checked} lines, {lit_total} pixels");
+    // Far-off starts that stay on the same line as a near one: a shallow line shifted by a whole number of
+    // its own periods draws the same pixels in the buffer.
+    let (mut a, mut b) = (fresh(40, 20), fresh(40, 20));
+    a.line(-3, 2, 60, 17, FG);
+    reference_line(&mut b, -3, 2, 60, 17, FG);
+    assert_eq!(a, b);
+}
+
+/// Draws a..b with `draw_line_3d` and checks, against an independent f64 projection of the endpoints, that
+/// the picture is the true straight line: every lit pixel within 1 pixel of it, and every column (or row,
+/// for a steep line) that the line crosses inside the image has a lit pixel. Returns the lit pixels.
+fn check_long_line(a: Vec3, b: Vec3) -> Vec<(i32, i32)> {
+    // Camera at the origin looking down -Z, image 160x120, fov 60 degrees.
+    let c = cam(Vec3::new(0.0, 0.0, 0.0), 0.0, 0.0);
+    let f = 1.0 / (30f64.to_radians().tan());
+    let aspect = 160.0 / 120.0;
+    let proj = |p: Vec3| -> (f64, f64) {
+        let d = -(p.z as f64);
+        ((p.x as f64 * f / (aspect * d) * 0.5 + 0.5) * 160.0, (0.5 - p.y as f64 * f / d * 0.5) * 120.0)
+    };
+    let (pa, pb) = (proj(a), proj(b));
+    assert!(pa.0.abs().max(pa.1.abs()).max(pb.0.abs()).max(pb.1.abs()) > 1.0e6, "an end is far off screen: {pa:?} {pb:?}");
+    let mut fb = fresh(160, 120);
+    draw_line_3d(&mut fb, &c, a, b, FG);
+    let pixels = lit(&fb);
+    let (dx, dy) = (pb.0 - pa.0, pb.1 - pa.1);
+    let shallow = dx.abs() >= dy.abs();
+    // Position of the true line along the minor axis at a given major coordinate.
+    let at = |major: f64| if shallow { pa.1 + dy / dx * (major - pa.0) } else { pa.0 + dx / dy * (major - pa.1) };
+    for &(x, y) in &pixels {
+        let (major, minor) = if shallow { (x, y) } else { (y, x) };
+        let want = at(major as f64);
+        assert!((minor as f64 - want).abs() <= 1.0, "pixel ({x},{y}) is off the line (should be near {want:.2})");
+    }
+    let (major_len, minor_len) = if shallow { (160, 120) } else { (120, 160) };
+    let mut crossing = 0;
+    for major in 0..major_len {
+        let want = at(major as f64);
+        if want >= 1.0 && want < minor_len as f64 - 1.0 {
+            crossing += 1;
+            assert!(
+                pixels.iter().any(|&(x, y)| {
+                    let (ma, mi) = if shallow { (x, y) } else { (y, x) };
+                    ma == major && (mi as f64 - want).abs() <= 1.0
+                }),
+                "no pixel at {major} (minor should be near {want:.2})"
+            );
+        }
+    }
+    assert!(crossing >= 50, "the line crosses {crossing} columns of the image; the test needs a real crossing");
+    pixels
+}
+
+#[test]
+fn a_very_long_ground_line_near_the_camera_keeps_its_slope() {
+    // Along the ground (y = -1) from x = -6000, z = -0.5 to x = 4e5, z = -400. The near end is at screen
+    // x = -1.25e6, past the old +-1e6 clamp: the clamp moved that end and the line drew 3.7 px too low
+    // across the image. Now the picture must stay within 1 px of the true line.
+    let a = Vec3::new(-6000.0, -1.0, -0.5);
+    let b = Vec3::new(4.0e5, -1.0, -400.0);
+    let pixels = check_long_line(a, b);
+    // The same line drawn from the other end covers the same pixels, give or take rounding at the cut ends.
+    let c = cam(Vec3::new(0.0, 0.0, 0.0), 0.0, 0.0);
+    let mut rev = fresh(160, 120);
+    draw_line_3d(&mut rev, &c, b, a, FG);
+    let diff = lit(&rev).iter().filter(|p| !pixels.contains(p)).count();
+    assert!(diff <= pixels.len() / 10, "{diff} of {} pixels differ when reversed", pixels.len());
+}
+
+#[test]
+fn a_steep_very_long_line_keeps_its_slope_too() {
+    // Up a wall at z = -0.4 from (0.02, -5000) to (0.2, 2000): the low end is at screen y = 1.3e6, past the old
+    // clamp, which made the line cross the middle of the image 2.6 px too far left.
+    check_long_line(Vec3::new(0.02, -5000.0, -0.4), Vec3::new(0.2, 2000.0, -0.4));
+}
+
+#[test]
+fn a_line_millions_of_pixels_long_is_clipped_in_2d_and_still_draws_the_whole_row() {
+    // Screen x of 3.5e10 at both ends: beyond what an i32 pixel can hold, so the 2D clip does the work.
+    // y = 0 maps to row 60 whatever x is, so the whole row 60 must be lit and nothing else.
+    let c = cam(Vec3::new(0.0, 0.0, 0.0), 0.0, 0.0);
+    let mut fb = fresh(160, 120);
+    draw_line_3d(&mut fb, &c, Vec3::new(-1.0e8, 0.0, -0.3), Vec3::new(1.0e8, 0.0, -0.3), FG);
+    assert_eq!(lit(&fb), (0..160).map(|x| (x, 60)).collect::<Vec<_>>());
+    // Same with both ends off the same side of the image: nothing is drawn.
+    let mut fb = fresh(160, 120);
+    draw_line_3d(&mut fb, &c, Vec3::new(1.0e8, 0.0, -0.3), Vec3::new(2.0e8, 0.0, -0.3), FG);
+    assert!(lit(&fb).is_empty());
 }

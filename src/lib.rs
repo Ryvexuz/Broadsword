@@ -4,6 +4,7 @@
 pub mod camera;
 pub mod framebuffer;
 pub mod math;
+pub mod replay;
 pub mod scene;
 #[cfg(windows)]
 pub mod window;
@@ -11,4 +12,5 @@ pub mod window;
 pub use camera::{draw_line_3d, draw_point_3d, Camera, FlyInput};
 pub use framebuffer::{Framebuffer, FramebufferError};
 pub use math::{Mat4, Vec3};
+pub use replay::{draw_frame, Trajectory};
 pub use scene::wire_cube;

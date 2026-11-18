@@ -143,26 +143,102 @@ impl Camera {
     }
 }
 
+/// Pixel for a screen coordinate: `s` lights pixel round(s). Saturates at the `i32` range (NaN gives 0).
 fn to_pixel(v: f32) -> i32 {
-    // Far enough off screen to be rejected, small enough that walking the line stays cheap.
-    const LIMIT: f32 = 1.0e6;
-    (v + 0.5).floor().clamp(-LIMIT, LIMIT) as i32
+    (v + 0.5).floor() as i32
+}
+
+/// Screen coordinates up to this size convert to `i32` pixels exactly, and `Framebuffer::line` clips them
+/// itself without changing a single pixel. It is 2^30, a safe margin inside `i32`; it is not a tuning knob.
+const EXACT_PIXEL_RANGE: f64 = 1_073_741_824.0;
+
+/// Margin, in pixels, kept around the buffer when a very long line is clipped in 2D: the cut ends then land
+/// outside the visible area, so their rounding cannot be seen. A fixed part of the clipping, not a tuning knob.
+const GUARD_BAND: f64 = 2.0;
+
+/// Liang-Barsky clip of the segment p0-p1 against the rectangle [xmin, xmax] x [ymin, ymax]. The result
+/// lies on the original line (so its slope is unchanged), or is `None` if no part is inside.
+fn clip_segment_2d(p0: (f64, f64), p1: (f64, f64), min: (f64, f64), max: (f64, f64)) -> Option<((f64, f64), (f64, f64))> {
+    let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    // For each edge: p * t <= q describes the side that is inside.
+    for (p, q) in [(-dx, p0.0 - min.0), (dx, max.0 - p0.0), (-dy, p0.1 - min.1), (dy, max.1 - p0.1)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None; // parallel to this edge and outside it
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    if !(t0 <= t1) {
+        return None;
+    }
+    Some(((p0.0 + dx * t0, p0.1 + dy * t0), (p0.0 + dx * t1, p0.1 + dy * t1)))
 }
 
 /// Draws a world-space line, clipped against the camera's near and far planes first so a line passing
-/// behind the camera draws correctly instead of wrapping around.
+/// behind the camera draws correctly instead of wrapping around. A line whose screen ends are far outside
+/// the buffer is then clipped in 2D (along the line, so its slope is kept) before it is rasterised.
 pub fn draw_line_3d(fb: &mut Framebuffer, cam: &Camera, a: Vec3, b: Vec3, color: u32) {
     let Some((ca, cb)) = cam.clip_line(a, b) else { return };
     let (w, h) = (fb.width(), fb.height());
     let (Some(pa), Some(pb)) = (cam.project_visible(ca, w, h), cam.project_visible(cb, w, h)) else {
         return;
     };
-    fb.line(to_pixel(pa.0), to_pixel(pa.1), to_pixel(pb.0), to_pixel(pb.1), color);
+    let (p0, p1) = ((pa.0 as f64, pa.1 as f64), (pb.0 as f64, pb.1 as f64));
+    let near_enough = [p0.0, p0.1, p1.0, p1.1].iter().all(|v| v.abs() <= EXACT_PIXEL_RANGE);
+    let (p0, p1) = if near_enough {
+        (p0, p1)
+    } else {
+        let min = (-GUARD_BAND, -GUARD_BAND);
+        let max = (w as f64 + GUARD_BAND, h as f64 + GUARD_BAND);
+        match clip_segment_2d(p0, p1, min, max) {
+            Some(c) => c,
+            None => return,
+        }
+    };
+    fb.line(to_pixel(p0.0 as f32), to_pixel(p0.1 as f32), to_pixel(p1.0 as f32), to_pixel(p1.1 as f32), color);
 }
 
 /// Draws a world-space point as a `size`-pixel square. Points outside the depth range are skipped.
 pub fn draw_point_3d(fb: &mut Framebuffer, cam: &Camera, p: Vec3, size: u32, color: u32) {
     if let Some((sx, sy)) = cam.project(p, fb.width(), fb.height()) {
         fb.point(to_pixel(sx), to_pixel(sy), size, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_segment_2d;
+
+    #[test]
+    fn clipping_keeps_the_line_and_its_slope_at_huge_coordinates() {
+        // A line of slope 0.25 through (0, 10), ends a trillion pixels out.
+        let (p0, p1) = ((-4.0e12, -1.0e12 + 10.0), (4.0e12, 1.0e12 + 10.0));
+        let (a, b) = clip_segment_2d(p0, p1, (-2.0, -2.0), (162.0, 122.0)).expect("it crosses the box");
+        for p in [a, b] {
+            assert!(p.0 >= -2.0 - 1e-6 && p.0 <= 162.0 + 1e-6 && p.1 >= -2.0 - 1e-6 && p.1 <= 122.0 + 1e-6, "{p:?}");
+            // On the original line: y = 10 + 0.25 x.
+            assert!((p.1 - (10.0 + 0.25 * p.0)).abs() < 1e-3, "{p:?} is off the line");
+        }
+        assert!(((b.1 - a.1) / (b.0 - a.0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clipping_rejects_lines_that_miss_the_box_and_handles_axis_parallel_ones() {
+        let (min, max) = ((0.0, 0.0), (160.0, 120.0));
+        assert!(clip_segment_2d((-1e9, -5.0), (1e9, -5.0), min, max).is_none()); // parallel, outside
+        assert!(clip_segment_2d((-1e9, -1e9), (-5.0, 1e9), min, max).is_none()); // runs past the left edge
+        assert!(clip_segment_2d((5.0, 5.0), (5.0, 5.0), min, max).is_some()); // a point inside
+        assert!(clip_segment_2d((500.0, 5.0), (500.0, 5.0), min, max).is_none()); // a point outside
+        let (a, b) = clip_segment_2d((-1e9, 60.0), (1e9, 60.0), min, max).unwrap();
+        // The cut ends are the box edges, to within the rounding of a parameter on a 2e9 pixel line.
+        assert!(a.0.abs() < 1e-3 && (b.0 - 160.0).abs() < 1e-3 && a.1 == 60.0 && b.1 == 60.0, "{a:?} {b:?}");
     }
 }
