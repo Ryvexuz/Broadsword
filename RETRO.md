@@ -94,6 +94,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 | Blind re-labelling for benchmark scores (anonymised, shuffled lines) | Fair scores despite wording differences | Score changes vs the pattern scorer (gpt-6.2-sol 5 → 9) | The labeller is a Claude model, so a contestant (it was blinded) | helped |
 | S4 | Codex CLI first for OpenAI calls (ChatGPT weekly allowance), API as fallback | No API spend for shadow reviews and benchmarks | `backend` field in shadow results | Codex's ~18.5k-token prompt overhead per call; plan rate limits | open |
 | S4 | Adjudicate every shadow-only finding (independent judge, recorded verdict), Lazlo's rule | Know how right the shadow is, and catch bugs the gating reviewer missed | Shadow precision and gating misses from `shadow_report.py` | Judge time per merge; verdicts by a Claude judge favouring Claude | open |
+| S4 | Self-optimization: the orchestrator may change or drop process rules that measurably cost throughput or money (Lazlo's standing OK; safety rules excluded) | Less waiting on approvals for process tweaks; rules that don't pay their way go | Changes made under it, each with before/after numbers, and how many were reverted | The orchestrator relaxing rules for convenience (lesson 27); a safety rule mislabelled as process | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first

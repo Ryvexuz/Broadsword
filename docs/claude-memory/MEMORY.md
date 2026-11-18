@@ -5,3 +5,4 @@
 - [Fast modes need a price check](fast-modes-need-price-check.md) — no paid speed tiers (OpenAI fast, Claude /fast) until a price comparison; orchestrator fast mode off
 - [Model budget routing](model-budget-routing.md) — OpenAI budget resets whenever Lazlo wants, Claude's doesn't; use either as fits, no fixed rule
 - [Adjudicate shadow findings](adjudicate-shadow-findings.md) — shadow-only bugs get an independent verdict; measure shadow precision and gating misses
+- [Self-optimize the process](self-optimize-process.md) — may change/drop process rules that hurt throughput or cost, with evidence + ledger; safety rules excluded

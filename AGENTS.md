@@ -23,6 +23,13 @@ Every area is in scope (rendering, 3D creation, physics, games, CAD, media), as 
 - **Resources:** follow the Disk rules below. Never delete work, history or failure evidence.
 - **Ask first:** before spending money, using credentials or network services, publishing, or deleting anything outside the scratch area.
 - **Retrospective:** before a milestone starts, read the last retro's "Carry into the next milestone" list and apply it. After each milestone, add a short entry to `RETRO.md`: what went wrong, why, and what changes so it doesn't happen again; and the same for speed and cost. Each change goes where it is enforced (Broadsword's code, a role file, `SPEC_CHECKLIST.md`), not only into the notes, and the next retro checks whether it worked or hindered anything (the improvement ledger in `RETRO.md`); a change that hinders is fixed or reverted. Lessons that apply beyond Broadsword go in its "Portable lessons" section; then run `python -I scripts/sync_playbook.py` so every project on this machine gets them (`--check` reports a stale copy). When retros keep coming back empty, this rule can be dropped.
+- **Self-optimization:** the orchestrator may change, replace or drop any process rule without asking when the evidence shows it costs throughput or money without enough benefit. Process rules cover how work is organised: review tiers and rounds, brief and check formats, check scope, agent counts, records and metrics, and Lazlo's own process rules. This is Lazlo's standing OK from 2026-11-18. Each change needs:
+  - the measured cost of the rule, in numbers;
+  - a ledger row in `RETRO.md`;
+  - a change that can be reverted, and is reverted if the next retro shows it hurt;
+  - a line in that session's report.
+
+  Some rules stay Lazlo's and are never changed this way: Ask first, Secrets, never deleting work or history, Done means verified (no faked tests), and an independent review before every merge. The review's form may change; its existence may not.
 - **Continuity:** commit often. End every session by updating `PROGRESS.md` and adding a `LAB_LOG.md` entry.
 - Keep this file in the repo as `AGENTS.md` with a CLAUDE.md next to it containing one line, @AGENTS.md, so Claude Code and any other tool loads these rules at startup.
 
