@@ -530,7 +530,11 @@ fn a_check_job_that_panics_ends_failed_and_its_child_is_gone() {
     assert!(se.contains("TEST HOOK ACTIVE") && se.contains("PANIC in job"), "{se}");
     let pid = so.split("killing orphaned process tree (pid ").nth(1).and_then(|t| t.split(')').next()).unwrap_or_else(|| panic!("the child must have been killed: {so}")).to_string();
     wait_until("the child to be gone", 10, || !pid_alive(&pid));
-    let rec = r.only_record();
+    // the ungated `run` above left its own record; this test is about the check job's
+    let recs = r.records();
+    let checks: Vec<&String> = recs.iter().map(|(_, t)| t).filter(|t| Root::field(t, "kind") == "check").collect();
+    assert_eq!(checks.len(), 1, "{recs:?}");
+    let rec = checks[0].clone();
     assert_eq!(Root::field(&rec, "status"), "failed", "{rec}");
     assert!(Root::field(&rec, "failure_reason").contains("panicked") && Root::field(&rec, "failure_reason").contains("test hook"), "{rec}");
     assert_eq!(Root::field(&rec, "child_pid"), "");

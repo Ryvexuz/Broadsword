@@ -998,10 +998,13 @@ fn a_run_job_that_panics_stays_running_and_blocks_only_its_own_folder() {
     assert_eq!(r.run_echo(Some(&b)).code, 0);
     assert_eq!(r.run_echo(None).code, 0);
     // recover rolls the worktree back as before
-    assert!(r.wt(&a).join("a.txt").exists());
+    // a.txt is tracked ("one\n"); the panicked run overwrote it
+    let read = |p: PathBuf| fs::read_to_string(p).unwrap().replace("\r\n", "\n");
+    assert_eq!(read(r.wt(&a).join("a.txt")).trim(), "changed");
     let o = r.run(&["recover"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
-    assert!(!r.wt(&a).join("a.txt").exists(), "rolled back in its own worktree: {}", o.stdout);
+    assert_eq!(read(r.wt(&a).join("a.txt")), "one\n", "rolled back in its own worktree: {}", o.stdout);
+    assert_eq!(read(r.wt(&b).join("a.txt")), "one\n", "the other worktree is untouched");
     assert_eq!(r.status_in_record(&id), "rolled_back");
     assert_eq!(r.run_echo(Some(&a)).code, 0);
 }
