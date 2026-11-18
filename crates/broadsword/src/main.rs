@@ -1,3 +1,23 @@
+// A closed stdout or stderr must never kill Broadsword. std's println! and friends PANIC when the reader has gone
+// (`broadsword run ... | head` closes the pipe early), and a panic in the middle of a job leaves its record `running`,
+// which blocks every new job on that project until someone runs `recover`. These shadow the std macros for the whole
+// crate (they are defined before every `mod`, so every module sees them): output that cannot be written is dropped,
+// and the job carries on and records its real result. The job log is unaffected (it is written to a file).
+macro_rules! println {
+    () => {{ use std::io::Write as _; let _ = writeln!(std::io::stdout()); }};
+    ($($a:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stdout(), $($a)*); }};
+}
+macro_rules! print {
+    ($($a:tt)*) => {{ use std::io::Write as _; let _ = write!(std::io::stdout(), $($a)*); }};
+}
+macro_rules! eprintln {
+    () => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr()); }};
+    ($($a:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($a)*); }};
+}
+macro_rules! eprint {
+    ($($a:tt)*) => {{ use std::io::Write as _; let _ = write!(std::io::stderr(), $($a)*); }};
+}
+
 mod buildsrc;
 mod cleanup;
 mod config;

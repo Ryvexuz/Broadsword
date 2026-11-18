@@ -486,3 +486,25 @@ fn abandon_lifts_the_refusal_without_touching_files() {
     let out = r.run(&["run", "p", "--", "echo hi"]);
     assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
 }
+
+/// `broadsword run ... | head -1`: the reader closes the pipe while the job is still printing. Broadsword must not die
+/// (std's println! would panic), so the job finishes and its record is `done`, not left `running` to block the project.
+#[test]
+fn closed_stdout_never_leaves_a_job_running() {
+    use std::io::BufRead;
+    let r = Root::new("pipe");
+    r.project("pub fn f() {}\n", true);
+    let mut child = r.cmd(&["run", "p", "--", "ping", "-n", "4", "127.0.0.1"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.starts_with("job: run p") {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "stdout ended before the job line");
+    }
+    drop(out); // the reader is gone, like `head` exiting; ping keeps printing for ~3 s
+    let status = child.wait().unwrap();
+    let rec = r.only_record();
+    assert_eq!(Root::field(&rec, "status"), "done", "exit {status:?}, record:\n{rec}");
+    let again = r.run(&["run", "p", "--", "cmd", "/C", "echo", "ok"]);
+    assert_eq!(again.status.code(), Some(0), "the next job on the project is not refused: {}", String::from_utf8_lossy(&again.stderr));
+}
