@@ -445,8 +445,9 @@ fn a_second_job_is_refused_with_exit_3_when_the_build_lock_stays_busy() {
     assert_eq!(o.code, 3, "{}", o.stderr);
     assert!(o.stderr.contains("build folder busy") && o.stderr.contains("build_lock_wait_seconds") && o.stderr.contains("nothing was built, cleaned or recorded"), "{}", o.stderr);
     assert!(started.elapsed() >= Duration::from_secs(1) && started.elapsed() < Duration::from_secs(20), "it waited the configured time, not forever: {:?}", started.elapsed());
-    let rec = fs::read_to_string(r.job_records().last().unwrap()).unwrap();
-    assert!(rec.contains("status = refused"), "{rec}");
+    // ids sort by name and two jobs of one second share a stem, so look for the refused record instead of taking the last one
+    let recs: Vec<String> = r.job_records().iter().map(|p| fs::read_to_string(p).unwrap()).collect();
+    assert!(recs.iter().any(|rec| rec.contains("status = refused")), "{recs:?}");
     assert!(!r.dir.join("build").exists() || r.note().is_none(), "the refused job changed nothing");
     // the same through check and test
     for k in ["test", "check"] {

@@ -344,31 +344,121 @@ fn dead_pid() -> u32 {
     pid
 }
 
-/// Blocker 3: a killed job that deleted and changed git-ignored files (`.env`) must not lose them.
+/// Blocker 3, secrets rule: a killed job that deleted a git-ignored file gets it back, but a secret file (`.env`) is never
+/// captured, restored or deleted: it keeps the bytes the job left in it.
 #[test]
-fn kill_mid_run_restores_ignored_files_the_job_deleted_or_changed() {
+fn kill_mid_run_restores_ignored_files_but_never_touches_secret_files() {
     let mut r = Root::new("killenv");
     r.project("", true);
     let p = r.project_dir();
     fs::write(p.join(".env"), "SECRET=1\r\n").unwrap();
-    fs::write(p.join(".env2"), "OTHER=2\n").unwrap();
-    let line = if cfg!(windows) { "echo changed> .env & del .env2 & echo made> made.log & ping -n 30 127.0.0.1 >nul" } else { "echo changed > .env; rm .env2; echo made > made.log; sleep 30" };
+    fs::write(p.join("data.log"), "OTHER=2\n").unwrap();
+    let env_hash = git(&p, &["hash-object", "--no-filters", ".env"]);
+    let line = if cfg!(windows) { "echo changed> .env & del data.log & echo made> made.log & ping -n 30 127.0.0.1 >nul" } else { "echo changed > .env; rm data.log; echo made > made.log; sleep 30" };
     let bs_pid = r.spawn(&["run", "p", "--", line]);
     wait_until("the job to have changed the ignored files", 60, || {
-        r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("made.log").exists() && !p.join(".env2").exists()
+        r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("made.log").exists() && !p.join("data.log").exists()
     });
-    let id = Root::field(&r.only_record(), "id");
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    assert_eq!(Root::field(&rec, "secret_skipped"), ".env", "the record lists the secret file by name: {rec}");
     kill_hard(bs_pid);
     let out = r.run(&["recover"]);
     let so = text(&out.stdout);
     println!("{so}");
     assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
-    assert_eq!(fs::read(p.join(".env")).unwrap(), b"SECRET=1\r\n");
-    assert_eq!(fs::read(p.join(".env2")).unwrap(), b"OTHER=2\n");
+    assert_eq!(fs::read_to_string(p.join(".env")).unwrap().trim(), "changed", "rollback leaves the secret file with the job's bytes");
+    assert_eq!(fs::read(p.join("data.log")).unwrap(), b"OTHER=2\n", "another ignored file is restored");
     assert!(p.join("made.log").exists(), "ignored files the job created are never deleted");
+    assert!(!so.contains("not restored"), "{so}");
     let ign = format!("refs/broadsword/interrupted-ignored/{id}/1");
-    assert_eq!(git(&p, &["show", &format!("{ign}:.env")]).trim(), "changed");
     assert_eq!(git(&p, &["show", &format!("{ign}:made.log")]).trim(), "made");
+    assert!(git(&p, &["ls-tree", "-r", "--name-only", &ign]).lines().all(|f| f != ".env"), "the interrupted snapshot holds no .env");
+    assert_eq!(git(&p, &["rev-parse", "--verify", "-q", &format!("refs/broadsword/checkpoints-ignored/{id}")]).len(), 40);
+    assert_no_secret_object(&p, &env_hash);
+    let changed_hash = git(&p, &["hash-object", "--no-filters", ".env"]);
+    assert_no_secret_object(&p, &changed_hash);
+}
+
+/// No object reachable from any refs/broadsword/* ref has this id, and the object store has no such object at all.
+fn assert_no_secret_object(p: &Path, hash: &str) {
+    let refs = git(p, &["for-each-ref", "--format=%(refname)", "refs/broadsword/"]);
+    let names: Vec<&str> = refs.lines().collect();
+    if !names.is_empty() {
+        let mut args = vec!["rev-list", "--objects"];
+        args.extend(names.iter().copied());
+        let objs = git(p, &args);
+        assert!(!objs.lines().any(|l| l.starts_with(hash)), "blob {hash} of a secret file is reachable from a broadsword ref");
+    }
+    let out = Command::new("git").args(["cat-file", "-e", hash]).current_dir(p).env_remove("GIT_DIR").output().unwrap();
+    assert!(!out.status.success(), "an object with a secret file's bytes ({hash}) exists in the object store");
+}
+
+/// A `run` in a repo with ignored secret files: nothing is stored from them, the record lists them by name, other ignored files are kept.
+#[test]
+fn run_checkpoint_never_stores_secret_files() {
+    let mut r = Root::new("secretckpt");
+    r.project("", true);
+    let p = r.project_dir();
+    fs::write(p.join(".gitignore"), ".env\n.env.local\nsub/.env\n*.log\n").unwrap();
+    git(&p, &["add", "-A"]);
+    git(&p, &["commit", "-q", "-m", "ignore secrets"]);
+    fs::write(p.join(".env"), "API_KEY=sk-fake-secret-value-1\n").unwrap();
+    fs::write(p.join(".env.local"), "API_KEY=sk-fake-secret-value-2\n").unwrap();
+    fs::create_dir_all(p.join("sub")).unwrap();
+    fs::write(p.join("sub/.env"), "API_KEY=sk-fake-secret-value-3\n").unwrap();
+    fs::write(p.join("keep.log"), "ordinary ignored file\n").unwrap();
+    let hashes: Vec<String> = [".env", ".env.local", "sub/.env"].iter().map(|f| git(&p, &["hash-object", "--no-filters", f])).collect();
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    let rec = r.only_record();
+    let ign = Root::field(&rec, "checkpoint_ignored");
+    assert!(ign.starts_with("refs/broadsword/checkpoints-ignored/"), "{rec}");
+    assert_eq!(Root::field(&rec, "secret_skipped"), ".env|.env.local|sub/.env", "{rec}");
+    assert_eq!(git(&p, &["show", &format!("{ign}:keep.log")]).trim(), "ordinary ignored file", "other ignored files are still captured");
+    for h in &hashes {
+        assert_no_secret_object(&p, h);
+    }
+    assert!(!rec.contains("sk-fake"), "the record never holds secret content: {rec}");
+    assert!(!so.contains("sk-fake"), "{so}");
+    r.children.clear();
+}
+
+/// A `run` that deletes `.env` is interrupted: rollback keeps it deleted and reports no error.
+#[test]
+fn rollback_keeps_a_deleted_secret_file_deleted() {
+    let mut r = Root::new("killdelenv");
+    r.project("", true);
+    let p = r.project_dir();
+    fs::write(p.join(".env"), "SECRET=1\n").unwrap();
+    let line = if cfg!(windows) { "del .env & echo changed> tracked.txt & ping -n 30 127.0.0.1 >nul" } else { "rm .env; echo changed > tracked.txt; sleep 30" };
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have deleted .env", 60, || {
+        r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && !p.join(".env").exists() && fs::read_to_string(p.join("tracked.txt")).unwrap().trim() == "changed"
+    });
+    kill_hard(bs_pid);
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(!p.join(".env").exists(), "a secret file the job deleted is not recreated");
+    assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap().trim(), "original", "tracked files roll back as before");
+}
+
+/// Only `run` takes a checkpoint: check (build + test) creates no refs/broadsword/* ref and its record says so.
+#[test]
+fn check_takes_no_checkpoint_and_creates_no_refs() {
+    let r = Root::new("nockpt");
+    r.project("#[cfg(test)] mod t { #[test] fn a() {} }\n", true);
+    let p = r.project_dir();
+    let out = r.run(&["check", "p"]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+    let rec = r.only_record();
+    assert_eq!(Root::field(&rec, "kind"), "check");
+    assert_eq!(Root::field(&rec, "checkpoint"), "none", "{rec}");
+    assert!(Root::field(&rec, "checkpoint_reason").contains("only `run` takes a checkpoint"), "{rec}");
+    assert_eq!(git(&p, &["for-each-ref", "refs/broadsword/"]), "", "no checkpoint refs");
+    assert!(!text(&out.stdout).contains("checkpoint:"), "{}", text(&out.stdout));
 }
 
 /// Item 9: the automatic recovery before a job never rolls back a `run`; it refuses new jobs on that project.

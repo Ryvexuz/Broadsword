@@ -217,7 +217,7 @@ fn process_secrets(cfg: &Config) -> reviewer::Secrets {
 /// A brief file may not be a secrets file, and must be a small UTF-8 text file.
 fn read_brief(cfg: &Config, path: &str) -> Result<String, String> {
     let p = Path::new(path);
-    if p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with(".env")) {
+    if crate::git::is_secret_file(path) {
         return Err(format!("`{path}` looks like an .env file; a brief is sent to a model and secrets must never be"));
     }
     let meta = std::fs::metadata(p).map_err(|e| format!("cannot read the brief file `{path}`: {e}"))?;

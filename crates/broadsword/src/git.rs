@@ -13,6 +13,9 @@
 //! - `refs/broadsword/index/<id>`: the real index at checkpoint time
 //! - `refs/broadsword/interrupted-index/<id>/<attempt>`: the real index just before a rollback replaced it
 //!
+//! Secret files (see `is_secret_file`) do not exist for any of this: they are never read, stored, restored,
+//! overwritten or deleted, by a snapshot or by a rollback.
+//!
 //! Refs are only ever created (never overwritten or deleted), so no snapshot is ever lost.
 
 use crate::config::{Config, MB};
@@ -43,6 +46,14 @@ impl Opts {
             ignored_max_bytes: cfg.checkpoint_ignored_max_mb * MB,
         }
     }
+}
+
+/// THE one rule for what a secret file is: a file whose name starts with `.env` (`.env`, `.env.local`, `.envrc`, ...),
+/// at any depth, compared case-insensitively. Checkpoint capture, rollback and the queue's `--brief` check all call this
+/// function. `.envrc` counts on purpose: direnv files usually hold keys, and wrongly protecting a file costs nothing.
+/// Both `/` and a backslash separate folders.
+pub fn is_secret_file(path: &str) -> bool {
+    path.rsplit(['/', '\\']).next().is_some_and(|n| n.to_lowercase().starts_with(".env"))
 }
 
 /// A project is a Git repo of its own when it has its own `.git` (folder, or file for a linked worktree).
@@ -181,6 +192,8 @@ pub struct Captured {
     pub ignored_tree: Option<String>,
     /// Ignored files left out because the size cap was reached.
     pub skipped: Vec<(String, u64)>,
+    /// Secret files left out (names only, never content); no object was ever made from them.
+    pub secret_skipped: Vec<String>,
 }
 
 fn excluded(rel: &str, opts: &Opts) -> bool {
@@ -201,6 +214,15 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
     files.sort();
     files.dedup();
     files.retain(|p| is_regular(dir, p)); // tracked files deleted from disk are simply absent from the snapshot
+    // Secret files are dropped here, before any blob is written: nothing below ever sees their bytes.
+    let mut secret_skipped: Vec<String> = Vec::new();
+    files.retain(|p| {
+        let secret = is_secret_file(p);
+        if secret {
+            secret_skipped.push(p.clone());
+        }
+        !secret
+    });
     let tree = tree_of(dir, state, tag, &files, &modes)?;
 
     let mut kept = Vec::new();
@@ -208,6 +230,12 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
     let mut used = 0u64;
     for p in list_files(dir, &["ls-files", "-z", "-o", "-i", "--exclude-standard"])? {
         if excluded(&p, opts) || !is_regular(dir, &p) {
+            continue;
+        }
+        if is_secret_file(&p) {
+            if !secret_skipped.contains(&p) {
+                secret_skipped.push(p);
+            }
             continue;
         }
         let len = std::fs::metadata(dir.join(&p)).map(|m| m.len()).unwrap_or(0);
@@ -219,7 +247,8 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
         }
     }
     let ignored_tree = if kept.is_empty() { None } else { Some(tree_of(dir, state, &format!("{tag}-ign"), &kept, &HashMap::new())?) };
-    Ok(Captured { tree, ignored_tree, skipped })
+    secret_skipped.sort();
+    Ok(Captured { tree, ignored_tree, skipped, secret_skipped })
 }
 
 pub struct Checkpoint {
@@ -227,6 +256,8 @@ pub struct Checkpoint {
     pub commit: String,
     pub ignored_ref: Option<String>,
     pub skipped: Vec<(String, u64)>,
+    /// Secret files not captured, by name.
+    pub secret_skipped: Vec<String>,
     /// Tree of the real index at the time, kept reachable under `refs/broadsword/index/<id>`.
     pub index_tree: Option<String>,
 }
@@ -252,7 +283,7 @@ pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Che
         let c = commit_tree(dir, t, parent.as_deref(), &format!("broadsword index at checkpoint {id}"))?;
         create_ref(dir, &format!("{INDEX_REFS}/{id}"), &c)?;
     }
-    Ok(Checkpoint { ref_name, commit, ignored_ref, skipped: cap.skipped, index_tree })
+    Ok(Checkpoint { ref_name, commit, ignored_ref, skipped: cap.skipped, secret_skipped: cap.secret_skipped, index_tree })
 }
 
 pub struct Rollback {
@@ -296,6 +327,9 @@ fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
         let f: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
         if f.len() < 5 {
             return Err(format!("unexpected diff-tree line: {meta}"));
+        }
+        if is_secret_file(path) {
+            continue; // a checkpoint made before this rule may hold one: it is never restored or deleted
         }
         v.push(Change { status: f[4].chars().next().unwrap_or('M'), mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
     }
@@ -351,6 +385,9 @@ impl Guard<'_> {
 
     /// Write the blob of `c` to its path. Ok(true) = written, Ok(false) = skipped.
     fn write(&mut self, c: &Change) -> Result<bool, String> {
+        if is_secret_file(&c.path) {
+            return Ok(false); // never written; not even listed as skipped: a secret file does not exist for rollback
+        }
         if !self.may_change(&c.path)? {
             self.skip(&c.path);
             return Ok(false);
@@ -372,6 +409,9 @@ impl Guard<'_> {
 
     /// Delete a file the job added (its bytes are in the snapshot), then the folders that leaves empty.
     fn remove(&mut self, rel: &str) -> Result<bool, String> {
+        if is_secret_file(rel) {
+            return Ok(false); // never deleted
+        }
         let full = self.dir.join(safe_rel(rel)?);
         if full.symlink_metadata().is_err() {
             return Ok(false); // already gone
@@ -712,20 +752,20 @@ mod tests {
     #[test]
     fn cap_never_lets_rollback_overwrite_an_uncaptured_file() {
         let d = temp_repo("capover");
-        fs::write(d.join(".env"), "SECRET=original").unwrap();
-        fs::write(d.join("big.log"), vec![b'x'; 500]).unwrap(); // 515 bytes in total: fits the checkpoint's cap
+        fs::write(d.join("keep.log"), "original").unwrap();
+        fs::write(d.join("big.log"), vec![b'x'; 500]).unwrap(); // 508 bytes in total: fits the checkpoint's cap
         let o = Opts { excludes: vec![], ignored_max_bytes: 1000 };
         let state = state_for("capover");
         let c = checkpoint(&d, &state, "j", &o).unwrap();
         assert!(c.skipped.is_empty());
         // the job adds an ignored file that sorts first and nearly fills the cap
         fs::write(d.join(".aaa.log"), vec![b'y'; 990]).unwrap();
-        fs::write(d.join(".env"), "SECRET=changed by job").unwrap();
-        // the interrupted snapshot now cannot hold .env; the user edits it after the kill
-        fs::write(d.join(".env"), "USER EDIT, in no snapshot").unwrap();
+        fs::write(d.join("keep.log"), "changed by job").unwrap();
+        // the interrupted snapshot now cannot hold keep.log; the user edits it after the kill
+        fs::write(d.join("keep.log"), "USER EDIT, in no snapshot").unwrap();
         let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &o).unwrap();
-        assert_eq!(fs::read_to_string(d.join(".env")).unwrap(), "USER EDIT, in no snapshot", "uncaptured bytes must never be overwritten");
-        assert!(r.not_restored.contains(&".env".to_string()), "{:?}", r.not_restored);
+        assert_eq!(fs::read_to_string(d.join("keep.log")).unwrap(), "USER EDIT, in no snapshot", "uncaptured bytes must never be overwritten");
+        assert!(r.not_restored.contains(&"keep.log".to_string()), "{:?}", r.not_restored);
         assert_eq!(fs::read(d.join(".aaa.log")).unwrap().len(), 990, "ignored files the job created stay");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
@@ -868,23 +908,114 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// Regression (blocker 3): ignored files (`.env`) the job deleted or changed come back.
+    /// Regression (blocker 3): ignored files the job deleted or changed come back.
     #[test]
     fn ignored_files_deleted_or_changed_by_the_job_are_restored() {
         let d = temp_repo("ign");
-        fs::write(d.join(".env"), "SECRET=1\r\nB=2\n").unwrap();
-        fs::write(d.join(".env2"), "OTHER=1").unwrap();
+        fs::write(d.join("a.log"), "A=1\r\nB=2\n").unwrap();
+        fs::write(d.join("ignored.txt"), "OTHER=1").unwrap();
         let state = state_for("ign");
         let c = checkpoint(&d, &state, "j", &opts()).unwrap();
-        fs::write(d.join(".env"), "SECRET=changed").unwrap();
-        fs::remove_file(d.join(".env2")).unwrap();
+        fs::write(d.join("a.log"), "changed").unwrap();
+        fs::remove_file(d.join("ignored.txt")).unwrap();
         fs::write(d.join("made.log"), "log made by job").unwrap();
         let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
-        assert_eq!(fs::read(d.join(".env")).unwrap(), b"SECRET=1\r\nB=2\n");
-        assert_eq!(fs::read(d.join(".env2")).unwrap(), b"OTHER=1");
+        assert_eq!(fs::read(d.join("a.log")).unwrap(), b"A=1\r\nB=2\n");
+        assert_eq!(fs::read(d.join("ignored.txt")).unwrap(), b"OTHER=1");
         assert_eq!(fs::read_to_string(d.join("made.log")).unwrap(), "log made by job", "ignored files the job created are never deleted");
         assert_eq!(r.ignored_restored, 2);
-        assert_eq!(show(&d, &r.interrupted_ignored_ref.unwrap(), ".env"), "SECRET=changed");
+        assert_eq!(show(&d, &r.interrupted_ignored_ref.unwrap(), "a.log"), "changed");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_secret_file_rule() {
+        for yes in [".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".envrc"] {
+            assert!(is_secret_file(yes), "{yes}");
+        }
+        for no in ["env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", ""] {
+            assert!(!is_secret_file(no), "{no}");
+        }
+    }
+
+    /// Does the object database hold a blob with exactly these bytes?
+    fn has_object(d: &Path, bytes: &[u8]) -> bool {
+        let sha = String::from_utf8_lossy(&git(d, &["hash-object", "--no-filters", "--stdin"], None, Some(bytes)).unwrap()).trim().to_string();
+        git_text(d, &["cat-file", "-e", &sha], None).is_ok()
+    }
+
+    /// Secret files are never captured: no blob is made from them, and capture records only their names.
+    #[test]
+    fn secret_files_are_never_captured() {
+        let d = temp_repo("secret-cap");
+        fs::write(d.join(".env"), "SECRET=never-in-git-aaa").unwrap();
+        fs::write(d.join(".env.local"), "SECRET=never-in-git-bbb").unwrap();
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub").join(".env"), "SECRET=never-in-git-ccc").unwrap();
+        fs::write(d.join("env.txt"), "not a secret name").unwrap(); // untracked, not ignored: in the main tree
+        fs::write(d.join("other.log"), "other ignored file").unwrap();
+        let state = state_for("secret-cap");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        for b in [&b"SECRET=never-in-git-aaa"[..], b"SECRET=never-in-git-bbb", b"SECRET=never-in-git-ccc"] {
+            assert!(!has_object(&d, b), "a blob was made from a secret file");
+        }
+        assert_eq!(c.secret_skipped, [".env", ".env.local", "sub/.env"]);
+        assert_eq!(show(&d, &c.ref_name, "env.txt"), "not a secret name");
+        assert_eq!(show(&d, &c.ignored_ref.unwrap(), "other.log"), "other ignored file", "other ignored files are still captured");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The hard case: rollback leaves secret files byte-identical (changed, deleted or created by the job); none is "new".
+    #[test]
+    fn rollback_never_touches_secret_files() {
+        let d = temp_repo("secret-rb");
+        fs::write(d.join(".env"), "SECRET=original").unwrap();
+        fs::write(d.join(".env.local"), "LOCAL=original").unwrap();
+        fs::write(d.join("other.log"), "other original").unwrap();
+        let state = state_for("secret-rb");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        fs::write(d.join(".env"), "SECRET=written by the job").unwrap();
+        fs::remove_file(d.join(".env.local")).unwrap();
+        fs::write(d.join(".env.new"), "NEW=made by the job").unwrap();
+        fs::write(d.join("other.log"), "other changed").unwrap();
+        fs::write(d.join("tracked.txt"), "job edit").unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(fs::read(d.join(".env")).unwrap(), b"SECRET=written by the job", "never overwritten");
+        assert!(!d.join(".env.local").exists(), "a deleted secret file is not recreated");
+        assert_eq!(fs::read(d.join(".env.new")).unwrap(), b"NEW=made by the job", "never deleted as new");
+        assert_eq!(fs::read(d.join("other.log")).unwrap(), b"other original");
+        assert_eq!(fs::read(d.join("tracked.txt")).unwrap(), b"one");
+        assert!(r.not_restored.is_empty(), "secrets are not even reported: {:?}", r.not_restored);
+        for b in [&b"SECRET=original"[..], b"SECRET=written by the job", b"LOCAL=original", b"NEW=made by the job"] {
+            assert!(!has_object(&d, b), "a blob was made from a secret file");
+        }
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A checkpoint made before this rule may hold a secret file: rollback must not restore it either.
+    #[test]
+    fn rollback_ignores_a_secret_file_inside_an_old_checkpoint() {
+        let d = temp_repo("secret-old");
+        fs::write(d.join("a.log"), "a").unwrap();
+        let state = state_for("secret-old");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        let blob = String::from_utf8_lossy(&git(&d, &["hash-object", "-w", "--no-filters", "--stdin"], None, Some(b"SECRET=old")).unwrap()).trim().to_string();
+        let old_tree = git_text(&d, &["rev-parse", &format!("{}^{{tree}}", c.ignored_ref.as_ref().unwrap())], None).unwrap();
+        let mut input = git(&d, &["ls-tree", "-z", &old_tree], None, None).unwrap();
+        input.extend_from_slice(format!("100644 blob {blob}\t.env").as_bytes());
+        input.push(0);
+        let tree = String::from_utf8_lossy(&git(&d, &["mktree", "-z"], None, Some(&input)).unwrap()).trim().to_string();
+        let commit = commit_tree(&d, &tree, None, "old style").unwrap();
+        create_ref(&d, "refs/broadsword/checkpoints-ignored/old", &commit).unwrap();
+        let main_commit = git_text(&d, &["rev-parse", &c.ref_name], None).unwrap();
+        create_ref(&d, "refs/broadsword/checkpoints/old", &main_commit).unwrap();
+        // .env is not on disk: the old checkpoint must not bring it back
+        let r = rollback(&d, &state, "old", "refs/broadsword/checkpoints/old", Some("refs/broadsword/checkpoints-ignored/old"), &[], c.index_tree.as_deref(), &opts()).unwrap();
+        assert!(!d.join(".env").exists());
+        assert!(r.not_restored.is_empty());
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }

@@ -464,7 +464,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
-/// before the first step (when the project is a Git repo), and runs the steps.
+/// before the first step (`run` only, and the project must be a Git repo), and runs the steps.
 /// The build lock, held until the job function returns. For `run`, dropping it first marks the notes of the folder's
 /// packages unknown (the command may have built anything), so the next build, test or check cleans and `install` refuses.
 struct BuildHold {
@@ -602,7 +602,12 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             return end(&mut rec, record::REFUSED, EXIT_REFUSED);
         }
         if i == spec.first_step {
-            if git::is_repo(&project_dir) {
+            if kind != "run" {
+                // Only `run` can change files, so only `run` is ever rolled back. build, test and check are resumed or re-run
+                // (recover.rs), never rolled back: a checkpoint for them would be used by nothing.
+                rec.set("checkpoint", "none");
+                rec.set("checkpoint_reason", format!("{kind} jobs are resumed or re-run, never rolled back: only `run` takes a checkpoint"));
+            } else if git::is_repo(&project_dir) {
                 match git::checkpoint(&project_dir, &cfg.state_dir, &job_id, &git::Opts::for_project(cfg, &project_dir)) {
                     Ok(c) => {
                         println!("checkpoint: {} ({})", c.ref_name, &c.commit[..c.commit.len().min(10)]);
@@ -610,6 +615,11 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                         rec.set("checkpoint_commit", c.commit);
                         rec.set("checkpoint_ignored", c.ignored_ref.unwrap_or_default());
                         rec.set("index_tree", c.index_tree.unwrap_or_default());
+                        if !c.secret_skipped.is_empty() {
+                            // names only, never content
+                            println!("checkpoint: secret file(s) not saved (by design): {}", c.secret_skipped.join(", "));
+                            rec.set("secret_skipped", c.secret_skipped.join("|"));
+                        }
                         if !c.skipped.is_empty() {
                             eprintln!(
                                 "broadsword: warning: {} ignored file(s) were NOT saved in the checkpoint (over the {} MB checkpoint_ignored_max_mb limit): {}",
@@ -621,17 +631,14 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                             rec.set("ignored_skipped_len", c.skipped.iter().map(|(_, n)| n.to_string()).collect::<Vec<_>>().join("|"));
                         }
                     }
-                    Err(e) if kind == "run" => {
+                    Err(e) => {
                         eprintln!("broadsword: refusing to run: cannot take a checkpoint: {e}");
                         return end(&mut rec, record::REFUSED, EXIT_REFUSED);
-                    }
-                    Err(e) => {
-                        eprintln!("broadsword: warning: no checkpoint: {e}");
-                        rec.set("checkpoint", "none");
                     }
                 }
             } else {
                 rec.set("checkpoint", "none");
+                rec.set("checkpoint_reason", "the project is not a Git repository");
             }
         }
         if build_hold.is_none() {

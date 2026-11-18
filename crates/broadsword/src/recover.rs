@@ -3,10 +3,11 @@
 //! Every record still `running` whose Broadsword process is gone is recovered:
 //! - the recorded child process tree is killed first if it is still alive (an orphaned cargo or command),
 //!   but only when its recorded creation time matches exactly (a reused pid is never killed);
-//! - `build` / `test` / `check` only read and rebuild, so they are resumed: re-run from the step they
+//! - `build` / `test` / `check` only read and rebuild, so they are resumed (they take no checkpoint): re-run from the step they
 //!   were on, as a new job linked to the old one (old record -> `resumed`), at most `max_resumes` times
 //!   in a row, then the record is marked `failed`;
-//! - `run` may have changed files, so it is rolled back to its checkpoint, after saving the partial work
+//! - `run` may have changed files, so it is rolled back to its checkpoint (the only kind that has one; secret files,
+//!   `.env*`, are never part of a checkpoint or of the rollback), after saving the partial work
 //!   under `refs/broadsword/interrupted/<id>/<attempt>` (old record -> `rolled_back`). Nothing is deleted.
 //!
 //! A record whose Broadsword is still alive is another job genuinely running and is left alone.
