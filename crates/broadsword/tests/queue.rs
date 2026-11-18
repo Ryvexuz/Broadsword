@@ -68,6 +68,16 @@ impl Root {
     }
 
     fn with_projects(name: &str, timeout_s: u64, projects: &'static str) -> Root {
+        Root::build(name, timeout_s, projects, "off", 5)
+    }
+
+    /// A root whose shadow reviewer is ON (`shadow_reviewer = "openai"`, timeout `shadow_timeout_s`); the shadow program is always
+    /// a fake script in scratch (see `shadow_env`), never the real wrapper, so the real API is never called.
+    fn with_shadow(name: &str, shadow_timeout_s: u64) -> Root {
+        Root::build(name, 30, "scratch/projects", "openai", shadow_timeout_s)
+    }
+
+    fn build(name: &str, timeout_s: u64, projects: &'static str, shadow: &str, shadow_timeout_s: u64) -> Root {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("qu-{name}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -96,6 +106,7 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = {timeout_s}\n\
              reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\nreviewer_max_calls_per_entry = 3
+shadow_reviewer = \"{shadow}\"\nshadow_reviewer_model = \"gpt-5.6-sol\"\nshadow_reviewer_timeout_seconds = {shadow_timeout_s}
 max_agents = 50\n"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
@@ -221,6 +232,30 @@ max_agents = 50\n"
         fs::write(&path, lines.join("\n") + "\n").unwrap();
     }
 
+    /// Environment that points the shadow reviewer at a fake Python script in scratch, answering as `kind`:
+    /// `pass`, `fail`, `slow` (sleeps past the timeout), `error` (the wrapper's is_error JSON), `garbage` (not JSON), `badformat`.
+    /// The script records its stdin to fake-out/shadow-stdin.txt and appends a line to fake-out/shadow-calls.log.
+    fn shadow_env(&self, kind: &str) -> Vec<(String, String)> {
+        let script = self.dir.join("scratch/shadow/fake_shadow.py");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, FAKE_SHADOW).unwrap();
+        vec![
+            ("BROADSWORD_SHADOW_REVIEWER_SCRIPT".into(), script.to_string_lossy().into_owned()),
+            ("FAKE_SHADOW_KIND".into(), kind.into()),
+            ("FAKE_SHADOW_OUT_DIR".into(), self.fake_out.to_string_lossy().into_owned()),
+        ]
+    }
+
+    fn run_shadow(&self, kind: &str, args: &[&str]) -> Out {
+        let env = self.shadow_env(kind);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.run_env(args, &env)
+    }
+
+    fn shadow_calls(&self) -> usize {
+        fs::read_to_string(self.fake_out.join("shadow-calls.log")).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
     fn fake_env(&self) -> Vec<(String, String)> {
         let text = fs::read_to_string(self.fake_out.join("env.txt")).unwrap();
         text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -249,6 +284,31 @@ fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// A stand-in for clients/openai_review.py: prints canned JSON like the Claude CLI. Never touches the network.
+const FAKE_SHADOW: &str = r#"import json, os, sys, time
+out = os.environ["FAKE_SHADOW_OUT_DIR"]
+os.makedirs(out, exist_ok=True)
+prompt = sys.stdin.buffer.read()
+open(os.path.join(out, "shadow-stdin.txt"), "wb").write(prompt)
+open(os.path.join(out, "shadow-calls.log"), "a", encoding="utf-8").write(" ".join(sys.argv[1:]).replace("\n", " ") + "\n")
+kind = os.environ["FAKE_SHADOW_KIND"]
+def reply(text, err=False):
+    print(json.dumps({"type": "result", "is_error": err, "result": text, "total_cost_usd": 0.5, "usage": {"input_tokens": 70, "output_tokens": 9}, "modelUsage": {"gpt-5.6-sol-2026-01-01": {}}}))
+if kind == "pass":
+    reply("VERDICT: PASS\nBLOCKING: none\nMINOR: none")
+elif kind == "fail":
+    reply("VERDICT: FAIL\nBLOCKING: src/lib.rs:9 - shadow says this is wrong\nMINOR: none")
+elif kind == "slow":
+    time.sleep(60)
+elif kind == "error":
+    reply("HTTP 500: the API server failed", True)
+    sys.exit(1)
+elif kind == "garbage":
+    print("this is not json")
+elif kind == "badformat":
+    reply("looks fine to me")
+"#;
 
 fn lib_with(extra: &str) -> String {
     format!("{LIB_BASE}{extra}")
@@ -1356,4 +1416,103 @@ fn queue_add_refuses_a_brief_outside_the_root_in_state_or_build_a_secret_file_or
     // nothing was queued by any refusal, and a brief inside the root still works
     fs::write(r.dir.join("ok.md"), "fine brief\n").unwrap();
     assert_eq!(add(r.dir.join("ok.md").to_str().unwrap()).code, 0);
+}
+
+// ---- the shadow reviewer (recorded only, never gating) --------------------------------------------
+
+#[test]
+fn a_fail_shadow_on_a_pass_gating_review_still_merges_and_is_recorded() {
+    let r = Root::with_shadow("shadowfail", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n"), "task: add sub");
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run_shadow("fail", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "merged");
+    assert_eq!(r.task_status(&id), "done");
+    assert_eq!(r.field(&entry, "verdict"), "PASS");
+    assert_eq!(r.field(&entry, "shadow verdict"), "FAIL");
+    assert_eq!(r.field(&entry, "shadow model"), "gpt-5.6-sol");
+    assert_eq!(r.field(&entry, "shadow model used"), "gpt-5.6-sol-2026-01-01");
+    assert_eq!(r.field(&entry, "shadow cost (USD)"), "0.5");
+    assert_eq!(r.field(&entry, "shadow tokens (in+out)"), "79");
+    assert!(!r.field(&entry, "shadow seconds").is_empty());
+    let show = r.show(&entry);
+    assert!(show.contains("shadow says this is wrong"), "{show}");
+    let raw = fs::read_to_string(r.dir.join("state/queue").join(format!("{entry}.shadow.review"))).unwrap();
+    assert!(raw.contains("VERDICT: FAIL") && raw.contains("recorded only, never gating"), "{raw}");
+    // the same prompt, asked once
+    assert_eq!(r.shadow_calls(), 1);
+    assert_eq!(r.calls(), 1);
+    assert_eq!(fs::read_to_string(r.fake_out.join("shadow-stdin.txt")).unwrap(), fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap());
+    let args = fs::read_to_string(r.fake_out.join("shadow-calls.log")).unwrap();
+    assert!(args.contains("--model gpt-5.6-sol") && args.contains("--output-format json"), "{args}");
+}
+
+#[test]
+fn a_pass_shadow_on_a_fail_gating_review_does_not_rescue_the_merge() {
+    let r = Root::with_shadow("shadowpass", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn sub(a: i32, b: i32) -> i32 {\n    a + b // PLANTED_BUG: this should subtract\n}\n"), "task: add sub (buggy)");
+    let main_before = r.head();
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run_shadow("pass", &["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "rejected");
+    assert_eq!(r.field(&entry, "verdict"), "FAIL");
+    assert_eq!(r.field(&entry, "shadow verdict"), "PASS", "the shadow is recorded even when the gating review rejects");
+    assert_eq!(r.head(), main_before);
+    assert_eq!(r.task_status(&id), "running");
+}
+
+#[test]
+fn a_shadow_timeout_or_error_is_recorded_and_the_merge_proceeds() {
+    for (kind, shadow_timeout, why) in [("slow", 1, "no answer within 1 s"), ("error", 30, "HTTP 500"), ("garbage", 30, "not its JSON answer"), ("badformat", 30, "no `VERDICT:` line")] {
+        let r = Root::with_shadow(&format!("shadow{kind}"), shadow_timeout);
+        let id = r.started("src");
+        r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n"), "task: add sub");
+        let entry = r.add(&id, "low", "sonnet");
+        let o = r.run_shadow(kind, &["queue", "run"]);
+        assert_eq!(o.code, 0, "{kind}: {}{}", o.stdout, o.stderr);
+        assert_eq!(r.status(&entry), "merged", "{kind}");
+        assert_eq!(r.field(&entry, "shadow verdict"), "ERROR", "{kind}");
+        assert!(r.field(&entry, "shadow reason").contains(why), "{kind}: {}", r.field(&entry, "shadow reason"));
+        assert_eq!(r.task_status(&id), "done", "{kind}");
+    }
+}
+
+#[test]
+fn a_gpt_coder_skips_the_gpt_shadow_and_off_never_calls_it() {
+    let r = Root::with_shadow("shadowskip", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/note.txt", "a note\n", "task: a note");
+    let entry = r.add(&id, "low", "gpt-5.5");
+    let o = r.run_shadow("fail", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "merged");
+    assert_eq!(r.field(&entry, "shadow verdict"), "SKIPPED");
+    assert!(r.field(&entry, "shadow reason").contains("same family"));
+    assert_eq!(r.shadow_calls(), 0);
+
+    let off = Root::new("shadowoff", 30);
+    let id = off.started("src");
+    off.commit(&off.wt(&id), "src/note.txt", "a note\n", "task: a note");
+    let entry = off.add(&id, "low", "sonnet");
+    let o = off.run_shadow("fail", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(off.field(&entry, "shadow verdict"), "");
+    assert_eq!(off.shadow_calls(), 0);
+}
+
+#[test]
+fn a_shadow_script_outside_scratch_is_refused_not_run() {
+    let r = Root::with_shadow("shadowout", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/note.txt", "a note\n", "task: a note");
+    let entry = r.add(&id, "low", "sonnet");
+    let outside = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let o = r.run_env(&["queue", "run"], &[("BROADSWORD_SHADOW_REVIEWER_SCRIPT", outside.to_str().unwrap())]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "shadow verdict"), "ERROR");
+    assert!(r.field(&entry, "shadow reason").contains("inside scratch_dir"), "{}", r.field(&entry, "shadow reason"));
 }

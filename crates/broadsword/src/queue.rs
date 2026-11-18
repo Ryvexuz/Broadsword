@@ -20,6 +20,9 @@
 //!   merged_check_failed  the branch IS on main but `check` failed there; main was NOT reset; a human decides [6]
 //!   cancelled            dropped by `queue cancel`
 //!
+//! SHADOW REVIEW. When `shadow_reviewer` is `openai`, a second model reviews the same prompt after the gating verdict is recorded; its
+//! verdict and cost are only recorded in the entry (`shadow_*`) and in `<entry id>.shadow.review`; it never changes the outcome (see `s_shadow`).
+//!
 //! Exit codes of `queue run`: 0 merged, 1 internal error (the entry stays `running`, resumable), 2 bad input, 3 blocked /
 //! conflict / stale, 4 queue busy, 5 rejected / check_failed, 6 merged_check_failed.
 //!
@@ -205,7 +208,10 @@ fn is_open(status: &str) -> bool {
 }
 
 /// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
-const TEXT_KEYS: [&str; 8] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor"];
+const TEXT_KEYS: [&str; 10] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason"];
+
+/// What a shadow review records in the entry (cleared on a fresh attempt).
+const SHADOW_KEYS: [&str; 9] = ["shadow_model", "shadow_model_used", "shadow_verdict", "shadow_reason", "shadow_blocking", "shadow_cost_usd", "shadow_tokens", "shadow_secs", "shadow_file"];
 
 fn process_secrets(cfg: &Config) -> reviewer::Secrets {
     let env: Vec<(String, String)> = std::env::vars().collect();
@@ -408,6 +414,14 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("review tokens in", "tokens_in"),
         ("review tokens out", "tokens_out"),
         ("review file", "review_file"),
+        ("shadow verdict", "shadow_verdict"),
+        ("shadow reason", "shadow_reason"),
+        ("shadow model", "shadow_model"),
+        ("shadow model used", "shadow_model_used"),
+        ("shadow cost (USD)", "shadow_cost_usd"),
+        ("shadow tokens (in+out)", "shadow_tokens"),
+        ("shadow seconds", "shadow_secs"),
+        ("shadow file", "shadow_file"),
         ("main commit", "main_sha"),
         ("last error", "error"),
     ] {
@@ -418,7 +432,7 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
     if !e.get("check_summary").is_empty() {
         println!("check summary:\n  {}", e.get("check_summary").replace('\n', "\n  "));
     }
-    for (label, k) in [("blocking findings", "blocking"), ("minor findings", "minor")] {
+    for (label, k) in [("blocking findings", "blocking"), ("minor findings", "minor"), ("shadow blocking findings (recorded only, never gating)", "shadow_blocking")] {
         if !e.get(k).is_empty() {
             println!("{label}:\n  {}", e.get(k).replace('\n', "\n  "));
         }
@@ -555,6 +569,9 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
                 "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "reviewer_model", "verdict",
                 "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
             ] {
+                e.set(k, "");
+            }
+            for k in SHADOW_KEYS {
                 e.set(k, "");
             }
             e.set("attempt", (e.get_num("attempt").unwrap_or(0) + 1).to_string());
@@ -955,11 +972,100 @@ impl<'a> Run<'a> {
         self.e.set("review_file", file.clone());
         self.save()?;
         self.log("review", &format!("{} by `{model}`; {} blocking, {} minor; cost {} USD; full output in {file}", self.e.get("verdict"), verdict.blocking.len(), verdict.minor.len(), review.cost_usd.as_deref().unwrap_or("unknown")))?;
+        self.s_shadow(&prompt)?;
         if verdict.pass {
             return Ok(());
         }
         let why = if verdict.note.is_empty() { verdict.blocking.join("; ") } else { format!("{} ({})", verdict.note, verdict.blocking.join("; ")) };
         Err(self.end(REJECTED, &format!("the `{model}` reviewer FAILED it: {why}. The task is still running and its worktree is kept: fix, commit, and queue it again with `queue add`. Full review: {file}"), EXIT_REJECTED))
+    }
+
+    /// The SHADOW review: the same prompt to a second model (`shadow_reviewer`), run once after the gating verdict is recorded.
+    /// It is only RECORDED: it never changes the entry's outcome, so no failure of it (timeout, API error, bad JSON, no python, no
+    /// script) ends or blocks the entry; each is recorded as `shadow_verdict = ERROR` with the reason. It runs at most once per
+    /// review call, because a resumed run that already has a gating verdict never reaches the review call again.
+    /// S4 (no reviewer program inside the root) does not apply to it: it never gates a merge.
+    fn s_shadow(&mut self, prompt: &str) -> R<()> {
+        if self.cfg.shadow_reviewer == "off" {
+            return Ok(());
+        }
+        let model = self.cfg.shadow_reviewer_model.clone();
+        self.e.set("shadow_model", model.clone());
+        let coder = self.e.get("coder").to_string();
+        if reviewer::shadow_family(&coder) == reviewer::shadow_family(&model) {
+            return self.shadow_end("SKIPPED", &format!("the coder `{coder}` and the shadow model `{model}` are the same family (a model never reviews its own code)"));
+        }
+        let (python, script) = match reviewer::resolve_shadow(self.cfg) {
+            Ok(p) => p,
+            Err(m) => return self.shadow_end("ERROR", &m),
+        };
+        self.log("shadow", &format!("calling the shadow reviewer `{model}` (recorded only, never gating; at most {} s); this spends money and uses the network", self.cfg.shadow_reviewer_timeout_seconds))?;
+        let t0 = std::time::Instant::now();
+        let result = reviewer::call_shadow(self.cfg, &python, &script, &model, prompt);
+        let secs = t0.elapsed().as_secs_f64();
+        self.e.set("shadow_secs", format!("{secs:.1}"));
+        let review = match result {
+            Ok(r) => r,
+            Err(CallError::Timeout(s)) => return self.shadow_end("ERROR", &format!("no answer within {s} s (shadow_reviewer_timeout_seconds); it was killed")),
+            Err(CallError::Start(m) | CallError::Failed(m)) => return self.shadow_end("ERROR", &m),
+        };
+        let v = reviewer::judge(&review);
+        let file = self.write_shadow_file(&model, &review, &v)?;
+        self.e.set("shadow_file", file);
+        self.e.set("shadow_model_used", review.models_used.join(", "));
+        self.e.set("shadow_cost_usd", review.cost_usd.clone().unwrap_or_default());
+        self.e.set("shadow_tokens", match (review.input_tokens, review.output_tokens) {
+            (Some(i), Some(o)) => (i + o).to_string(),
+            _ => String::new(),
+        });
+        if review.invalid.is_some() || !v.parsed {
+            return self.shadow_end("ERROR", &v.note);
+        }
+        self.e.set("shadow_blocking", v.blocking.join("
+"));
+        self.shadow_end(if v.pass { "PASS" } else { "FAIL" }, "")
+    }
+
+    fn shadow_end(&mut self, verdict: &str, reason: &str) -> R<()> {
+        self.e.set("shadow_verdict", verdict);
+        self.e.set("shadow_reason", reason);
+        self.save()?;
+        println!("queue entry {}: shadow review {verdict}{} (recorded only; the gating review decides)", self.e.id(), if reason.is_empty() { String::new() } else { format!(": {reason}") });
+        self.log("shadow", &format!("{verdict}{}", if reason.is_empty() { String::new() } else { format!(": {reason}") }))
+    }
+
+    fn write_shadow_file(&mut self, model: &str, r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
+        let attempt = self.e.get_num("attempt").unwrap_or(1);
+        let name = if attempt <= 1 { format!("{}.shadow.review", self.e.id()) } else { format!("{}.{attempt}.shadow.review", self.e.id()) };
+        let path = queue_dir(self.cfg).join(&name);
+        let text = format!(
+            "entry: {}
+attempt: {attempt}
+shadow review: recorded only, never gating
+model: {model}
+models reported: {}
+verdict: {} (answer followed the format: {})
+{}blocking:
+{}
+--- raw shadow output (exactly as printed) ---
+{}
+",
+            self.e.id(),
+            r.models_used.join(", "),
+            if v.pass { "PASS" } else { "FAIL" },
+            if v.parsed && r.invalid.is_none() { "yes" } else { "NO" },
+            if v.note.is_empty() { String::new() } else { format!("note: {}
+", v.note) },
+            v.blocking.iter().map(|b| format!("  {b}")).collect::<Vec<_>>().join("
+"),
+            r.raw
+        );
+        let text = self.secrets.redact(&text);
+        let tmp = path.with_extension("review.tmp");
+        if let Err(e) = std::fs::write(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path)) {
+            return Err(self.internal(&format!("cannot write the shadow review file {}: {e}", path.display())));
+        }
+        Ok(path.strip_prefix(&self.cfg.root).unwrap_or(&path).to_string_lossy().replace('\\', "/"))
     }
 
     /// A verdict is already recorded (a resumed run). Returns Ok only for a PASS on exactly the checked commit; anything else ends

@@ -423,6 +423,78 @@ impl ReviewBackend for ClaudeCli {
     }
 }
 
+// ---- the shadow reviewer ----------------------------------------------------------------------
+
+/// The env var that points the shadow reviewer at another script: ONLY a file inside `scratch_dir` is accepted (the test hook, so
+/// tests never call the real API). Its value is never written to any file.
+pub const SHADOW_SCRIPT_ENV: &str = "BROADSWORD_SHADOW_REVIEWER_SCRIPT";
+/// The shadow reviewer program, relative to the root: a Python wrapper that answers like the Claude CLI.
+pub const SHADOW_SCRIPT: &str = "clients/openai_review.py";
+
+/// The shadow reviewer's family: every `gpt*` / `o<digit>*` / `openai*` name is `gpt`; anything else its own name.
+pub fn shadow_family(name: &str) -> String {
+    let n = name.trim().to_lowercase();
+    let o_series = n.strip_prefix('o').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    if n.starts_with("gpt") || n.starts_with("openai") || o_series {
+        "gpt".into()
+    } else {
+        model_family(&n)
+    }
+}
+
+/// The shadow program: `python -I -B <script>`. The script is `clients/openai_review.py` under the root, or (test hook) the file
+/// `BROADSWORD_SHADOW_REVIEWER_SCRIPT` names, which must lie inside `scratch_dir`.
+///
+/// S4 (no reviewer CLI inside the root) does NOT apply here: the shadow review never gates a merge, its verdict is only recorded,
+/// so a reviewer program inside the root cannot approve anything.
+pub fn resolve_shadow(cfg: &Config) -> Result<(String, String), String> {
+    let script = match std::env::var(SHADOW_SCRIPT_ENV) {
+        Ok(v) if !v.trim().is_empty() => {
+            let real = clean_path(std::fs::canonicalize(v.trim()).map_err(|e| format!("the shadow script override is not readable: {e}"))?);
+            let scratch = clean_path(std::fs::canonicalize(&cfg.scratch_dir).unwrap_or_else(|_| cfg.scratch_dir.clone()));
+            if !real.starts_with(&scratch) {
+                return Err(format!("{SHADOW_SCRIPT_ENV} must point inside scratch_dir (a test hook); refused"));
+            }
+            real
+        }
+        _ => {
+            let p = cfg.root.join(SHADOW_SCRIPT);
+            if !p.is_file() {
+                return Err(format!("the shadow reviewer program {SHADOW_SCRIPT} was not found under the project root"));
+            }
+            clean_path(std::fs::canonicalize(&p).unwrap_or(p))
+        }
+    };
+    let python = ["python", "python3"].iter().find_map(|n| find_on_path(n)).ok_or("python was not found on PATH (the shadow reviewer needs it)")?;
+    Ok((python.to_string_lossy().replace('\\', "/"), script.to_string_lossy().replace('\\', "/")))
+}
+
+/// The shadow answer must come from the requested model: every name `modelUsage` lists starts with the requested name
+/// (`gpt-5.6-sol` answers as `gpt-5.6-sol-2026-01-01`).
+pub fn check_shadow_model(rev: &mut Review, requested: &str) {
+    if rev.invalid.is_some() {
+        return;
+    }
+    let want = requested.trim().to_lowercase();
+    if rev.models_used.is_empty() || rev.models_used.iter().any(|m| !m.to_lowercase().starts_with(&want)) {
+        rev.invalid = Some(format!("the shadow answer's modelUsage ({}) does not name the requested model `{requested}`", if rev.models_used.is_empty() { "empty".to_string() } else { rev.models_used.join(", ") }));
+    }
+}
+
+/// Call the shadow reviewer once, with the same prompt, the scrubbed environment and `shadow_reviewer_timeout_seconds`.
+pub fn call_shadow(cfg: &Config, python: &str, script: &str, model: &str, prompt: &str) -> Result<Review, CallError> {
+    let cwd = cfg.scratch_dir.join("review-cwd");
+    std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
+    let mut args: Vec<String> = vec!["-I".into(), "-B".into(), script.into()];
+    args.extend(["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()));
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
+    let out = run_cli(python, &args, &cwd, &remove, prompt, Duration::from_secs(cfg.shadow_reviewer_timeout_seconds))?;
+    let mut rev = parse_claude_output(&out.stdout, out.code, &out.stderr)?;
+    check_shadow_model(&mut rev, model);
+    Ok(rev)
+}
+
 pub struct CliOut {
     pub code: i32,
     pub stdout: String,
@@ -651,6 +723,21 @@ mod tests {
             assert!(p.invalid.is_some() && p.text.is_empty() && p.raw == plain, "{plain:?}");
             assert!(!judge(&p).pass);
         }
+    }
+
+    #[test]
+    fn shadow_families_and_model_check() {
+        for n in ["gpt-5.6-sol", "GPT-5.5", "o3", "o4-mini", "openai-x"] {
+            assert_eq!(shadow_family(n), "gpt", "{n}");
+        }
+        assert_ne!(shadow_family("sonnet"), shadow_family("gpt-5.6-sol"));
+        assert_eq!(shadow_family("claude-opus-4"), "opus");
+        let mut ok = parse_claude_output(r#"{"is_error":false,"result":"x","modelUsage":{"gpt-5.6-sol-2026-01-01":{}}}"#, 0, "").unwrap();
+        check_shadow_model(&mut ok, "gpt-5.6-sol");
+        assert!(ok.invalid.is_none());
+        let mut other = parse_claude_output(r#"{"is_error":false,"result":"x","modelUsage":{"gpt-4o":{}}}"#, 0, "").unwrap();
+        check_shadow_model(&mut other, "gpt-5.6-sol");
+        assert!(other.invalid.is_some());
     }
 
     #[test]

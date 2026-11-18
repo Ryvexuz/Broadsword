@@ -107,6 +107,12 @@ pub struct Config {
     pub queue_lock_wait_seconds: u64,
     /// The most reviewer calls (real model calls, resumes and re-runs included) one queue entry may make; at the cap it is `blocked`.
     pub reviewer_max_calls_per_entry: u64,
+    /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
+    pub shadow_reviewer: String,
+    /// The shadow reviewer's model (an OpenAI model name).
+    pub shadow_reviewer_model: String,
+    /// A shadow review that runs longer than this is killed and recorded as `ERROR`; the merge goes on.
+    pub shadow_reviewer_timeout_seconds: u64,
     /// The most tasks that may be `running` on the board at once, across all projects (`task start` refuses at the cap).
     pub max_agents: u64,
     /// How long `recover` (and `recover <id>`, `recover --abandon`) waits for the recover lock before it says another recover is running.
@@ -205,7 +211,14 @@ impl Config {
                 Err(format!("{k} = \"{v}\": a model name uses letters, digits and . _ - : [ ] only, and does not start with `-`"))
             }
         };
+        let shadow_reviewer = get_str(&m, "shadow_reviewer")?;
+        if shadow_reviewer != "openai" && shadow_reviewer != "off" {
+            return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
+        }
         Ok(Config {
+            shadow_reviewer,
+            shadow_reviewer_model: model("shadow_reviewer_model")?,
+            shadow_reviewer_timeout_seconds: positive("shadow_reviewer_timeout_seconds")?,
             reviewer_backend,
             reviewer_cli,
             reviewer_model_low: model("reviewer_model_low")?,
@@ -343,6 +356,9 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+shadow_reviewer = \"off\"
+shadow_reviewer_model = \"gpt-5.6-sol\"
+shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
@@ -391,12 +407,32 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn shadow_reviewer_settings_are_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert_eq!((c.shadow_reviewer.as_str(), c.shadow_reviewer_model.as_str()), ("openai", "gpt-5.6-sol"));
+        for key in ["shadow_reviewer", "shadow_reviewer_model", "shadow_reviewer_timeout_seconds"] {
+            let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
+            assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
+        }
+        let with = |key: &str, line: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { line.to_string() } else { l.to_string() }).collect::<Vec<_>>().join("
+");
+        assert!(Config::from_text(&with("shadow_reviewer", "shadow_reviewer = \"off\""), Path::new("p")).is_ok());
+        assert!(Config::from_text(&with("shadow_reviewer", "shadow_reviewer = \"claude\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("shadow_reviewer_model", "shadow_reviewer_model = \"--evil\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("shadow_reviewer_timeout_seconds", "shadow_reviewer_timeout_seconds = 0"), Path::new("p")).is_err());
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+shadow_reviewer = \"off\"
+shadow_reviewer_model = \"gpt-5.6-sol\"
+shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
@@ -433,6 +469,9 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+shadow_reviewer = \"off\"
+shadow_reviewer_model = \"gpt-5.6-sol\"
+shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {

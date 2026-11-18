@@ -25,6 +25,9 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+shadow_reviewer = \"off\"
+shadow_reviewer_model = \"gpt-5.6-sol\"
+shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 "
         );
