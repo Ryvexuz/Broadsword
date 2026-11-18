@@ -82,7 +82,13 @@ A task without a passing proof is not done.
 
 It extracts the code from the single fenced code block of the answer. No block, or several blocks, is a recorded format failure (score 0). Then it grades all tasks in one batch and writes `<out-dir>/<task>__<provider>__<model>__<effort>.json` with: provider, model, effort, task, tokens, cost_usd (from the CLI's JSON), wall_s (the model call), harness_wall_s, compiles, passed, total, format_failure, first_error. The raw CLI output, the answer and the extracted `.rs` are kept next to it.
 
-`provider openai` is a stub that raises "not built yet". It will reuse the request code of `bench/reviewer/run_openai.py` once that exists, with cost computed only from prices given explicitly.
+`provider openai` (`openai_provider.py`) sends one Chat Completions request with the same system and user prompt as the claude provider. It imports the request, key and error logic of `bench/reviewer/run_openai.py` by path (the main checkout's copy if this checkout does not have it yet): key from `OPENAI_API_KEY`, then the root `.env`; no redirects; bounded retries on 429/5xx; an empty or non-`stop` answer is a recorded failed call (not graded); `model_used` comes from the response. `cost_usd` is null unless both `--price-in` and `--price-out` (USD per 1M tokens) are given; prices are never guessed. Other options after the tasks: `--max-tokens` (default 16000, reasoning included), `--timeout`, `--retries`, `--backoff`, `--base-url`, `--root`. It costs real money: ask first. Tests (fake server on 127.0.0.1, never the real API): `env -u OPENAI_API_KEY python -I -B -m unittest discover -s bench/coder -p "test_openai_provider.py" -v`.
+
+One OpenAI model on all six tasks (prices are the model's current list prices, which you must look up):
+
+```
+BENCH_CWD=<outside-folder> python -I -B bench/coder/run.py <out> openai <model> default --price-in <usd per 1M in> --price-out <usd per 1M out>
+```
 
 Every Claude model, at its default effort and at `high` (run from the project root; `<out>` is for example `scratch/coder-bench/results`, and `BENCH_CWD` any empty folder outside the project, for example one under the system temp folder):
 

@@ -2,11 +2,13 @@
 
 Usage (from anywhere):
   BENCH_CWD=<folder outside the project> [BENCH_CLAUDE=<path to claude cli>] \
-    python -I -B run.py <out-dir> <provider> <model> <effort|default> [task ...]
+    python -I -B run.py <out-dir> <provider> <model> <effort|default> [task ...] [openai options]
 
   provider  claude  the headless Claude Code CLI, run like bench/reviewer/run.py: cwd = BENCH_CWD, no tools,
                     no MCP, prompt on stdin, JSON output
-            openai  not built yet (raises)
+            openai  one Chat Completions request (see openai_provider.py); key from OPENAI_API_KEY or the root .env.
+                    Options: --price-in/--price-out (USD per 1M tokens; cost_usd is null without both), --max-tokens,
+                    --timeout, --retries, --backoff, --base-url, --root. Costs real money: only for a model Lazlo named.
   task      folder names under tasks/ (01-duration ...); none given = all six
 
 BENCH_CWD must be OUTSIDE the project and have no CLAUDE.md, AGENTS.md or .git in it or any parent, so no
@@ -15,7 +17,7 @@ that is how the smoke test uses a fake CLI. The model sees only the task's spec.
 
 Per task it writes <out-dir>/<task>__<provider>__<model>__<effort>.{raw.json,answer.txt,rs,json}.
 The result .json holds: provider, model, effort, task, tokens, cost_usd, wall_s (the model call),
-harness_wall_s, compiles, passed, total, format_failure, first_error.
+harness_wall_s, compiles, passed, total, format_failure, first_error, model_used.
 """
 import importlib.util, json, os, pathlib, re, subprocess, sys, time, tomllib
 
@@ -24,8 +26,12 @@ CFG = tomllib.loads((HERE / "config.toml").read_text(encoding="utf-8"))
 _spec = importlib.util.spec_from_file_location("coder_harness", HERE / "harness.py")
 H = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(H)
+_spec = importlib.util.spec_from_file_location("coder_openai_provider", HERE / "openai_provider.py")
+OP = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(OP)
 CLAUDE = os.environ.get("BENCH_CLAUDE", "claude")
 WORKDIR = os.environ.get("BENCH_CWD")
+OPENAI_OPTS = []  # the --price-in ... options of the command line, set in main()
 
 SYSTEM = """You are an expert Rust programmer. You are given a specification for one Rust library file.
 Write that file. Follow the specification exactly: the public items, their signatures, the behaviour, the error cases and the constraints.
@@ -49,13 +55,12 @@ def provider_claude(prompt, model, effort):
     tokens = {"input": u.get("input_tokens"), "output": u.get("output_tokens"),
               "cache_read": u.get("cache_read_input_tokens"), "cache_write": u.get("cache_creation_input_tokens")}
     return {"answer": r.get("result") or "", "raw": p.stdout, "tokens": tokens, "cost_usd": r.get("total_cost_usd"),
-            "exit": p.returncode, "is_error": r.get("is_error"), "error": r.get("error")}
+            "exit": p.returncode, "is_error": r.get("is_error"), "error": r.get("error"),
+            "model_used": list((r.get("modelUsage") or {}).keys())}
 
 
 def provider_openai(prompt, model, effort):
-    # bench/reviewer/run_openai.py does not exist yet. When it does, reuse its request code here and
-    # compute cost only from prices passed in explicitly.
-    raise NotImplementedError("openai provider: not built yet")
+    return OP.call(SYSTEM, prompt, model, effort)
 
 
 PROVIDERS = {"claude": provider_claude, "openai": provider_openai}
@@ -83,12 +88,18 @@ def check_workdir():
 
 
 def main():
+    global OPENAI_OPTS
+    sys.argv[1:], OPENAI_OPTS = OP.split_options(sys.argv[1:])
     if len(sys.argv) < 5:
         sys.exit(__doc__)
     out = pathlib.Path(sys.argv[1]); provider, model, effort = sys.argv[2:5]
     if provider not in PROVIDERS:
         sys.exit(f"provider must be one of {sorted(PROVIDERS)}")
+    if OPENAI_OPTS and provider != "openai":
+        sys.exit("--price-in/--price-out/--max-tokens/--timeout/--retries/--backoff/--base-url/--root are for provider openai only")
     check_workdir()
+    if provider == "openai":
+        OP.prepare(model, effort, OPENAI_OPTS, CFG["model_timeout_seconds"])  # settings and key checked before any task
     all_tasks = [d for d in sorted((HERE / "tasks").iterdir()) if d.is_dir()]
     want = sys.argv[5:]
     tasks = [d for d in all_tasks if not want or d.name in want]
@@ -113,7 +124,7 @@ def main():
         rec = {"provider": provider, "model": model, "effort": effort, "task": t.name, "tokens": res["tokens"],
                "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"], "harness_wall_s": None,
                "compiles": False, "passed": 0, "total": total, "format_failure": problem is not None,
-               "first_error": problem}
+               "first_error": problem, "model_used": res.get("model_used", [])}
         recs.append((tag, rec))
         if code is not None:
             rs = out / f"{tag}.rs"
