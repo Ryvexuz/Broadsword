@@ -58,6 +58,11 @@ impl Framebuffer {
         &self.pixels
     }
 
+    /// The pixels, row 0 first, for code that fills many pixels at once. Keep each value `0x00RRGGBB`.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+
     pub fn clear(&mut self, color: u32) {
         self.pixels.fill(color & 0x00FF_FFFF);
     }

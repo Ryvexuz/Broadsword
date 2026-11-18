@@ -94,6 +94,44 @@ impl Mat4 {
         Mat4 { m }
     }
 
+    pub fn translation(t: Vec3) -> Mat4 {
+        let mut r = Mat4::IDENTITY;
+        r.m[0][3] = t.x;
+        r.m[1][3] = t.y;
+        r.m[2][3] = t.z;
+        r
+    }
+
+    /// Rotation about +Y by `angle` radians (right-handed: +X turns toward -Z).
+    pub fn rotation_y(angle: f32) -> Mat4 {
+        let (s, c) = angle.sin_cos();
+        Mat4 {
+            m: [
+                [c, 0.0, s, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [-s, 0.0, c, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Transforms a point by an affine matrix (the last row is ignored).
+    pub fn transform_point3(&self, p: Vec3) -> Vec3 {
+        let h = self.transform_point(p);
+        Vec3::new(h[0], h[1], h[2])
+    }
+
+    /// Transforms a direction (the translation is ignored). Correct for normals only if the matrix is a
+    /// rotation, possibly with a uniform scale; the caller renormalises.
+    pub fn transform_dir(&self, d: Vec3) -> Vec3 {
+        let m = &self.m;
+        Vec3::new(
+            m[0][0] * d.x + m[0][1] * d.y + m[0][2] * d.z,
+            m[1][0] * d.x + m[1][1] * d.y + m[1][2] * d.z,
+            m[2][0] * d.x + m[2][1] * d.y + m[2][2] * d.z,
+        )
+    }
+
     /// Transforms the point (x, y, z, 1) and returns the homogeneous result [x, y, z, w].
     pub fn transform_point(&self, p: Vec3) -> [f32; 4] {
         let v = [p.x, p.y, p.z, 1.0];

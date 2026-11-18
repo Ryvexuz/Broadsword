@@ -1,0 +1,23 @@
+# A 2 x 2 x 2 cube centred on the origin: 8 positions, 6 normals, 6 quads written v//vn.
+# Every face is counter-clockwise seen from outside.
+v -1 -1 -1
+v 1 -1 -1
+v 1 1 -1
+v -1 1 -1
+v -1 -1 1
+v 1 -1 1
+v 1 1 1
+v -1 1 1
+vn 1 0 0
+vn -1 0 0
+vn 0 1 0
+vn 0 -1 0
+vn 0 0 1
+vn 0 0 -1
+o cube
+f 6//1 2//1 3//1 7//1
+f 1//2 5//2 8//2 4//2
+f 4//3 8//3 7//3 3//3
+f 1//4 2//4 6//4 5//4
+f 5//5 6//5 7//5 8//5
+f 2//6 1//6 4//6 3//6

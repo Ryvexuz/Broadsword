@@ -88,9 +88,94 @@ camera, zero length, camera inside the cube, a 1x1 buffer).
 The images assume `f32` sine and cosine give the same results on the machine; if a golden test fails
 on a new platform with a pixel or two different, that is why.
 
+## Shaded meshes, one light and shadows (milestone 2)
+
+```
+broadsword run render -- cargo run --offline --release --example car
+broadsword run render -- cargo run --offline --release --example car -- --frames 120
+broadsword run render -- cargo run --offline --release --example car -- --present 30
+```
+
+`examples/car.rs` turns a car on a turntable in a window (fly keys as above). `--frames N` renders headless and
+prints the average frame time at 640x480 with the shadow pass, split into shadow pass and main pass, plus the
+triangle counts. `--present N` presents N frames off screen without activation and also reports the blit.
+Options: `--width`, `--height`, `--shadow-size` (default 1024), `--segments` (wheel sides, default 24).
+Measured on the build machine while it was busy with other jobs: about 8 to 10 ms per frame (limit 16.6),
+410 triangles, 199 surviving culling; shadow pass about 5.5 to 6.3 ms, main pass about 2.7 to 3.5 ms, blit about 0.09 ms.
+
+### The pipeline (`src/raster.rs`, `src/mesh.rs`)
+
+- `Mesh { positions, normals, triangles }`: counter-clockwise triangles seen from outside. `normals` is empty
+  (flat shading with each triangle's own normal) or has one unit normal per position (smooth, Gouraud).
+  `Mesh::from_obj` reads `v`, `vn`, `vt` (ignored), and `f` with 3 or 4 vertices in the forms `v`, `v//vn`,
+  `v/vt/vn`; quads are split on their first diagonal. It refuses everything else with the line number (other
+  directives, `v/vt`, negative or zero or not-yet-defined indices, polygons of five or more, non-finite numbers,
+  faces with and without normals mixed). `car_mesh(segments)`, `car_body_mesh()`, `wheel_mesh(segments)` and
+  `ground_plane_mesh(half)` are procedural; the car faces +X, is 4.0 long and rests on y = 0.
+- `Renderer::render(fb, camera, scene)` clears the framebuffer and a depth buffer, then runs two passes:
+  1. **Shadow pass.** Every shadow-casting object is drawn, both faces, into a square `f32` map
+     (`ShadowSettings::map_size`) seen along the light direction with an orthographic projection fitted to a sphere
+     (`focus_center`, `focus_radius`). Each texel keeps the smallest distance from the light. `caster_sphere`
+     computes a sphere for you.
+  2. **Main pass.** For each triangle: world positions and normals, then the diffuse term `max(N.L, 0)` per vertex,
+     the clip position, and the shadow-map position and distance. The triangle is **clipped against the near plane in
+     clip space** (z >= -w, before the divide; it can become a quad, which is split in two). Then it is projected,
+     **back faces are culled** (`Sides::FrontOnly`), and it is filled with the fill rule below. Each pixel does an
+     `f32` depth test first; the colour is `base * (ambient + diffuse * N.L * lit)`, where `lit` is 1 or 0 from the
+     shadow test, per channel, rounded, no gamma. Attributes are interpolated perspective-correctly.
+- It is deterministic: the same scene gives the same bytes, whatever the renderer drew before.
+- A pixel (x, y) is sampled at the screen coordinate (x, y), the same convention as the line drawing, so lines drawn
+  on top of a mesh line up with it.
+
+### The fill rule
+
+`fill_triangle` snaps each screen vertex to 1/16 pixel and evaluates the three edge functions in exact `i64`
+integers, so there is no rounding to disagree about. A pixel exactly on an edge belongs to the triangle only if the
+edge is a **top** edge (horizontal, the triangle below it) or a **left** edge (the triangle to its right). The two
+triangles sharing an edge walk it in opposite directions, so exactly one owns each pixel on it: no gaps, no double
+pixels. Zero-area triangles (including exactly edge-on ones) are not drawn. Vertices beyond 2^24 pixels are clamped,
+a limit of the integer maths.
+
+### Shadow bias
+
+A pixel is in shadow if `distance_from_light - bias > map value`, where
+`bias = texel * (1.0 + 1.0 * min(tan(angle), 8))`, `texel = 2 * focus_radius / map_size`, and `angle` is between the
+triangle's true (geometric) normal and the light. The three numbers are `BIAS_CONST_TEXELS`, `BIAS_SLOPE` and
+`BIAS_MAX_SLOPE`, and are fields of `ShadowSettings`.
+
+- The map stores the surface depth at texel centres, and a pixel looks up the nearest texel (no filtering). On a
+  surface tilted `angle` from the light, the depth can differ across half a texel by up to about
+  `0.71 * texel * tan(angle)`; the slope term (1.0 * texel * tan) covers that with margin, and the constant term
+  (one texel) covers rounding. These round values pass the acne test below at all four sun heights; no search was made for the smallest ones.
+- **Acne** (a surface shadowing itself in stripes): `tests/shadows.rs` renders a ground plane that casts and
+  receives, at sun heights of 75, 45, 20 and 10 degrees, and requires every visible ground pixel to be lit (over
+  10000 pixels each). With the bias switched off the same test finds hundreds of wrong pixels, so it can see acne.
+- **Peter-panning** (a gap between an object and its shadow) is as large as the bias. For the 2 m cube test the bias on
+  the floor is 0.5 cm (one texel is 0.34 cm), far less than a pixel, and the test checks that the shadow reaches the
+  cube's foot and ends where the maths says (within 5 cm at its far end).
+- `max_slope` stops a surface almost edge-on to the light from getting a huge bias; such a surface is nearly black
+  from `N.L` anyway.
+
+### What the tests check
+
+`tests/raster.rs`, `tests/shadows.rs`, `tests/mesh.rs`, with an independent model in `tests/common/mod.rs` (f64
+projection, the near-plane clip redone in view space, and a pixel-ownership rule defined by an infinitesimal shift of
+the sample point rather than by the rasterizer's bias form). Golden images: `depth_order`, `near_clip`,
+`sphere_shaded`, `car_shadow`. Each test checks its scene against the model first (exact pixel masks for depth order
+and the near clip; N.L within 3 levels at 5600 sphere pixels; every judged ground pixel of the car scene classed as
+shadow or lit by projecting the car's boxes along the light, with a control that fails when the shadow is moved 0.7 m).
+`two_triangles_sharing_an_edge_cover_every_pixel_exactly_once` prints exact counts: for the 4-point quad, both
+diagonals give triangle counts that sum to the quad's count with no pixel doubled, including pixels exactly on the
+shared edge.
+
 ## Not done yet
 
-- No filled triangles, no shading, no lights, no depth buffer, no textures, no text.
+- Shadows are hard, one map, nearest-sample (no PCF, no cascades): edges are stair-stepped.
+- Shading is Gouraud with no specular, no gamma, no textures, no transparency, no clipping to the other frustum
+  planes (pixels beyond the far plane are dropped one by one), no multi-threading.
+- `model` matrices may rotate, translate and scale uniformly only; a non-uniform scale would skew the normals.
+- OBJ: no negative indices, forward references, polygons of five or more, groups or materials.
+- No text.
 - Lines are one pixel wide and not anti-aliased; colours are not blended.
 - The viewer is Win32 only and its window cannot be resized. `Window` is not `Send`: keep it on the thread that opened it.
 - `present` to a minimised window does nothing (and is not an error).
