@@ -81,6 +81,8 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 audit | Full independent audit at every stage end, before the tag | Cross-cutting bugs, false claims, rules not in force | Blocking and serious findings per audit (S0–3: 1 and 17) | Audit cost (about 334k tokens) outweighing what it finds | open |
 | S3 audit | All code reaches main through the merge queue, the orchestrator's included | Review independence that is recorded and enforced | Commits on main without a queue entry | Slower small fixes | open |
 | S3 audit | Secret files (`.env*`) never stored in checkpoints; only `run` takes a checkpoint | No key in Git objects; faster build, test and check jobs | Objects holding a secret blob under `refs/broadsword/*` (now 0) | Lost rollback protection for tracked files named `.env*` (Opus minor) | done (`f660c76`) |
+| S3 audit | Work ahead: a coder starts the next non-overlapping task while the queue checks and reviews | Pipeline idle (62%) and handoff waits (up to 9 min) | `scripts/dev_metrics.py` idle share and handoff column | Wasted work when ahead work depends on an unmerged change; more rebase conflicts | open |
+| S3 audit | `scripts/dev_metrics.py`: throughput, idle time and model use | Seeing where time goes | Whether retros use it | Logging agent runs by hand (`state/agent-runs.tsv`) gets skipped | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first

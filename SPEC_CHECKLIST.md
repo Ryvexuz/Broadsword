@@ -41,6 +41,7 @@ Start from `templates/brief.md` for the brief and `templates/coder-prompt.md` fo
   - High-risk changes get Opus as reviewer. High risk means deleting or rewriting files, locks, secrets, or anything that runs before or instead of a safety check.
   - Lower-risk changes get a cheaper reviewer from a different model family than the coder.
   - Record which tier was used and whether it caught anything. `python -I scripts/review_costs.py` totals cost, passes and fails by model for the retro.
+- **Work ahead:** keep the next task's brief written and its claims checked, and start a coder on it while the queue checks and reviews the current one, provided its claims overlap nothing running or queued. Watch for ahead work that depends on an unmerged change. [S3 audit fixes: finished work waited up to 9 min for the queue; the pipeline was empty 62% of the time.]
 - **Fix rounds:** start a fresh coder with a tight brief (the diff, the findings, the claim) instead of resuming a long-running coder whose context keeps growing.
 - **Tests:**
   - The coder writes physics, behaviour and race tests.
