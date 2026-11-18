@@ -130,6 +130,17 @@ Process items:
 
 0. **After the move:** follow `docs/MOVING.md` (worktree repair, `BROADSWORD_REVIEWER_CLI`, rebuild and install, the playbook and memory, `codex login`).
 0b. **Backfill the shadow reviews (Lazlo said yes, 2026-11-18):** re-run the shadow review through Codex (gpt-5.6-sol, `clients/openai_review.py`) on tonight's four gated entries, whose shadow calls all ERRORed on the empty API credits: `q-20261118-100920` and `q-20261118-101835` (tp1, branch `task/t-20261118-095350`), `q-20261118-102429` (Codex wrapper, `3b67777`) and `q-20261118-103743` (its fix, `92d5c7c`). The queue keeps only the reviews, not the prompts, so rebuild each prompt from the entry's brief and the diff of its base against its reviewed commit, the same way `queue.rs` builds it. Save the results as `<entry>.shadow-backfill.review`, then judge every shadow-only finding (see `SPEC_CHECKLIST.md`, shadow-only findings) and record the verdicts.
-1. **Benchmarks:** finish the unfinished OpenAI coding runs, re-run the errored models (Responses API, per-model token cap), run 5x consistency on the gpt-6.2 models and a stable comparison, benchmark the `fast`/`flex` tiers, and update `evidence/benchmarks-2026-11-18.md`. The hard case is already blind re-scored.
-2. **Merge the two benchmark tasks** (see Unfinished).
-3. **Run the Stage 4 v1 audit,** then tag.
+**Lazlo's order (2026-11-18): clear the whole backlog first, then push on through the stages.** "There is an entire mountain behind this small hill." Run coders in parallel wherever the claims allow.
+
+1. **Clear the backlog**, in roughly this order:
+   - tp1 scoped checks: fix the pipe-holding timeout, measure with the branch binary in a scratch root, then requeue;
+   - the Codex-wrapper minors;
+   - tp2 main re-check, tp3 build lock compile-only, tp4 `queue run --all` with overlap, then tp6 parallel tests (after tp3);
+   - `t-20261118-135124` shadow adjudication;
+   - merge the two benchmark tasks (hard case and coding);
+   - a Codex backend for the benchmarks;
+   - the tp8 price comparison. It only informs Lazlo; Claude fast mode stays off regardless.
+
+   Then the benchmark follow-ups: the credit-blocked OpenAI rows through Codex, Responses API models, per-model token caps, 5x consistency on the gpt-6.2 models, an instruction-following test, a drift test, and labelling the extra single-bug lines.
+2. **Stage 4 v1:** the stage-end audit, its blockers fixed, then the tag (and the pending Stage 0 tag).
+3. **Then onward through the stages** in `DEVELOPMENT_PLAN.md`, with the crash sim as the first workload. Each stage gets its done check written before work starts.
