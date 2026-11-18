@@ -1327,17 +1327,12 @@ struct LightRun {
     output: String,
 }
 
-/// The folders to test: every folder that holds a changed path, and each of its parents up to the project root (`.`), that has a
-/// `test_*.py` file. Sorted, each once.
+/// The folders to test: every folder that directly holds a changed path (a changed file's own folder, `.` for the root) and has a
+/// `test_*.py` file itself. Parents are not tested. Sorted, each once.
 fn light_folders(dir: &Path, paths: &[String]) -> Vec<String> {
     let mut found = std::collections::BTreeSet::new();
     for p in paths {
-        let mut cur = p.as_str();
-        while let Some((parent, _)) = cur.rsplit_once('/') {
-            found.insert(parent.to_string());
-            cur = parent;
-        }
-        found.insert(".".to_string());
+        found.insert(p.rsplit_once('/').map(|(parent, _)| parent.to_string()).unwrap_or_else(|| ".".to_string()));
     }
     found
         .into_iter()
@@ -1345,8 +1340,66 @@ fn light_folders(dir: &Path, paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// One `python -I -B -m unittest discover` run: its exit code, whether the timeout killed it, and its output.
+struct PyRun {
+    code: Option<i32>,
+    timed_out: bool,
+    text: String,
+}
+
+/// Start `exe`, read its output on threads (so a full pipe never blocks it) and wait at most `timeout`; on timeout kill the whole
+/// process tree. `Err(NotFound)` when `exe` does not exist.
+fn run_python(cfg: &Config, exe: &str, dir: &Path, folder: &str, timeout: std::time::Duration) -> std::io::Result<PyRun> {
+    use std::io::Read;
+    let mut c = std::process::Command::new(exe);
+    c.args(["-I", "-B", "-m", "unittest", "discover", "-s", folder, "-p", "test_*.py"]).current_dir(dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    crate::scrub::apply(&mut c, cfg);
+    let mut child = c.spawn()?;
+    let mut readers = Vec::new();
+    if let Some(mut o) = child.stdout.take() {
+        readers.push(std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = o.read_to_end(&mut b);
+            b
+        }));
+    }
+    if let Some(mut e) = child.stderr.take() {
+        readers.push(std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = e.read_to_end(&mut b);
+            b
+        }));
+    }
+    let start = std::time::Instant::now();
+    let (mut code, mut timed_out) = (None, false);
+    loop {
+        match child.try_wait()? {
+            Some(st) => {
+                code = st.code();
+                break;
+            }
+            None if start.elapsed() >= timeout => {
+                crate::sys::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let mut text = String::new();
+    for r in readers {
+        if let Ok(b) = r.join() {
+            text.push_str(&String::from_utf8_lossy(&b));
+        }
+    }
+    Ok(PyRun { code, timed_out, text })
+}
+
 /// `python -I -B -m unittest discover -s <folder> -p test_*.py` in each folder from `light_folders`, run in `dir` with the scrubbed
-/// environment. `Err` when python cannot be started at all.
+/// environment, each killed after `light_check_timeout_seconds`. Exit 5 (Python 3.12+: no tests found) is a pass. `Err` when python
+/// cannot be started at all.
 fn light_python(cfg: &Config, dir: &Path, paths: &[String]) -> Result<LightRun, String> {
     let folders = light_folders(dir, paths);
     let mut run = LightRun { ok: true, lines: Vec::new(), output: String::new() };
@@ -1354,14 +1407,12 @@ fn light_python(cfg: &Config, dir: &Path, paths: &[String]) -> Result<LightRun, 
         run.lines.push("python tests: none (no test_*.py in the changed folders)".into());
         return Ok(run);
     }
+    let timeout = std::time::Duration::from_secs(cfg.light_check_timeout_seconds);
     for f in folders {
         let t0 = std::time::Instant::now();
         let mut result = None;
         for exe in ["python", "python3"] {
-            let mut c = std::process::Command::new(exe);
-            c.args(["-I", "-B", "-m", "unittest", "discover", "-s", &f, "-p", "test_*.py"]).current_dir(dir).stdin(std::process::Stdio::null());
-            crate::scrub::apply(&mut c, cfg);
-            match c.output() {
+            match run_python(cfg, exe, dir, &f, timeout) {
                 Ok(o) => {
                     result = Some(o);
                     break;
@@ -1371,14 +1422,18 @@ fn light_python(cfg: &Config, dir: &Path, paths: &[String]) -> Result<LightRun, 
             }
         }
         let o = result.ok_or("python was not found on PATH (the light check runs the Python tests)")?;
-        let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let text = o.text;
         let ran = text.lines().find_map(|l| l.strip_prefix("Ran ")).unwrap_or("? tests").to_string();
         let secs = t0.elapsed().as_secs_f64();
-        if o.status.success() {
-            run.lines.push(format!("python tests {f}: ok (Ran {ran}; {secs:.1} s)"));
+        if o.timed_out {
+            run.ok = false;
+            run.lines.push(format!("python tests {f}: FAILED (timed out after {} s (light_check_timeout_seconds) and the process tree was killed; {secs:.1} s)", cfg.light_check_timeout_seconds));
+        } else if o.code == Some(0) || o.code == Some(5) {
+            let note = if o.code == Some(5) { "no tests ran" } else { "ok" };
+            run.lines.push(format!("python tests {f}: {note} (Ran {ran}; {secs:.1} s)"));
         } else {
             run.ok = false;
-            run.lines.push(format!("python tests {f}: FAILED ({}; Ran {ran}; {secs:.1} s)", o.status.code().map(|c| format!("exit {c}")).unwrap_or_else(|| "terminated".into())));
+            run.lines.push(format!("python tests {f}: FAILED ({}; Ran {ran}; {secs:.1} s)", o.code.map(|c| format!("exit {c}")).unwrap_or_else(|| "terminated".into())));
         }
         run.output.push_str(&format!("=== python -I -B -m unittest discover -s {f} ===\n{text}\n"));
         if !run.ok {
@@ -1458,18 +1513,20 @@ mod tests {
     }
 
     #[test]
-    fn light_folders_are_the_changed_folders_and_parents_that_hold_test_files() {
+    fn light_folders_are_the_touched_folders_that_hold_test_files_themselves() {
         let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-queue-light-{}", std::process::id()));
         std::fs::create_dir_all(d.join("scripts/sub")).unwrap();
         std::fs::create_dir_all(d.join("docs")).unwrap();
         std::fs::write(d.join("scripts/test_a.py"), "").unwrap();
         std::fs::write(d.join("scripts/helper.py"), "").unwrap();
         std::fs::write(d.join("docs/a.md"), "").unwrap();
-        assert_eq!(light_folders(&d, &s(&["scripts/sub/x.py"])), ["scripts"]);
+        assert_eq!(light_folders(&d, &s(&["scripts/x.py"])), ["scripts"]);
+        assert_eq!(light_folders(&d, &s(&["scripts/sub/x.py"])), Vec::<String>::new(), "a parent's tests are not run");
         assert_eq!(light_folders(&d, &s(&["docs/a.md"])), Vec::<String>::new());
         assert_eq!(light_folders(&d, &s(&["scripts/gone.py", "docs/a.md"])), ["scripts"], "a deleted file still names its folder");
         std::fs::write(d.join("test_root.py"), "").unwrap();
-        assert_eq!(light_folders(&d, &s(&["docs/a.md"])), ["."]);
+        assert_eq!(light_folders(&d, &s(&["docs/a.md"])), Vec::<String>::new(), "the root's tests are not run for a change below it");
+        assert_eq!(light_folders(&d, &s(&["README.md"])), ["."]);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

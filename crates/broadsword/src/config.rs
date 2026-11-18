@@ -126,6 +126,8 @@ pub struct Config {
     /// An entry ending in `/` is a folder prefix at the project root (`docs/`); an entry starting with `*.` matches a file extension
     /// anywhere (`*.md`).
     pub light_check_paths: Vec<String>,
+    /// The light check's Python test run is killed (whole process tree) after this many seconds, and the entry ends `check_failed`.
+    pub light_check_timeout_seconds: u64,
 }
 
 /// `light_check_paths`: comma-separated entries, each a folder prefix ending in `/` or an extension pattern `*.ext`.
@@ -236,8 +238,10 @@ impl Config {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
         let light_check_paths = parse_light_paths(&get_str(&m, "light_check_paths")?)?;
+        let light_check_timeout_seconds = positive("light_check_timeout_seconds")?;
         Ok(Config {
             light_check_paths,
+            light_check_timeout_seconds,
             shadow_reviewer,
             shadow_reviewer_model: model("shadow_reviewer_model")?,
             shadow_reviewer_timeout_seconds: positive("shadow_reviewer_timeout_seconds")?,
@@ -377,6 +381,7 @@ mod tests {
 sweep_older_than_days = 7
 redact_min_chars = 6
 light_check_paths = \"docs/,*.md\"
+light_check_timeout_seconds = 300
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
@@ -453,6 +458,9 @@ install_dir=\"build/bin\"\n";
         assert_eq!(c.light_check_paths, ["scripts/", "bench/", "clients/", "docs/", "evidence/", "*.md"]);
         let e = Config::from_text(&without_key(text, "light_check_paths"), Path::new("p")).unwrap_err();
         assert!(e.contains("light_check_paths") && e.contains("missing"), "{e}");
+        assert_eq!(c.light_check_timeout_seconds, 300);
+        let e = Config::from_text(&without_key(text, "light_check_timeout_seconds"), Path::new("p")).unwrap_err();
+        assert!(e.contains("light_check_timeout_seconds") && e.contains("missing"), "{e}");
         let with = |v: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "light_check_paths") { format!("light_check_paths = \"{v}\"") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
         assert!(Config::from_text(&with("docs/,*.md"), Path::new("p")).is_ok());
         for bad in ["", "docs", "docs/,", "/abs/", "a/../b/", "*", "*.", "*.a/b", "docs\\\\"] {
@@ -466,6 +474,7 @@ install_dir=\"build/bin\"\n";
 sweep_older_than_days = 7
 redact_min_chars = 6
 light_check_paths = \"docs/,*.md\"
+light_check_timeout_seconds = 300
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
@@ -506,6 +515,7 @@ worktrees_dir = \"worktrees\"\n";
 sweep_older_than_days = 7
 redact_min_chars = 6
 light_check_paths = \"docs/,*.md\"
+light_check_timeout_seconds = 300
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"

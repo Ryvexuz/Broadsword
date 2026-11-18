@@ -105,6 +105,7 @@ impl Root {
 sweep_older_than_days = 7
 redact_min_chars = 6
 light_check_paths = \"scripts/,bench/,clients/,docs/,evidence/,*.md\"
+light_check_timeout_seconds = 300
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = {timeout_s}\n\
              reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\nreviewer_max_calls_per_entry = 3
 shadow_reviewer = \"{shadow}\"\nshadow_reviewer_model = \"gpt-5.6-sol\"\nshadow_reviewer_timeout_seconds = {shadow_timeout_s}
@@ -422,6 +423,41 @@ fn a_failing_light_check_blocks_the_merge_like_a_failing_full_check() {
     assert_eq!(r.head(), main_before, "nothing merged");
     assert_eq!(r.task_status(&id), "running");
     assert_eq!(r.branch_tip(&id), tip);
+}
+
+#[test]
+fn a_light_check_python_test_that_hangs_is_killed_at_the_timeout_and_ends_check_failed() {
+    let r = Root::new("lighthang", 30);
+    let toml = fs::read_to_string(r.dir.join("broadsword.toml")).unwrap();
+    assert!(toml.contains("light_check_timeout_seconds = 300"));
+    fs::write(r.dir.join("broadsword.toml"), toml.replace("light_check_timeout_seconds = 300", "light_check_timeout_seconds = 2")).unwrap();
+    let id = r.started("scripts");
+    let tip = r.commit(&r.wt(&id), "scripts/test_slow.py", "import time\ntime.sleep(120)\n", "task: a python test that hangs");
+    let main_before = r.head();
+    let entry = r.add(&id, "low", "sonnet");
+    let t0 = std::time::Instant::now();
+    let o = r.run(&["queue", "run"]);
+    assert!(t0.elapsed().as_secs() < 60, "the hang was not cut off: {:?}", t0.elapsed());
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "check_failed");
+    let shown = r.show(&entry);
+    assert!(shown.contains("timed out after 2 s") && shown.contains("light_check_timeout_seconds"), "{shown}");
+    assert_eq!(r.calls(), 0, "no model was asked");
+    assert_eq!(r.head(), main_before, "nothing merged");
+    assert_eq!(r.branch_tip(&id), tip);
+}
+
+#[test]
+fn a_light_check_folder_whose_test_file_holds_no_tests_passes() {
+    let r = Root::new("lightnone", 30);
+    let id = r.started("scripts");
+    // Python 3.12+ exits 5 for "no tests ran"; older Pythons exit 0. Either way the check passes.
+    r.commit(&r.wt(&id), "scripts/test_helper.py", "import unittest\n\nVALUE = 1\n", "task: a test file with no TestCase");
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "queue run failed:\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "merged");
+    assert_eq!(r.field(&entry, "check kind"), "light");
 }
 
 #[test]

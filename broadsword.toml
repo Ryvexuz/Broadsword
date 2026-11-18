@@ -64,3 +64,5 @@ shadow_reviewer_timeout_seconds = 300  # a shadow call that runs longer is kille
 
 # Merge queue check kind: a diff whose every path matches is checked by the light check (Python tests in the touched folders that hold test_*.py, plus `cargo build`, no Rust tests); anything else, and any mixed diff, gets the full check (build + test). Comma-separated; `folder/` = a prefix at the project root, `*.ext` = that extension anywhere
 light_check_paths = "scripts/,bench/,clients/,docs/,evidence/,*.md"
+# The light check's Python test run is killed (whole process tree) and the entry ends check_failed after this many seconds
+light_check_timeout_seconds = 300
