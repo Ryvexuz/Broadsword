@@ -92,6 +92,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 audit | `max_agents` raised 4 → 6 so the backlog's Python benchmark tasks run beside the Rust ones | Backlog wait; pipeline idle | Open tasks waiting while slots are full; `dev_metrics.py` idle share | Build-lock waits (already 10 min once at 4 agents), RAM (15 GB machine) | open |
 | S4 | Shadow second reviewer (gpt-5.6-sol), recorded only | Learn whether a GPT reviewer catches what Claude misses, at what cost and time | `scripts/shadow_report.py` agreement and unique findings | Shadow time making entries stale (Opus minor); OpenAI spend | open |
 | S4 | Blind re-labelling for benchmark scores (anonymised, shuffled lines) | Fair scores despite wording differences | Score changes vs the pattern scorer (gpt-6.2-sol 5 → 9) | The labeller is a Claude model, so a contestant (it was blinded) | helped |
+| S4 | Codex CLI first for OpenAI calls (ChatGPT weekly allowance), API as fallback | No API spend for shadow reviews and benchmarks | `backend` field in shadow results | Codex's ~18.5k-token prompt overhead per call; plan rate limits | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
@@ -320,3 +321,11 @@ Read this list before the next milestone starts. The next retro checks each item
 3. Tasks stay the size of one or two files wherever possible.
 4. Check: no coder piped Broadsword output, and no brief got a false rejection.
 5. Briefs and coder prompts start from `templates/`, done checks are written as commands, and the cost section uses `scripts/review_costs.py`. Check that this made briefs faster to write and the retro numbers exact.
+
+## Throughput test: tp1 scoped checks (2026-11-18)
+
+- **Wrong:** the brief's done check ("show the queue's step timings before and after") could only be met after the change was installed. Opus failed it twice on that alone.
+- **Why:** the brief set a done check measured by the tool being changed, with no route to measure it before the merge.
+- **Change:** `SPEC_CHECKLIST.md` row: a done check for a change to the queue or the job runner says how to measure it before the merge (the branch's binary against a scratch root). Enforced in the checklist; next retro checks it.
+- **Speed and cost:** two Opus reviews (~10 minutes of queue time) spent on an unmeetable check. Parked rather than merged directly, because Opus's finding was right, not wrong, and a timeout gap remained.
+

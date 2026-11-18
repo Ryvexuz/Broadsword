@@ -2,6 +2,14 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Session end: throughput test, Codex-first wrapper, ready to move
+
+- **Stage:** 4 (v1 built, audit pending).
+- **Models:** Opus 5.5 orchestrator; Sonnet coders (tp1, Codex-first wrapper); Opus queue reviewer; gpt-5.6-sol shadow reviewer.
+- **tp1 scoped checks:** parked after two Opus FAILs on an unmeasurable done check (see RETRO). Codex-first wrapper: rejected by Opus (Windows timeout kill, double budget, unparseable run); fix round started.
+- **Git:** plain commits, then `git push origin` for main, tags and the two project branches (Lazlo's standing OK), as an off-drive backup before the move.
+- **Lesson:** a done check must be measurable by someone before the merge. If only the installed tool can measure it, the brief has to give a route, or every review fails.
+
 ## 2026-11-18 — Late session: RAM gate, shadow reviewer, benchmark results
 
 - **Merged through the queue:** the RAM gate (`10e9120`, Opus PASS first time) and the shadow second reviewer (`bb7375c`, Opus PASS first time).

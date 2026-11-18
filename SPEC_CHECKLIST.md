@@ -15,6 +15,7 @@ Start from `templates/brief.md` for the brief and `templates/coder-prompt.md` fo
 - **Examples are examples:** a list in a brief is either marked "for example" or is the complete rule. Reviewers read an unmarked list as complete. [Stage 3 m4: a correct `max_speed()` call was rejected because the brief listed some public functions in parentheses.]
 - **Standing rules touched:** name each `AGENTS.md` rule the change touches (secrets, deletion, settings, build folder), and how the change keeps it. [S3 audit: checkpoints were documented as saving `.env`, breaking the secrets rule.]
 - **Done-check output:** until the queue runs done-check commands itself, the orchestrator runs them before queueing and puts their output in the brief, because the reviewer cannot run anything. [S3 audit: an unreachable guard passed review.]
+- **Measurable before the merge:** if the done check measures the tool being changed (the queue, the job runner, the build lock), the brief says how to measure it with the branch's own binary against a scratch root, before `queue add`. [S4 tp1: two Opus FAILs on timings only the installed binary could produce.]
 - **What not to touch:** real repos, `projects/*`, Claude Code settings, the network, the real `.env`.
 
 ## Risk checks: name each one that applies

@@ -83,4 +83,5 @@ Ideas outside the current stage go here, not into code. Each one names the stage
     - a `shadow_reviewer = "codex"` option;
     - a `codex` provider for both benchmarks;
     - re-run the credit-blocked OpenAI rows through it.
-
+- **Throughput (tp1 `t-20261118-095350`):** the light check's Python run has no timeout (add `light_check_timeout_seconds`). The main check after a light merge is also light (fits Lazlo's middle ground; tp2 adds the hourly full run). One function added to `wtgit.rs`, outside the claim, accepted. `docs/` non-markdown files count as light.
+- **tp1 measurement route:** a queue change can't show real queue timings before it is installed. Run the branch's binary against a scratch copy of the root with two throwaway branches, and put the timings in the brief, so the reviewer can check done check 2 before the merge.

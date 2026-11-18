@@ -87,7 +87,7 @@ Full tables are in `evidence/benchmarks-2026-11-18.md`: hard case blind re-score
 
 ## Unfinished
 
-- **Benchmark runs still going at session end:** the Claude coding and reviewer run (from configuration 8 of 10), the OpenAI reviewer run, and the OpenAI coding run. They write results as they go. Before unplugging the drive, stop them (close the Claude app or end the session); anything unfinished is simply re-run next time.
+- **Benchmark runs stopped at session end** for the move. Their results so far are in `state/bench-results/`. The Claude run had reached the older Claude 4.5 models (reviewer step for claude-sonnet-4-5). Re-run whatever is missing; the OpenAI rows should go through Codex once the benchmarks have a Codex backend.
 - **Merge two finished tasks** once the benchmark runs no longer use their worktrees:
   - the hard case `t-20261118-075707`: fix the joined `catch` regex that crashes the old `score.py`, then send it through the queue;
   - the coding benchmark `t-20261118-080157`: send it through the queue.
@@ -99,14 +99,14 @@ Full tables are in `evidence/benchmarks-2026-11-18.md`: hard case blind re-score
 
 ## Throughput backlog (Lazlo approved all on 2026-11-18; briefs in `state/backlog/<task id>.md`)
 
-1. `t-20261118-095350`: queue checks scoped to the diff (Python-only diffs skip the Rust suite).
+1. `t-20261118-095350`: queue checks scoped to the diff (Python-only diffs skip the Rust suite). **Parked, not merged.** Built and tested on its branch (fix commit `da0108e`). Opus failed both reviews on the done check: no real before and after timings, which can only be measured once it is installed. Opus also found a real minor: a child process that keeps the stdout or stderr pipe open stops the light-check timeout from firing, and a `try_wait` error returns without killing Python. Next: fix those two, then measure with the branch's binary on a throwaway queue in a scratch root (docs-only branch against a Rust branch), and queue it again with the timings in the brief. Its binary needs the two `light_check_*` keys, so it can't be installed before the merge.
 2. `t-20261118-095350-2`: after a fast-forward to the checked commit, a quick build on main, with the full suite hourly (Lazlo's middle ground).
 3. `t-20261118-095350-3`: the build lock covers compiling only; tests run from copied binaries.
 4. `t-20261118-095351`: `queue run --all`, with the next entry's check overlapping the current review.
 5. `t-20261118-095351-2`: test binaries run in parallel (after 3).
 6. `t-20261118-095351-3`: a price comparison for paid speed tiers. **No fast tier and no Claude fast mode until Lazlo decides on it.**
 
-7. **Use the ChatGPT allowance:** the Codex CLI is installed and signed in with ChatGPT, and `codex exec` reviews through gpt-5.6-sol, terra and 6.2-sol work on the plan, not API credits. Next: a `codex` backend for the shadow reviewer and the benchmarks (see IDEAS), then re-run the credit-blocked OpenAI rows. On a new PC: `npm install -g @openai/codex`, then `codex login` (or `codex login --device-auth`). Separately, Lazlo will check the Platform billing after the move.
+7. **Use the ChatGPT allowance:** the shadow wrapper tries Codex first, then the API (`t-20261118-100744`; queue outcome: rejected by Opus (Windows timeout kill, double budget, unparseable run); fix round started). The Codex CLI is installed and signed in with ChatGPT, and `codex exec` reviews through gpt-5.6-sol, terra and 6.2-sol work on the plan, not API credits. Next: a `codex` backend for the shadow reviewer and the benchmarks (see IDEAS), then re-run the credit-blocked OpenAI rows. On a new PC: `npm install -g @openai/codex`, then `codex login` (or `codex login --device-auth`). Separately, Lazlo will check the Platform billing after the move.
 
 Process items:
 - The orchestrator gets out of the critical path: a Sonnet drafts briefs from a short spec, the Housekeeper writes records while the pipeline runs.
@@ -126,6 +126,7 @@ Process items:
 
 ## Next step
 
+0. **After the move:** follow `docs/MOVING.md` (worktree repair, `BROADSWORD_REVIEWER_CLI`, rebuild and install, the playbook and memory, `codex login`).
 1. **Benchmarks:** finish the unfinished OpenAI coding runs, re-run the errored models (Responses API, per-model token cap), run 5x consistency on the gpt-6.2 models and a stable comparison, benchmark the `fast`/`flex` tiers, and update `evidence/benchmarks-2026-11-18.md`. The hard case is already blind re-scored.
 2. **Merge the two benchmark tasks** (see Unfinished).
 3. **Run the Stage 4 v1 audit,** then tag.
