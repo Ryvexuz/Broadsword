@@ -325,7 +325,7 @@ fn the_first_plain_build_after_a_run_rebuilds_an_exe_the_run_replaced() {
 }
 
 /// If `cargo metadata` fails before a `run` (a broken Cargo.toml) the run still marks the folder, and what it builds is
-/// never installable: a package name it can read gets a `run:` note; otherwise a folder marker that the next plain build clears.
+/// never installable: a package name it can read gets a `run:` note; otherwise a marker file for that folder that the next plain build of that folder clears.
 #[test]
 fn a_run_in_a_folder_whose_packages_cannot_be_listed_still_marks_it() {
     for (broken, expect_note) in [("[package]
@@ -343,7 +343,7 @@ version =
         let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml && cargo build --offline", good.display()) } else { format!("cp '{}' Cargo.toml && cargo build --offline", good.display()) };
         let o = r.ok(&["run", "proj", "--", &fix]);
         assert!(o.stdout.contains("not checked"), "{}", o.stdout);
-        let marker = r.dir.join("state/build-sources/unlisted-run.marker");
+        let marker = r.dir.join("state/build-sources/unlisted-run.d/projects%2Fproj");
         if expect_note {
             assert_eq!(r.note().as_deref(), Some("run:projects/proj"), "{}", o.stdout);
             assert!(!marker.exists());
@@ -356,6 +356,75 @@ version =
         assert!(!marker.exists());
         assert_eq!(r.note().as_deref(), Some("projects/proj"));
         assert_eq!(r.probe(), "MARK-main");
+    }
+}
+
+/// The reviewer's scenario: a `run` in a task worktree whose Cargo.toml is broken repairs it and builds. Its marker is for THAT
+/// folder, so a plain build of another folder (the main checkout, another project) must not lift it and `install` stays
+/// refused; only a plain build of the worktree itself removes it.
+#[test]
+fn a_folder_marker_survives_plain_builds_of_other_folders() {
+    let r = Root::new("markerscope", 120);
+    r.ok(&["build", "proj"]);
+    let t1 = r.task("src", "MARK-t1");
+    let wt = r.worktree(&t1);
+    let good = r.scratch("Cargo.good");
+    fs::copy(wt.join("Cargo.toml"), &good).unwrap();
+    fs::write(wt.join("Cargo.toml"), "this is not toml at all\n").unwrap();
+    let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml && cargo build --offline", good.display()) } else { format!("cp '{}' Cargo.toml && cargo build --offline", good.display()) };
+    let o = r.ok(&["run", "proj", "--task", &t1, "--", &fix]);
+    assert!(o.stdout.contains("folder is marked"), "{}", o.stdout);
+    let dir = r.dir.join("state/build-sources/unlisted-run.d");
+    let names = |d: &Path| -> Vec<String> { fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default() };
+    let wt_marker = format!("worktrees%2Fproj%2F{t1}");
+    assert_eq!(names(&dir), [wt_marker.clone()]);
+    assert_eq!(fs::read_to_string(dir.join(&wt_marker)).unwrap().trim(), format!("worktrees/proj/{t1}"));
+    let refused = |r: &Root| {
+        let o = r.run(&["install"]);
+        assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains("folder marker") && o.stderr.contains(&t1), "{}", o.stderr);
+    };
+    refused(&r);
+    // plain builds of the main checkout and of the other project, in between: the marker stays, install stays refused
+    r.ok(&["build", "proj"]);
+    r.ok(&["build", "other"]);
+    assert_eq!(names(&dir), [wt_marker.clone()], "another folder's build must not remove it");
+    refused(&r);
+    // the worktree's own plain build cleans every package there, then removes only its marker
+    let o = r.ok(&["build", "proj", "--task", &t1]);
+    assert!(o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+    assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+}
+
+/// A broken root manifest whose `[workspace] members` can be read: the members' packages get `run:` notes too; a member whose
+/// manifest cannot be read marks the folder.
+#[test]
+fn a_run_notes_workspace_member_packages_and_marks_the_folder_if_one_is_unreadable() {
+    for (member_ok, want_marker) in [(true, false), (false, true)] {
+        let r = Root::new("members", 120);
+        let proj = r.dir.join("projects/proj");
+        fs::create_dir_all(proj.join("crates/m1/src")).unwrap();
+        fs::write(proj.join("crates/m1/Cargo.toml"), "[package]\nname = \"memberone\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[package.metadata.x]\nname = \"decoy\"\n").unwrap();
+        fs::write(proj.join("crates/m1/src/lib.rs"), "").unwrap();
+        let good = "[package]\nname = \"markprobe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\n  \"crates/m1\",\n]\n";
+        git(&proj, &["add", "."]);
+        git(&proj, &["commit", "-q", "-m", "member"]);
+        fs::write(proj.join("Cargo.toml"), good).unwrap();
+        if !member_ok {
+            fs::write(proj.join("Cargo.toml"), good.replace("crates/m1", "crates/gone")).unwrap();
+        }
+        // the root is broken by a stray line after the members, so cargo metadata fails but the names are readable
+        let broken = format!("{}\nversion = = =\n", fs::read_to_string(proj.join("Cargo.toml")).unwrap());
+        fs::write(proj.join("Cargo.toml"), broken).unwrap();
+        let o = r.ok(&["run", "proj", "--", "echo hi"]);
+        assert!(o.stdout.contains("not checked"), "{}", o.stdout);
+        let notes = r.dir.join("state/build-sources");
+        assert_eq!(fs::read_to_string(notes.join("markprobe")).unwrap().trim(), "run:projects/proj", "{}", o.stdout);
+        if member_ok {
+            assert_eq!(fs::read_to_string(notes.join("memberone")).unwrap().trim(), "run:projects/proj", "{}", o.stdout);
+            assert!(!notes.join("decoy").exists(), "[package.metadata.x] is not [package]");
+        }
+        assert_eq!(notes.join("unlisted-run.d/projects%2Fproj").exists(), want_marker, "{}", o.stdout);
     }
 }
 

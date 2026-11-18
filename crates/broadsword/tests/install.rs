@@ -255,9 +255,11 @@ edition = \"2021\"
         for args in [&["init", "-q"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["config", "core.autocrlf", "false"], &["add", "-A"], &["commit", "-q", "-m", "init"]] {
             assert!(Command::new("git").args(args).current_dir(&p).output().unwrap().status.success(), "git {args:?}");
         }
-        let exe = r.exe(); // note is "." (vouched) before the run
-        let good_path = PathBuf::from(fs::canonicalize(r.dir.join("scratch/Cargo.good")).unwrap().to_string_lossy().trim_start_matches(r"\?\"));
-        let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml", good_path.display()) } else { format!("cp '{}' Cargo.toml", good_path.display()) };
+        // the repair command builds the package `broadsword` into the build folder, so the test must not run from a copy of the
+        // binary in that very folder (a running exe cannot be replaced on Windows)
+        let exe = BIN.to_string(); // note is "." (vouched) before the run
+        let good_path = PathBuf::from(fs::canonicalize(r.dir.join("scratch/Cargo.good")).unwrap().to_string_lossy().trim_start_matches(r"\\?\"));
+        let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml && cargo build --offline", good_path.display()) } else { format!("cp '{}' Cargo.toml && cargo build --offline", good_path.display()) };
         let o = r.run(&exe, &["run", "broadsword", "--", &fix]);
         assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
         let o = r.run(&exe, &["install"]);

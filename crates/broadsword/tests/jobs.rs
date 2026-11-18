@@ -318,7 +318,9 @@ fn a_kill_when_already_paused_does_not_blame_the_disk() {
         if r.dir.join("build").exists() {
             fs::write(r.dir.join("broadsword.paused"), "reason: paused by hand
 ").unwrap();
-            fs::write(&hook, "0").unwrap();
+            let tmp = r.dir.join("scratch/free.txt.tmp");
+            fs::write(&tmp, "0").unwrap();
+            fs::rename(&tmp, &hook).unwrap(); // atomic: a poll never reads a half-written hook
             break;
         }
         std::thread::sleep(Duration::from_millis(20));

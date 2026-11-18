@@ -18,7 +18,10 @@
 //! later job in that folder needs no clean, but never exactly `.`, so `install` refuses it. A build, test or check in the
 //! same folder first runs `cargo clean -p` once for a package with a `run:` note (the run may have replaced the built exe
 //! while cargo's fingerprint stays fresh), then writes the plain folder note. A `run` whose packages cannot be listed notes
-//! the `[package] name` it can read, else leaves a folder marker that `install` refuses and the next plain build clears.
+//! the package names it can read (the root's and the `[workspace] members`'), and when that list may be incomplete or empty it
+//! also leaves a marker FILE for that folder (`unlisted-run.d/<folder>`). `install` is refused while ANY marker exists; a plain
+//! build of the same folder removes only its own marker, and only after cleaning every package of that folder, so a build of
+//! another project never lifts the refusal.
 //!
 //! Clean, note and build are one step across processes: the job holds `state/build.lock` (an OS file lock, lock.rs) for
 //! all of its cargo steps. Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
@@ -240,58 +243,176 @@ pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<Str
             // The packages cannot be listed (a broken Cargo.toml the command may be there to repair), but whatever the command
             // builds must still never be installable: note every package name still findable, else mark the whole folder.
             let wanted = format!("{RUN_NOTE_PREFIX}{source}");
-            let names = manifest_package_names(dir);
-            let how = if names.is_empty() {
+            let (names, complete) = manifest_package_names(dir);
+            for n in &names {
+                write_note(cfg, n, &wanted)?;
+            }
+            if !complete {
                 write_unlisted_marker(cfg, source)?;
-                "no package name found, so the folder is marked (`install` refuses until a plain build)".to_string()
-            } else {
-                for n in &names {
-                    write_note(cfg, n, &wanted)?;
-                }
-                format!("noted `{wanted}` for {}", names.join(", "))
+            }
+            let how = match (names.is_empty(), complete) {
+                (true, _) => "no package name found, so the folder is marked (`install` refuses until a plain build of this folder)".to_string(),
+                (false, true) => format!("noted `{wanted}` for {}", names.join(", ")),
+                (false, false) => format!("noted `{wanted}` for {}, and the folder is marked because a workspace member could not be read", names.join(", ")),
             };
             Ok(vec![format!("build source: not checked (the stale-binary protection is skipped for this run; {how}): {e}")])
         }
     }
 }
 
-/// File name of the folder-level marker a `run` leaves when its packages could not be listed and none could be named.
-pub const UNLISTED_MARKER: &str = "unlisted-run.marker";
+/// Directory (inside the notes folder) of the folder markers a `run` leaves when its packages could not be listed: ONE file
+/// per source folder, named by the encoded folder, holding that folder's source. The name has a `.`, which no package name
+/// has, so it can never collide with a package note.
+pub const UNLISTED_DIR: &str = "unlisted-run.d";
 
-fn write_unlisted_marker(cfg: &Config, source: &str) -> Result<(), String> {
-    let dir = notes_dir(cfg);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join(UNLISTED_MARKER);
-    std::fs::write(&path, format!("{RUN_NOTE_PREFIX}{source}\n")).map_err(|e| format!("cannot write the build-source marker {}: {e}", path.display()))
+fn unlisted_dir(cfg: &Config) -> PathBuf {
+    notes_dir(cfg).join(UNLISTED_DIR)
 }
 
-/// The `[package] name` of `dir/Cargo.toml`, read line by line (the file may be too broken for cargo). Empty if none.
-fn manifest_package_names(dir: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else { return Vec::new() };
+/// The marker file of a source folder: every character but letters, digits, `-` and `_` becomes `%XX` (per byte).
+fn marker_file(cfg: &Config, source: &str) -> PathBuf {
+    let mut n = String::new();
+    for b in source.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            n.push(b as char);
+        } else {
+            n.push_str(&format!("%{b:02X}"));
+        }
+    }
+    unlisted_dir(cfg).join(n)
+}
+
+fn write_unlisted_marker(cfg: &Config, source: &str) -> Result<(), String> {
+    let dir = unlisted_dir(cfg);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = marker_file(cfg, source);
+    std::fs::write(&path, format!("{source}\n")).map_err(|e| format!("cannot write the build-source marker {}: {e}", path.display()))
+}
+
+/// Every folder marker that exists: (file, the folder it holds). An unreadable marker names the folder `?`.
+pub fn unlisted_markers(cfg: &Config) -> Vec<(PathBuf, String)> {
+    let Ok(rd) = std::fs::read_dir(unlisted_dir(cfg)) else { return Vec::new() };
+    let mut v: Vec<(PathBuf, String)> = rd
+        .flatten()
+        .map(|e| {
+            let f = std::fs::read_to_string(e.path()).ok().and_then(|t| t.lines().next().map(|l| l.trim().to_string())).filter(|l| !l.is_empty());
+            (e.path(), f.unwrap_or_else(|| "?".into()))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A manifest line without its `#` comment, trimmed.
+fn toml_line(line: &str) -> &str {
+    line.split('#').next().unwrap_or("").trim()
+}
+
+/// The `[package] name` of one manifest text, read line by line (the file may be too broken for cargo). `[package.metadata.*]`
+/// and other `[package.*]` tables are not `[package]`.
+pub fn package_name_in(text: &str) -> Option<String> {
     let mut in_package = false;
     for line in text.lines() {
-        let l = line.trim();
+        let l = toml_line(line);
         if l.starts_with('[') {
-            in_package = l.starts_with("[package]");
+            in_package = l == "[package]";
         } else if in_package {
             if let Some((k, v)) = l.split_once('=') {
                 if k.trim() == "name" {
                     let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
                     if valid_package(v) {
-                        return vec![v.to_string()];
+                        return Some(v.to_string());
                     }
                 }
             }
         }
     }
-    Vec::new()
+    None
+}
+
+/// The quoted strings of the `[workspace] members = [...]` array of one manifest text (it may span lines).
+pub fn workspace_members_in(text: &str) -> Vec<String> {
+    let (mut in_ws, mut in_arr) = (false, false);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = toml_line(line);
+        let mut rest = l;
+        if !in_arr {
+            if l.starts_with('[') {
+                in_ws = l == "[workspace]";
+                continue;
+            }
+            match l.split_once('=') {
+                Some((k, v)) if in_ws && k.trim() == "members" => {
+                    in_arr = true;
+                    rest = v;
+                }
+                _ => continue,
+            }
+        }
+        let mut quote: Option<char> = None;
+        let mut cur = String::new();
+        for c in rest.chars() {
+            match quote {
+                Some(q) if c == q => {
+                    out.push(std::mem::take(&mut cur));
+                    quote = None;
+                }
+                Some(_) => cur.push(c),
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if c == ']' => in_arr = false,
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+/// The package names findable in `dir/Cargo.toml` and in the manifests of its `[workspace] members` (a trailing `/*` lists that
+/// folder's subfolders), plus whether the list is complete: false if the root manifest is unreadable, nothing was found, or a
+/// member's manifest could not be read or has no name. Incomplete means the caller marks the whole folder.
+fn manifest_package_names(dir: &Path) -> (Vec<String>, bool) {
+    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else { return (Vec::new(), false) };
+    let mut names: Vec<String> = package_name_in(&text).into_iter().collect();
+    let mut complete = true;
+    for m in workspace_members_in(&text) {
+        let folders: Vec<PathBuf> = match m.strip_suffix("/*") {
+            Some(parent) => match std::fs::read_dir(dir.join(parent)) {
+                Ok(rd) => rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect(),
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            },
+            None if m.contains('*') || m.contains('?') || m.contains('[') => {
+                complete = false;
+                continue;
+            }
+            None => vec![dir.join(&m)],
+        };
+        for f in folders {
+            match std::fs::read_to_string(f.join("Cargo.toml")).ok().as_deref().and_then(package_name_in) {
+                Some(n) => {
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+                None => complete = false,
+            }
+        }
+    }
+    if names.is_empty() {
+        complete = false;
+    }
+    (names, complete)
 }
 
 fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>, as_run: bool) -> Result<Prepared, String> {
     let notes: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).collect();
     // A plain build also cleans a package whose note is `run:<this folder>` (the run may have replaced the built exe while
-    // cargo's fingerprint stays fresh), and every package when a run left a folder-level marker.
-    let marker = notes_dir(cfg).join(UNLISTED_MARKER);
+    // cargo's fingerprint stays fresh), and every package of the folder when a run in THIS folder left a folder marker (only
+    // that folder's marker is removed, and only after every package here is cleaned).
+    let marker = marker_file(cfg, source);
     let marked = !as_run && marker.exists();
     let stale: Vec<(String, Option<String>)> = notes
         .iter()
@@ -338,10 +459,13 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
 /// pause hook and the MCP server for everyone. Reads the same note. Err = the message to print (exit 1).
 pub fn check_installable(cfg: &Config) -> Result<(), String> {
     let pkg = env!("CARGO_PKG_NAME");
-    if notes_dir(cfg).join(UNLISTED_MARKER).exists() {
+    let markers = unlisted_markers(cfg);
+    if !markers.is_empty() {
+        let folders: Vec<String> = markers.iter().map(|(_, f)| format!("`{f}`")).collect();
         return Err(format!(
-            "refusing to install: a `run` whose packages could not be listed left a folder-level marker ({}), so the `{pkg}` binary in the build folder may be its. Build the main checkout first (`broadsword build {pkg}`, with no --task), then run `install` from the binary it built",
-            notes_dir(cfg).join(UNLISTED_MARKER).display()
+            "refusing to install: a `run` whose packages could not be listed left a folder marker for {} (in {}), so the `{pkg}` binary in the build folder may be its. Install stays refused while ANY such marker exists; a plain build, test or check of that same folder removes its marker, so repeat that for each folder named, then build the main checkout (`broadsword build {pkg}`, with no --task) and run `install` from the binary it built",
+            folders.join(", "),
+            unlisted_dir(cfg).display()
         ));
     }
     match read_note(cfg, pkg) {
@@ -542,6 +666,37 @@ mod tests {
         write_note(&cfg, pkg, "run:.").unwrap();
         let e = check_installable(&cfg).unwrap_err();
         assert!(e.contains("a `run`"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn package_table_is_not_a_package_subtable() {
+        let t = "[package.metadata.x]\nname = \"decoy\"\n[package]\nname = \"real\" # c\n";
+        assert_eq!(package_name_in(t).as_deref(), Some("real"));
+        assert_eq!(package_name_in("[package.metadata.x]\nname = \"decoy\"\n"), None);
+        assert_eq!(package_name_in("[dependencies]\nname = \"x\"\n"), None);
+        let ws = "[workspace]\nmembers = [\"a\", 'b/*',\n  \"c\"] # x\nresolver = \"2\"\n[other]\nmembers = [\"no\"]\n";
+        assert_eq!(workspace_members_in(ws), ["a", "b/*", "c"]);
+    }
+
+    #[test]
+    fn markers_are_per_folder_and_any_one_refuses_install() {
+        let d = tmp("markers");
+        let mut cfg = cfg_at(&d);
+        cfg.state_dir = d.join("state");
+        let pkg = env!("CARGO_PKG_NAME");
+        write_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        assert!(check_installable(&cfg).is_ok());
+        write_unlisted_marker(&cfg, "worktrees/p/t-1").unwrap();
+        write_unlisted_marker(&cfg, ".").unwrap();
+        assert_eq!(unlisted_markers(&cfg).len(), 2);
+        assert!(marker_file(&cfg, "worktrees/p/t-1") != marker_file(&cfg, "worktrees%2Fp/t-1"));
+        let e = check_installable(&cfg).unwrap_err();
+        assert!(e.contains("folder marker") && e.contains("worktrees/p/t-1"), "{e}");
+        std::fs::remove_file(marker_file(&cfg, ".")).unwrap();
+        assert!(check_installable(&cfg).is_err(), "a marker for another folder still refuses");
+        std::fs::remove_file(marker_file(&cfg, "worktrees/p/t-1")).unwrap();
+        assert!(check_installable(&cfg).is_ok());
         std::fs::remove_dir_all(&d).unwrap();
     }
 
