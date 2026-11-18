@@ -64,4 +64,6 @@ Ideas outside the current stage go here, not into code. Each one names the stage
   - Test: an agentic multi-step coding task (the coding bench's planned agentic track) with firm rules stated at step 0: a file never to edit, a signature to keep, run the tests before declaring done.
   - Check each rule at steps 5, 20 and 50+, and score both the work and the step where each rule first breaks.
   - Compare gpt-6.2-astra, the sol models and a Claude model, to get a drift curve per model.
+- **Bench:** `bench/coder` records an API error (for example HTTP 429, no credits) as `format_failure`, so a refused call scores 0% instead of being excluded as an error. Map provider errors to `is_error`, and have score.py exclude them, as reviewer/score.py now does.
+  Also: the OpenAI account ran out of credits on 2026-11-18 during the coding run. Every later 6.x coding row needs a re-run after credits are added.
 

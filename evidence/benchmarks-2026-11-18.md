@@ -157,6 +157,8 @@ claude:sonnet  high     12/12        13/13        14/14        19/19       20/20
 ```
 
 OpenAI (all 30 models; gpt-6.1-terra also ran separately, last line):
+**The OpenAI coding run is partly invalid.** The OpenAI account ran out of credits mid-run (HTTP 429, "You have no credits remaining"). Every row from gpt-5.5 onward, all the gpt-5.6 and gpt-6.x models, shows 0% because no call was made, not because the code was wrong. The coding runner recorded those refusals as format failures; that is a bug, noted in IDEAS. Only gpt-6.1-terra's separate run (last line, 97/97) is a real 6.x coding result. Re-run the rest after adding credits.
+
 ```
 model                 effort   01-duration  02-ring-buf  03-merge-in  04-ttl-lru  05-expressi  06-line-dif  score      compile  format  cost  time
 openai:chat-latest    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
