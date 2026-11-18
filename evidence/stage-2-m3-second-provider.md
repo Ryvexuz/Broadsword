@@ -57,6 +57,7 @@ exit=0
 - **Reviewer (Opus), first pass: FAIL.** The server inherited `OPENAI_API_KEY`. With `run` allowed, a command that echoed the environment put the full key into the model's context and into Broadsword's job log on disk. The commit also included `.pyc` files with absolute paths. Minor items: redirects carried the Authorization header, odd arguments caused tracebacks, an unknown `--allow` name only warned, Ctrl+C was slow, and tests left temp files outside `scratch/`.
 - **Second pass: FAIL.** The key still leaked to the job log when it was stored under another variable name.
 - **Third pass:** the orchestrator read the fix diff. Variables are now dropped by value as well as by name.
+- **Correction (2026-11-18, full audit S10):** this third pass was not an independent review. The secrets fix merged with no independent PASS, against the rule that an independent reviewer checks work before it merges. The same area (child environments and secrets) was re-examined in the audit, and is being fixed through the merge queue (audit finding S6).
 
 ## Not covered
 

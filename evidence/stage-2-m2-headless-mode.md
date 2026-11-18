@@ -15,6 +15,8 @@ $ build/debug/broadsword.exe install
 installed: C:\Users\setup\Desktop\Broadsword\build/bin\broadsword.exe (1481728 bytes)
 ```
 
+> **Correction (2026-11-18, full audit S10):** this run is weaker than the done check's wording, "a fresh AI session that has never seen the project". Its prompt named the server, the project and the action. Only four tools were allowed, and it ran from the project folder, so it may have loaded `CLAUDE.md`. It proves that a headless session can drive a crash-sim build through MCP with no interface open. It does not prove that a session with no hints finds its own way. A stricter re-run is planned, with a neutral prompt, all tools allowed and a working folder outside the project.
+
 A fresh headless Claude Code 2.1.325 session then ran with a temporary MCP config pointing at `build/bin/broadsword.exe mcp`. No Claude Code settings or `.mcp.json` were changed for this. Its own built-in tools were off, and only four Broadsword tools were allowed:
 
 ```bash

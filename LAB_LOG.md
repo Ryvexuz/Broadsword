@@ -219,7 +219,7 @@ Reuse carries limitations along with code. The coder correctly reused a reviewed
 ## Stage 2 lessons (AI Integration, closed 2026-11-17)
 
 1. **Name the hard cases in the spec, and review passes drop.**
-   - Every Stage 2 milestone passed review on its first or second pass. Stage 1 never passed on a first pass.
+   - Every Stage 2 milestone passed review on its first or second pass except milestone 3, whose secrets fix merged after FAIL, FAIL and then only an orchestrator read, with no independent PASS. Stage 1 never passed on a first pass. [Corrected 2026-11-18 after the full audit, finding S10.]
    - The difference was the spec, which listed the risky cases up front: stdout purity, argument injection, timeout and cancel cleanup, version gating, key leakage.
    - Specs got longer; review rounds got shorter. That's a good trade.
 2. **Secrets leak through side channels.**
