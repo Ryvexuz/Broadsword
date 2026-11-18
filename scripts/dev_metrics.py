@@ -5,7 +5,10 @@
 
 Read-only. Sources: state/tasks/*.task (created, started, ended), state/queue/*.entry (each step's UTC timestamps,
 attempts, verdicts), state/jobs/*.rec (job start and end), and the author time of each task's merged commits (when
-the coder committed). Not recorded anywhere yet, so not shown: build-lock wait inside a job, and coder token use.
+the coder committed). Model use comes from every queue review (state/queue/*.entry:
+model, review time, tokens, cost) and from state/agent-runs.tsv, where the orchestrator logs each subagent run (role,
+model, task, tokens, seconds) from the agent's completion report. Not recorded anywhere yet, so not shown: build-lock
+wait inside a job, and the orchestrator's own tokens.
 
 Per task:
   lead       task created -> task ended (done, failed or abandoned)
@@ -17,6 +20,8 @@ Window (first task created -> last task ended):
   busy        share of the window with at least one task running (agents had work)
   idle        share with no task running (nothing in progress: the pipeline was empty)
   jobs        share with at least one Broadsword job running (the machine was building or testing)
+Models (same window, by date for agent runs):
+  runs, active time, tokens and review cost per model and role; utilisation = active time / window
 """
 import calendar
 import pathlib
@@ -25,15 +30,17 @@ import sys
 import time
 
 def main_root():
-    """The main checkout, where state/ and projects/ live, even when this script runs from a task worktree."""
+    """The main checkout, where state/ and projects/ live, even when this script runs from a task worktree.
+    Exits loudly if it can't be found: a report read from the wrong folder would be silently wrong."""
     here = pathlib.Path(__file__).resolve().parent
     try:
         common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=30).stdout.strip()
-        if common:
-            return pathlib.Path(common).parent
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return here.parent
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"dev_metrics: cannot run git to find the main checkout ({e})")
+    root = pathlib.Path(common).parent if common else None
+    if root is None or not (root / "broadsword.toml").is_file() or not (root / "state" / "tasks").is_dir():
+        raise SystemExit(f"dev_metrics: no Broadsword main checkout with state/tasks found (git said {common!r})")
+    return root
 
 
 ROOT = main_root()
@@ -178,8 +185,52 @@ def main():
     print(f"busy        {busy / window:5.1%}  at least one task running")
     print(f"idle        {1 - busy / window:5.1%}  no task running (pipeline empty)")
     print(f"jobs        {job_time / window:5.1%}  at least one Broadsword job running")
-    print("not recorded: build-lock wait inside a job; coder tokens (take them from agent reports)")
+    models(entries, since, lo, hi, window)
+    print("not recorded: build-lock wait inside a job; the orchestrator's own tokens (see the app's usage card)")
     return 0
+
+
+def models(entries, since, lo, hi, window):
+    """Per model and role: runs, active seconds, tokens, cost, and active share of the window."""
+    rows = {}
+
+    def add(model, role, secs, tokens, cost):
+        k = (model, role)
+        r = rows.setdefault(k, [0, 0, 0, 0.0])
+        r[0] += 1
+        r[1] += secs or 0
+        r[2] += tokens or 0
+        r[3] += cost or 0.0
+
+    for e in entries:
+        c = num(e.get("created")) or 0
+        if not e.get("reviewer_model") or not (lo <= c <= hi):
+            continue
+        if e.get("test_hook") == "true":
+            continue
+        secs = steps(e).get("review")
+        tokens = (num(e.get("tokens_in")) or 0) + (num(e.get("tokens_out")) or 0)
+        try:
+            cost = float(e.get("cost_usd") or 0)
+        except ValueError:
+            cost = 0.0
+        if e.get("verdict"):
+            add(e.get("reviewer_model"), "reviewer", secs, tokens, cost)
+    log = ROOT / "state" / "agent-runs.tsv"
+    if log.is_file():
+        lines = log.read_text(encoding="utf-8").splitlines()
+        head = lines[0].split("\t") if lines else []
+        for line in lines[1:]:
+            v = dict(zip(head, line.split("\t")))
+            if since and v.get("date_utc", "").replace("-", "") < since:
+                continue
+            add(v.get("model", "?"), v.get("role", "?"), num(v.get("seconds")), num(v.get("tokens")), 0.0)
+    print()
+    print(f"{'model':<8} {'role':<12} {'runs':>4} {'active':>8} {'tokens':>10} {'cost $':>8} {'util':>6}")
+    for (model, role), (n, secs, tokens, cost) in sorted(rows.items()):
+        print(f"{model:<8} {role:<12} {n:>4} {dur(secs):>8} {tokens:>10} {cost:>8.4f} {secs / window:>6.1%}")
+    if not log.is_file():
+        print("(no state/agent-runs.tsv: subagent runs are not logged yet)")
 
 
 if __name__ == "__main__":
