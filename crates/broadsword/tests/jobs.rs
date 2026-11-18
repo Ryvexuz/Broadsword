@@ -43,6 +43,7 @@ impl Root {
              job_disk_reserve_gb = {reserve_gb}\n\
              job_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+max_agents = 50
 "
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();

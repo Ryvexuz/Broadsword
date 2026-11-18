@@ -48,6 +48,7 @@ impl Root {
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
              checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = {}\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+max_agents = 50
 ",
             wait.unwrap_or(10)
         );
@@ -572,4 +573,58 @@ fn non_overlapping_starts_in_a_race_all_run() {
 fn hold_is_free(r: &Root) -> bool {
     let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path(r)).unwrap();
     f.try_lock().is_ok()
+}
+
+// ---- the agent cap (max_agents) -----------------------------------------------------------
+
+fn set_cap(r: &Root, cap: u64) {
+    let p = r.dir.join("broadsword.toml");
+    let t: String = fs::read_to_string(&p).unwrap().lines().map(|l| if l.starts_with("max_agents") { format!("max_agents = {cap}
+") } else { format!("{l}
+") }).collect();
+    assert_eq!(t.matches(&format!("max_agents = {cap}
+")).count(), 1);
+    fs::write(p, t).unwrap();
+}
+
+#[test]
+fn start_refuses_at_the_agent_cap_across_projects() {
+    let r = Root::new("cap");
+    set_cap(&r, 2);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    let c = r.add("p", "c", &["src/c.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    assert_eq!(r.start(&b, "coder-2").code, 0);
+    let o = r.start(&c, "coder-3");
+    assert_eq!(o.code, 3, "third start must be refused at cap 2: {}", o.stderr);
+    assert!(o.stderr.contains("max_agents") && o.stderr.contains(&a) && o.stderr.contains(&b), "{}", o.stderr);
+    assert_eq!(r.status_of(&c), "open", "a refused start changes nothing");
+    assert_eq!(r.run(&["task", "done", &a]).code, 0);
+    assert_eq!(r.start(&c, "coder-3").code, 0, "a freed slot can be taken");
+    // Lowering the cap below the running count stops new starts but leaves running tasks alone.
+    set_cap(&r, 1);
+    let d = r.add("q", "d", &["docs"]);
+    assert_eq!(r.start(&d, "coder-4").code, 3);
+    assert_eq!((r.status_of(&b), r.status_of(&c)), ("running".to_string(), "running".to_string()));
+}
+
+#[test]
+fn eight_gated_starts_never_exceed_a_cap_of_three() {
+    let r = Root::new("capr");
+    set_cap(&r, 3);
+    for round in 0..3 {
+        let ids: Vec<String> = (0..8).map(|i| r.add(if i % 2 == 0 { "p" } else { "q" }, "t", &[&format!("r{round}/f{i}.rs")])).collect();
+        let who: Vec<(&str, String)> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), format!("coder-{i}"))).collect();
+        let res = start_together(&r, &who, round);
+        let won = res.iter().filter(|(c, _)| *c == 0).count();
+        assert_eq!(won, 3, "round {round}: exactly the cap may start: {res:?}");
+        assert!(res.iter().all(|(c, _)| *c == 0 || *c == 3), "losers exit 3: {res:?}");
+        assert_eq!(r.list(&["--status", "running"]).len(), 3);
+        for id in &ids {
+            if r.status_of(id) == "running" {
+                assert_eq!(r.run(&["task", "abandon", id]).code, 0);
+            }
+        }
+    }
 }

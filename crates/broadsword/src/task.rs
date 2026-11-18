@@ -358,6 +358,13 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             Ok(a) => a,
             Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
         };
+        // The agent cap: one running task is one agent at work. Counted under the board lock, across every project.
+        let running: Vec<&Record> = all.iter().filter(|o| o.status() == RUNNING).collect(); // this task is still `open` here
+        if running.len() as u64 >= cfg.max_agents {
+            let ids: Vec<String> = running.iter().map(|o| format!("{} ({})", o.id(), o.get("project"))).collect();
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running, the max_agents cap in broadsword.toml is {}: {}
+start it after one of them is done, failed or abandoned (`task abandon` frees the slot of a task whose agent died)", running.len(), cfg.max_agents, ids.join(", ")));
+        }
         let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
         if !conflicts.is_empty() {
             let lines: Vec<String> = conflicts.iter().map(|c| format!("  {}", describe(c))).collect();
