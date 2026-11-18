@@ -2,9 +2,10 @@
 //! (tiny) cargo project, inside throwaway Broadsword roots under the repo's `scratch/` folder. The project `p` of each root is
 //! its own Git repo under `projects/`; the real Broadsword repo and the crash sim are never touched.
 //!
-//! NO MODEL IS EVER CALLED and there is no network: the reviewer CLI is `fake_claude` (tests/support/fake_claude.rs), which
-//! `BROADSWORD_REVIEWER_CLI` points at. It records what it was given, so the tests can assert that it received the diff and
-//! the check output, and that its environment was scrubbed.
+//! NO MODEL IS EVER CALLED and there is no network: the reviewer CLI is `fake_claude` (tests/support/fake_claude.rs), COPIED into
+//! the throwaway root's `scratch/reviewer/` (the only place inside a root an override may point at: the TEST HOOK), which
+//! `BROADSWORD_REVIEWER_CLI` names. It records what it was given, so the tests can assert that it received the diff and the check
+//! output, and that its environment was scrubbed.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -54,6 +55,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 struct Root {
     dir: PathBuf,
     fake_out: PathBuf,
+    /// The fake reviewer, copied into this root's scratch folder.
+    fake: PathBuf,
 }
 
 impl Root {
@@ -83,11 +86,14 @@ impl Root {
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
              checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 60\n\
              reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = {timeout_s}\n\
-             reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\n"
+             reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\nreviewer_max_calls_per_entry = 3\n"
         );
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         let fake_out = dir.join("fake-out");
-        Root { dir, fake_out }
+        let fake = dir.join("scratch/reviewer").join(Path::new(FAKE).file_name().unwrap());
+        fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        fs::copy(FAKE, &fake).unwrap();
+        Root { dir, fake_out, fake }
     }
 
     fn p(&self) -> PathBuf {
@@ -100,7 +106,7 @@ impl Root {
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(BIN);
-        c.args(args).current_dir(&self.dir).stdin(Stdio::null()).env("BROADSWORD_REVIEWER_CLI", FAKE).env("FAKE_CLAUDE_OUT_DIR", &self.fake_out);
+        c.args(args).current_dir(&self.dir).stdin(Stdio::null()).env("BROADSWORD_REVIEWER_CLI", &self.fake).env("FAKE_CLAUDE_OUT_DIR", &self.fake_out);
         for (k, v) in env {
             c.env(k, v);
         }
@@ -478,19 +484,14 @@ fn queue_add_refuses_what_cannot_be_merged_and_is_documented_in_exit_codes() {
     let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert!(o.stderr.contains("no commit beyond its base"), "{}", o.stderr);
-    // an untracked file, then an ignored one: both block
+    // an untracked file blocks
     r.commit(&r.wt(&id), "src/a.txt", "a\n", "task: a");
     fs::write(r.wt(&id).join("loose.txt"), "x").unwrap();
     let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
     assert_eq!(o.code, 3);
     assert!(o.stderr.contains("not clean") && o.stderr.contains("loose.txt"), "{}", o.stderr);
     fs::remove_file(r.wt(&id).join("loose.txt")).unwrap();
-    fs::create_dir_all(r.wt(&id).join("target")).unwrap();
-    fs::write(r.wt(&id).join("target/x"), "ignored").unwrap();
-    let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
-    assert_eq!(o.code, 3, "ignored files count, like for worktree removal: {}", o.stderr);
-    assert!(o.stderr.contains("target"), "{}", o.stderr);
-    fs::remove_dir_all(r.wt(&id).join("target")).unwrap();
+    // (an ignored file does not block: see `an_ignored_file_in_the_worktree_does_not_block_the_queue...`)
     // a brief that is a secrets file, or too big, or empty
     fs::write(r.dir.join(".env"), "OPENAI_API_KEY=sk-test-abcdefghij\n").unwrap();
     let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet", "--brief", r.dir.join(".env").to_str().unwrap()]);
@@ -574,8 +575,8 @@ fn a_failing_reviewer_cli_blocks_the_entry() {
     let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", "no-such-reviewer-cli-anywhere")]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     let reason = r.field(&e, "reason");
-    assert!(reason.contains("cannot start the reviewer CLI") && !reason.contains("no-such-reviewer-cli-anywhere"), "the override path is never written to a record: {reason}");
-    assert!(!fs::read_to_string(r.entry_file(&e)).unwrap().contains("no-such-reviewer-cli-anywhere"));
+    assert!(reason.contains("cannot start the reviewer CLI") && reason.contains("no-such-reviewer-cli-anywhere"), "{reason}");
+    assert_eq!(r.calls(), 1, "only the first (exit 7) call reached the fake");
 }
 
 #[test]
@@ -639,7 +640,284 @@ fn the_reviewer_cli_gets_a_scrubbed_environment_and_a_redacted_prompt() {
     let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
     assert!(stdin.contains("the key is [REDACTED], oops"), "{stdin}");
     assert!(!stdin.contains("sk-test-abcdefghij") && !stdin.contains("OTHER=1"), "{stdin}");
-    assert!(!fs::read_to_string(r.entry_file(&e)).unwrap().contains(FAKE), "the CLI path is never written to the entry");
+}
+
+
+// ---- B1: one commit from check to merge ------------------------------------------------------
+
+#[test]
+fn a_commit_added_between_check_and_review_is_never_reviewed_or_merged() {
+    let r = Root::new("onecommit", 120);
+    let id = r.started("src");
+    let checked = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    // the run dies in the middle of the review step: the check already passed on `checked`
+    let mut child = r.spawn(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    wait_for("the reviewer to start", 120, || r.calls() == 1);
+    kill_tree(&mut child);
+    assert_eq!(r.field(&e, "step"), "review");
+    assert_eq!(r.field(&e, "checked commit"), checked);
+    // a commit that does not even compile lands on the branch before the resume: it was never checked
+    let broken = r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn broken( {\n"), "task: late commit that does not compile");
+    fs::remove_file(&hang).unwrap();
+    let main_before = r.head();
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "stale", "{}{}", o.stdout, o.stderr);
+    assert!(r.field(&e, "reason").contains("branch changed after check"), "{}", r.field(&e, "reason"));
+    assert_eq!(r.head(), main_before, "nothing merged");
+    assert_eq!(r.calls(), 1, "the unchecked commit was never sent to the reviewer");
+    assert_eq!(r.branch_tip(&id), broken);
+    assert_eq!(r.task_status(&id), "running");
+    // run again: the new commit is checked, and the broken build stops it before any reviewer is asked
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "check_failed");
+    assert_eq!(r.calls(), 1);
+    assert_eq!(r.head(), main_before);
+}
+
+#[test]
+fn the_merge_refuses_a_tip_that_is_not_the_checked_and_reviewed_commit() {
+    let r = Root::new("mergebind", 30);
+    let id = r.started("src");
+    let tip = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    // a recorded PASS whose reviewed commit is not the checked one (a hand-edited or corrupt entry): refused, nothing merged
+    let base = git(&r.p(), &["rev-parse", "HEAD"]);
+    r.edit_entry(&e, &[("status", "running"), ("step", "merge"), ("attempt", "1"), ("verdict", "PASS"), ("checked_tip", &base), ("reviewed_tip", &tip), ("base_head", &base), ("main_branch", "main")]);
+    let main_before = r.head();
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("not the commit the check passed on"), "{}", o.stderr);
+    assert_eq!(r.head(), main_before);
+    assert_eq!(r.calls(), 0);
+}
+
+// ---- B2, M5: every .env value is a secret --------------------------------------------------
+
+#[test]
+fn every_env_file_value_is_redacted_and_scrubbed_whatever_its_name_and_stored_text_is_redacted_too() {
+    let r = Root::new("envall", 30);
+    fs::write(r.dir.join(".env"), "GITHUB_PAT=ghp_abcdef0123456789\nDB_PASSWORD=hunter2-hunter2\nREGION=eu-central-17\nTINY=ab\n").unwrap();
+    let id = r.started("src");
+    // the diff leaks the values, and the build prints one (an unused-variable warning quotes the source line)
+    r.commit(&r.wt(&id), "src/note.txt", "pat ghp_abcdef0123456789 pw hunter2-hunter2 region eu-central-17 tiny ab\n", "task: note");
+    r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn leak() {\n    let unused_leak = \"eu-central-17\";\n}\n"), "task: leak");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run_env(
+        &["queue", "run"],
+        &[
+            ("GITHUB_PAT", "ghp_abcdef0123456789"),
+            ("PLAIN_NAME", "ghp_abcdef0123456789"),
+            ("WRAPPED", "<hunter2-hunter2>"),
+            ("REGION_COPY", "eu-central-17"),
+            ("SHORT_EQUAL", "ab"),
+            ("SHORT_INSIDE", "xaby"),
+            ("MY_PASS", "p"),
+            ("CLOUD_CREDENTIALS", "c"),
+            ("X_AUTH_HEADER", "a"),
+            ("HARMLESS_SETTING", "keep-me"),
+        ],
+    );
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let env = r.fake_env();
+    for gone in ["GITHUB_PAT", "PLAIN_NAME", "WRAPPED", "REGION_COPY", "SHORT_EQUAL", "MY_PASS", "CLOUD_CREDENTIALS", "X_AUTH_HEADER"] {
+        assert!(!env.iter().any(|(k, _)| k == gone), "{gone} reached the reviewer CLI");
+    }
+    assert!(env.iter().any(|(k, v)| k == "SHORT_INSIDE" && v == "xaby"), "a short .env value is scrubbed only where a variable equals it");
+    assert!(env.iter().any(|(k, v)| k == "HARMLESS_SETTING" && v == "keep-me"));
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(stdin.contains("pat [REDACTED] pw [REDACTED] region [REDACTED] tiny ab"), "{stdin}");
+    assert!(stdin.contains("unused variable") && stdin.contains("let unused_leak = \"[REDACTED]\""), "the check tail is redacted: {stdin}");
+    for secret in ["ghp_abcdef0123456789", "hunter2-hunter2", "eu-central-17"] {
+        assert!(!stdin.contains(secret), "{secret} in the prompt");
+        for f in [r.entry_file(&e), r.dir.join("state/queue").join(format!("{e}.review"))] {
+            let text = fs::read_to_string(&f).unwrap();
+            assert!(!text.contains(secret), "{secret} stored in {}", f.display());
+        }
+    }
+    let entry = fs::read_to_string(r.entry_file(&e)).unwrap();
+    assert!(entry.contains("unused variable") && entry.contains("[REDACTED]"), "the check tail is stored, redacted");
+    assert!(r.show(&e).contains("shorter than 6 characters"), "{}", r.show(&e));
+}
+
+// ---- B3: the reviewer cannot be swapped without a trace -------------------------------------
+
+#[test]
+fn the_reviewer_cli_path_is_printed_and_recorded_and_a_scratch_override_is_a_loud_test_hook() {
+    let r = Root::new("hook", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let path = r.fake.to_string_lossy().replace('\\', "/");
+    assert!(o.stdout.contains(&format!("TEST HOOK ACTIVE: reviewer CLI is {path}")), "{}", o.stdout);
+    assert_eq!(r.field(&e, "reviewer CLI"), path);
+    assert_eq!(r.field(&e, "test hook"), "true");
+    let review = fs::read_to_string(r.dir.join("state/queue").join(format!("{e}.review"))).unwrap();
+    assert!(review.contains("test_hook: true") && review.contains(&format!("reviewer cli: {path}")), "{review}");
+}
+
+#[test]
+fn a_reviewer_cli_outside_the_root_is_a_normal_reviewer_and_one_inside_build_is_refused() {
+    let r = Root::new("outside", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    // the shipped fake, copied into the root's build folder: refused, no model is called
+    fs::create_dir_all(r.dir.join("build")).unwrap();
+    fs::write(r.dir.join("build/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55
+").unwrap(); // so cargo will still clean in it
+    let in_build = r.dir.join("build").join(r.fake.file_name().unwrap());
+    fs::copy(FAKE, &in_build).unwrap();
+    let main_before = r.head();
+    let o = r.run_env(&["queue", "run"], &[("BROADSWORD_REVIEWER_CLI", in_build.to_str().unwrap())]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "blocked");
+    assert!(r.field(&e, "reason").contains("refused") && r.field(&e, "reason").contains("build/"), "{}", r.field(&e, "reason"));
+    assert_eq!((r.calls(), r.head()), (0, main_before.clone()), "nothing was called or merged");
+    // any other folder inside the root is refused too (a relative path included)
+    fs::create_dir_all(r.dir.join("tools")).unwrap();
+    fs::copy(FAKE, r.dir.join("tools").join(r.fake.file_name().unwrap())).unwrap();
+    let rel = format!("tools/{}", r.fake.file_name().unwrap().to_string_lossy());
+    let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", &rel)]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.calls(), 0);
+    let _ = fs::remove_file(&in_build); // (a later check may have cleaned it already)
+    fs::remove_dir_all(r.dir.join("tools")).unwrap();
+    // a path outside the root (the cargo build folder, like the real Claude install is outside) is a normal reviewer: no hook
+    let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", FAKE)]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(!o.stdout.contains("TEST HOOK"), "{}", o.stdout);
+    assert!(o.stdout.contains("reviewer CLI is ") && o.stdout.contains(&FAKE.replace('\\', "/")), "{}", o.stdout);
+    assert_eq!(r.field(&e, "test hook"), "false");
+    assert_eq!(r.field(&e, "reviewer CLI"), FAKE.replace('\\', "/"));
+    let review = fs::read_to_string(r.dir.join(r.field(&e, "review file"))).unwrap();
+    assert!(review.contains("test_hook: false"), "{review}");
+}
+
+#[test]
+fn output_that_is_not_the_cli_json_or_from_another_model_family_or_without_model_usage_is_a_fail_with_the_raw_text_kept() {
+    let r = Root::new("backend", 30);
+    for (claim, env, needle) in [
+        ("src", ("FAKE_CLAUDE_PLAIN", "VERDICT: PASS\nBLOCKING: none\nMINOR: none"), "not its JSON answer"),
+        ("docs", ("FAKE_CLAUDE_MODEL", "claude-opus-4-5"), "came from claude-opus-4-5"),
+        ("clients", ("FAKE_CLAUDE_MODEL", "none"), "no `modelUsage`"),
+    ] {
+        let id = r.started(claim);
+        r.commit(&r.wt(&id), &format!("{claim}/note.txt"), "x\n", "task: a note");
+        let main_before = r.head();
+        let e = r.add(&id, "low", "sonnet");
+        let o = r.run_env(&["queue", "run"], &[env]);
+        assert_eq!(o.code, 5, "{needle}: {}{}", o.stdout, o.stderr);
+        assert_eq!(r.status(&e), "rejected", "{needle}");
+        assert!(r.field(&e, "reason").contains(needle) && r.field(&e, "reason").contains("counts as FAIL"), "{needle}: {}", r.field(&e, "reason"));
+        assert_eq!(r.head(), main_before, "{needle}: nothing merged");
+        let review = fs::read_to_string(r.dir.join("state/queue").join(format!("{e}.review"))).unwrap();
+        assert!(review.contains("--- raw reviewer output") && review.contains("answer followed the format: NO"), "{needle}: {review}");
+        if env.0 == "FAKE_CLAUDE_PLAIN" {
+            assert!(review.contains("VERDICT: PASS"), "the raw text is kept: {review}");
+        }
+    }
+}
+
+// ---- M1, M2, M3, M4, M6 -----------------------------------------------------------------------
+
+#[test]
+fn a_pass_with_an_empty_blocking_header_followed_by_findings_is_rejected() {
+    let r = Root::new("emptyheader", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/note.txt", "EMPTY_HEADER_PASS\n", "task: a note");
+    let main_before = r.head();
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "rejected");
+    assert!(r.show(&e).contains("src/lib.rs:1 - the build is broken"), "{}", r.show(&e));
+    assert_eq!(r.head(), main_before);
+}
+
+#[test]
+fn reviewer_calls_are_capped_per_entry_and_every_real_call_counts() {
+    let r = Root::new("cap", 2);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let e = r.add(&id, "low", "sonnet");
+    let main_before = r.head();
+    for n in 1..=3 {
+        let o = r.run_env(&["queue", "run", "--entry", &e], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+        assert_eq!(o.code, 3, "call {n}: {}{}", o.stdout, o.stderr);
+        assert!(r.field(&e, "reason").contains("within 2 s"), "call {n}: {}", r.field(&e, "reason"));
+        assert_eq!(r.field(&e, "review calls"), n.to_string());
+    }
+    assert_eq!(r.calls(), 3);
+    fs::remove_file(&hang).unwrap();
+    let o = r.run(&["queue", "run", "--entry", &e]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "blocked");
+    assert!(r.field(&e, "reason").contains("review call cap reached"), "{}", r.field(&e, "reason"));
+    assert_eq!(r.calls(), 3, "the fourth call was never made");
+    assert_eq!(r.head(), main_before);
+}
+
+#[test]
+fn a_task_with_a_blocked_or_stale_entry_cannot_be_queued_again() {
+    let r = Root::new("twice", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    fs::write(r.p().join("junk.txt"), "x\n").unwrap();
+    assert_eq!(r.run(&["queue", "run"]).code, 3);
+    assert_eq!(r.status(&e), "blocked");
+    let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains(&e) && o.stderr.contains("blocked"), "the existing entry is named: {}", o.stderr);
+    r.edit_entry(&e, &[("status", "stale")]);
+    let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains(&e) && o.stderr.contains("stale"), "{}", o.stderr);
+    assert_eq!(r.run(&["queue", "cancel", &e]).code, 0);
+    assert_eq!(r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]).code, 0, "a cancelled entry does not block");
+}
+
+#[test]
+fn model_names_are_compared_by_family_for_the_reviewer_must_differ_from_coder_rule() {
+    let r = Root::new("family", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "claude-haiku-4-5-20251001");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "blocked");
+    assert!(r.field(&e, "reason").contains("same as the coder"), "{}", r.field(&e, "reason"));
+    assert_eq!(r.calls(), 0);
+}
+
+#[test]
+fn an_ignored_file_in_the_worktree_does_not_block_the_queue_and_done_keeps_the_worktree_but_the_entry_is_merged() {
+    let r = Root::new("ignored", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    fs::create_dir_all(r.wt(&id).join("target")).unwrap();
+    fs::write(r.wt(&id).join("target/x"), "ignored").unwrap();
+    fs::write(r.wt(&id).join(".env"), "A=b\n").unwrap();
+    fs::write(r.wt(&id).join(".gitignore"), "target\n.env\n").unwrap();
+    git(&r.wt(&id), &["add", ".gitignore"]);
+    git(&r.wt(&id), &["commit", "-q", "-m", "task: ignore .env"]);
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged");
+    assert!(r.field(&e, "reason").contains("KEPT"), "{}", r.field(&e, "reason"));
+    assert_eq!(r.task_status(&id), "done");
+    assert!(r.wt(&id).exists(), "the worktree with ignored files is kept, never deleted");
+    assert!(r.p().join("src/new.txt").exists());
 }
 
 // ---- merged_check_failed ----------------------------------------------------------------
@@ -755,7 +1033,7 @@ fn resuming_at_the_merge_step_records_a_fast_forward_that_already_happened() {
     let e = r.add(&id, "low", "sonnet");
     // main already holds the reviewed commit (the run died right after `git merge --ff-only`, before recording it)
     git(&r.p(), &["merge", "--ff-only", &tip]);
-    r.edit_entry(&e, &[("status", "running"), ("step", "merge"), ("attempt", "1"), ("verdict", "PASS"), ("reviewed_tip", &tip), ("base_head", &git(&r.p(), &["rev-parse", "HEAD~1"])), ("main_branch", "main")]);
+    r.edit_entry(&e, &[("status", "running"), ("step", "merge"), ("attempt", "1"), ("verdict", "PASS"), ("checked_tip", &tip), ("reviewed_tip", &tip), ("base_head", &git(&r.p(), &["rev-parse", "HEAD~1"])), ("main_branch", "main")]);
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "merged");

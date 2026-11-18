@@ -34,7 +34,9 @@
 //!   rebase    a rebase the dead run left half done is aborted first (so the branch is back at its `pre_rebase` tip), then the step
 //!             runs again (it is skipped when the branch already contains main's HEAD);
 //!   check     the check runs again (the job's own recovery handles a check job that died);
-//!   review    if the verdict was already recorded it is NOT asked again (no second bill); otherwise the reviewer is called again;
+//!   review    if the verdict was already recorded it is NOT asked again (no second bill); otherwise the branch tip must still be the
+//!             commit the check passed on (`checked_tip`), else the entry is `stale` ("branch changed after check") and nothing is
+//!             reviewed; then the reviewer is called again (every real call counts toward reviewer_max_calls_per_entry);
 //!   merge     if main's HEAD already is the reviewed commit, the fast-forward is recorded as done; otherwise it is attempted;
 //!   main_check, done   run again (`task done` on a task that is already done is skipped).
 //! To give up instead: `queue cancel <id>` on an interrupted entry aborts a leftover rebase, touches nothing else, and is refused
@@ -44,6 +46,10 @@
 //! `queue_lock_wait_seconds`, then exits 4. `entries.lock` is held for milliseconds, around "is this task already queued, create
 //! the entry" and around choosing the next entry. Order is always queue.lock then entries.lock. The TASK BOARD lock is never held
 //! during the rebase, check, review or merge: it is taken only by `task done` (inside `task::cmd_finish`), which is short.
+//!
+//! ONE COMMIT. The check records `checked_tip`, the commit it ran on. The review diff is `<base>...<checked_tip>`, the reviewer is
+//! called only while the branch tip still equals it, and `merge --ff-only` merges exactly that commit. A tip that moved at any
+//! point makes the entry `stale`; an unchecked commit is never reviewed or merged.
 //!
 //! SAFETY. The only commands that move history are `git rebase <main HEAD>` in the task's worktree (aborted on any failure, the tip
 //! verified) and `git merge --ff-only <reviewed commit>` in the main checkout (so the commit merged is exactly the one reviewed;
@@ -186,14 +192,24 @@ pub fn reviewer_model_for<'a>(cfg: &'a Config, risk: &str) -> &'a str {
     }
 }
 
-/// Same model? Names are compared case-insensitively and trimmed.
+/// Same model? Compared by family (`sonnet` and `claude-sonnet-4-5` are the same), case-insensitively.
 fn same_model(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
+    reviewer::model_family(a) == reviewer::model_family(b)
 }
 
-/// A queue entry is "live" while a run could still act on it: queued or running.
-fn is_live(status: &str) -> bool {
-    status == QUEUED || status == RUNNING
+/// An entry is "open" while `queue run` can still act on it (queued, running, blocked, stale): it blocks `queue add` for its task.
+/// Finished entries do not: merged, cancelled, rejected, and also check_failed, conflict and merged_check_failed, which `queue run`
+/// refuses to run again (the documented way on is a new `queue add`, or a human for merged_check_failed).
+fn is_open(status: &str) -> bool {
+    matches!(status, QUEUED | RUNNING | BLOCKED | STALE)
+}
+
+/// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
+const TEXT_KEYS: [&str; 8] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor"];
+
+fn process_secrets(cfg: &Config) -> reviewer::Secrets {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    reviewer::Secrets::collect(&cfg.root, &env)
 }
 
 // ---- add --------------------------------------------------------------------------------
@@ -248,9 +264,11 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         Ok(other) => return refuse(format!("its worktree is on {} instead of `{branch}`", other.map(|b| format!("`{b}`")).unwrap_or_else(|| "a detached HEAD".into()))),
         Err(e) => return refuse(e),
     }
-    match wtgit::status_porcelain(&wt) {
+    // Tracked and untracked changes only: a rebase leaves ignored files (an ignored .env, target/) alone. The strict rule, ignored
+    // files included, guards worktree REMOVAL at `task done`, which keeps the worktree instead of failing.
+    match wtgit::status_porcelain_plain(&wt) {
         Ok(s) if s.is_empty() => {}
-        Ok(s) => return refuse(format!("its worktree is not clean, ignored files included (the rule that also guards removal): {}", some(&s))),
+        Ok(s) => return refuse(format!("its worktree is not clean (uncommitted or untracked changes; ignored files do not count here): {}", some(&s))),
         Err(e) => return refuse(e),
     }
     let base = t.get("base").to_string();
@@ -262,7 +280,7 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         Ok(_) => {}
         Err(e) => return refuse(e),
     }
-    let brief = brief_text.unwrap_or_else(|| {
+    let brief = process_secrets(cfg).redact(&brief_text.unwrap_or_else(|| {
         format!(
             "Task {}: {}\nProject: {}. The task claims these files and folders: {}.\nNo separate done check was given: judge whether the diff does what the task title says, and flag changes outside the claims.",
             t.id(),
@@ -270,7 +288,7 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
             t.get("project"),
             task::claims_of(&t).join(", ")
         )
-    });
+    }));
     let _lock = match entries_lock(cfg) {
         Ok(l) => l,
         Err(c) => return c,
@@ -279,8 +297,8 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         Ok(a) => a,
         Err(e) => return fail(EXIT_ERROR, format!("cannot read the queue, so nothing was queued: {e}")),
     };
-    if let Some(x) = all.iter().find(|x| x.get("task") == task_id && is_live(x.status())) {
-        return fail(EXIT_RETRY, format!("task {task_id} is already in the queue as {} ({}); a task is queued once at a time. Cancel that entry or let it finish", x.id(), x.status()));
+    if let Some(x) = all.iter().find(|x| x.get("task") == task_id && is_open(x.status())) {
+        return fail(EXIT_RETRY, format!("task {task_id} is already in the queue as {} ({}); a task has one open entry at a time (queued, running, blocked and stale entries are open). Run it with `queue run --entry {}`, or cancel it with `queue cancel {}`, then add again", x.id(), x.status(), x.id(), x.id()));
     }
     let mut e = match record::create_ext(&queue_dir(cfg), &format!("q-{}", job::file_stamp(now_secs())), EXT) {
         Ok(r) => r,
@@ -356,7 +374,11 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("pre-rebase tip", "pre_rebase"),
         ("pre-rebase ref", "pre_rebase_ref"),
         ("rebased tip", "rebased_tip"),
+        ("checked commit", "checked_tip"),
         ("reviewed commit", "reviewed_tip"),
+        ("reviewer CLI", "reviewer_cli"),
+        ("test hook", "test_hook"),
+        ("review calls", "review_calls"),
         ("check job", "check_job"),
         ("check exit", "check_exit"),
         ("verdict", "verdict"),
@@ -508,7 +530,7 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
         if e.status() != RUNNING {
             // a fresh attempt: forget what the last attempt learned (its log and review file stay)
             for k in [
-                "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "reviewed_tip", "check_job", "check_exit", "check_summary", "check_tail", "reviewer_model", "verdict",
+                "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "reviewer_model", "verdict",
                 "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
             ] {
                 e.set(k, "");
@@ -546,11 +568,13 @@ struct Run<'a> {
     dir: PathBuf,
     /// The task's worktree (set by `locate`).
     wt: PathBuf,
+    /// Secret values (every `.env` value, secret-named variables): redacted from the prompt and from everything stored.
+    secrets: reviewer::Secrets,
 }
 
 impl<'a> Run<'a> {
     fn new(cfg: &'a Config, e: Record, dir: PathBuf) -> Run<'a> {
-        Run { cfg, e, dir, wt: PathBuf::new() }
+        Run { cfg, e, dir, wt: PathBuf::new(), secrets: process_secrets(cfg) }
     }
 
     fn branch(&self) -> String {
@@ -559,6 +583,13 @@ impl<'a> Run<'a> {
 
     /// Write the entry. A queue that cannot write its own record must not go on: exit 1, loudly.
     fn save(&mut self) -> R<()> {
+        for k in TEXT_KEYS {
+            let v = self.e.get(k);
+            if !v.is_empty() {
+                let r = self.secrets.redact(v);
+                self.e.set(k, r);
+            }
+        }
         self.e.save().map_err(|err| fail(EXIT_ERROR, format!("queue entry {}: cannot write {}: {err}; stopping. Its last saved step is `{}`; `queue run --entry {}` resumes it", self.e.id(), self.e.path.display(), self.e.get("step"), self.e.id())))
     }
 
@@ -577,11 +608,16 @@ impl<'a> Run<'a> {
 
     /// The entry is finished with `status`; print the one-line outcome and return the exit code.
     fn end(&mut self, status: &str, reason: &str, code: u8) -> ExitCode {
+        let reason = &self.secrets.redact(reason);
         self.e.set("status", status);
         self.e.set("reason", reason);
         self.e.set("ended", now_secs().to_string());
         let step = self.e.get("step").to_string();
         let _ = self.log(&step, &format!("{status}: {reason}"));
+        for k in TEXT_KEYS {
+            let r = self.secrets.redact(self.e.get(k));
+            self.e.set(k, r);
+        }
         let saved = self.e.save();
         if status == MERGED {
             println!("queue entry {}: merged: {reason}", self.e.id());
@@ -605,6 +641,7 @@ impl<'a> Run<'a> {
 
     /// Something unexpected: the entry stays `running` at its step, so a later `queue run` resumes it.
     fn internal(&mut self, msg: &str) -> ExitCode {
+        let msg = &self.secrets.redact(msg);
         self.e.set("error", msg);
         let _ = self.e.save();
         eprintln!(
@@ -697,9 +734,10 @@ impl<'a> Run<'a> {
                 return Err(self.blocked(&format!("the task's worktree is on {on}, not `{branch}`")));
             }
         }
-        let wt_status = self.g(wtgit::status_porcelain(&wt))?;
+        // tracked and untracked only: a rebase leaves ignored files alone (see `cmd_add`)
+        let wt_status = self.g(wtgit::status_porcelain_plain(&wt))?;
         if !wt_status.is_empty() {
-            return Err(self.blocked(&format!("the task's worktree is not clean, ignored files included ({}); commit or remove them, then run again", some(&wt_status))));
+            return Err(self.blocked(&format!("the task's worktree is not clean ({}); commit or remove those changes, then run again (ignored files do not matter here)", some(&wt_status))));
         }
         let (coder, model) = (self.e.get("coder").to_string(), reviewer_model_for(self.cfg, self.e.get("risk")).to_string());
         if same_model(&coder, &model) {
@@ -793,6 +831,8 @@ impl<'a> Run<'a> {
             return Err(self.blocked(&format!("the check was refused before it started (exit {code}; the reason is printed above, e.g. Broadsword paused or an interrupted run to recover); nothing changed")));
         }
         println!("queue entry {}: check {project} --task {task_id}", self.e.id());
+        let (dir, branch) = (self.dir.clone(), self.branch());
+        let tip_before = self.g(wtgit::branch_tip(&dir, &branch))?;
         let mut info = JobInfo::default();
         let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
         let summary = info.summary.join("\n");
@@ -803,7 +843,16 @@ impl<'a> Run<'a> {
         self.e.set("check_tail", tail);
         self.save()?;
         match code {
-            0 => self.log("check", &format!("passed ({})", info.summary.join("; "))),
+            0 => {
+                // The one commit the check ran on. Review and merge are bound to exactly this commit.
+                let tip_after = self.g(wtgit::branch_tip(&dir, &branch))?;
+                if tip_after != tip_before {
+                    return Err(self.end(STALE, &format!("branch changed during the check: `{branch}` was at {} when the check started and is at {} now; nothing was reviewed or merged. Run `queue run --entry {}` to check it again", short(&tip_before), short(&tip_after), self.e.id()), EXIT_RETRY));
+                }
+                self.e.set("checked_tip", tip_before.clone());
+                self.save()?;
+                self.log("check", &format!("passed on commit {} ({})", short(&tip_before), info.summary.join("; ")))
+            }
             1 if !info.summary.is_empty() => Err(self.end(CHECK_FAILED, &format!("build or tests failed on the rebased branch (job {}): {}. No model was asked. Fix it, commit, and queue the task again with `queue add`", info.id.as_deref().unwrap_or("?"), info.summary.join("; ")), EXIT_REJECTED)),
             c => Err(self.blocked(&format!("the check could not run to a verdict (exit {c}; job {}); nothing was merged; see its output above, fix the cause, then `queue run --entry {}`", info.id.as_deref().unwrap_or("none"), self.e.id()))),
         }
@@ -821,9 +870,18 @@ impl<'a> Run<'a> {
         if same_model(self.e.get("coder"), &model) {
             return Err(self.blocked(&format!("the reviewer model `{model}` is the same as the coder; a model never reviews its own code")));
         }
+        // Check, review and merge are bound to ONE commit: the one the check passed on. A branch that moved since (a commit added
+        // after the check, live or before a resume) was never checked, so it is never reviewed and never merged.
+        let checked = self.e.get("checked_tip").to_string();
         let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
+        if checked.is_empty() {
+            return Err(self.end(STALE, &format!("no checked commit is recorded for this entry, so nothing was reviewed or merged. Run `queue run --entry {}` to check it", self.e.id()), EXIT_RETRY));
+        }
+        if tip != checked {
+            return Err(self.end(STALE, &format!("branch changed after check: `{branch}` was checked at {} but is at {} now; the new commit(s) were never checked, so nothing was reviewed or merged. Run `queue run --entry {}` to rebase and check it again", short(&checked), short(&tip), self.e.id()), EXIT_RETRY));
+        }
         let base = self.e.get("base_head").to_string();
-        let diff = self.g(wtgit::diff_since(&dir, &base, &tip))?;
+        let diff = self.g(wtgit::diff_since(&dir, &base, &checked))?;
         if diff.trim().is_empty() {
             return Err(self.blocked("the diff against main is empty: nothing to review or merge"));
         }
@@ -831,24 +889,40 @@ impl<'a> Run<'a> {
         if diff.len() as u64 > max {
             return Err(self.blocked(&format!("the diff is {} KB, over reviewer_diff_max_kb = {}: it is never cut, so it is never sent. Split the task into smaller ones", diff.len() / 1024, self.cfg.reviewer_diff_max_kb)));
         }
-        self.e.set("reviewed_tip", tip.clone());
-        self.e.set("reviewer_model", model.clone());
-        self.save()?;
-        let env: Vec<(String, String)> = std::env::vars().collect();
-        let secrets = reviewer::secret_values(&self.cfg.root, &env);
-        let prompt = reviewer::redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff), &secrets);
         let backend = match reviewer::backend(self.cfg) {
             Ok(b) => b,
             Err(m) => return Err(self.blocked(&m)),
         };
-        self.log("review", &format!("calling the {} reviewer `{model}` on {} (diff {} bytes, commit {}); this spends money and uses the network", backend.name(), if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&tip)))?;
-        let review = match backend.call(self.cfg, &model, &prompt) {
+        let cli = match backend.prepare(self.cfg) {
+            Ok(c) => c,
+            Err(m) => return Err(self.blocked(&format!("the reviewer CLI was refused: {m}. No model was called, nothing merged"))),
+        };
+        let calls = self.e.get_num("review_calls").unwrap_or(0);
+        if calls >= self.cfg.reviewer_max_calls_per_entry {
+            return Err(self.blocked(&format!("review call cap reached: this entry already made {calls} reviewer call(s) (reviewer_max_calls_per_entry = {}); no model was called, nothing merged. Cancel it and queue the task again if more reviews are wanted", self.cfg.reviewer_max_calls_per_entry)));
+        }
+        self.e.set("reviewed_tip", checked.clone());
+        self.e.set("reviewer_model", model.clone());
+        self.e.set("reviewer_cli", cli.path.clone());
+        self.e.set("test_hook", if cli.test_hook { "true" } else { "false" });
+        // counted BEFORE the call, so a run that dies in the middle of it still paid for one
+        self.e.set("review_calls", (calls + 1).to_string());
+        self.save()?;
+        if cli.test_hook {
+            println!("TEST HOOK ACTIVE: reviewer CLI is {}", cli.path);
+        } else {
+            println!("queue entry {}: reviewer CLI is {}", self.e.id(), cli.path);
+        }
+        let prompt = self.secrets.redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff));
+        let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), reviewer::MIN_REDACT_LEN) } else { String::new() };
+        self.log("review", &format!("calling the {} reviewer `{model}` through {}{} on {} (diff {} bytes, commit {}, call {} of at most {}); this spends money and uses the network{short_note}", backend.name(), cli.path, if cli.test_hook { " [TEST HOOK]" } else { "" }, if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&checked), calls + 1, self.cfg.reviewer_max_calls_per_entry))?;
+        let review = match backend.call(self.cfg, &cli, &model, &prompt) {
             Ok(r) => r,
             Err(CallError::Timeout(s)) => return Err(self.blocked(&format!("the reviewer `{model}` gave no answer within {s} s (reviewer_timeout_seconds) and was killed: no verdict, nothing merged. Run `queue run --entry {}` to ask again", self.e.id()))),
             Err(CallError::Start(m) | CallError::Failed(m)) => return Err(self.blocked(&format!("the reviewer `{model}` could not be used: {m}. No verdict, nothing merged. Fix it, then `queue run --entry {}`", self.e.id()))),
         };
-        let verdict = reviewer::parse_verdict(&review.text);
-        let file = self.write_review(&model, &tip, &base, prompt.len(), &review, &verdict)?;
+        let verdict = reviewer::judge(&review);
+        let file = self.write_review(&model, &checked, &base, prompt.len(), &cli, &review, &verdict)?;
         self.e.set("verdict", if verdict.pass { "PASS" } else { "FAIL" });
         self.e.set("blocking", verdict.blocking.join("\n"));
         self.e.set("minor", verdict.minor.join("\n"));
@@ -866,16 +940,19 @@ impl<'a> Run<'a> {
     }
 
     /// The review file: header lines, then the reviewer's raw output. Returns its path relative to root. Written atomically.
-    fn write_review(&mut self, model: &str, tip: &str, base: &str, prompt_bytes: usize, r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
+    #[allow(clippy::too_many_arguments)]
+    fn write_review(&mut self, model: &str, tip: &str, base: &str, prompt_bytes: usize, cli: &reviewer::Cli, r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
         let attempt = self.e.get_num("attempt").unwrap_or(1);
         let name = if attempt <= 1 { format!("{}.review", self.e.id()) } else { format!("{}.{attempt}.review", self.e.id()) };
         let path = queue_dir(self.cfg).join(&name);
         let or_unknown = |o: Option<String>| o.unwrap_or_else(|| "unknown".into());
         let text = format!(
-            "entry: {}\nattempt: {attempt}\ntask: {}\nbackend: {}\nmodel: {model}\nmodels reported by the backend: {}\nrisk: {}\ncoder: {}\nreviewed commit: {tip}\ndiff base: {base}\nprompt bytes: {prompt_bytes}\ncost_usd: {}\ninput tokens: {}\noutput tokens: {}\nverdict: {} (answer followed the format: {})\n{}blocking:\n{}\nminor:\n{}\n--- raw reviewer output (exactly as printed) ---\n{}\n",
+            "entry: {}\nattempt: {attempt}\ntask: {}\nbackend: {}\nreviewer cli: {}\ntest_hook: {}\nmodel: {model}\nmodels reported by the backend: {}\nrisk: {}\ncoder: {}\nreviewed commit: {tip}\ndiff base: {base}\nprompt bytes: {prompt_bytes}\ncost_usd: {}\ninput tokens: {}\noutput tokens: {}\nverdict: {} (answer followed the format: {})\n{}blocking:\n{}\nminor:\n{}\n--- raw reviewer output (exactly as printed) ---\n{}\n",
             self.e.id(),
             self.e.get("task"),
             self.cfg.reviewer_backend,
+            cli.path,
+            cli.test_hook,
             if r.models_used.is_empty() { "-".to_string() } else { r.models_used.join(", ") },
             self.e.get("risk"),
             self.e.get("coder"),
@@ -889,6 +966,7 @@ impl<'a> Run<'a> {
             v.minor.iter().map(|b| format!("  {b}")).collect::<Vec<_>>().join("\n"),
             r.raw
         );
+        let text = self.secrets.redact(&text);
         let tmp = path.with_extension("review.tmp");
         let written = std::fs::write(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, &path));
         if let Err(e) = written {
@@ -907,6 +985,9 @@ impl<'a> Run<'a> {
         let base = self.e.get("base_head").to_string();
         if reviewed.is_empty() || base.is_empty() || self.e.get("verdict") != "PASS" {
             return Err(self.internal("the merge step was reached without a recorded PASS for a reviewed commit; refusing to merge"));
+        }
+        if self.e.get("checked_tip") != reviewed {
+            return Err(self.internal(&format!("the merge step was reached with a reviewed commit ({}) that is not the commit the check passed on ({}); refusing to merge", short(&reviewed), short(self.e.get("checked_tip")))));
         }
         let main_branch = self.g(wtgit::current_branch(&dir))?;
         if main_branch.as_deref() != Some(self.e.get("main_branch")) {
@@ -929,9 +1010,9 @@ impl<'a> Run<'a> {
         }
         let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
         if tip != reviewed {
-            return Err(self.end(STALE, &format!("`{branch}` moved from the reviewed commit {} to {} after the review; nothing was merged. Run `queue run --entry {}` to review it again", short(&reviewed), short(&tip), self.e.id()), EXIT_RETRY));
+            return Err(self.end(STALE, &format!("branch changed after check and review: `{branch}` moved from the checked and reviewed commit {} to {}; nothing was merged. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(&tip), self.e.id()), EXIT_RETRY));
         }
-        let wt_status = self.g(wtgit::status_porcelain(&wt))?;
+        let wt_status = self.g(wtgit::status_porcelain_plain(&wt))?;
         if !wt_status.is_empty() {
             return Err(self.blocked(&format!("the task's worktree got changes after the review ({}); nothing merged", some(&wt_status))));
         }
@@ -987,7 +1068,13 @@ impl<'a> Run<'a> {
         if t.status() != task::DONE {
             return Err(self.internal(&format!("`task done {id}` did not complete (the task is `{}`; it may be that the board was busy); the commit {} IS on main. Resume with `queue run --entry {}`", t.status(), short(self.e.get("main_sha")), self.e.id())));
         }
-        let wt_note = if worktree::has_worktree(&t) { "its worktree and branch were KEPT (see the warning above; nothing was lost)" } else { "its worktree and branch are removed" };
+        // Removal keeps a worktree that holds anything git would lose (ignored files included): the entry is still `merged`.
+        let wt_note = if worktree::has_worktree(&t) {
+            let why = worktree::abs_path(self.cfg, t.get("worktree")).ok().and_then(|p| wtgit::status_porcelain(&p).ok()).filter(|s| !s.is_empty()).map(|s| format!(": it holds files removal will not delete ({})", some(&s))).unwrap_or_else(|| " (the reason is in the warning `task done` printed)".into());
+            format!("its worktree and branch were KEPT{why}; nothing was lost")
+        } else {
+            "its worktree and branch are removed".to_string()
+        };
         Ok(self.end(MERGED, &format!("commit {} is on `{}`, check on main passed, task {id} is done; {wt_note}", short(self.e.get("main_sha")), self.e.get("main_branch")), 0))
     }
 }
@@ -1039,6 +1126,6 @@ mod tests {
     fn steps_are_in_the_documented_order() {
         assert_eq!(STEPS, ["preconditions", "rebase", "check", "review", "merge", "main_check", "done"]);
         assert_eq!(STEPS[STEP_MERGE], "merge");
-        assert!(is_live(QUEUED) && is_live(RUNNING) && !is_live(MERGED) && !is_live(STALE) && !is_live(REJECTED));
+        assert!(is_open(QUEUED) && is_open(RUNNING) && is_open(BLOCKED) && is_open(STALE) && !is_open(MERGED) && !is_open(CANCELLED) && !is_open(REJECTED) && !is_open(CHECK_FAILED) && !is_open(CONFLICT));
     }
 }

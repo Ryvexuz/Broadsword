@@ -89,7 +89,8 @@ pub struct Config {
     pub worktrees_dir: PathBuf,
     /// Which reviewer backend `queue run` calls. Only `claude` (the Claude Code CLI, headless) exists today.
     pub reviewer_backend: String,
-    /// The reviewer CLI program (resolved on PATH). The env var BROADSWORD_REVIEWER_CLI overrides it with a machine-specific path.
+    /// The reviewer CLI program (resolved on PATH). The env var BROADSWORD_REVIEWER_CLI overrides it with a machine-specific path
+    /// that must lie OUTSIDE the root or inside scratch_dir (a test hook); any other path inside the root is refused.
     pub reviewer_cli: String,
     /// The reviewer model for a `--risk low` / `--risk high` queue entry.
     pub reviewer_model_low: String,
@@ -104,6 +105,8 @@ pub struct Config {
     pub reviewer_check_tail_kb: u64,
     /// How long a `queue` command waits for a queue lock before it exits 4 "queue busy".
     pub queue_lock_wait_seconds: u64,
+    /// The most reviewer calls (real model calls, resumes and re-runs included) one queue entry may make; at the cap it is `blocked`.
+    pub reviewer_max_calls_per_entry: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -204,6 +207,7 @@ impl Config {
             reviewer_brief_max_kb: positive("reviewer_brief_max_kb")?,
             reviewer_check_tail_kb: positive("reviewer_check_tail_kb")?,
             queue_lock_wait_seconds: positive("queue_lock_wait_seconds")?,
+            reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
             cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
             scratch_max_age_hours: get_int(&m, "scratch_max_age_hours")?,
@@ -323,6 +327,7 @@ mod tests {
     #[test]
     fn worktrees_dir_is_required_and_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_max_calls_per_entry = 3
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -350,7 +355,7 @@ install_dir=\"build/bin\"\n";
         assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
         for key in [
             "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
-            "queue_lock_wait_seconds",
+            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry",
         ] {
             let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
 ");
@@ -370,6 +375,7 @@ install_dir=\"build/bin\"\n";
     #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_max_calls_per_entry = 3
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -401,6 +407,7 @@ worktrees_dir = \"worktrees\"\n";
     #[test]
     fn rejects_paths_outside_root() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_max_calls_per_entry = 3
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

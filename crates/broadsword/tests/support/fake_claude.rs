@@ -4,13 +4,17 @@
 //! prompt and by these env vars (set by the test on the `broadsword` process, which passes them on):
 //! - FAKE_CLAUDE_OUT_DIR: if set, it records what it was given there: `calls.log` (one line per call: its arguments),
 //!   `stdin.txt` (the last prompt), `env.txt` (its whole environment, `NAME=value` lines) and `cwd.txt`.
-//! - a prompt containing `PLANTED_BUG` gets a FAIL with one blocking finding; `GARBAGE_REVIEW` gets text that is no verdict;
+//! - a prompt containing `EMPTY_HEADER_PASS` gets a PASS whose `BLOCKING:` header is empty and followed by a finding;
+//!   a prompt containing `PLANTED_BUG` gets a FAIL with one blocking finding; `GARBAGE_REVIEW` gets text that is no verdict;
 //!   `EMPTY_PASS` gets a PASS with no BLOCKING line; anything else gets a PASS.
 //! - FAKE_CLAUDE_HANG_FILE: if that file exists, it sleeps for a minute first (so a test can kill it, time it out, or run a
 //!   second `queue run` against it).
 //! - FAKE_CLAUDE_COMMIT_IN: a folder (a git repo) in which it commits a file first, simulating the main branch moving while
 //!   the review runs.
 //! - FAKE_CLAUDE_EXIT: exit with that code and print nothing (a CLI that fails).
+//! - FAKE_CLAUDE_MODEL: the model name it reports in `modelUsage` (default: `claude-<the --model family>-4-5`, like the real CLI);
+//!   the value `none` leaves `modelUsage` out.
+//! - FAKE_CLAUDE_PLAIN: print this plain text instead of the JSON (a program that is not the Claude CLI).
 
 use std::io::{Read, Write};
 use std::process::Command;
@@ -55,16 +59,26 @@ fn main() {
     if let Ok(c) = std::env::var("FAKE_CLAUDE_EXIT") {
         std::process::exit(c.parse().unwrap_or(1));
     }
+    if let Ok(t) = std::env::var("FAKE_CLAUDE_PLAIN") {
+        println!("{t}");
+        return;
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let asked = args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
+    let reported = std::env::var("FAKE_CLAUDE_MODEL").unwrap_or_else(|_| format!("claude-{asked}-4-5"));
+    let usage = if reported == "none" { String::new() } else { format!(",\"modelUsage\":{{\"{reported}\":{{}}}}") };
     let result = if input.contains("GARBAGE_REVIEW") {
         "Looks fine to me, nothing to add."
     } else if input.contains("EMPTY_PASS") {
         "VERDICT: PASS\\nMINOR: none"
+    } else if input.contains("EMPTY_HEADER_PASS") {
+        "VERDICT: PASS\\nBLOCKING:\\n- src/lib.rs:1 - the build is broken\\nMINOR: none"
     } else if input.contains("PLANTED_BUG") {
         "VERDICT: FAIL\\nBLOCKING: src/lib.rs:1 - planted bug: the function subtracts instead of adding\\nMINOR: none"
     } else {
         "VERDICT: PASS\\nBLOCKING: none\\nMINOR: none"
     };
     println!(
-        "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{result}\",\"total_cost_usd\":0.0123,\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100}},\"modelUsage\":{{\"fake-model\":{{}}}}}}"
+        "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{result}\",\"total_cost_usd\":0.0123,\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100}}{usage}}}"
     );
 }
