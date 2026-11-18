@@ -35,3 +35,12 @@ Broadsword is portable by design: every path is relative to the project root, an
 - `ram_warn_percent` is a percentage, so it scales from a 16 GB PC to a 128 GB one. `task start` will refuse new tasks above it once the RAM-gate task is merged; until then, the orchestrator checks it by hand.
 - `disk_floor_gb` and `job_disk_reserve_gb` are absolute numbers for the drive that holds the project. Check they suit the external drive.
 - `max_agents` (6) is the ceiling. With more RAM, it can go higher; raise it in `broadsword.toml`.
+
+## The 128 GB unified-memory PC
+
+That PC's 128 GB is shared between the CPU and the GPU, and the split (for example 64/64) is set in the BIOS or the graphics driver (on AMD, "Variable Graphics Memory" in Adrenalin, or the UMA frame buffer size in the BIOS). Windows only reports the CPU's share as RAM.
+
+1. **Check the split.** Task Manager → Performance: Memory shows the system share and GPU shows the dedicated share. Or run `systeminfo | findstr Memory`.
+2. **What Broadsword needs:** coders, cargo builds and test runs use system RAM. The GPU share only matters for local models (Stage 2's optional local model) and later GPU rendering. With no local model planned yet, a system-heavy split such as 96/32 runs more agents. Keep a big GPU share only if a local model is coming soon. Lazlo decides.
+3. **The RAM gate adapts by itself:** `ram_warn_percent` is a percentage of the RAM Windows reports, so it is right for any split.
+4. **Raise `max_agents`** in `broadsword.toml` from 6 once the first merges on that PC are clean. Watch the RAM gate and build-lock waits as it goes up.
