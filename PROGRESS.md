@@ -6,7 +6,7 @@ Rewritten at the end of each session. Last updated 2026-11-18, after Stage 3 mil
 
 - **Stage 1 (Foundation):** done, tagged `stage-1-done`.
 - **Stage 2 (AI Integration):** done, tagged `stage-2-done`.
-- **Stage 3 (Autonomous Development):** all four milestones passed. Stage close-out waits on Lazlo's confirmation before tagging `stage-3-done`.
+- **Stage 3 (Autonomous Development):** done, tagged `stage-3-done`.
 
 | Milestone | Status | Evidence |
 | --- | --- | --- |
@@ -22,9 +22,9 @@ Between milestones 2 and 3, an extra piece (not numbered): worktree builds and t
 - every change was reviewed by a model different from its coder (Sonnet coders, Haiku reviewers);
 - the milestone 3 done check caught the planted bug.
 
-One reading is not shown: if "each reviewed by a different model" means the two parallel features get two *different reviewer* models, that did not happen. Haiku reviewed all of them. Covering it needs one run with one feature queued `--risk low` (Haiku) and the other `--risk high` (Opus), about $0.20.
+The stricter reading, two different reviewer models, was then run too: a damping-stability feature reviewed by Haiku and a `--summary` feature reviewed by Opus, built in parallel, both merged (`0e6805c`, `9c016cc`). See the addendum in `evidence/stage-3-m4-scale-up.md`.
 
-Tagging `stage-3-done` awaits Lazlo's confirmation.
+Stage 3 is done, tagged `stage-3-done`.
 
 Stage 0 is still untagged; see Unfinished.
 
@@ -54,7 +54,7 @@ Stage 0 is still untagged; see Unfinished.
   - `clean` refuses if `build_dir` or any of its parents is a symlink or junction.
   - Build, test and check stay `destructiveHint` false.
 - **Locks:** the board, `recover`, the build lock and the queue (`queue.lock`, and `entries.lock` briefly) all use OS file locks, which the OS releases when a process dies.
-- **Crash sim:** has `--gravity <m/s^2>` (default 9.81, must be finite and above 0). It has 31 tests, all passing, and a `docs/PHYSICS.md` physics model document. crash-sim main is `9f1b5fc`, status clean, with no worktrees or task branches left.
+- **Crash sim:** has `--gravity <m/s^2>` (default 9.81, must be finite and above 0). It has 40 tests, a `--summary` option, a damping-stability check in `validate`, all passing, and a `docs/PHYSICS.md` physics model document. crash-sim main is `9c016cc`, status clean, with no worktrees or task branches left.
 - **Server:** `broadsword mcp` runs from `build/bin/`.
 - **OpenAI client:** `clients/openai_mcp.py`.
 - **Building:** after changing Broadsword's code, run `broadsword build broadsword` from `build/bin/` or a copy (a running `build/debug` exe cannot be cleaned, so it is not built from there). Then run `build/debug/broadsword.exe install`. No plain cargo, and no timestamp touching.
@@ -62,8 +62,7 @@ Stage 0 is still untagged; see Unfinished.
 
 ## Unfinished
 
-- **Stage 3 close-out.** All four milestones passed. Tag `stage-3-done` once Lazlo confirms.
-- **Next after Stage 3 close-out:** the OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 starts only after that.
+- **Next:** the OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 starts only after that.
 - **Stage 0 close-out.** Confirm in a new session started from the app that task-router no longer loads, then tag `stage-0-done`.
 - **Reviewer benchmark, OpenAI half.** Needs a small chat-completions runner, and Lazlo's models list. "Terra 6.1" is unverified.
 - **An `openai` reviewer backend for the queue.** Not built. The model should be chosen from the benchmark results.
@@ -98,4 +97,4 @@ Stage 0 is still untagged; see Unfinished.
 
 ## Next step
 
-Stage 3 close-out: tag `stage-3-done` once Lazlo confirms. Then the OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 (graphics and rendering) starts only after that.
+The OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 (graphics and rendering) starts only after that.

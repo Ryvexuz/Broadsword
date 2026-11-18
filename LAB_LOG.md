@@ -2,6 +2,27 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Stage 3 close-out: two reviewer models
+
+**Models and roles**
+- Opus orchestrator.
+- 2 Sonnet coders in parallel, about 73k tokens each.
+- Reviewers through the queue: Haiku ($0.0026) for the damping-stability feature, Opus ($0.0875) for the `--summary` feature.
+
+**What went wrong and what fixed it**
+- Nothing failed. Both reviews passed first time and both merged; the queue rebased the second onto the first.
+- Haiku's one minor (a NaN step) did not apply once checked against the code.
+
+**Rough cost and time**
+- About 2 minutes of agent wall clock and $0.09 of reviews.
+
+**Git commands used, beyond a plain commit**
+- `git tag stage-3-done`: marks the verified end of Stage 3, so it can be found or checked out later.
+
+**One lesson about AI development**
+
+Writing "never pipe broadsword output" into the coder prompt cost one line, and no job was interrupted this time. A guard in the tool and a line in the brief work together: the fix stops the damage, and the line stops the habit.
+
 ## 2026-11-18 — Stage 3, milestone 4: scale-up test (max_agents 3, then 4)
 
 **Models and roles**

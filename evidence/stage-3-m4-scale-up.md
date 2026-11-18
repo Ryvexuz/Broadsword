@@ -121,3 +121,21 @@ The crash-sim test count went from 13 to 31 tests (physics 13, plus sweep 2, inv
 - **The tasks were designed not to overlap,** so the board's claim refusals between agents were not exercised in this session. Milestone 1's race tests cover them.
 - **The doc coder flagged a comment in `src/lib.rs`, lines 12 to 13.** The comment says `sqrt(10 k / m)`, which is about 447, while the real top mode is 400 = `sqrt(8 k / m)`. The comment's "omega·dt about 0.40" is consistent with 400. No task claimed lib.rs, so this went to IDEAS.md rather than being fixed.
 - **Refs keep accumulating.** Crash-sim now holds 142 `refs/broadsword/*` refs (checkpoints, queue pre-rebase tips). Pruning is already in IDEAS.md.
+
+## Addendum: Stage 3 stage-level check, two reviewer models
+
+AGENTS.md's Stage 3 done check: "two agents build two separate crash-sim features in parallel. Each is reviewed by a different model, both merge cleanly, and the reviewer catches at least one planted bug." The rounds above used Haiku for every review, so this run covers the stricter reading: two different reviewer models.
+
+| Feature | Claims | Coder | Queue risk | Reviewer (from the CLI's modelUsage) | Cost | Verdict | Merged |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Damping stability limit in `Config::validate`, plus the `sqrt(8 k / m)` comment fix | src/lib.rs, tests/stability.rs | Sonnet, 1 job | low | `claude-haiku-5-5` | $0.0026 | PASS | `0e6805c` |
+| `--summary` option | src/main.rs, README.md, tests/summary.rs | Sonnet, 2 jobs | high | `claude-opus-5-5` | $0.0875 | PASS | `9c016cc` (rebased onto `0e6805c` by the queue) |
+
+- **How they ran:** both tasks started on the board together, at 03:29 UTC, each in its own worktree, with the coders running at the same time. Both merged with `--ff-only` after check and review, and the check on main passed: crash-sim has 40 tests, 0 failed. Main is `9c016cc`, with no worktrees left.
+- **The planted bug:** caught in milestone 3. Haiku rejected `7ab23fc`, the `--gravity` flag that was parsed but never used. See `evidence/stage-3-m3-merge-queue.md`.
+- **Reviewer minors:**
+  - Haiku said a NaN step could pass the damping check. This doesn't apply: `validate` rejects a non-finite `dt` before that line, and `substeps` is an integer.
+  - Opus noted that `--summary` prints nothing when a run aborts after starting, while CSV mode prints the partial rows. This is the coder's documented choice. Opus also noted that the test compares against values rounded from the CSV. Both are recorded in IDEAS.md.
+- **Damping limit:** the coder found that no configuration breaks only the damping limit (h < 0.05 s) with the current constants, because the stiffness limit (h <= about 0.0038 s) always fails first. The damping functions are tested directly.
+
+Stage 3's stage-level done check is met.
