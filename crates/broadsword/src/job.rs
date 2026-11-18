@@ -155,6 +155,15 @@ pub fn hooked_free_source(cfg: &Config) -> Box<dyn FnMut() -> u64> {
     Box::new(move || real_free(&root))
 }
 
+/// The cleanup a low-disk kill or refusal runs, once: the same pass as `broadsword cleanup` (scratch by age, log caps, the
+/// build-folder sweep if cargo-sweep is installed), measured with the job's own free-space source. It re-measures and pauses
+/// only if free space is still below the floor (`context` goes into the pause reason). Prints what was freed.
+fn low_disk_cleanup(cfg: &Config, free_src: &mut dyn FnMut() -> u64, context: &str) -> crate::cleanup::Report {
+    let r = crate::cleanup::cleanup_pass_in(cfg, SystemTime::now(), free_src, true, context);
+    crate::cleanup::print_report(&r);
+    r
+}
+
 /// Real free space on the root's disk.
 fn real_free(root: &Path) -> u64 {
     sys::disk(root).map(|d| d.free).unwrap_or_else(|e| {
@@ -528,7 +537,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     let name = name.as_str();
     let steps = steps_for(kind);
     let mut free_src = hooked_free_source(cfg);
-    let poll = Duration::from_secs(cfg.job_disk_poll_seconds.max(1));
+    let poll = Duration::from_secs(cfg.job_disk_poll_seconds);
 
     let secs = now_secs();
     let log_dir = cfg.scratch_dir.join("logs").join("jobs");
@@ -580,7 +589,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     info.id = Some(job_id.clone());
     info.log = Some(log_path.clone());
     let panic_hook = panic_hook_active(cfg);
-    let secrets = Arc::new(scrub::secrets(&cfg.root));
+    let secrets = Arc::new(scrub::secrets(cfg));
     // From here the record exists: a panic must leave a truthful record (see the handling after this block).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     if let Some(old) = &spec.resumed_from {
@@ -609,10 +618,22 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     let mut exit_code: Option<i32> = None;
     let mut build_hold: Option<BuildHold> = None; // held (when taken) until this function returns
     for (i, step) in steps.iter().enumerate().skip(spec.first_step) {
-        let free = free_src();
+        let mut free = free_src();
         if let Err(why) = guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()) {
-            eprintln!("broadsword: refusing to start {step}: {why}");
-            return end(&mut rec, record::REFUSED, EXIT_REFUSED);
+            // Low free space (not an existing pause) gets the same cleanup `cleanup` runs, once, before the job is refused;
+            // if that frees enough, the job goes on. The cleanup pauses by itself only if space is still below the floor.
+            let low = !pause::is_paused(&cfg.root);
+            let retry = low && {
+                println!("broadsword: {why}; running one cleanup pass before refusing");
+                let r = low_disk_cleanup(cfg, &mut *free_src, &format!("(when starting `{kind} {name}`; job refused)"));
+                free = r.free_after;
+                guard_decision(pause::is_paused(&cfg.root), free, cfg.reserve_bytes(), cfg.floor_bytes()).is_ok()
+            };
+            if !retry {
+                eprintln!("broadsword: refusing to start {step}: {why}");
+                return end(&mut rec, record::REFUSED, EXIT_REFUSED);
+            }
+            println!("broadsword: cleanup freed enough space (free {}): the job goes on", pause::gb(free));
         }
         if i == spec.first_step {
             if kind != "run" {
@@ -659,8 +680,9 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             // lock and the prepare below are never skipped. Clean, record and build are one step across processes: take
             // the build lock now and keep it until this job ends (every cargo step below, tests included, runs the
             // binaries the shared folder holds). `run` runs a shell command that may call cargo itself, so it takes the
-            // lock too and, instead of preparing, forgets the notes of the folder's packages (before the command, so a
-            // crash cannot leave a stale note, and again after it).
+            // lock too and prepares the same way (a `cargo test` inside it must test THIS folder's code, not the binary
+            // another checkout left), then forgets the notes of the folder's packages (before the command, so a crash
+            // cannot leave a note that vouches for what the command builds, and again after it).
             let lock = match buildsrc::lock(cfg) {
                 Ok(l) => l,
                 Err((code, msg)) => {
@@ -670,7 +692,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             };
             build_hold = Some(BuildHold { forget: (kind == "run").then(|| (cfg.clone(), project_dir.clone())), _lock: lock });
             let outcome = if kind == "run" {
-                Ok(buildsrc::forget_notes(cfg, &project_dir))
+                buildsrc::prepare_for_run(cfg, &project_dir, &source)
             } else {
                 buildsrc::prepare(cfg, &project_dir, &source).map(|p| p.lines)
             };
@@ -704,7 +726,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         // The one place every job's child gets the shared build folder: cargo steps, and any `cargo ...` inside `run`
         // (a worktree's .cargo/config.toml with a relative target-dir would otherwise build inside the worktree).
         // The same place gives the child the scrubbed environment (`scrub.rs`): no secret-named variable, nothing holding a `.env` value.
-        scrub::apply(&mut cmd, &cfg.root);
+        scrub::apply(&mut cmd, cfg);
         cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
         let mut spawn_err: Option<String> = None;
         let mut on_spawn = |pid: u32| {
@@ -729,10 +751,13 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             return end(&mut rec, record::FAILED, EXIT_FAILED);
         }
         if let Outcome::DiskDropped(f) = run.outcome {
-            let reason = format!("free space {} fell below the {} GB floor during `{kind} {name}`; job killed", pause::gb(f), cfg.disk_floor_gb);
-            let _ = pause::write_pause(&cfg.root, f, &reason);
-            pause::alert(cfg, &format!("Broadsword PAUSED: {reason}"));
-            eprintln!("broadsword: {reason}");
+            eprintln!("broadsword: free space {} fell below the {} GB floor during `{kind} {name}`; job killed; running one cleanup pass before pausing", pause::gb(f), cfg.disk_floor_gb);
+            let r = low_disk_cleanup(cfg, &mut *free_src, &format!("(during `{kind} {name}`; job killed)"));
+            if pause::is_paused(&cfg.root) {
+                eprintln!("broadsword: still below the floor after cleanup (free {}): Broadsword is paused", pause::gb(r.free_after));
+            } else {
+                eprintln!("broadsword: cleanup freed enough space (free {} is above the {} GB floor): Broadsword is NOT paused; the killed job can be started again", pause::gb(r.free_after), cfg.disk_floor_gb);
+            }
             return end(&mut rec, record::KILLED_LOW_DISK, EXIT_DISK_DROPPED);
         }
         if let Outcome::Exited(c) = run.outcome {
@@ -798,7 +823,7 @@ fn recover_after_panic(rec: &mut Record, kind: &str, why: &str) {
         if let Err(e) = save_record(rec) {
             eprintln!("broadsword: ERROR: {e}");
         }
-        eprintln!("broadsword: this run job may have changed files: run `broadsword recover` to roll it back, or `broadsword recover --abandon {}`", rec.id());
+        eprintln!("broadsword: this run job may have changed files: run `broadsword recover {id}` to roll it back (plain `broadsword recover` only lists interrupted runs), or `broadsword recover --abandon {id}`", id = rec.id());
     } else {
         rec.set("failure_reason", format!("Broadsword panicked while running this job: {why}"));
         end(rec, record::FAILED, EXIT_FAILED);

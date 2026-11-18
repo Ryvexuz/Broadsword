@@ -116,7 +116,7 @@ fn acquire(cfg: &Config, wait: Duration) -> Result<Lock, String> {
 
 /// Recover every dead running job. Returns non-zero if any job needs attention or a resumed job failed.
 pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
-    let _lock = match acquire(cfg, Duration::from_secs(5)) {
+    let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
         Ok(l) => l,
         Err(e) => {
             if mode == Mode::Auto {
@@ -225,7 +225,7 @@ pub fn recover_one(cfg: &Config, id: &str) -> ExitCode {
     if id.is_empty() || record::sanitize(id) != id {
         return refuse("not a job id (see `broadsword jobs`)".into());
     }
-    let _lock = match acquire(cfg, Duration::from_secs(5)) {
+    let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("broadsword: {e}");
@@ -326,7 +326,7 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
 /// `broadsword recover --abandon <id>`: give up on an interrupted job without touching any file.
 /// The record becomes `abandoned` (which lifts the per-folder refusal); the record and every ref stay.
 pub fn abandon(cfg: &Config, id: &str) -> ExitCode {
-    let _lock = match acquire(cfg, Duration::from_secs(5)) {
+    let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("broadsword: {e}");

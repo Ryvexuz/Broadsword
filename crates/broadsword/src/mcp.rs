@@ -683,7 +683,7 @@ impl<W: Write> Server<'_, W> {
     fn run_child(&mut self, id: &J, p: &Prepared, cfg: &Config, exe: &std::path::Path) -> Result<Ran, String> {
         let mut cmd = Command::new(exe);
         cmd.args(&p.args).current_dir(&cfg.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        scrub::apply(&mut cmd, &cfg.root); // the tool child gets the scrubbed environment (scrub.rs), never the server's own
+        scrub::apply(&mut cmd, cfg); // the tool child gets the scrubbed environment (scrub.rs), never the server's own
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -747,7 +747,7 @@ impl<W: Write> Server<'_, W> {
         let (stdout, stdout_cut) = out_tail.lock().map(|t| t.text()).unwrap_or_default();
         let (stderr, stderr_cut) = err_tail.lock().map(|t| t.text()).unwrap_or_default();
         // Redact after the whole output is collected, so a secret at a chunk boundary is still found.
-        let secrets = scrub::secrets(&cfg.root);
+        let secrets = scrub::secrets(cfg);
         let (stdout, stderr) = (secrets.redact(&stdout), secrets.redact(&stderr));
         self.log.set_secrets(secrets);
         Ok(Ran::Done(Captured {

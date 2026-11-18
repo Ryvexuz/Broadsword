@@ -209,7 +209,7 @@ const TEXT_KEYS: [&str; 8] = ["brief", "check_summary", "check_tail", "reason", 
 
 fn process_secrets(cfg: &Config) -> reviewer::Secrets {
     let env: Vec<(String, String)> = std::env::vars().collect();
-    reviewer::Secrets::collect(&cfg.root, &env)
+    reviewer::Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize)
 }
 
 // ---- add --------------------------------------------------------------------------------
@@ -937,7 +937,7 @@ impl<'a> Run<'a> {
             println!("queue entry {}: reviewer CLI is {}", self.e.id(), cli.path);
         }
         let prompt = self.secrets.redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff));
-        let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), reviewer::MIN_REDACT_LEN) } else { String::new() };
+        let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), self.cfg.redact_min_chars) } else { String::new() };
         self.log("review", &format!("calling the {} reviewer `{model}` through {}{} on {} (diff {} bytes, commit {}, call {} of at most {}); this spends money and uses the network{short_note}", backend.name(), cli.path, if cli.test_hook { " [TEST HOOK]" } else { "" }, if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&checked), calls + 1, self.cfg.reviewer_max_calls_per_entry))?;
         let review = match backend.call(self.cfg, &cli, &model, &prompt) {
             Ok(r) => r,

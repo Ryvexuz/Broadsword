@@ -7,8 +7,10 @@
 //! - a prompt containing `EMPTY_HEADER_PASS` gets a PASS whose `BLOCKING:` header is empty and followed by a finding;
 //!   a prompt containing `PLANTED_BUG` gets a FAIL with one blocking finding; `GARBAGE_REVIEW` gets text that is no verdict;
 //!   `EMPTY_PASS` gets a PASS with no BLOCKING line; anything else gets a PASS.
-//! - FAKE_CLAUDE_HANG_FILE: if that file exists, it sleeps for a minute first (so a test can kill it, time it out, or run a
-//!   second `queue run` against it).
+//! - FAKE_CLAUDE_HANG_FILE: while that file exists, it waits (so a test can kill it, time it out, or run a second `queue run`
+//!   against it). It leaves as soon as the file is removed, or after HANG_CAP_SECONDS if the test never removes it. It used
+//!   to sleep a fixed 60 s: under the load of the full suite the first run woke up early, went on to merge and was killed
+//!   there, and the resumed run found main dirty (a flaky test).
 //! - FAKE_CLAUDE_COMMIT_IN: a folder (a git repo) in which it commits a file first, simulating the main branch moving while
 //!   the review runs.
 //! - FAKE_CLAUDE_EXIT: exit with that code and print nothing (a CLI that fails).
@@ -19,6 +21,10 @@
 
 use std::io::{Read, Write};
 use std::process::Command;
+
+/// The longest FAKE_CLAUDE_HANG_FILE keeps the fake waiting if the test never removes the file (a failed test must not leave
+/// a process behind for long). Far longer than any test needs.
+const HANG_CAP_SECONDS: u64 = 300;
 
 fn main() {
     let mut raw = Vec::new();
@@ -53,8 +59,9 @@ fn main() {
         git(&["commit", "-q", "-m", "main moved while the review ran"]);
     }
     if let Ok(f) = std::env::var("FAKE_CLAUDE_HANG_FILE") {
-        if std::path::Path::new(&f).exists() {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(HANG_CAP_SECONDS);
+        while std::path::Path::new(&f).exists() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
     if let Ok(c) = std::env::var("FAKE_CLAUDE_EXIT") {

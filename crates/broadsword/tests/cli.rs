@@ -41,7 +41,10 @@ impl Project {
              checkpoint_ignored_max_mb = 50\n\
              max_resumes = 3\n\
              job_disk_reserve_gb = 2\n\
-             job_disk_poll_seconds = 5\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+             job_disk_poll_seconds = 5\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
+sweep_older_than_days = 7
+redact_min_chars = 6
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 max_agents = 50
 "
@@ -228,6 +231,75 @@ fn hook_write_allowed_when_not_paused() {
     assert!(!p.pause_file().exists());
     let out = p.run(&["hook", "pre-tool"], &hook_json("Write"));
     assert_eq!(code(&out), Some(0), "stderr: {}", text(&out.stderr));
+}
+
+#[test]
+fn hook_bypass_attempts_are_blocked_while_paused_and_a_real_exe_path_passes() {
+    let p = Project::new("hook-bypass", 99999);
+    p.pause_via_cleanup();
+    for bad in [
+        "rm x; broadsword status",
+        "broadsword status && rm x",
+        "broadsword status; rm x",
+        "broadsword status | cat",
+        "broadsword status & del x",
+        "rm x\\nbroadsword status",
+        "broadsword status\\nrm x",
+        "echo broadsword status",
+        "broadsword status $(rm x)",
+    ] {
+        let out = p.run(&["hook", "pre-tool"], &bash_json(bad));
+        assert_eq!(code(&out), Some(2), "`{bad}` must be denied while paused; stderr: {}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("PAUSED"), "{}", text(&out.stderr));
+    }
+    for ok in ["C:/some/dir/build/bin/broadsword.exe status", "./build/bin/broadsword.exe cleanup", "broadsword resume --force"] {
+        let out = p.run(&["hook", "pre-tool"], &bash_json(ok));
+        assert_eq!(code(&out), Some(0), "`{ok}` must pass while paused; stderr: {}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn hook_with_a_broken_config_fails_closed_and_says_why() {
+    let p = Project::new("hook-broken-config", 1);
+    // not paused, config present: everything passes (control)
+    assert_eq!(code(&p.run(&["hook", "pre-tool"], &hook_json("Write"))), Some(0));
+    for (what, toml) in [("an unreadable value", "root = \".\"\ndisk_floor_gb = banana\n"), ("missing keys", "root = \".\"\n")] {
+        fs::write(p.path("broadsword.toml"), toml).unwrap();
+        for tool in ["Write", "Edit", "WebFetch", "Agent", "mcp__broadsword__build", "mcp__broadsword__cleanup"] {
+            let out = p.run(&["hook", "pre-tool"], &hook_json(tool));
+            let se = text(&out.stderr);
+            assert_eq!(code(&out), Some(2), "{tool} must be denied with {what}: {se}");
+            assert!(se.contains("DENIED") && se.contains("broadsword.toml could not be loaded") && se.contains("Why:"), "{se}");
+        }
+        for cmd in ["rm x", "broadsword cleanup", "rm x; broadsword status"] {
+            let out = p.run(&["hook", "pre-tool"], &bash_json(cmd));
+            assert_eq!(code(&out), Some(2), "`{cmd}` must be denied with {what}: {}", text(&out.stderr));
+        }
+        for tool in ["Read", "Glob", "Grep", "mcp__broadsword__status"] {
+            let out = p.run(&["hook", "pre-tool"], &hook_json(tool));
+            assert_eq!(code(&out), Some(0), "read-only {tool} passes with {what}: {}", text(&out.stderr));
+        }
+        let out = p.run(&["hook", "pre-tool"], &bash_json("broadsword status"));
+        assert_eq!(code(&out), Some(0), "{}", text(&out.stderr));
+        let out = p.run(&["hook", "pre-tool"], "not json at all");
+        assert_eq!(code(&out), Some(2), "unparseable hook input is denied: {}", text(&out.stderr));
+    }
+    // the same broken config is still an ordinary error (exit 1) for every other command
+    assert_eq!(code(&p.run(&["status"], "")), Some(1));
+}
+
+#[test]
+fn cleanup_says_clearly_when_cargo_sweep_is_missing() {
+    let p = Project::new("sweep-note", 1);
+    let installed = Command::new("cargo").args(["sweep", "--version"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    let out = p.run(&["cleanup"], "");
+    let so = text(&out.stdout);
+    assert_eq!(code(&out), Some(0), "{so}\n{}", text(&out.stderr));
+    if installed {
+        assert!(so.contains("cargo sweep ran") || so.contains("cargo sweep failed"), "{so}");
+    } else {
+        assert!(so.contains("WARNING: cargo-sweep is NOT installed") && so.contains("build folder was NOT swept"), "{so}");
+    }
 }
 
 // ---- resume ----------------------------------------------------------------

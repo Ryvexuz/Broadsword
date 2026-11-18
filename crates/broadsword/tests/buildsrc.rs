@@ -78,7 +78,10 @@ impl Root {
             "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
              ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = {build_lock_wait}\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = {build_lock_wait}\nrecover_lock_wait_seconds = 5
+sweep_older_than_days = 7
+redact_min_chars = 6
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 max_agents = 50\n"
         );
@@ -246,6 +249,26 @@ fn run_that_builds_in_a_worktree_makes_the_note_unknown_so_the_next_build_cleans
     assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("no record"), "{}", o.stdout);
     assert_eq!(r.probe(), "MARK-main");
     assert_eq!(r.note().as_deref(), Some("projects/proj"));
+}
+
+/// A `cargo test` inside `run` right after ANOTHER worktree built must test THIS worktree's code. Cargo keeps a fingerprint per
+/// checkout: build B, then A, and B looks fresh, so cargo says `Finished` and runs the binary A left in the shared folder. `run`
+/// now does the same preparation as build, test and check (`cargo clean -p` for a package whose note names another checkout).
+#[test]
+fn run_after_another_worktrees_build_tests_its_own_code_not_the_other_binary() {
+    let r = Root::new("runstale", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let t2 = r.task("b", "MARK-t2");
+    r.ok(&["check", "proj", "--task", &t2]); // B built: cargo now thinks B is fresh
+    assert_eq!(r.probe(), "MARK-t2");
+    r.ok(&["build", "proj", "--task", &t1]); // A built after it: the shared folder holds A's binary
+    assert_eq!(r.probe(), "MARK-t1");
+    let target = r.dir.join("build").to_string_lossy().replace('\\', "/");
+    let o = r.ok(&["run", "proj", "--task", &t2, "--", "cargo", "test", "--offline", "--target-dir", &target]);
+    assert!(o.stdout.contains("cleaned `markprobe`"), "run prepared the build folder before its command: {}", o.stdout);
+    assert!(o.stdout.contains("test result: ok") && o.stdout.contains("the_binary_is_this_checkouts_binary"), "B's test ran and passed against B's own binary: {}\n{}", o.stdout, o.stderr);
+    assert_eq!(r.probe(), "MARK-t2", "the binary in the shared folder is B's: the run tested B's code");
+    assert_eq!(r.note(), None, "a `run` build is still never installable: no note vouches for it");
 }
 
 /// `run` holds the build lock for its whole command.

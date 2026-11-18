@@ -12,9 +12,9 @@
 //!   value of every secret-named variable of this process (the `.env` file is read only for its values; its text is never sent);
 //! - the child's environment loses every variable named `*_API_KEY`, `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PAT`, `*_PASSWORD`,
 //!   `*_PASS`, `*_CREDENTIAL*` or `*_AUTH*`, and every variable whose VALUE equals or contains a secret value; a `.env` value
-//!   shorter than `MIN_REDACT_LEN` is removed from the environment only when a variable EQUALS it;
+//!   shorter than the `redact_min_chars` setting is removed from the environment only when a variable EQUALS it;
 //! - the prompt (brief, diff, check output) and everything the queue stores (entry, review file) have the secret values replaced
-//!   by `[REDACTED]`; `.env` values shorter than `MIN_REDACT_LEN` are not (they would blank out ordinary words), and the queue
+//!   by `[REDACTED]`; `.env` values shorter than the `redact_min_chars` setting are not (they would blank out ordinary words), and the queue
 //!   says how many were skipped.
 //!
 //! REDACTION LIMITS. Redaction is plain text replacement: (1) a secret split across two diff lines is not redacted; (2) a `.env`
@@ -183,15 +183,11 @@ pub fn secret_name(name: &str) -> bool {
         || ["API_KEY", "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS"].contains(&n.as_str())
 }
 
-/// Values shorter than this are not redacted from text (they would blank out ordinary words); they are still kept out of the
-/// reviewer's environment (see `Secrets::scrub_names`).
-pub const MIN_REDACT_LEN: usize = 6;
-
 /// Every secret value this process knows of.
 /// - EVERY value in `<root>/.env` is a secret, whatever its name (`GITHUB_PAT`, `DB_PASSWORD`, `REGION`...);
 /// - so is the value of every secret-named variable of the process environment.
 ///
-/// Values of `MIN_REDACT_LEN` characters or more are replaced by `[REDACTED]` in any text; shorter `.env` values are not (they
+/// Values of `redact_min_chars` characters or more are replaced by `[REDACTED]` in any text; shorter `.env` values are not (they
 /// would redact common words), but a variable of the reviewer's environment that EQUALS one is still removed.
 #[derive(Debug, Default, Clone)]
 pub struct Secrets {
@@ -220,18 +216,20 @@ fn env_file_values(root: &Path) -> Vec<String> {
 }
 
 impl Secrets {
-    pub fn collect(root: &Path, env: &[(String, String)]) -> Secrets {
+    /// `min_len` is the `redact_min_chars` setting: values shorter than this are not redacted from text (they would blank out
+    /// ordinary words); they are still kept out of the reviewer's environment (see `scrub_names`).
+    pub fn collect(root: &Path, env: &[(String, String)], min_len: usize) -> Secrets {
         let mut redact: Vec<String> = Vec::new();
         let mut short_env: Vec<String> = Vec::new();
         for val in env_file_values(root) {
-            if val.chars().count() >= MIN_REDACT_LEN {
+            if val.chars().count() >= min_len {
                 redact.push(val);
             } else {
                 short_env.push(val);
             }
         }
         for (k, val) in env {
-            if secret_name(k) && val.chars().count() >= MIN_REDACT_LEN {
+            if secret_name(k) && val.chars().count() >= min_len {
                 redact.push(val.clone());
             }
         }
@@ -417,7 +415,7 @@ impl ReviewBackend for ClaudeCli {
         std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
         let args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
         let env: Vec<(String, String)> = std::env::vars().collect();
-        let remove = Secrets::collect(&cfg.root, &env).scrub_names(&env);
+        let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
         let out = run_cli(&cli.path, &args, &cwd, &remove, prompt, Duration::from_secs(cfg.reviewer_timeout_seconds))?;
         let mut rev = parse_claude_output(&out.stdout, out.code, &out.stderr)?;
         check_model(&mut rev, model);
@@ -580,7 +578,7 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let s = Secrets::collect(Path::new("no-such-folder-here"), &env);
+        let s = Secrets::collect(Path::new("no-such-folder-here"), &env, 6);
         assert_eq!(s.redact("key=sk-live-0123456789;abc"), "key=[REDACTED];abc", "short values are not redacted");
         assert_eq!(s.scrub_names(&env), ["OPENAI_API_KEY", "COPIED", "SHORT_KEY"]);
     }
@@ -591,7 +589,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(".env"), "# c\nREGION=eu-west-1\nGITHUB_PAT=ghp_abcdef123456\nexport DB_PASSWORD=\"hunter2hunter2\"\nTINY=ab\nEMPTY=\n").unwrap();
         let env: Vec<(String, String)> = [("MY_COPY", "x-ghp_abcdef123456-y"), ("EXACT_SHORT", "ab"), ("HAS_SHORT", "xaby"), ("OTHER", "plain")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        let s = Secrets::collect(&d, &env);
+        let s = Secrets::collect(&d, &env, 6);
         assert_eq!(s.redact("r=eu-west-1 p=ghp_abcdef123456 q=hunter2hunter2 t=ab"), "r=[REDACTED] p=[REDACTED] q=[REDACTED] t=ab");
         assert_eq!(s.short_count(), 1);
         assert_eq!(s.scrub_names(&env), ["MY_COPY", "EXACT_SHORT"], "contains for long values, equals for short ones");

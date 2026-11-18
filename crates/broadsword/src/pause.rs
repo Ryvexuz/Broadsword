@@ -120,12 +120,61 @@ pub fn mcp_tool_allowed_while_paused(tool_name: &str) -> bool {
     matches!(name, "resume" | "cleanup") || crate::tools::find(name).is_some_and(|t| t.read_only)
 }
 
+/// The broadsword commands a shell call may run while paused: how the pause is inspected and ended.
+const PAUSED_SHELL_COMMANDS: [&str; 3] = ["status", "resume", "cleanup"];
+
+/// True only if the whole shell command line IS one broadsword command from `allowed`: the program is broadsword (a bare
+/// name or a path ending in `broadsword` or `broadsword.exe`), the rest parses as exactly one registry command (the CLI's
+/// own parser decides, so an unknown flag or word is refused) whose tool is in `allowed`, and nothing else is on the
+/// line: no `;`, `&`, `|`, newline, redirection, substitution (`$`, backtick, parentheses) and no quote after the program.
+/// A command that merely CONTAINS `broadsword status` (`rm x; broadsword status`) never passes.
+pub fn is_allowed_broadsword_command(line: &str, allowed: &[&str]) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.contains([';', '&', '|', '\n', '\r', '<', '>', '`', '$', '(', ')', '%', '^']) {
+        return false;
+    }
+    // The program may be quoted (a path with spaces); no other token may hold a quote.
+    let (program, rest) = match line.chars().next() {
+        Some(q @ ('"' | '\'')) => match line[1..].split_once(q) {
+            Some((prog, rest)) if !prog.contains(['"', '\'']) && (rest.is_empty() || rest.starts_with(char::is_whitespace)) => (prog, rest),
+            _ => return false,
+        },
+        _ => line.split_once(char::is_whitespace).unwrap_or((line, "")),
+    };
+    if rest.contains(['"', '\'']) {
+        return false;
+    }
+    let file = program.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
+    if file != "broadsword" && file != "broadsword.exe" {
+        return false;
+    }
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    crate::tools::resolve(&args).is_some_and(|(tool, _)| allowed.contains(&tool.name))
+}
+
+/// The command line of a Bash or PowerShell hook call (`tool_input.command`), or None if the JSON has no such string.
+fn shell_command(stdin: &str) -> Option<String> {
+    let j = crate::json::parse(stdin).ok()?;
+    Some(j.get("tool_input")?.get("command")?.str()?.to_string())
+}
+
 /// True if the hook call may proceed while paused.
 pub fn allowed_while_paused(stdin: &str) -> bool {
     match tool_name(stdin).as_deref() {
         Some("Read" | "Glob" | "Grep") => true,
         Some(n) if n.starts_with(MCP_PREFIX) => mcp_tool_allowed_while_paused(n),
-        Some("Bash" | "PowerShell") => ["broadsword status", "broadsword resume", "broadsword cleanup"].iter().any(|s| stdin.contains(s)),
+        Some("Bash" | "PowerShell") => shell_command(stdin).is_some_and(|c| is_allowed_broadsword_command(&c, &PAUSED_SHELL_COMMANDS)),
+        _ => false,
+    }
+}
+
+/// True if the hook call is read-only: it may proceed when the config cannot be loaded (the hook then fails closed for
+/// everything else). Read, Glob, Grep, a read-only tool of the Broadsword MCP server, or the shell command `broadsword status`.
+pub fn read_only_call(stdin: &str) -> bool {
+    match tool_name(stdin).as_deref() {
+        Some("Read" | "Glob" | "Grep") => true,
+        Some(n) if n.starts_with(MCP_PREFIX) => crate::tools::find(&n[MCP_PREFIX.len()..]).is_some_and(|t| t.read_only),
+        Some("Bash" | "PowerShell") => shell_command(stdin).is_some_and(|c| is_allowed_broadsword_command(&c, &["status"])),
         _ => false,
     }
 }
@@ -164,12 +213,86 @@ mod tests {
         assert_eq!(tool_name(w).as_deref(), Some("Write"));
         assert!(!allowed_while_paused(w));
         assert!(allowed_while_paused(r));
-        assert!(!allowed_while_paused(ok)); // exe path form has ".exe" between; plain substring rule
+        assert!(allowed_while_paused(ok), "a real path to broadsword.exe passes");
         assert!(allowed_while_paused(ok2));
         assert!(!allowed_while_paused(bad));
         assert!(allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"broadsword cleanup"}}"#));
         assert!(!allowed_while_paused(r#"{"tool_name":"PowerShell","tool_input":{"command":"dir"}}"#));
         assert!(!allowed_while_paused("garbage"));
+    }
+
+    fn shell(tool: &str, cmd: &str) -> String {
+        format!(r#"{{"tool_name":"{tool}","tool_input":{{"command":{}}}}}"#, crate::json::string(cmd))
+    }
+
+    #[test]
+    fn paused_shell_calls_that_are_exactly_an_allowed_broadsword_command_pass() {
+        for ok in [
+            "broadsword status",
+            "broadsword.exe status",
+            "  broadsword status  ",
+            "build/bin/broadsword.exe status",
+            "C:\\Users\\x\\build\\bin\\broadsword.exe status",
+            "./Broadsword.EXE cleanup",
+            "broadsword resume",
+            "broadsword resume --force",
+            "\"C:/My Dir/broadsword.exe\" status",
+        ] {
+            assert!(allowed_while_paused(&shell("Bash", ok)), "{ok}");
+            assert!(allowed_while_paused(&shell("PowerShell", ok)), "{ok}");
+        }
+    }
+
+    #[test]
+    fn paused_shell_calls_that_merely_contain_an_allowed_command_are_denied() {
+        for bad in [
+            "rm x; broadsword status",
+            "broadsword status && rm x",
+            "broadsword status; rm x",
+            "broadsword status | cat",
+            "broadsword status & del x",
+            "broadsword status\nrm x",
+            "rm x\nbroadsword status",
+            "broadsword status\r\nrm x",
+            "echo broadsword status",
+            "echo broadsword status > x",
+            "rm -rf x # broadsword status",
+            "broadsword status $(rm x)",
+            "broadsword status `rm x`",
+            "broadsword status > out.txt",
+            "evil broadsword status",
+            "notbroadsword status",
+            "broadswordx.exe status",
+            "broadsword.exe.bat status",
+            "broadsword",
+            "broadsword build broadsword",
+            "broadsword status extra",
+            "broadsword status \"x\"",
+            "broadsword task add",
+            "\"broadsword status",
+            "",
+        ] {
+            assert!(!allowed_while_paused(&shell("Bash", bad)), "{bad:?}");
+            assert!(!allowed_while_paused(&shell("PowerShell", bad)), "{bad:?}");
+        }
+        // a command string that is not where the hook JSON puts it never passes by substring
+        assert!(!allowed_while_paused(r#"{"tool_name":"Bash","tool_input":{"command":"rm x","note":"broadsword status"}}"#));
+        assert!(!allowed_while_paused(r#"{"tool_name":"Bash","tool_input":{"description":"broadsword status"}}"#));
+        assert!(!allowed_while_paused(r#"{"tool_name":"Bash","tool_input":{"command":"rm x"}} broadsword status"#));
+    }
+
+    #[test]
+    fn read_only_calls_are_the_only_ones_allowed_without_a_config() {
+        assert!(read_only_call(&hook_for("Read")) && read_only_call(&hook_for("Glob")) && read_only_call(&hook_for("Grep")));
+        assert!(read_only_call(&hook_for("mcp__broadsword__status")) && read_only_call(&hook_for("mcp__broadsword__task_list")));
+        assert!(read_only_call(&shell("Bash", "broadsword status")));
+        for bad in ["Write", "Edit", "WebFetch", "Agent", "mcp__broadsword__build", "mcp__broadsword__cleanup", "mcp__broadsword__resume", "mcp__other__status", ""] {
+            assert!(!read_only_call(&hook_for(bad)), "{bad}");
+        }
+        for bad in ["broadsword cleanup", "broadsword resume", "rm x; broadsword status", "cargo build"] {
+            assert!(!read_only_call(&shell("Bash", bad)), "{bad}");
+        }
+        assert!(!read_only_call("garbage") && !read_only_call(""));
     }
 
     fn hook_for(tool: &str) -> String {

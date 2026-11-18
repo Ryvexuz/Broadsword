@@ -221,7 +221,25 @@ pub struct Prepared {
 /// package's artifacts, then record `source` for it. The caller holds the build lock. Err = nothing may be built (the
 /// message says why and what to do).
 pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, String> {
-    let packages = packages_of(dir)?;
+    prepare_packages(cfg, dir, source, packages_of(dir)?)
+}
+
+/// The preparation a `run` job makes before its command (the command may be `cargo test`, which would otherwise test the
+/// binary another checkout left in the shared build folder): the same clean as `prepare`, then the notes of the folder's
+/// packages are forgotten again, because the command may build anything and nothing may vouch for the result (`install`
+/// refuses, and the next build, test or check cleans). `run` runs arbitrary commands, so a folder whose packages cannot be
+/// listed (a broken Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped.
+/// A `cargo clean` that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
+pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
+    let mut lines = match packages_of(dir) {
+        Ok(packages) => prepare_packages(cfg, dir, source, packages)?.lines,
+        Err(e) => vec![format!("build source: not checked (the stale-binary protection is skipped for this run): {e}")],
+    };
+    lines.extend(forget_notes(cfg, dir));
+    Ok(lines)
+}
+
+fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>) -> Result<Prepared, String> {
     let stale: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).filter(|(_, n)| n.as_deref() != Some(source)).collect();
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];

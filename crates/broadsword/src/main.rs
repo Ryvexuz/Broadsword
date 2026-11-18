@@ -59,6 +59,22 @@ fn cmd_hook(cfg: &Config) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// The hook when `broadsword.toml` cannot be loaded: it FAILS CLOSED. Only read-only calls pass (the same registry
+/// `read_only` flag the paused hook uses); everything else is denied with the reason on stderr. Claude Code reads exit
+/// code 2 as "deny" and any other non-zero code as a non-blocking error that lets the call through, so a broken
+/// config must never exit 1 here.
+fn cmd_hook_without_config(error: &str) -> ExitCode {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    if pause::read_only_call(&input) {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "Broadsword hook DENIED this tool call: broadsword.toml could not be loaded, so the pause state is unknown and only read-only tools are allowed.\nWhy: {error}\nFix broadsword.toml by hand (Write and Edit are denied until it loads) or run `broadsword status` to see the error."
+    );
+    ExitCode::from(2)
+}
+
 fn usage() -> ExitCode {
     eprint!("{}", tools::usage_text());
     ExitCode::from(64)
@@ -74,9 +90,10 @@ fn main() -> ExitCode {
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
-            // Fail open on purpose: in hook mode exit 1 is a non-blocking error, so a broken
-            // or missing broadsword.toml never locks agents out of every tool call.
             eprintln!("broadsword: {e}");
+            if args == ["hook", "pre-tool"] {
+                return cmd_hook_without_config(&e);
+            }
             return ExitCode::from(1);
         }
     };

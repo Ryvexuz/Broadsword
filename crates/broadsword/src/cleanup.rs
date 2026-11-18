@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime};
 #[derive(Debug, Default)]
 pub struct Report {
     pub sweep_note: String,
+    /// True only if `cargo sweep` really ran on the build folder; false when it was skipped, missing or failed (the note says which).
+    pub swept: bool,
     pub deleted: Vec<(PathBuf, u64)>,
     pub truncated: Vec<(PathBuf, u64)>,
     pub free_before: u64,
@@ -69,7 +71,11 @@ pub fn cap_log(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
     Ok(len - max_bytes)
 }
 
-fn sweep(cfg: &Config) -> String {
+/// What `cleanup` says when cargo-sweep is missing: loud, because the build folder was NOT swept.
+pub const SWEEP_MISSING_NOTE: &str = "WARNING: cargo-sweep is NOT installed, so the build folder was NOT swept (install it with `cargo install cargo-sweep`; Broadsword never installs it itself). Scratch files and logs were still cleaned";
+
+/// Sweep the shared build folder. Returns the note and whether the sweep really ran.
+fn sweep(cfg: &Config) -> (String, bool) {
     let installed = Command::new("cargo")
         .args(["sweep", "--version"])
         .stdout(Stdio::null())
@@ -77,24 +83,30 @@ fn sweep(cfg: &Config) -> String {
         .status()
         .is_ok_and(|s| s.success());
     if !installed {
-        return "cargo-sweep not installed, skipped".to_string();
+        return (SWEEP_MISSING_NOTE.to_string(), false);
     }
+    let days = cfg.sweep_older_than_days.to_string();
     match Command::new("cargo")
-        .args(["sweep", "--time", "7"])
+        .args(["sweep", "--time", days.as_str()])
         .env("CARGO_TARGET_DIR", &cfg.build_dir)
         .current_dir(&cfg.root)
         .output()
     {
-        Ok(o) if o.status.success() => format!("cargo sweep ran: {}", String::from_utf8_lossy(&o.stdout).trim()),
-        Ok(o) => format!("cargo sweep failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
-        Err(e) => format!("cargo sweep could not start: {e}"),
+        Ok(o) if o.status.success() => (format!("cargo sweep ran (files unused for {days} days): {}", String::from_utf8_lossy(&o.stdout).trim()), true),
+        Ok(o) => (format!("WARNING: cargo sweep failed, so the build folder was NOT swept: {}", String::from_utf8_lossy(&o.stderr).trim()), false),
+        Err(e) => (format!("WARNING: cargo sweep could not start, so the build folder was NOT swept: {e}"), false),
     }
 }
 
 /// Run one pass. `free` reports current free bytes (injected so tests can fake it).
 pub fn cleanup_pass(cfg: &Config, now: SystemTime, free: &mut dyn FnMut() -> u64, run_sweep: bool) -> Report {
+    cleanup_pass_in(cfg, now, free, run_sweep, "")
+}
+
+/// Like `cleanup_pass`; `context` (for example "during `build x`; job killed") is added to the pause reason if the pass still ends below the floor.
+pub fn cleanup_pass_in(cfg: &Config, now: SystemTime, free: &mut dyn FnMut() -> u64, run_sweep: bool, context: &str) -> Report {
     let mut r = Report { free_before: free(), ..Default::default() };
-    r.sweep_note = if run_sweep { sweep(cfg) } else { "cargo-sweep skipped (disabled)".into() };
+    (r.sweep_note, r.swept) = if run_sweep { sweep(cfg) } else { ("cargo-sweep skipped (disabled)".into(), false) };
 
     let max_age = Duration::from_secs(cfg.scratch_max_age_hours * 3600);
     for (path, size) in select_expired(&cfg.scratch_dir, now, max_age) {
@@ -119,9 +131,10 @@ pub fn cleanup_pass(cfg: &Config, now: SystemTime, free: &mut dyn FnMut() -> u64
     r.free_after = free();
     if pause::below_floor(r.free_after, cfg.floor_bytes()) && !pause::is_paused(&cfg.root) {
         let reason = format!(
-            "free space {} is below the {} GB floor after cleanup",
+            "free space {} is below the {} GB floor after cleanup{}{context}",
             pause::gb(r.free_after),
-            cfg.disk_floor_gb
+            cfg.disk_floor_gb,
+            if context.is_empty() { "" } else { " " }
         );
         if pause::write_pause(&cfg.root, r.free_after, &reason).is_ok() {
             r.paused_now = true;

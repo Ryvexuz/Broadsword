@@ -12,9 +12,11 @@ Before you start, read `AGENTS.md` and `broadsword.toml` at the project root. Th
 
 **Cleanup.** Run it when asked, every `cleanup_every_hours`, and at once when free space is below the floor:
 
-1. Run `cargo sweep` on the shared build folder.
-2. Delete files in the scratch folder older than `scratch_max_age_hours`.
-3. Cap log sizes.
+Run `broadsword cleanup` (through `broadsword`, never plain `cargo`). It does all three steps:
+
+1. Runs `cargo sweep` on the shared build folder (`sweep_older_than_days`). If cargo-sweep is not installed the report says `WARNING: cargo-sweep is NOT installed` and the build folder was NOT swept: report that to the orchestrator, who asks Lazlo about installing it. Do not install it yourself.
+2. Deletes files in the scratch folder older than `scratch_max_age_hours`.
+3. Caps log sizes.
 
 Leave the `.gitkeep` file in each working folder. Delete nothing outside the scratch and build folders. Never delete source, Git history, worktrees with unmerged work, or evidence of a failure. If something outside those two folders looks like it should go, report it and let the orchestrator ask.
 

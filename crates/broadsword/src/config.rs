@@ -109,6 +109,13 @@ pub struct Config {
     pub reviewer_max_calls_per_entry: u64,
     /// The most tasks that may be `running` on the board at once, across all projects (`task start` refuses at the cap).
     pub max_agents: u64,
+    /// How long `recover` (and `recover <id>`, `recover --abandon`) waits for the recover lock before it says another recover is running.
+    pub recover_lock_wait_seconds: u64,
+    /// `cargo sweep --time N`: build-folder files not used for N days are swept (by `cleanup`, and by the cleanup a low-disk kill runs).
+    pub sweep_older_than_days: u64,
+    /// A `.env` or secret-named value shorter than this many characters is not redacted from text (it would blank ordinary words);
+    /// it is still kept out of every child's environment.
+    pub redact_min_chars: u64,
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -161,7 +168,6 @@ impl Config {
     pub fn from_text(text: &str, config_dir: &Path) -> Result<Config, String> {
         let m = parse_flat(text)?;
         let root = normalize(&config_dir.join(get_str(&m, "root")?));
-        inside_root(&m, "shared_dir", false)?;
         let (scratch_dir, build_dir) = (root.join(inside_root(&m, "scratch_dir", true)?), root.join(inside_root(&m, "build_dir", true)?));
         let state_dir = root.join(inside_root(&m, "state_dir", true)?);
         for (name, other) in [("scratch_dir", &scratch_dir), ("build_dir", &build_dir)] {
@@ -211,11 +217,14 @@ impl Config {
             queue_lock_wait_seconds: positive("queue_lock_wait_seconds")?,
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             max_agents: positive("max_agents")?,
+            recover_lock_wait_seconds: positive("recover_lock_wait_seconds")?,
+            sweep_older_than_days: positive("sweep_older_than_days")?,
+            redact_min_chars: positive("redact_min_chars")?,
             disk_floor_gb: get_int(&m, "disk_floor_gb")?,
-            cleanup_every_hours: get_int(&m, "cleanup_every_hours")?,
-            scratch_max_age_hours: get_int(&m, "scratch_max_age_hours")?,
-            disk_check_every_seconds: get_int(&m, "disk_check_every_seconds")?,
-            log_max_mb: get_int(&m, "log_max_mb")?,
+            cleanup_every_hours: positive("cleanup_every_hours")?,
+            scratch_max_age_hours: positive("scratch_max_age_hours")?,
+            disk_check_every_seconds: positive("disk_check_every_seconds")?,
+            log_max_mb: positive("log_max_mb")?,
             ram_warn_percent: get_int(&m, "ram_warn_percent")?,
             cpu_warn_percent: get_int(&m, "cpu_warn_percent")?,
             alert_command: get_str(&m, "alert_command")?,
@@ -229,7 +238,7 @@ impl Config {
             checkpoint_ignored_max_mb: get_int(&m, "checkpoint_ignored_max_mb")?,
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
-            job_disk_poll_seconds: get_int(&m, "job_disk_poll_seconds")?,
+            job_disk_poll_seconds: positive("job_disk_poll_seconds")?,
             task_lock_wait_seconds: positive("task_lock_wait_seconds")?,
             build_lock_wait_seconds: positive("build_lock_wait_seconds")?,
             worktrees_dir,
@@ -329,7 +338,10 @@ mod tests {
 
     #[test]
     fn worktrees_dir_is_required_and_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+sweep_older_than_days = 7
+redact_min_chars = 6
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 max_agents = 50
 install_dir=\"build/bin\"\n";
@@ -380,7 +392,10 @@ install_dir=\"build/bin\"\n";
 
     #[test]
     fn install_dir_and_mcp_settings_are_validated() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+sweep_older_than_days = 7
+redact_min_chars = 6
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 max_agents = 50
 worktrees_dir = \"worktrees\"\n";
@@ -413,7 +428,10 @@ worktrees_dir = \"worktrees\"\n";
 
     #[test]
     fn rejects_paths_outside_root() {
-        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nreviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+        let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+sweep_older_than_days = 7
+redact_min_chars = 6
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 max_agents = 50
 worktrees_dir = \"worktrees\"\n";
@@ -421,8 +439,6 @@ worktrees_dir = \"worktrees\"\n";
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "{bad}");
         }
-        let t = format!("{base}scratch_dir = \"scratch\"\nshared_dir = \"..\"\n");
-        assert!(Config::from_text(&t, Path::new("p")).is_err());
         for bad in ["../p", "/p", "C:/p", "."] {
             let t = format!("{base}scratch_dir = \"scratch\"\nprojects_dir = \"{bad}\"\n");
             assert!(Config::from_text(&t, Path::new("p")).is_err(), "projects_dir {bad}");
@@ -437,6 +453,50 @@ worktrees_dir = \"worktrees\"\n";
         }
         let t = format!("{base}scratch_dir = \"a/b\"\nprojects_dir = \"projects\"\nstate_dir = \"state\"\n");
         assert!(Config::from_text(&t, Path::new("p")).is_ok());
+    }
+
+    fn without_key(text: &str, key: &str) -> String {
+        text.lines().filter(|l| l.split_once('=').is_none_or(|(k, _)| k.trim() != key)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn limits_that_were_hard_coded_are_required_positive_settings() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert_eq!((c.recover_lock_wait_seconds, c.sweep_older_than_days, c.redact_min_chars), (5, 7, 6), "the shipped values are the old constants");
+        // every setting that used to be clamped silently with `.max(1)`, or fed a loop, is refused at 0 at load
+        for key in ["recover_lock_wait_seconds", "sweep_older_than_days", "redact_min_chars", "job_disk_poll_seconds", "disk_check_every_seconds", "cleanup_every_hours", "scratch_max_age_hours", "log_max_mb"] {
+            let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
+            assert!(e.contains(key) && e.contains("missing"), "{key} is required: {e}");
+            let zero = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+            let e = Config::from_text(&zero, Path::new("p")).unwrap_err();
+            assert!(e.contains(key) && e.contains("at least 1"), "{key} = 0 is refused: {e}");
+        }
+    }
+
+    #[test]
+    fn every_key_in_the_real_toml_is_required_by_the_loader_and_used_by_code() {
+        let text = include_str!("../../../broadsword.toml");
+        let keys: Vec<String> = parse_flat(text).unwrap().into_keys().collect();
+        assert!(keys.len() > 35, "{keys:?}");
+        // 1. the loader reads it: with the key removed the config no longer loads (a key nothing reads would still load)
+        let unread: Vec<&String> = keys.iter().filter(|k| Config::from_text(&without_key(text, k), Path::new("p")).is_ok()).collect();
+        assert!(unread.is_empty(), "keys in broadsword.toml that the loader never reads (delete them, or read them): {unread:?}");
+        // 2. some code outside this file uses the field it fills (`cfg.<key>`), so a validated-but-unused key (shared_dir) fails too
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut code = String::new();
+        for e in std::fs::read_dir(&src).unwrap().flatten() {
+            if e.file_name() != "config.rs" && e.path().extension().is_some_and(|x| x == "rs") {
+                code.push_str(&std::fs::read_to_string(e.path()).unwrap());
+            }
+        }
+        // a key may reach the code through an accessor method of Config instead of the field itself
+        fn accessor(k: &str) -> &str {
+            if k == "job_disk_reserve_gb" { "reserve_bytes" } else { k }
+        }
+        let used = |name: &str| code.match_indices(&format!(".{name}")).any(|(i, _)| !code[i + 1 + name.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+        let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k))).collect();
+        assert!(unused.is_empty(), "keys in broadsword.toml that no code outside config.rs uses as `.key`: {unused:?}");
     }
 
     #[test]

@@ -129,18 +129,32 @@ impl Inputs {
     }
 }
 
+/// The free-text string parameters, as (tool, parameter, line breaks allowed). Each one ALWAYS follows its own flag as one
+/// argument in `to_args` (`--title <text>`, `--note <text>`), and the command-line parser takes the argument after a flag
+/// verbatim, so a leading `-` cannot be read as an option. Line breaks: `title` and `note` have every whitespace run collapsed
+/// to one space by the task board, so a multi-line value is stored safely. NOT listed on purpose: `owner` (`task_start`'s parser
+/// removes every `--worktree` word before it reads the flags, so `--owner --worktree` would not round-trip) and every other
+/// string (a name, an id, a path): a bare argument, or one the parser cannot take verbatim.
+const FREE_TEXT: &[(&str, &str, bool)] = &[("task_add", "title", true), ("task_done", "note", true), ("task_fail", "note", true)];
+
 /// The one place that keeps a caller's string value from becoming a command-line option of the child: every
-/// string parameter of every tool becomes a bare argument in `to_args`, so a value starting with `-` (`--all`,
-/// `--worktree`) would be read as a flag. Also refuses NUL and line breaks. Array parameters (the `run`
-/// command) are meant to be arguments and are exempt. The MCP server calls this before `to_args`.
+/// string parameter of every tool becomes an argument in `to_args`. A plain value (an id, a name, a path) is a BARE argument,
+/// so a value starting with `-` (`--all`, `--worktree`) would be read as a flag, and it is refused; so are NUL and line
+/// breaks. The free-text parameters in `FREE_TEXT` are exempt from the `-` rule (they always follow their flag) and, where the
+/// table says so, from the line-break rule. NUL is refused everywhere. Array parameters (the `run` command) are meant to be
+/// arguments and are exempt. The MCP server calls this before `to_args`. Each parameter's description says which rule applies.
 pub fn check_string_inputs(tool: &Tool, inputs: &Inputs) -> Result<(), String> {
     for p in tool.params.iter().filter(|p| p.ty == Ty::String) {
         let Some(v) = inputs.str(p.name) else { continue };
-        if v.starts_with('-') {
+        let free = FREE_TEXT.iter().find(|(t, n, _)| *t == tool.name && *n == p.name);
+        if v.starts_with('-') && free.is_none() {
             return Err(format!("argument `{}` must not start with `-`: it would be read as a command-line option, not as a value; got {v:?}", p.name));
         }
-        if v.contains(['\0', '\n', '\r']) {
-            return Err(format!("argument `{}` must not contain a NUL or a line break", p.name));
+        if v.contains('\0') {
+            return Err(format!("argument `{}` must not contain a NUL", p.name));
+        }
+        if v.contains(['\n', '\r']) && !free.is_some_and(|(_, _, multi)| *multi) {
+            return Err(format!("argument `{}` must not contain a line break", p.name));
         }
     }
     Ok(())
@@ -148,18 +162,26 @@ pub fn check_string_inputs(tool: &Tool, inputs: &Inputs) -> Result<(), String> {
 
 // ---- the table --------------------------------------------------------------------------
 
+/// The sentence every plain string parameter ends with: over MCP such a value becomes one bare argument of the tool's command
+/// line, so `check_string_inputs` refuses a leading `-` (it would be read as an option) and a NUL or line break.
+macro_rules! NO_DASH {
+    () => {
+        " Over MCP this value must not start with `-` (it would be read as a command-line option) and must not contain a NUL or a line break; such a call is refused."
+    };
+}
+
 const PROJECT: Param = Param {
     name: "project",
     ty: Ty::String,
     required: true,
-    description: "Project name. Must be `broadsword` (this repository) or the name of a folder in the projects folder that contains a Cargo.toml; use the `projects` tool to list them. A plain folder name only: paths, `..` and absolute paths are rejected. Anything else fails with exit code 2.",
+    description: concat!("Project name. Must be `broadsword` (this repository) or the name of a folder in the projects folder that contains a Cargo.toml; use the `projects` tool to list them. A plain folder name only: paths, `..` and absolute paths are rejected. Anything else fails with exit code 2.", NO_DASH!()),
 };
 
 const TASK: Param = Param {
     name: "task",
     ty: Ty::String,
     required: false,
-    description: "The id of a task (see `task_list`) to run in that task's own worktree instead of the project's main checkout. The task must be `running`, belong to `project` and have a worktree (`task_start` with `worktree`) that really is a git worktree of the project. Omit it to use the main checkout. An unknown task id fails with exit code 2; a task that may not be used fails with exit code 3 and nothing runs.",
+    description: concat!("The id of a task (see `task_list`) to run in that task's own worktree instead of the project's main checkout. The task must be `running`, belong to `project` and have a worktree (`task_start` with `worktree`) that really is a git worktree of the project. Omit it to use the main checkout. An unknown task id fails with exit code 2; a task that may not be used fails with exit code 3 and nothing runs.", NO_DASH!()),
 };
 
 /// The paragraph about `task` and the shared build folder that `build`, `test` and `check` all end with.
@@ -197,7 +219,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "cleanup",
         summary: "Free disk space now: old scratch files, oversized logs, and old build artifacts if cargo-sweep is installed.",
-        description: "Runs one disk cleanup pass: deletes files in the scratch folder older than scratch_max_age_hours, cuts every *.log file in scratch to its last log_max_mb, and runs `cargo sweep --time 7` on the shared build folder only if the cargo-sweep program is installed (if it is not, the report says `cargo-sweep not installed, skipped` and the other steps still run, so do not count on old build output being freed). If free space is still below the disk floor afterwards, it writes the pause file and sends the configured alert, which makes every job refuse to start until the `resume` tool succeeds. Use it when `status` shows low disk. It deletes only expired scratch files and, when cargo-sweep is installed, build artifacts older than 7 days (never project source, state or job records), so it is safe to repeat. It does not touch any project's working tree.",
+        description: "Runs one disk cleanup pass: deletes files in the scratch folder older than scratch_max_age_hours, cuts every *.log file in scratch to its last log_max_mb, and runs `cargo sweep --time N` (N = sweep_older_than_days) on the shared build folder only if the cargo-sweep program is installed (if it is not, the report starts with `WARNING: cargo-sweep is NOT installed, so the build folder was NOT swept` and the other steps still run, so do not count on old build output being freed; Broadsword never installs it). If free space is still below the disk floor afterwards, it writes the pause file and sends the configured alert, which makes every job refuse to start until the `resume` tool succeeds. Use it when `status` shows low disk. A job that is killed or refused because free space fell below the floor runs this same pass by itself, once, before it pauses, and pauses only if space is still below the floor. It deletes only expired scratch files and, when cargo-sweep is installed, build artifacts unused for sweep_older_than_days days (never project source, state or job records), so it is safe to repeat. It does not touch any project's working tree.",
         params: &[],
         outputs: "A report: the cargo sweep result (or that it was skipped), each deleted file and capped log, bytes freed, free space before and after, and `PAUSED: still below the floor` if it paused Broadsword.",
         exit_codes: &[E0],
@@ -363,7 +385,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. SECRET FILES ARE NEVER SAVED: any file whose name starts with `.env` (`.env`, `.env.local`, `sub/.env`, `.envrc`; any depth, any letter case) is not stored in the checkpoint, and rollback never restores, overwrites or deletes it, so after a rollback it keeps whatever bytes it has then; the job record lists such files by name only (`secret_skipped`). Other git-ignored files are saved (up to checkpoint_ignored_max_mb) and restored. If Broadsword is killed mid-run, `recover <job id>` rolls that one run's files back to the checkpoint (plain `recover` only lists it, and no other job's files are touched), and until then new jobs in the same source folder (the main checkout, or that task's worktree) are refused; jobs in other worktrees of the project are not. A panic inside a `run` job (a Broadsword bug) leaves it interrupted the same way, after killing its command. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. SECRET FILES ARE NEVER SAVED: any file whose name starts with `.env` (`.env`, `.env.local`, `sub/.env`, `.envrc`; any depth, any letter case) is not stored in the checkpoint, and rollback never restores, overwrites or deletes it, so after a rollback it keeps whatever bytes it has then; the job record lists such files by name only (`secret_skipped`). Other git-ignored files are saved (up to checkpoint_ignored_max_mb) and restored. If Broadsword is killed mid-run, `recover <job id>` rolls that one run's files back to the checkpoint (plain `recover` only lists it, and no other job's files are touched), and until then new jobs in the same source folder (the main checkout, or that task's worktree) are refused; jobs in other worktrees of the project are not. A panic inside a `run` job (a Broadsword bug) leaves it interrupted the same way, after killing its command. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and BEFORE the command starts it makes the same preparation as `build`, `test` and `check`: every package of the folder whose build-source note names another checkout (or has none) gets `cargo clean -p <package>`, so a `cargo test` inside the command tests THIS folder's code and not the binary another worktree left in the shared build folder (if the folder's packages cannot be listed, for example because its Cargo.toml is broken, the job still runs and says the protection was skipped; a failing `cargo clean` refuses the job with exit 1). Then, and again when the command ends (also in case Broadsword is killed), it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source, so a `run` build is never installable. Apart from that `cargo clean -p`, `run` deletes nothing in the build folder; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
         params: &[
             PROJECT,
             TASK,
@@ -380,7 +402,7 @@ pub static TOOLS: &[Tool] = &[
             ExitDoc { code: "1", meaning: "the command exited 1 or failed without a usable code, or Broadsword could not set the job up (log or record could not be written)" },
             ExitDoc { code: "2", meaning: "Broadsword: unknown project name, or with `task` no task with that id; or the command itself exited 2" },
             ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken (a `run` only); an earlier interrupted run in the same source folder still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project); or the command itself exited 3" },
-            ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, and is now paused; or the command itself exited 4" },
+            ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, ran one cleanup pass, and is now paused unless that freed enough space; or the command itself exited 4" },
             ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: Broadsword's own verdict is the last `run:` line (`run: ok` or `run: FAILED (exit N)`) after the final `--- summary ---` line on stdout; the command may print a fake one itself, so only the last counts. If there is no such line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
         ],
         read_only: false,
@@ -428,7 +450,7 @@ pub static TOOLS: &[Tool] = &[
                 name: "id",
                 ty: Ty::String,
                 required: false,
-                description: "The exact id of one interrupted `run` job to roll back (see the list this tool prints, or the `jobs` tool). Without it nothing is rolled back. Not together with `all`.",
+                description: concat!("The exact id of one interrupted `run` job to roll back (see the list this tool prints, or the `jobs` tool). Without it nothing is rolled back. Not together with `all`.", NO_DASH!()),
             },
             Param {
                 name: "all",
@@ -490,7 +512,7 @@ pub static TOOLS: &[Tool] = &[
             name: "id",
             ty: Ty::String,
             required: true,
-            description: "The exact job id, as shown in the first column of the `jobs` tool's output.",
+            description: concat!("The exact job id, as shown in the first column of the `jobs` tool's output.", NO_DASH!()),
         }],
         outputs: "A confirmation that the job was abandoned and no file changed, then the checkpoint refs saved for it and a git command to compare files.",
         exit_codes: &[
@@ -536,7 +558,7 @@ pub static TOOLS: &[Tool] = &[
         summary: "List these tools, or describe one in full.",
         description: "Returns this registry: every tool Broadsword offers, with its inputs, outputs, exit codes and flags. Give a tool name to get that one tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get JSON instead of text: the same tool objects an MCP client already sees in tools/list. Use it to re-check what Broadsword can do. It only reads and returns immediately.",
         params: &[
-            Param { name: "name", ty: Ty::String, required: false, description: "Show only this tool, in full. Omit to list all tools. An unknown name fails with exit code 2." },
+            Param { name: "name", ty: Ty::String, required: false, description: concat!("Show only this tool, in full. Omit to list all tools. An unknown name fails with exit code 2.", NO_DASH!()) },
             Param { name: "json", ty: Ty::Boolean, required: false, description: "Print JSON instead of text: an array of {name, description, inputSchema, annotations, _meta}, or one such object when name is given. The array is what an MCP server puts under the `tools` key of its tools/list result. Default false." },
         ],
         outputs: "The tool list, or one tool in full, as text or (with json) as JSON.",
@@ -716,8 +738,8 @@ pub static TOOLS: &[Tool] = &[
         summary: "List tasks on the board with their status, owner, project, title and claims.",
         description: "Lists the tasks on the task board, oldest first, optionally only those with one status and/or in one project. Use it to see what is open, who is running what and which claims are held (the claims of `running` tasks are the held ones). It only reads and returns immediately.",
         params: &[
-            Param { name: "status", ty: Ty::String, required: false, description: "Show only tasks with this status: open, running, done, failed or abandoned. An unknown status fails with exit code 2." },
-            Param { name: "project", ty: Ty::String, required: false, description: "Show only tasks of this project name. Not checked against the known projects: an unknown name just matches nothing." },
+            Param { name: "status", ty: Ty::String, required: false, description: concat!("Show only tasks with this status: open, running, done, failed or abandoned. An unknown status fails with exit code 2.", NO_DASH!()) },
+            Param { name: "project", ty: Ty::String, required: false, description: concat!("Show only tasks of this project name. Not checked against the known projects: an unknown name just matches nothing.", NO_DASH!()) },
         ],
         outputs: "One tab-separated line per task: id, status, owner (`-` if none), project, title, claims separated by `, `; or `no tasks` / `no tasks match`.",
         exit_codes: &[E0, ExitDoc { code: "1", meaning: "the board could not be read (a task record is unreadable)" }, ExitDoc { code: "2", meaning: "unknown status" }],
@@ -975,7 +997,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "queue_run",
         summary: "Process one queue entry: rebase onto main, check, review by another model, fast-forward merge, check main, finish the task. (destructive, spends money)",
-        description: "Takes the oldest entry that is interrupted (`running` with no process behind it), else the oldest `queued` or `stale` one (or the one named by `entry`: queued, running-but-interrupted, stale or blocked) and runs it through the pipeline, one entry at a time (an OS file lock, state/queue/queue.lock; a second call waits queue_lock_wait_seconds, then exits 4). STEPS, each recorded in the entry before it is relied on: (1) preconditions: the task is still running, the main checkout of the project is clean (`git status --porcelain`) and on a branch, the task's worktree is clean (uncommitted and untracked changes; ignored files such as an ignored .env do not count, they only make `task done` keep the worktree), the reviewer model for the risk differs from the entry's coder model, and the branch has a commit main lacks; if one fails the entry is `blocked` and nothing was changed. (2) rebase: `git rebase <main HEAD>` inside the task's worktree, skipped if the branch already contains main's HEAD; the pre-rebase tip is first saved in the entry and, create-only, under refs/broadsword/queue/<entry>/pre-rebase; on a conflict the rebase is ABORTED, the branch tip is verified to be exactly what it was, and the entry is `conflict` naming the files. (3) check: `check <project> --task <id>` (the same job as the `check` tool: disk guard, build lock, notes, log); if it fails the entry is `check_failed` and NO model is asked. (4) review: the reviewer model (reviewer_model_low or reviewer_model_high by risk, through the reviewer_backend setting, `claude` as shipped = the Claude Code CLI run headless, one turn, no tools, in a folder under scratch with no CLAUDE.md, with every environment variable named *_API_KEY, *_KEY, *_TOKEN, *_SECRET, *_PAT, *_PASSWORD, *_PASS, *_CREDENTIAL* or *_AUTH* removed, and every one whose value equals or contains ANY value of the root's .env, whatever its name) gets a fixed reviewer prompt, the brief, the check summary and the end of its output, and the whole diff main-HEAD...task branch (never cut: a diff over reviewer_diff_max_kb makes the entry `blocked`); EVERY value of the root's .env (6 characters or longer; shorter ones are only kept out of the environment) and every secret-named variable's value are replaced by [REDACTED] first, in the prompt and in everything stored in the entry and review file. Limits: a secret split across two diff lines is not redacted, and a .env value that is also ordinary code (REGION=return) is blanked everywhere, hiding that code from the reviewer, so keep .env values distinctive. The check, review and merge are bound to ONE commit: the one the check passed on; a branch that moved after the check makes the entry `stale` (\"branch changed after check\") and nothing is reviewed or merged. THIS CALLS A MODEL: it costs money (about $0.006 for haiku, $0.18 for opus per the benchmark) and uses the network; the CLI program is the reviewer_cli setting, or the env var BROADSWORD_REVIEWER_CLI (a machine-specific path); the RESOLVED PATH is printed and recorded in the entry and the review file every time, the override must point OUTSIDE the project root (like the real Claude install) or inside the root's scratch_dir (a TEST HOOK: it prints `TEST HOOK ACTIVE: reviewer CLI is <path>` and the review is marked test_hook: true), and any other path inside the root, build/ included, is refused; the answer must be the CLI's JSON and its modelUsage must name the requested model family (haiku, sonnet, opus), else it is a FAIL; at most reviewer_max_calls_per_entry calls are made per entry (then `blocked`, \"review call cap reached\"); a call longer than reviewer_timeout_seconds is killed and the entry is `blocked` (no verdict). The answer must follow `VERDICT: PASS|FAIL`, `BLOCKING:` lines and `MINOR:` lines; an answer that does not is a FAIL, and a PASS needs an explicit `BLOCKING: none` and no blocking finding (an empty `BLOCKING:` header followed by findings is a FAIL). The full raw output, cost and tokens are saved in state/queue/<entry>.review. A FAIL makes the entry `rejected`: the task stays running and its worktree is kept so the coder can fix, commit and `queue_add` again. (5) merge, on PASS only (a review made by a TEST HOOK reviewer never merges into a project whose folder is outside scratch_dir: the entry is `blocked`; the reviewer CLI's resolved path is printed and logged at the merge; LIMIT: an override that points outside the root is trusted as a real reviewer, because nothing can prove a program there is not a stand-in; a resumed entry whose recorded verdict is not PASS ends `rejected`, and one whose PASS does not name the checked commit ends `stale`): `git merge --ff-only` of the exact reviewed commit into the main checkout (never a merge commit); if main or the branch moved since the rebase the entry is `stale` and nothing is merged (call again to rebase again). (6) `check <project>` on main; if it fails, which should not happen, main is NOT reset: the entry is `merged_check_failed` with a loud message naming the commit, and a human decides. (7) `task done`, which removes the worktree and branch under its usual safety rules; the entry is `merged` with main's commit. NEVER uses --force, -D, reset --hard or push. NOT IDEMPOTENT, DESTRUCTIVE (it rewrites the task branch, moves main's branch forward and removes the worktree), and LONG-RUNNING (a check plus a review take minutes; over MCP the call blocks and is killed after the mcp_call_timeout_seconds setting, 1800 s as shipped, leaving the entry `running` for the next call to resume). CRASH AND RESUME: every step is recorded, so if the process dies the entry stays `running`; the next `queue_run` resumes it from the recorded step (a half-done rebase is aborted first, a recorded verdict is not asked for again, a fast-forward that already happened is recorded, not repeated). The task-board lock is never held during any of this; `task done` takes it for a moment. Every outcome except `merged` exits non-zero with a one-line reason and the entry id on stderr.",
+        description: "Takes the oldest entry that is interrupted (`running` with no process behind it), else the oldest `queued` or `stale` one (or the one named by `entry`: queued, running-but-interrupted, stale or blocked) and runs it through the pipeline, one entry at a time (an OS file lock, state/queue/queue.lock; a second call waits queue_lock_wait_seconds, then exits 4). STEPS, each recorded in the entry before it is relied on: (1) preconditions: the task is still running, the main checkout of the project is clean (`git status --porcelain`) and on a branch, the task's worktree is clean (uncommitted and untracked changes; ignored files such as an ignored .env do not count, they only make `task done` keep the worktree), the reviewer model for the risk differs from the entry's coder model, and the branch has a commit main lacks; if one fails the entry is `blocked` and nothing was changed. (2) rebase: `git rebase <main HEAD>` inside the task's worktree, skipped if the branch already contains main's HEAD; the pre-rebase tip is first saved in the entry and, create-only, under refs/broadsword/queue/<entry>/pre-rebase; on a conflict the rebase is ABORTED, the branch tip is verified to be exactly what it was, and the entry is `conflict` naming the files. (3) check: `check <project> --task <id>` (the same job as the `check` tool: disk guard, build lock, notes, log); if it fails the entry is `check_failed` and NO model is asked. (4) review: the reviewer model (reviewer_model_low or reviewer_model_high by risk, through the reviewer_backend setting, `claude` as shipped = the Claude Code CLI run headless, one turn, no tools, in a folder under scratch with no CLAUDE.md, with every environment variable named *_API_KEY, *_KEY, *_TOKEN, *_SECRET, *_PAT, *_PASSWORD, *_PASS, *_CREDENTIAL* or *_AUTH* removed, and every one whose value equals or contains ANY value of the root's .env, whatever its name) gets a fixed reviewer prompt, the brief, the check summary and the end of its output, and the whole diff main-HEAD...task branch (never cut: a diff over reviewer_diff_max_kb makes the entry `blocked`); EVERY value of the root's .env (redact_min_chars characters or longer, 6 as shipped; shorter ones are only kept out of the environment) and every secret-named variable's value are replaced by [REDACTED] first, in the prompt and in everything stored in the entry and review file. Limits: a secret split across two diff lines is not redacted, and a .env value that is also ordinary code (REGION=return) is blanked everywhere, hiding that code from the reviewer, so keep .env values distinctive. The check, review and merge are bound to ONE commit: the one the check passed on; a branch that moved after the check makes the entry `stale` (\"branch changed after check\") and nothing is reviewed or merged. THIS CALLS A MODEL: it costs money (about $0.006 for haiku, $0.18 for opus per the benchmark) and uses the network; the CLI program is the reviewer_cli setting, or the env var BROADSWORD_REVIEWER_CLI (a machine-specific path); the RESOLVED PATH is printed and recorded in the entry and the review file every time, the override must point OUTSIDE the project root (like the real Claude install) or inside the root's scratch_dir (a TEST HOOK: it prints `TEST HOOK ACTIVE: reviewer CLI is <path>` and the review is marked test_hook: true), and any other path inside the root, build/ included, is refused; the answer must be the CLI's JSON and its modelUsage must name the requested model family (haiku, sonnet, opus), else it is a FAIL; at most reviewer_max_calls_per_entry calls are made per entry (then `blocked`, \"review call cap reached\"); a call longer than reviewer_timeout_seconds is killed and the entry is `blocked` (no verdict). The answer must follow `VERDICT: PASS|FAIL`, `BLOCKING:` lines and `MINOR:` lines; an answer that does not is a FAIL, and a PASS needs an explicit `BLOCKING: none` and no blocking finding (an empty `BLOCKING:` header followed by findings is a FAIL). The full raw output, cost and tokens are saved in state/queue/<entry>.review. A FAIL makes the entry `rejected`: the task stays running and its worktree is kept so the coder can fix, commit and `queue_add` again. (5) merge, on PASS only (a review made by a TEST HOOK reviewer never merges into a project whose folder is outside scratch_dir: the entry is `blocked`; the reviewer CLI's resolved path is printed and logged at the merge; LIMIT: an override that points outside the root is trusted as a real reviewer, because nothing can prove a program there is not a stand-in; a resumed entry whose recorded verdict is not PASS ends `rejected`, and one whose PASS does not name the checked commit ends `stale`): `git merge --ff-only` of the exact reviewed commit into the main checkout (never a merge commit); if main or the branch moved since the rebase the entry is `stale` and nothing is merged (call again to rebase again). (6) `check <project>` on main; if it fails, which should not happen, main is NOT reset: the entry is `merged_check_failed` with a loud message naming the commit, and a human decides. (7) `task done`, which removes the worktree and branch under its usual safety rules; the entry is `merged` with main's commit. NEVER uses --force, -D, reset --hard or push. NOT IDEMPOTENT, DESTRUCTIVE (it rewrites the task branch, moves main's branch forward and removes the worktree), and LONG-RUNNING (a check plus a review take minutes; over MCP the call blocks and is killed after the mcp_call_timeout_seconds setting, 1800 s as shipped, leaving the entry `running` for the next call to resume). CRASH AND RESUME: every step is recorded, so if the process dies the entry stays `running`; the next `queue_run` resumes it from the recorded step (a half-done rebase is aborted first, a recorded verdict is not asked for again, a fast-forward that already happened is recorded, not repeated). The task-board lock is never held during any of this; `task done` takes it for a moment. Every outcome except `merged` exits non-zero with a one-line reason and the entry id on stderr.",
         params: &[QUEUE_RUN_ENTRY],
         outputs: "Progress lines `queue entry <id>: step <name>`, the check job's own output, then one final line: `queue entry <id>: merged: ...` on stdout, or `broadsword: queue entry <id> is <status>: <reason>` on stderr (`broadsword: LOUD: ...` for merged_check_failed). The reviewer's full answer is in state/queue/<id>.review (see `queue_show`). `the queue is empty` and exit 0 when there is nothing to run.",
         exit_codes: &[
@@ -1033,44 +1055,44 @@ pub static TOOLS: &[Tool] = &[
     },
 ];
 
-const QUEUE_TASK: Param = Param { name: "task", ty: Ty::String, required: true, description: "The id of the task whose branch `task/<id>` is queued (see `task_list`). It must be `running` with a clean worktree and at least one commit beyond its base." };
+const QUEUE_TASK: Param = Param { name: "task", ty: Ty::String, required: true, description: concat!("The id of the task whose branch `task/<id>` is queued (see `task_list`). It must be `running` with a clean worktree and at least one commit beyond its base.", NO_DASH!()) };
 const QUEUE_RISK: Param = Param {
     name: "risk",
     ty: Ty::String,
     required: true,
-    description: "`low` or `high`: picks the reviewer model (the reviewer_model_low or reviewer_model_high setting). Use `high` for deleting or rewriting files, locks, secrets, or anything that runs before or instead of a safety check; `low` for the rest. Anything else fails with exit code 2.",
+    description: concat!("`low` or `high`: picks the reviewer model (the reviewer_model_low or reviewer_model_high setting). Use `high` for deleting or rewriting files, locks, secrets, or anything that runs before or instead of a safety check; `low` for the rest. Anything else fails with exit code 2.", NO_DASH!()),
 };
-const QUEUE_CODER: Param = Param { name: "coder", ty: Ty::String, required: true, description: "The model name that wrote the code, for example `sonnet`. The reviewer model must differ from it (compared case-insensitively), or `queue_run` blocks the entry." };
+const QUEUE_CODER: Param = Param { name: "coder", ty: Ty::String, required: true, description: concat!("The model name that wrote the code, for example `sonnet`. The reviewer model must differ from it (compared case-insensitively), or `queue_run` blocks the entry.", NO_DASH!()) };
 const QUEUE_BRIEF: Param = Param {
     name: "brief",
     ty: Ty::String,
     required: false,
-    description: "Path of a UTF-8 text file with the brief the reviewer gets: what the task is and its done check. At most reviewer_brief_max_kb KB; a file whose name starts with `.env` is refused. Default: a brief made from the task's title and claims.",
+    description: concat!("Path of a UTF-8 text file with the brief the reviewer gets: what the task is and its done check. At most reviewer_brief_max_kb KB; a file whose name starts with `.env` is refused. Default: a brief made from the task's title and claims.", NO_DASH!()),
 };
-const QUEUE_ENTRY: Param = Param { name: "entry", ty: Ty::String, required: true, description: "The exact queue entry id, as printed by `queue_add` and shown in the first column of `queue_list`." };
+const QUEUE_ENTRY: Param = Param { name: "entry", ty: Ty::String, required: true, description: concat!("The exact queue entry id, as printed by `queue_add` and shown in the first column of `queue_list`.", NO_DASH!()) };
 const QUEUE_RUN_ENTRY: Param = Param {
     name: "entry",
     ty: Ty::String,
     required: false,
-    description: "Run this entry (it must be queued, interrupted, stale or blocked) instead of the oldest one. Omit it to take the oldest interrupted entry, else the oldest queued or stale one. An unknown id or a finished entry fails with exit code 2.",
+    description: concat!("Run this entry (it must be queued, interrupted, stale or blocked) instead of the oldest one. Omit it to take the oldest interrupted entry, else the oldest queued or stale one. An unknown id or a finished entry fails with exit code 2.", NO_DASH!()),
 };
 
 const TASK_PROJECT: Param = Param {
     name: "project",
     ty: Ty::String,
     required: true,
-    description: "Project the task works in: `broadsword` or the name of a folder in the projects folder that contains a Cargo.toml (use the `projects` tool to list them). Matched case-insensitively and stored under the folder's real name; a trailing dot or space is rejected. Claims are relative to this project's root. Anything else fails with exit code 2.",
+    description: concat!("Project the task works in: `broadsword` or the name of a folder in the projects folder that contains a Cargo.toml (use the `projects` tool to list them). Matched case-insensitively and stored under the folder's real name; a trailing dot or space is rejected. Claims are relative to this project's root. Anything else fails with exit code 2.", NO_DASH!()),
 };
-const TASK_TITLE: Param = Param { name: "title", ty: Ty::String, required: true, description: "A short title saying what the task does. Must not be empty; whitespace runs are collapsed to single spaces." };
+const TASK_TITLE: Param = Param { name: "title", ty: Ty::String, required: true, description: concat!("A short title saying what the task does. Must not be empty; whitespace runs are collapsed to single spaces.", " FREE TEXT: over MCP a value that starts with `-` and a value with line breaks are both accepted (the command line gets it as the single argument after `--title`; whitespace runs, line breaks included, are collapsed). A NUL is refused.") };
 const TASK_CLAIMS: Param = Param {
     name: "claims",
     ty: Ty::StringArray,
     required: true,
     description: "The paths the task will change, each a file or folder relative to the project root (not a pattern): `src`, `src/lib.rs`, or `*` for the whole project. A folder covers everything below it. `/` and `\\` are alike, `.` segments and a trailing slash are ignored, case is ignored on Windows. Absolute paths, `..`, empty strings, `*` or `?` inside a path, `:`, and names ending in a dot or space are rejected. Compared lexically as text: 8.3 short names, junctions and symlinks are not resolved, so claim the real path. At least one. On the command line each one is its own `--claim <path>`.",
 };
-const TASK_ID: Param = Param { name: "id", ty: Ty::String, required: true, description: "The exact task id, as printed by `task_add` and shown in the first column of `task_list`." };
-const TASK_OWNER: Param = Param { name: "owner", ty: Ty::String, required: true, description: "Free text naming who runs the task, for example `coder-1`. Shown in conflict messages so others know whom to wait for. Must not be empty." };
-const TASK_NOTE: Param = Param { name: "note", ty: Ty::String, required: false, description: "A short note stored with the task, for example what was merged or why it failed. Whitespace runs are collapsed. Default: none." };
+const TASK_ID: Param = Param { name: "id", ty: Ty::String, required: true, description: concat!("The exact task id, as printed by `task_add` and shown in the first column of `task_list`.", NO_DASH!()) };
+const TASK_OWNER: Param = Param { name: "owner", ty: Ty::String, required: true, description: concat!("Free text naming who runs the task, for example `coder-1`. Shown in conflict messages so others know whom to wait for. Must not be empty.", NO_DASH!()) };
+const TASK_NOTE: Param = Param { name: "note", ty: Ty::String, required: false, description: concat!("A short note stored with the task, for example what was merged or why it failed. Whitespace runs are collapsed. Default: none.", " FREE TEXT: over MCP a value that starts with `-` and a value with line breaks are both accepted (the command line gets it as the single argument after `--note`; whitespace runs, line breaks included, are collapsed). A NUL is refused.") };
 const TASK_WORKTREE: Param = Param {
     name: "worktree",
     ty: Ty::Boolean,
@@ -1183,7 +1205,7 @@ const JOB_EXITS: &[ExitDoc] = &[
     ExitDoc { code: "1", meaning: "a step failed (see the log), or the job could not be set up (log or record could not be written; or `cargo metadata` or `cargo clean -p` failed, so the shared build folder could not be made safe and nothing was built)" },
     ExitDoc { code: "2", meaning: "unknown project name (stderr lists the known projects), or with `task` no task with that id" },
     ExitDoc { code: "3", meaning: "refused, nothing built or cleaned: Broadsword is paused, free disk minus the reserve is below the floor, an earlier interrupted run in the same source folder still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project; or the build lock was not free within build_lock_wait_seconds (`build folder busy`: repeat later)" },
-    ExitDoc { code: "4", meaning: "killed: free disk fell below the floor while the job ran, and Broadsword is now paused" },
+    ExitDoc { code: "4", meaning: "killed: free disk fell below the floor while the job ran; Broadsword ran one cleanup pass, and is now paused unless that freed enough space" },
 ];
 
 fn parse_tools(a: &[&str]) -> Option<Inputs> {
@@ -1279,7 +1301,7 @@ fn cmd_watch(cfg: &Config) -> Result<(), String> {
     let mut last = Instant::now();
     run_cleanup(cfg);
     loop {
-        std::thread::sleep(Duration::from_secs(cfg.disk_check_every_seconds.max(1)));
+        std::thread::sleep(Duration::from_secs(cfg.disk_check_every_seconds));
         let free = free_now(cfg);
         if pause::below_floor(free, cfg.floor_bytes()) {
             println!("[{}] free space {} below floor, running cleanup", pause::now_string(), pause::gb(free));
@@ -1692,6 +1714,60 @@ mod tests {
         assert_eq!(ok.args, ["run", "p", "--", "cargo", "--version"]);
         // a plain id still passes
         assert!(prepare_call(Some(&parse(r#"{"name":"recover","arguments":{"id":"20261117-120000-ab12"}}"#).unwrap())).is_ok());
+    }
+
+    #[test]
+    fn free_text_parameters_accept_a_leading_dash_and_line_breaks_and_the_cli_parses_them_back() {
+        use crate::mcp::prepare_call;
+        // legitimate text over MCP: a list-style title, a multi-line note
+        let call = r#"{"name":"task_add","arguments":{"project":"p","title":"- fix x\n- and y","claims":["src"]}}"#;
+        let ok = prepare_call(Some(&parse(call).unwrap())).unwrap_or_else(|e| panic!("{e:?}"));
+        let args: Vec<&str> = ok.args.iter().map(String::as_str).collect();
+        assert_eq!(args[..5], ["task", "add", "p", "--title", "- fix x\n- and y"]);
+        let (tool, inputs) = resolve(&args).expect("the command line the child gets parses back");
+        assert_eq!((tool.name, inputs.str("title")), ("task_add", Some("- fix x\n- and y")));
+        for call in [
+            r#"{"name":"task_done","arguments":{"id":"t-1","note":"--merged\nline two"}}"#,
+            r#"{"name":"task_fail","arguments":{"id":"t-1","note":"-x"}}"#,
+        ] {
+            let ok = prepare_call(Some(&parse(call).unwrap())).unwrap_or_else(|e| panic!("{call}: {e:?}"));
+            let args: Vec<&str> = ok.args.iter().map(String::as_str).collect();
+            let (tool, inputs) = resolve(&args).unwrap_or_else(|| panic!("{args:?} must parse back"));
+            assert!(tool.name.starts_with("task_") && inputs.str("note").is_some_and(|n| n.starts_with(['-']) || n.contains('\n')), "{args:?}");
+        }
+        // the refusal stays everywhere else: a NUL anywhere, a leading dash or line break in a plain value (names, ids, owner)
+        for (call, param) in [
+            (r#"{"name":"task_add","arguments":{"project":"p","title":"a\u0000b","claims":["src"]}}"#, "title"),
+            (r#"{"name":"task_done","arguments":{"id":"t-1","note":"a\u0000b"}}"#, "note"),
+            (r#"{"name":"task_add","arguments":{"project":"-p","title":"t","claims":["src"]}}"#, "project"),
+            (r#"{"name":"task_add","arguments":{"project":"p\nq","title":"t","claims":["src"]}}"#, "project"),
+            (r#"{"name":"task_done","arguments":{"id":"-t","note":"n"}}"#, "id"),
+            (r#"{"name":"task_start","arguments":{"id":"t-1","owner":"-o"}}"#, "owner"),
+            (r#"{"name":"task_start","arguments":{"id":"t-1","owner":"o\np"}}"#, "owner"),
+            (r#"{"name":"queue_add","arguments":{"task":"t-1","risk":"low","coder":"-c"}}"#, "coder"),
+        ] {
+            match prepare_call(Some(&parse(call).unwrap())) {
+                Err(crate::mcp::Reject::Tool(m)) => assert!(m.contains(&format!("`{param}`")), "{call}: {m}"),
+                other => panic!("{call} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_string_parameter_description_says_which_refusal_rule_applies() {
+        for t in TOOLS {
+            for p in t.params.iter().filter(|p| p.ty == Ty::String) {
+                let free = FREE_TEXT.iter().any(|(tool, name, _)| *tool == t.name && *name == p.name);
+                if free {
+                    assert!(p.description.contains("FREE TEXT") && p.description.contains("starts with `-`"), "{}.{}: {}", t.name, p.name, p.description);
+                } else {
+                    assert!(p.description.contains("must not start with `-`") && p.description.contains("line break"), "{}.{} must document the refusal: {}", t.name, p.name, p.description);
+                }
+            }
+        }
+        for (tool, name, _) in FREE_TEXT {
+            assert!(find(tool).is_some_and(|t| t.params.iter().any(|p| p.name == *name && p.ty == Ty::String)), "FREE_TEXT names {tool}.{name}, which does not exist");
+        }
     }
 
     #[test]
