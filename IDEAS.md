@@ -60,3 +60,8 @@ Ideas outside the current stage go here, not into code. Each one names the stage
   - (b) an instruction-following set: exact format, length limits and forbidden content, scored mechanically.
   Tonight's single runs fit but do not prove it: 6.2-sol scored 5 with the patterns and 9 blind, with 3 unsure; 6.2-astra had 6 extra findings and 2 unsure. Keep the 6.2 models out of gating roles until (a) is in.
 - **Audit follow-up (Opus minors on `bb7375c`, shadow reviewer):** run the shadow AFTER the merge step, or don't hold the merge for it, because it currently runs between the gating PASS and the fast-forward, so a slow shadow (up to 300 s) can make a good entry stale. A shadow file or log write error ends the run as internal with the entry running; make it ERROR and continue. The wrapper exits 2 with no JSON on a bad flag. The wrapper timeout default (600 s) is in code. The model check accepts a prefix (`gpt-5.6-sol-mini` would pass). The .env key path is untested. shadow_report.py unescapes in the wrong order. `codex-*` coders are not treated as OpenAI. Consider service_tier fast for the shadow.
+- **Bench, long-task drift (Lazlo's hypothesis, unproven):** the gpt-6.2-astra reports may come from very long tasks, where a model strays over time, rather than from single prompts. Tonight's benchmarks are all one-shot and can't see this.
+  - Test: an agentic multi-step coding task (the coding bench's planned agentic track) with firm rules stated at step 0: a file never to edit, a signature to keep, run the tests before declaring done.
+  - Check each rule at steps 5, 20 and 50+, and score both the work and the step where each rule first breaks.
+  - Compare gpt-6.2-astra, the sol models and a Claude model, to get a drift curve per model.
+
