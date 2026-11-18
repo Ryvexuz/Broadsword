@@ -59,6 +59,91 @@ fn two_triangles_sharing_an_edge_cover_every_pixel_exactly_once() {
     }
 }
 
+/// The shared-edge golden image, through the real pipeline: `Renderer::render` with culling, the near clip and the
+/// depth test. The camera is set up so that, at depth 3, one world unit is exactly 24 pixels in both directions
+/// (fov_y with tan(fov/2) = 0.5 on a 96 x 72 target), and every vertex sits at a whole number of 1/24 units, so
+/// the projected vertices are the pixel coordinates below to within f32 rounding (far less than the 1/16 pixel
+/// snap). The expected pixels come from the f64 ownership model in `common`, which is independent of the rasterizer.
+#[test]
+fn golden_shared_edge_through_the_renderer_lights_every_pixel_exactly_once() {
+    let (w, h) = (96usize, 72usize);
+    let mut cam = camera(Vec3::new(0.0, 0.0, 0.0), 0.0, 0.0, w, h);
+    cam.fov_y = 2.0 * 0.5f32.atan();
+    let px = [(10.0f64, 8.0f64), (70.0, 14.0), (82.0, 60.0), (14.0, 52.0)]; // a, b, c, d on screen
+    let world = |(x, y): (f64, f64)| [((x - 48.0) / 24.0) as f32, ((36.0 - y) / 24.0) as f32, -3.0];
+    let [a, b, c, d] = px.map(world);
+    let (red, blue, bg) = (0x00D0_3030u32, 0x0030_30D0u32, 0x0010_1018u32);
+    let rc = RefCamera::new(&cam, w, h);
+    let quad_px: Vec<(f64, f64)> = [a, b, c, d].iter().map(|p| rc.project([p[0] as f64, p[1] as f64, p[2] as f64])).collect();
+    // The projection really is the intended pixel grid (otherwise the on-edge pixels below would not be on the edge).
+    for (got, want) in quad_px.iter().zip(&px) {
+        assert!((got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3, "projected {got:?}, wanted {want:?}");
+    }
+    let want_quad = count_ref(w, h, &quad_px);
+
+    // Both diagonals. Triangles are given counter-clockwise as seen from the camera (front faces).
+    for (name, t1, t2) in [("a-c", [a, c, b], [a, d, c]), ("b-d", [a, d, b], [b, d, c])] {
+        let (m1, m2) = (tri_mesh(t1), tri_mesh(t2));
+        let objs = [object(&m1, red), object(&m2, blue)];
+        let forward = render_scene(w, h, &cam, &objs, ambient_only(), None, bg).0;
+        // Drawn in the other order: a pixel drawn by both would change colour, so equal pictures mean none was.
+        let backward = render_scene(w, h, &cam, &[objs[1], objs[0]], ambient_only(), None, bg).0;
+        assert_eq!(forward, backward, "{name}: draw order changed the picture, so a pixel was drawn twice");
+
+        let proj = |t: [[f32; 3]; 3]| -> Vec<(f64, f64)> { t.iter().map(|p| rc.project([p[0] as f64, p[1] as f64, p[2] as f64])).collect() };
+        let (mask1, mask2) = (pixels_ref(w, h, &proj(t1)), pixels_ref(w, h, &proj(t2)));
+        let (r1, r2) = (mask1.iter().filter(|&&m| m).count(), mask2.iter().filter(|&&m| m).count());
+        let union = (0..w * h).filter(|&i| mask1[i] || mask2[i]).count();
+        let overlap = (0..w * h).filter(|&i| mask1[i] && mask2[i]).count();
+        let lit1 = forward.pixels().iter().filter(|&&p| p == red).count();
+        let lit2 = forward.pixels().iter().filter(|&&p| p == blue).count();
+        let lit = lit1 + lit2;
+        let other = forward.pixels().iter().filter(|&&p| p != red && p != blue && p != bg).count();
+        println!(
+            "shared edge golden {name}: model r1 = {r1}, r2 = {r2}, r1 + r2 = {}, union = {union}, overlap = {overlap}, quad = {want_quad}; \
+             rendered red = {lit1}, blue = {lit2}, lit total = {lit}, other colours = {other}",
+            r1 + r2
+        );
+        assert_eq!(overlap, 0, "{name}: the model says no pixel belongs to both triangles");
+        assert_eq!(union, r1 + r2);
+        assert_eq!(r1 + r2, want_quad, "{name}: the two triangles together own exactly the quad's pixels");
+        assert_eq!(other, 0);
+        assert_eq!((lit1, lit2), (r1, r2), "{name}: each triangle lights exactly its own exact count");
+        assert_eq!(lit, r1 + r2, "{name}: lit pixels = exact count of A + exact count of B");
+        // And pixel for pixel: nothing missed, nothing extra, along the edge or anywhere else.
+        for i in 0..w * h {
+            let want = if mask1[i] { red } else if mask2[i] { blue } else { bg };
+            assert_eq!(forward.pixels()[i], want, "{name}: pixel ({}, {})", i % w, i / w);
+        }
+        // Pixels whose centre lies exactly on the shared edge (integer test on the snapped vertices).
+        let (s, t) = if name == "a-c" { (px[0], px[2]) } else { (px[1], px[3]) };
+        let on_edge: Vec<(usize, usize)> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let (s, t) = ((snap(s.0), snap(s.1)), (snap(t.0), snap(t.1)));
+                (t.0 - s.0) * (y as i64 * 16 - s.1) - (t.1 - s.1) * (x as i64 * 16 - s.0) == 0
+                    && x as i64 * 16 >= s.0.min(t.0)
+                    && x as i64 * 16 <= s.0.max(t.0)
+            })
+            .collect();
+        println!("shared edge golden {name}: {} pixel centres lie exactly on the shared edge: {on_edge:?}", on_edge.len());
+        assert!(!on_edge.is_empty(), "{name}: the scene must contain pixels exactly on the shared edge");
+        // The two end points are corners of the quad: the top-left rule gives a corner of the quad to the quad only
+        // if the quad owns it, and the model above already agrees with the picture there. Every pixel strictly
+        // between the ends is inside the quad and must be lit, by exactly one of the two triangles.
+        for &(x, y) in &on_edge {
+            let (xs, ys) = (x as f64, y as f64);
+            let is_end = (xs, ys) == s || (xs, ys) == t;
+            if !is_end {
+                assert_ne!(forward.pixels()[y * w + x], bg, "{name}: edge pixel ({x},{y}) was missed");
+            }
+        }
+        if name == "a-c" {
+            check("shared_edge", &forward);
+        }
+    }
+}
+
 #[test]
 fn right_triangles_on_a_square_have_the_closed_form_pixel_counts() {
     // The square [0,n) x [0,n) cut along its diagonal. With the top-left rule the upper-left triangle owns its top
@@ -79,7 +164,9 @@ fn right_triangles_on_a_square_have_the_closed_form_pixel_counts() {
 #[test]
 fn winding_decides_culling_but_not_coverage() {
     let (w, h) = (32, 32);
-    let t = [(3.0, 3.0), (3.0, 25.0), (28.0, 6.5)]; // clockwise as drawn on screen (y down): a front face
+    // Seen on screen (y down) the path t[0] -> t[1] -> t[2] turns counter-clockwise (area0 < 0 in pixel coordinates).
+    // That is the front face: the only winding `Sides::FrontOnly` draws.
+    let t = [(3.0, 3.0), (3.0, 25.0), (28.0, 6.5)];
     let rev = [t[0], t[2], t[1]];
     assert!(fill_triangle(w, h, t, Sides::FrontOnly, |_, _, _| {}), "the front face is drawn");
     assert!(!fill_triangle(w, h, rev, Sides::FrontOnly, |_, _, _| panic!("a back face must not be drawn")));

@@ -133,8 +133,13 @@ Measured on the build machine while it was busy with other jobs: about 8 to 10 m
 integers, so there is no rounding to disagree about. A pixel exactly on an edge belongs to the triangle only if the
 edge is a **top** edge (horizontal, the triangle below it) or a **left** edge (the triangle to its right). The two
 triangles sharing an edge walk it in opposite directions, so exactly one owns each pixel on it: no gaps, no double
-pixels. Zero-area triangles (including exactly edge-on ones) are not drawn. Vertices beyond 2^24 pixels are clamped,
-a limit of the integer maths.
+pixels. Zero-area triangles (including exactly edge-on ones) are not drawn.
+
+Known limitation: a vertex more than 2^24 (16,777,216) pixels from the origin is **clamped** to that range, so the
+integer products stay inside `i64`. This is not clipping. The clamp moves the vertex, which changes the triangle's
+shape, so such a triangle can cover different pixels than the true one. Only the near plane is clipped; there is no
+clipping against the sides of the screen. Triangles whose vertices all lie within 2^24 pixels, however far outside
+the screen, are filled exactly (the tests use corners at 1e6 pixels).
 
 ### Shadow bias
 
@@ -161,12 +166,15 @@ triangle's true (geometric) normal and the light. The three numbers are `BIAS_CO
 `tests/raster.rs`, `tests/shadows.rs`, `tests/mesh.rs`, with an independent model in `tests/common/mod.rs` (f64
 projection, the near-plane clip redone in view space, and a pixel-ownership rule defined by an infinitesimal shift of
 the sample point rather than by the rasterizer's bias form). Golden images: `depth_order`, `near_clip`,
-`sphere_shaded`, `car_shadow`. Each test checks its scene against the model first (exact pixel masks for depth order
-and the near clip; N.L within 3 levels at 5600 sphere pixels; every judged ground pixel of the car scene classed as
+`shared_edge`, `sphere_shaded`, `car_shadow`. Each test checks its scene against the model first (exact pixel masks for depth order
+and the near clip; sphere N.L within 3 levels (10 levels where |N.L| < 0.12, near the terminator) at every sphere pixel inside 0.93 of the outline radius, with the exact count printed by the test; every judged ground pixel of the car scene classed as
 shadow or lit by projecting the car's boxes along the light, with a control that fails when the shadow is moved 0.7 m).
 `two_triangles_sharing_an_edge_cover_every_pixel_exactly_once` prints exact counts: for the 4-point quad, both
 diagonals give triangle counts that sum to the quad's count with no pixel doubled, including pixels exactly on the
-shared edge.
+shared edge. `golden_shared_edge_through_the_renderer_lights_every_pixel_exactly_once` does the same through
+`Renderer::render` (culling, near clip, depth test) with two coloured triangles, in both draw orders, compares the
+rendered picture pixel for pixel with the f64 ownership model, prints r1, r2, their sum, the union and the lit total,
+and locks the picture in as `tests/golden/shared_edge.ppm`.
 
 ## Not done yet
 

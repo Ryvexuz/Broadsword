@@ -15,13 +15,15 @@ const SUBPIXEL: i64 = 16;
 
 /// Screen coordinates beyond this many pixels are clamped. It keeps every edge-function product inside `i64`
 /// (2^24 pixels * 16 = 2^28; a difference is 2^29; a product 2^58), so it is a limit of the integer maths,
-/// not a tuning knob. Only absurdly large triangles are affected.
+/// not a tuning knob. This is NOT clipping: a clamped vertex is moved, so the triangle's shape changes and it can
+/// cover different pixels than the true triangle. Only triangles with a vertex beyond 2^24 pixels are affected.
 const MAX_COORD: f32 = 16_777_216.0;
 
 /// Which triangles `fill_triangle` draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sides {
-    /// Only front faces: counter-clockwise on screen when y points up, which is clockwise in pixel coordinates.
+    /// Only triangles whose vertices p[0] -> p[1] -> p[2] run counter-clockwise as seen on the screen (the edge
+    /// function area is negative in pixel coordinates, y down). Triangles running clockwise on screen are not drawn.
     FrontOnly,
     /// Both. The weights handed to the callback are correct either way.
     Both,
