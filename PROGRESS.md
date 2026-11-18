@@ -147,6 +147,16 @@ Process items:
      Check which bugs are still on main and file fixes.
    - `t-20261118-141428-2`: cost to completion per model (Lazlo's rule: total cost until done, not per call).
    Then the benchmark follow-ups: the credit-blocked OpenAI rows through Codex, Responses API models, per-model token caps, 5x consistency on the gpt-6.2 models, an instruction-following test, a drift test, and labelling the extra single-bug lines.
+   **astra as a merge reviewer** (Lazlo, 2026-11-18):
+   1. Check that `codex exec -m gpt-6.2-astra` works on the plan; tonight's Codex checks covered sol, terra and 6.2-sol only.
+   2. Make gpt-6.2-astra the shadow reviewer (`shadow_reviewer_model`), or alternate it with gpt-5.6-sol by entry, so both get real-merge data.
+   3. After about 15 to 20 shadowed merges with verdicts, compare with the gating reviewers (Haiku for low risk, Opus for high):
+      - real bugs caught;
+      - false alarms that would have blocked a merge;
+      - time;
+      - cost to completion.
+   4. If astra holds up, try it as the gating reviewer for low risk first. High risk keeps an Opus gate until the numbers say otherwise.
+
    **Then move work to GPT** (Lazlo, 2026-11-18): this keeps the Claude plan for orchestration. Once the shadow verdicts and the benchmark re-runs show which GPT models to trust:
    - add a `codex` coder route: `codex exec` with write access inside the task's own worktree only, on the ChatGPT allowance;
    - trial it on one real low-risk task, with Claude as the gating reviewer;
