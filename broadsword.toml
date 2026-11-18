@@ -62,3 +62,5 @@ shadow_reviewer = "openai"          # "openai" runs the shadow review after the 
 shadow_reviewer_model = "gpt-5.6-sol"  # the OpenAI model that shadow-reviews (benchmark: 9 of 12 planted bugs, no false alarms)
 shadow_reviewer_timeout_seconds = 300  # a shadow call that runs longer is killed and recorded as shadow_verdict = ERROR; the merge goes on
 
+# Merge queue check kind: a diff whose every path matches is checked by the light check (Python tests in the touched folders that hold test_*.py, plus `cargo build`, no Rust tests); anything else, and any mixed diff, gets the full check (build + test). Comma-separated; `folder/` = a prefix at the project root, `*.ext` = that extension anywhere
+light_check_paths = "scripts/,bench/,clients/,docs/,evidence/,*.md"

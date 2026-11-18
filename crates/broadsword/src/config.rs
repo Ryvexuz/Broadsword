@@ -122,6 +122,26 @@ pub struct Config {
     /// A `.env` or secret-named value shorter than this many characters is not redacted from text (it would blank ordinary words);
     /// it is still kept out of every child's environment.
     pub redact_min_chars: u64,
+    /// The merge queue's light check: a diff whose every path matches one of these is checked with the Python tests and a build only.
+    /// An entry ending in `/` is a folder prefix at the project root (`docs/`); an entry starting with `*.` matches a file extension
+    /// anywhere (`*.md`).
+    pub light_check_paths: Vec<String>,
+}
+
+/// `light_check_paths`: comma-separated entries, each a folder prefix ending in `/` or an extension pattern `*.ext`.
+fn parse_light_paths(v: &str) -> Result<Vec<String>, String> {
+    let list: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+    if list.iter().any(|e| e.is_empty()) {
+        return Err("light_check_paths: must be a comma-separated list with no empty entry (at least one entry)".into());
+    }
+    for e in &list {
+        let folder = e.ends_with('/') && e.len() > 1 && !e.starts_with('/') && !e.contains("..") && !e.contains('\\');
+        let ext = e.strip_prefix("*.").is_some_and(|x| !x.is_empty() && !x.contains(['/', '\\', '*']));
+        if !folder && !ext {
+            return Err(format!("light_check_paths: `{e}` must be a folder prefix ending in `/` (docs/) or an extension pattern (*.md)"));
+        }
+    }
+    Ok(list)
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -215,7 +235,9 @@ impl Config {
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
+        let light_check_paths = parse_light_paths(&get_str(&m, "light_check_paths")?)?;
         Ok(Config {
+            light_check_paths,
             shadow_reviewer,
             shadow_reviewer_model: model("shadow_reviewer_model")?,
             shadow_reviewer_timeout_seconds: positive("shadow_reviewer_timeout_seconds")?,
@@ -354,6 +376,7 @@ mod tests {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
+light_check_paths = \"docs/,*.md\"
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
@@ -424,10 +447,25 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn light_check_paths_is_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert_eq!(c.light_check_paths, ["scripts/", "bench/", "clients/", "docs/", "evidence/", "*.md"]);
+        let e = Config::from_text(&without_key(text, "light_check_paths"), Path::new("p")).unwrap_err();
+        assert!(e.contains("light_check_paths") && e.contains("missing"), "{e}");
+        let with = |v: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "light_check_paths") { format!("light_check_paths = \"{v}\"") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&with("docs/,*.md"), Path::new("p")).is_ok());
+        for bad in ["", "docs", "docs/,", "/abs/", "a/../b/", "*", "*.", "*.a/b", "docs\\\\"] {
+            assert!(Config::from_text(&with(bad), Path::new("p")).is_err(), "light_check_paths `{bad}` must be refused");
+        }
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
+light_check_paths = \"docs/,*.md\"
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
@@ -467,6 +505,7 @@ worktrees_dir = \"worktrees\"\n";
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
+light_check_paths = \"docs/,*.md\"
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"

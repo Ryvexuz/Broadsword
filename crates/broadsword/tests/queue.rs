@@ -104,6 +104,7 @@ impl Root {
              recover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
+light_check_paths = \"scripts/,bench/,clients/,docs/,evidence/,*.md\"
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = {timeout_s}\n\
              reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\nreviewer_max_calls_per_entry = 3
 shadow_reviewer = \"{shadow}\"\nshadow_reviewer_model = \"gpt-5.6-sol\"\nshadow_reviewer_timeout_seconds = {shadow_timeout_s}
@@ -378,6 +379,64 @@ fn happy_path_rebases_onto_a_moved_main_checks_reviews_and_merges() {
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 0);
     assert!(o.stdout.contains("queue is empty"), "{}", o.stdout);
+}
+
+// ---- the check fits the diff ----------------------------------------------------------------
+
+const PY_OK: &str = "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1 + 1, 2)\n\nif __name__ == '__main__':\n    unittest.main()\n";
+const PY_BAD: &str = "import unittest\n\nclass T(unittest.TestCase):\n    def test_bad(self):\n        self.assertEqual(1 + 1, 3)\n";
+
+#[test]
+fn light_check_runs_for_a_docs_and_python_only_diff_and_is_recorded_and_shown_to_the_reviewer() {
+    let r = Root::new("light", 30);
+    let id = r.started("scripts");
+    r.commit(&r.wt(&id), "scripts/test_x.py", PY_OK, "task: python test");
+    r.commit(&r.wt(&id), "docs/notes.md", "# notes\n", "task: docs");
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "queue run failed:\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "merged");
+    assert_eq!(r.field(&entry, "check kind"), "light");
+    assert!(r.field(&entry, "check kind reason").contains("match light_check_paths"), "{}", r.show(&entry));
+    assert!(!r.field(&entry, "check seconds").is_empty());
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(stdin.contains("check kind: light") && stdin.contains("python tests scripts: ok") && stdin.contains("build: ok"), "the reviewer is told which check ran: {stdin}");
+    assert!(!stdin.contains("test: ok"), "no Rust tests ran: {stdin}");
+    assert!(r.show(&entry).contains("light check on main passed"), "{}", r.show(&entry));
+    assert!(r.p().join("scripts/test_x.py").exists());
+}
+
+#[test]
+fn a_failing_light_check_blocks_the_merge_like_a_failing_full_check() {
+    let r = Root::new("lightfail", 30);
+    let id = r.started("scripts");
+    let tip = r.commit(&r.wt(&id), "scripts/test_bad.py", PY_BAD, "task: failing python test");
+    let main_before = r.head();
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "check_failed");
+    assert_eq!(r.field(&entry, "check kind"), "light");
+    assert!(r.show(&entry).contains("python tests scripts: FAILED"), "{}", r.show(&entry));
+    assert_eq!(r.calls(), 0, "no model was asked");
+    assert_eq!(r.head(), main_before, "nothing merged");
+    assert_eq!(r.task_status(&id), "running");
+    assert_eq!(r.branch_tip(&id), tip);
+}
+
+#[test]
+fn a_mixed_diff_gets_the_full_check() {
+    let r = Root::new("mixed", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "docs/notes.md", "# notes\n", "task: docs");
+    r.commit(&r.wt(&id), "src/lib.rs", &lib_with("\npub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n"), "task: add sub");
+    let entry = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "check kind"), "full");
+    assert!(r.field(&entry, "check kind reason").contains("outside light_check_paths"), "{}", r.show(&entry));
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(stdin.contains("check kind: full") && stdin.contains("test: ok") && stdin.contains("build: ok"), "{stdin}");
 }
 
 // ---- the reviewer says FAIL ---------------------------------------------------------------

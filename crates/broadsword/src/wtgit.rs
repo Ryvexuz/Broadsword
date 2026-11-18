@@ -263,6 +263,17 @@ pub fn diff_since(dir: &Path, base: &str, tip: &str) -> Result<String, String> {
     ok(dir, &["diff", "--no-color", "--no-ext-diff", &format!("{base}...{tip}")])
 }
 
+/// `git diff --name-only -z --no-renames <base>...<tip>`: every path the branch changes since it split from `base` (a rename lists
+/// both its old and new path; `-z` so odd names are never quoted). Why: the merge queue picks the light or full check from the paths.
+pub fn diff_names(dir: &Path, base: &str, tip: &str) -> Result<Vec<String>, String> {
+    let range = format!("{base}...{tip}");
+    let o = run(dir, &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", &range])?;
+    if o.code != 0 {
+        return Err(format!("git diff --name-only {range} failed: {}", without_force_hints(&o.stderr)));
+    }
+    Ok(o.stdout.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+}
+
 /// `git rev-parse --path-format=absolute --git-path rebase-merge` (and `rebase-apply`), then does that folder exist? Git
 /// keeps the state of a rebase that is stopped or was killed there. Why: a crashed `queue run` may have left a worktree
 /// in the middle of a rebase, which must be aborted before anything else touches it.

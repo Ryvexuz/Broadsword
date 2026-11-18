@@ -26,6 +26,13 @@
 //! Exit codes of `queue run`: 0 merged, 1 internal error (the entry stays `running`, resumable), 2 bad input, 3 blocked /
 //! conflict / stale, 4 queue busy, 5 rejected / check_failed, 6 merged_check_failed.
 //!
+//! CHECK KIND. The check fits the diff `base...tip` (see `classify_check`): when EVERY changed path matches `light_check_paths`
+//! (broadsword.toml: scripts/, docs/, *.md, ...) the check is `light` (`python -I -B -m unittest discover` in each changed folder
+//! that holds `test_*.py`, then `cargo build`, no Rust tests); anything else, a mixed diff included, is `full` (build and test).
+//! The kind and the reason are recorded in the entry (`check_kind`, `check_kind_reason`, `check_secs`) and the first line of the
+//! check summary the reviewer reads. A failing light check blocks the merge exactly like a failing full check. The check on main
+//! after the merge uses the same kind.
+//!
 //! PIPELINE, steps in this order: preconditions, rebase, check, review, merge, main_check, done. Every step is recorded in the
 //! entry (`step`, the `log` lines, and the facts each step learned) BEFORE its effect is relied on, and every step is safe to
 //! run twice, so any step can be run again from its start.
@@ -208,7 +215,7 @@ fn is_open(status: &str) -> bool {
 }
 
 /// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
-const TEXT_KEYS: [&str; 10] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason"];
+const TEXT_KEYS: [&str; 11] = ["check_kind_reason", "brief","check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason"];
 
 /// What a shadow review records in the entry (cleared on a fresh attempt).
 const SHADOW_KEYS: [&str; 9] = ["shadow_model", "shadow_model_used", "shadow_verdict", "shadow_reason", "shadow_blocking", "shadow_cost_usd", "shadow_tokens", "shadow_secs", "shadow_file"];
@@ -407,6 +414,9 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("reviewer CLI", "reviewer_cli"),
         ("test hook", "test_hook"),
         ("review calls", "review_calls"),
+        ("check kind", "check_kind"),
+        ("check kind reason", "check_kind_reason"),
+        ("check seconds", "check_secs"),
         ("check job", "check_job"),
         ("check exit", "check_exit"),
         ("verdict", "verdict"),
@@ -566,7 +576,7 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
         if e.status() != RUNNING {
             // a fresh attempt: forget what the last attempt learned (its log and review file stay)
             for k in [
-                "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "reviewer_model", "verdict",
+                "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "check_kind", "check_kind_reason", "check_secs", "reviewer_model", "verdict",
                 "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
             ] {
                 e.set(k, "");
@@ -869,15 +879,45 @@ impl<'a> Run<'a> {
         if let Some(code) = tools::guard_refusal(self.cfg, &project, Some(&task_id)) {
             return Err(self.blocked(&format!("the check was refused before it started (exit {code}; the reason is printed above, e.g. Broadsword paused or an interrupted run to recover); nothing changed")));
         }
-        println!("queue entry {}: check {project} --task {task_id}", self.e.id());
         let (dir, branch) = (self.dir.clone(), self.branch());
         let tip_before = self.g(wtgit::branch_tip(&dir, &branch))?;
+        // The check fits the diff: classify the paths the branch changes since main (the rebase made `base_head` its ancestor).
+        let base = self.e.get("base_head").to_string();
+        let paths = self.g(wtgit::diff_names(&dir, &base, &tip_before))?;
+        let (kind, why) = classify_check(&paths, &self.cfg.light_check_paths);
+        self.e.set("check_kind", kind);
+        self.e.set("check_kind_reason", why.clone());
+        self.save()?;
+        println!("queue entry {}: check {project} --task {task_id}: {kind} check ({why})", self.e.id());
+        let started = std::time::Instant::now();
+        let mut lines = vec![format!("check kind: {kind} ({why})")];
+        let mut py_output = String::new();
+        if kind == KIND_LIGHT {
+            let wt = self.wt.clone();
+            let light = match light_python(self.cfg, &wt, &paths) {
+                Ok(l) => l,
+                Err(m) => return Err(self.blocked(&format!("the light check could not run its Python tests: {m}; nothing was merged"))),
+            };
+            lines.extend(light.lines.clone());
+            if !light.ok {
+                self.e.set("check_exit", "1");
+                self.e.set("check_secs", format!("{:.1}", started.elapsed().as_secs_f64()));
+                self.e.set("check_summary", lines.join("\n"));
+                self.e.set("check_tail", cut_tail(&light.output, self.cfg.reviewer_check_tail_kb * 1024));
+                self.save()?;
+                return Err(self.end(CHECK_FAILED, &format!("the light check failed: {}. No model was asked. Fix it, commit, and queue the task again with `queue add`", light.lines.join("; ")), EXIT_REJECTED));
+            }
+            py_output = light.output;
+        }
         let mut info = JobInfo::default();
-        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
-        let summary = info.summary.join("\n");
-        let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
+        let code = job::run_job_info(self.cfg, JobSpec { kind: if kind == KIND_LIGHT { "build" } else { "check" }.into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
+        lines.extend(info.summary.iter().cloned());
+        let summary = lines.join("\n");
+        let job_tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
+        let tail = if py_output.is_empty() { job_tail } else { cut_tail(&format!("{py_output}\n{job_tail}"), self.cfg.reviewer_check_tail_kb * 1024) };
         self.e.set("check_job", info.id.clone().unwrap_or_default());
         self.e.set("check_exit", code.to_string());
+        self.e.set("check_secs", format!("{:.1}", started.elapsed().as_secs_f64()));
         self.e.set("check_summary", summary.clone());
         self.e.set("check_tail", tail);
         self.save()?;
@@ -890,7 +930,7 @@ impl<'a> Run<'a> {
                 }
                 self.e.set("checked_tip", tip_before.clone());
                 self.save()?;
-                self.log("check", &format!("passed on commit {} ({})", short(&tip_before), info.summary.join("; ")))
+                self.log("check", &format!("passed on commit {} ({} check, {} s: {})", short(&tip_before), kind, self.e.get("check_secs"), lines.join("; ")))
             }
             1 if !info.summary.is_empty() => Err(self.end(CHECK_FAILED, &format!("build or tests failed on the rebased branch (job {}): {}. No model was asked. Fix it, commit, and queue the task again with `queue add`", info.id.as_deref().unwrap_or("?"), info.summary.join("; ")), EXIT_REJECTED)),
             c => Err(self.blocked(&format!("the check could not run to a verdict (exit {c}; job {}); nothing was merged; see its output above, fix the cause, then `queue run --entry {}`", info.id.as_deref().unwrap_or("none"), self.e.id()))),
@@ -1205,14 +1245,27 @@ verdict: {} (answer followed the format: {})
         if let Some(code) = tools::guard_refusal(self.cfg, &project, None) {
             return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("the check was refused before it started, exit {code}"), ""), EXIT_MERGED_BAD));
         }
-        println!("queue entry {}: check {project} (the main checkout)", self.e.id());
+        // The same kind the branch was checked with: a light diff (docs, scripts, ...) brought no Rust change to test again.
+        let light = self.e.get("check_kind") == KIND_LIGHT;
+        println!("queue entry {}: {} check {project} (the main checkout)", self.e.id(), if light { KIND_LIGHT } else { KIND_FULL });
+        let mut py_note = String::new();
+        if light {
+            let (base, tip) = (self.e.get("base_head").to_string(), self.e.get("checked_tip").to_string());
+            let dir = self.dir.clone();
+            let paths = self.g(wtgit::diff_names(&dir, &base, &tip))?;
+            match light_python(self.cfg, &dir, &paths) {
+                Ok(l) if l.ok => py_note = format!("{}; ", l.lines.join("; ")),
+                Ok(l) => return Err(self.end(MERGED_CHECK_FAILED, &loud("the light check's Python tests failed".into(), &format!(": {}", l.lines.join("; "))), EXIT_MERGED_BAD)),
+                Err(m) => return Err(self.end(MERGED_CHECK_FAILED, &loud("the light check's Python tests could not run".into(), &format!(": {m}")), EXIT_MERGED_BAD)),
+            }
+        }
         let mut info = JobInfo::default();
-        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
+        let code = job::run_job_info(self.cfg, JobSpec { kind: if light { "build" } else { "check" }.into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
         if code != 0 {
             let extra = if info.summary.is_empty() { String::new() } else { format!(": {}", info.summary.join("; ")) };
             return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("exit {code}, job {}", info.id.as_deref().unwrap_or("none")), &extra), EXIT_MERGED_BAD));
         }
-        self.log("main_check", &format!("check on main passed ({})", info.summary.join("; ")))
+        self.log("main_check", &format!("{} check on main passed ({}{})", if light { KIND_LIGHT } else { KIND_FULL }, py_note, info.summary.join("; ")))
     }
 
     // -- step 7: done -----------------------------------------------------------------------
@@ -1238,6 +1291,115 @@ verdict: {} (answer followed the format: {})
         };
         Ok(self.end(MERGED, &format!("commit {} is on `{}`, check on main passed, task {id} is done; {wt_note}", short(self.e.get("main_sha")), self.e.get("main_branch")), 0))
     }
+}
+
+pub const KIND_LIGHT: &str = "light";
+pub const KIND_FULL: &str = "full";
+
+/// Does `path` (a Git path, `/`-separated) match one `light_check_paths` entry? `folder/` is a prefix; `*.ext` an extension.
+fn is_light_path(path: &str, entry: &str) -> bool {
+    match entry.strip_prefix('*') {
+        Some(ext) => path.to_lowercase().ends_with(&ext.to_lowercase()),
+        None => path.starts_with(entry),
+    }
+}
+
+/// The check kind for a diff and why. `light` only when there is at least one path and EVERY path matches an entry; any other path,
+/// and so any mixed diff, is `full`. An empty list is `full` (nothing proves it safe).
+pub fn classify_check(paths: &[String], light: &[String]) -> (&'static str, String) {
+    if paths.is_empty() {
+        return (KIND_FULL, "the diff lists no changed path, so nothing says it is safe to skip the Rust tests".into());
+    }
+    let outside: Vec<&String> = paths.iter().filter(|p| !light.iter().any(|e| is_light_path(p, e))).collect();
+    if outside.is_empty() {
+        (KIND_LIGHT, format!("all {} changed path(s) match light_check_paths ({}): Python tests and a build, no Rust tests", paths.len(), light.join(", ")))
+    } else {
+        (KIND_FULL, format!("{} of {} changed path(s) are outside light_check_paths, e.g. {}: build and all tests", outside.len(), paths.len(), outside.iter().take(3).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")))
+    }
+}
+
+/// What the Python half of the light check found.
+struct LightRun {
+    ok: bool,
+    /// One summary line per folder tested.
+    lines: Vec<String>,
+    /// The unittest output of every folder, for the review prompt.
+    output: String,
+}
+
+/// The folders to test: every folder that holds a changed path, and each of its parents up to the project root (`.`), that has a
+/// `test_*.py` file. Sorted, each once.
+fn light_folders(dir: &Path, paths: &[String]) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for p in paths {
+        let mut cur = p.as_str();
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            found.insert(parent.to_string());
+            cur = parent;
+        }
+        found.insert(".".to_string());
+    }
+    found
+        .into_iter()
+        .filter(|f| std::fs::read_dir(dir.join(f)).is_ok_and(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("test_") && e.file_name().to_string_lossy().ends_with(".py") && e.path().is_file())))
+        .collect()
+}
+
+/// `python -I -B -m unittest discover -s <folder> -p test_*.py` in each folder from `light_folders`, run in `dir` with the scrubbed
+/// environment. `Err` when python cannot be started at all.
+fn light_python(cfg: &Config, dir: &Path, paths: &[String]) -> Result<LightRun, String> {
+    let folders = light_folders(dir, paths);
+    let mut run = LightRun { ok: true, lines: Vec::new(), output: String::new() };
+    if folders.is_empty() {
+        run.lines.push("python tests: none (no test_*.py in the changed folders)".into());
+        return Ok(run);
+    }
+    for f in folders {
+        let t0 = std::time::Instant::now();
+        let mut result = None;
+        for exe in ["python", "python3"] {
+            let mut c = std::process::Command::new(exe);
+            c.args(["-I", "-B", "-m", "unittest", "discover", "-s", &f, "-p", "test_*.py"]).current_dir(dir).stdin(std::process::Stdio::null());
+            crate::scrub::apply(&mut c, cfg);
+            match c.output() {
+                Ok(o) => {
+                    result = Some(o);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("cannot start {exe}: {e}")),
+            }
+        }
+        let o = result.ok_or("python was not found on PATH (the light check runs the Python tests)")?;
+        let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let ran = text.lines().find_map(|l| l.strip_prefix("Ran ")).unwrap_or("? tests").to_string();
+        let secs = t0.elapsed().as_secs_f64();
+        if o.status.success() {
+            run.lines.push(format!("python tests {f}: ok (Ran {ran}; {secs:.1} s)"));
+        } else {
+            run.ok = false;
+            run.lines.push(format!("python tests {f}: FAILED ({}; Ran {ran}; {secs:.1} s)", o.status.code().map(|c| format!("exit {c}")).unwrap_or_else(|| "terminated".into())));
+        }
+        run.output.push_str(&format!("=== python -I -B -m unittest discover -s {f} ===\n{text}\n"));
+        if !run.ok {
+            break;
+        }
+    }
+    Ok(run)
+}
+
+/// The last `max` bytes of a string, cut at a line start, saying so when it cut.
+fn cut_tail(s: &str, max: u64) -> String {
+    let max = max as usize;
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let rest = s[start..].split_once('\n').map(|(_, r)| r).unwrap_or(&s[start..]);
+    format!("[... earlier output cut: only the last {} KB are shown ...]\n{rest}", max / 1024)
 }
 
 /// The last `max` bytes of a file as text (empty if it cannot be read). Cut at a line start when it cut anything.
@@ -1275,6 +1437,47 @@ mod tests {
         assert!(t.starts_with("[... earlier output cut") && t.ends_with("line three\n") && !t.contains("line one"), "{t}");
         assert_eq!(read_tail(&d.join("missing"), 10), "");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_check_is_light_only_when_every_path_is_light() {
+        let light = s(&["scripts/", "bench/", "clients/", "docs/", "evidence/", "*.md"]);
+        assert_eq!(classify_check(&s(&["scripts/a.py", "scripts/test_a.py"]), &light).0, KIND_LIGHT);
+        assert_eq!(classify_check(&s(&["docs/x.txt", "README.md", "crates/x/NOTES.MD"]), &light).0, KIND_LIGHT);
+        let (k, why) = classify_check(&s(&["scripts/a.py", "crates/broadsword/src/queue.rs"]), &light);
+        assert_eq!(k, KIND_FULL);
+        assert!(why.contains("1 of 2") && why.contains("crates/broadsword/src/queue.rs"), "{why}");
+        assert_eq!(classify_check(&s(&["Cargo.toml"]), &light).0, KIND_FULL);
+        assert_eq!(classify_check(&s(&["scriptsx/a.py"]), &light).0, KIND_FULL, "a prefix needs its slash");
+        assert_eq!(classify_check(&s(&["notes.mdx"]), &light).0, KIND_FULL);
+        assert_eq!(classify_check(&[], &light).0, KIND_FULL, "an empty diff proves nothing");
+    }
+
+    #[test]
+    fn light_folders_are_the_changed_folders_and_parents_that_hold_test_files() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-queue-light-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("scripts/sub")).unwrap();
+        std::fs::create_dir_all(d.join("docs")).unwrap();
+        std::fs::write(d.join("scripts/test_a.py"), "").unwrap();
+        std::fs::write(d.join("scripts/helper.py"), "").unwrap();
+        std::fs::write(d.join("docs/a.md"), "").unwrap();
+        assert_eq!(light_folders(&d, &s(&["scripts/sub/x.py"])), ["scripts"]);
+        assert_eq!(light_folders(&d, &s(&["docs/a.md"])), Vec::<String>::new());
+        assert_eq!(light_folders(&d, &s(&["scripts/gone.py", "docs/a.md"])), ["scripts"], "a deleted file still names its folder");
+        std::fs::write(d.join("test_root.py"), "").unwrap();
+        assert_eq!(light_folders(&d, &s(&["docs/a.md"])), ["."]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn cut_tail_keeps_the_end() {
+        assert_eq!(cut_tail("a\nb\n", 100), "a\nb\n");
+        let t = cut_tail("aaaa\nbbbb\ncccc\n", 8);
+        assert!(t.starts_with("[... earlier output cut") && t.ends_with("cccc\n") && !t.contains("aaaa"), "{t}");
     }
 
     #[test]
