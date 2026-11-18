@@ -484,21 +484,10 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "(no message)".into())
 }
 
-/// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
-/// before the first step (`run` only, and the project must be a Git repo), and runs the steps.
-/// The build lock, held until the job function returns. For `run`, dropping it first marks the notes of the folder's
-/// packages unknown (the command may have built anything), so the next build, test or check cleans and `install` refuses.
+/// The build lock, held until the job function returns. (A `run` also leaves the note `run:<folder>` for each package: see
+/// `buildsrc::prepare_for_run`; it is written before the command, so a crash cannot leave a note that vouches for it.)
 struct BuildHold {
-    forget: Option<(Config, PathBuf)>,
-    _lock: crate::lock::Lock, // dropped after the Drop body below: the notes change while the lock is still held
-}
-
-impl Drop for BuildHold {
-    fn drop(&mut self) {
-        if let Some((cfg, dir)) = &self.forget {
-            buildsrc::forget_notes(cfg, dir);
-        }
-    }
+    _lock: crate::lock::Lock,
 }
 
 /// What a finished job tells its caller besides the exit code (the merge queue reads it; the command line ignores it).
@@ -512,6 +501,8 @@ pub struct JobInfo {
     pub summary: Vec<String>,
 }
 
+/// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
+/// before the first step (`run` only, and the project must be a Git repo), and runs the steps.
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
     ExitCode::from(run_job_info(cfg, spec, &mut JobInfo::default()))
 }
@@ -681,8 +672,8 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             // the build lock now and keep it until this job ends (every cargo step below, tests included, runs the
             // binaries the shared folder holds). `run` runs a shell command that may call cargo itself, so it takes the
             // lock too and prepares the same way (a `cargo test` inside it must test THIS folder's code, not the binary
-            // another checkout left), then forgets the notes of the folder's packages (before the command, so a crash
-            // cannot leave a note that vouches for what the command builds, and again after it).
+            // another checkout left), then marks the notes of the folder's packages as `run:<folder>` (before the command, so a
+            // crash cannot leave a note that vouches for what the command builds).
             let lock = match buildsrc::lock(cfg) {
                 Ok(l) => l,
                 Err((code, msg)) => {
@@ -690,7 +681,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                     return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, code);
                 }
             };
-            build_hold = Some(BuildHold { forget: (kind == "run").then(|| (cfg.clone(), project_dir.clone())), _lock: lock });
+            build_hold = Some(BuildHold { _lock: lock });
             let outcome = if kind == "run" {
                 buildsrc::prepare_for_run(cfg, &project_dir, &source)
             } else {
@@ -752,8 +743,12 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         }
         if let Outcome::DiskDropped(f) = run.outcome {
             eprintln!("broadsword: free space {} fell below the {} GB floor during `{kind} {name}`; job killed; running one cleanup pass before pausing", pause::gb(f), cfg.disk_floor_gb);
+            let was_paused = pause::is_paused(&cfg.root);
             let r = low_disk_cleanup(cfg, &mut *free_src, &format!("(during `{kind} {name}`; job killed)"));
-            if pause::is_paused(&cfg.root) {
+            if was_paused {
+                // the cleanup writes no pause (and sends no alert) over an existing one: do not blame the disk for it
+                eprintln!("broadsword: Broadsword was already paused before this job was killed ({}); free space after cleanup is {}", pause::read_pause(&cfg.root).unwrap_or_default().trim(), pause::gb(r.free_after));
+            } else if pause::is_paused(&cfg.root) {
                 eprintln!("broadsword: still below the floor after cleanup (free {}): Broadsword is paused", pause::gb(r.free_after));
             } else {
                 eprintln!("broadsword: cleanup freed enough space (free {} is above the {} GB floor): Broadsword is NOT paused; the killed job can be started again", pause::gb(r.free_after), cfg.disk_floor_gb);

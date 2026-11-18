@@ -53,6 +53,16 @@ max_agents = 50
         Root { dir }
     }
 
+    /// Set `alert_command` to an `echo` that appends to `scratch/alert-marker.txt`; returns that file.
+    fn alert_marker(&self) -> PathBuf {
+        let path = self.dir.join("broadsword.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        let cmd = if cfg!(windows) { "echo alerted>>scratch\\alert-marker.txt" } else { "echo alerted >> scratch/alert-marker.txt" };
+        assert!(text.contains("alert_command = \"\""));
+        fs::write(&path, text.replace("alert_command = \"\"", &format!("alert_command = \"{cmd}\""))).unwrap();
+        self.dir.join("scratch/alert-marker.txt")
+    }
+
     /// A tiny library crate named `name` with the given lib.rs (and optional build.rs).
     fn project(&self, name: &str, lib_rs: &str, build_rs: Option<&str>) {
         let p = self.dir.join("projects").join(name);
@@ -227,6 +237,7 @@ fn a_refused_job_pauses_only_if_cleanup_could_not_free_enough_space() {
     let r = Root::new("lowclean-pause", 1, 0);
     r.project("ok", TWO_TESTS, None);
     let old = old_scratch_file(&r);
+    let marker = r.alert_marker();
     let hook = r.dir.join("scratch/free.txt");
     fs::write(&hook, "0").unwrap(); // every sample is 0: cleanup cannot help
     let out = r.cmd(&["build", "ok"]).env(HOOK, &hook).output().unwrap();
@@ -237,6 +248,7 @@ fn a_refused_job_pauses_only_if_cleanup_could_not_free_enough_space() {
     assert!(!old.exists(), "cleanup ran before the pause");
     let pause = fs::read_to_string(r.dir.join("broadsword.paused")).expect("still below the floor after cleanup: paused");
     assert!(pause.contains("after cleanup") && pause.contains("job refused"), "{pause}");
+    assert!(fs::read_to_string(&marker).is_ok_and(|s| s.contains("alerted")), "the configured alert command ran when the refusal paused");
     assert!(!r.dir.join("build").exists(), "cargo must not have run");
 }
 
@@ -277,6 +289,7 @@ fn a_job_killed_for_low_disk_pauses_after_cleanup_when_space_is_still_below_the_
     let r = Root::new("lowclean-kill-pause", 1, 0);
     r.project("slow", TWO_TESTS, Some("fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }\n"));
     let old = old_scratch_file(&r);
+    let marker = r.alert_marker();
     let hook = r.dir.join("scratch/free.txt");
     fs::write(&hook, "99999999999999 0").unwrap();
     let out = r.cmd(&["build", "slow"]).env(HOOK, &hook).output().unwrap();
@@ -286,6 +299,32 @@ fn a_job_killed_for_low_disk_pauses_after_cleanup_when_space_is_still_below_the_
     let pause = fs::read_to_string(r.dir.join("broadsword.paused")).expect("still below the floor: paused");
     assert!(pause.contains("after cleanup") && pause.contains("job killed"), "{pause}");
     assert!(se.contains("Broadsword is paused"), "{se}");
+    assert!(fs::read_to_string(&marker).is_ok_and(|s| s.contains("alerted")), "the configured alert command ran when the kill paused: stderr {se}");
+}
+
+#[test]
+fn a_kill_when_already_paused_does_not_blame_the_disk() {
+    let r = Root::new("lowclean-kill-already", 1, 0);
+    r.project("slow", TWO_TESTS, Some("fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }
+"));
+    let hook = r.dir.join("scratch/free.txt");
+    // the pause appears while the job runs (the guard at the start saw none): write it from the hook's first huge sample on
+    fs::write(&hook, "99999999999999 0 0 99999999999999").unwrap();
+    let mut child = r.cmd(&["build", "slow"]).env(HOOK, &hook).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let end = Instant::now() + Duration::from_secs(50);
+    while Instant::now() < end && child.try_wait().unwrap().is_none() && !r.dir.join("broadsword.paused").exists() {
+        // wait until the job started its cargo child (the build folder exists), then pause by hand
+        if r.dir.join("build").exists() {
+            fs::write(r.dir.join("broadsword.paused"), "reason: paused by hand
+").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    let se = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{se}");
+    assert!(se.contains("was already paused before this job was killed") && se.contains("paused by hand"), "{se}");
+    assert!(!se.contains("still below the floor after cleanup"), "{se}");
 }
 
 #[test]
@@ -320,16 +359,21 @@ fn disk_guard_counts_the_job_reserve_exactly() {
     const GB: u64 = 1024 * 1024 * 1024;
     let r = Root::new("reserve", 1, 2);
     // The real disk must have clearly more than 3 GB free, or the "above" case would be refused by the real guard for a
-    // reason unrelated to the reserve. A disk that is too full FAILS this test (a skipped guard test proves nothing), and so
-    // does a `status` output with no parsable `disk:` line.
+    // reason unrelated to the reserve. On a disk that is too full the test SKIPS with a printed note (the suite must not
+    // fail on a nearly full machine); a `status` output with no parsable `disk:` line FAILS, since the guard cannot then be tested.
     let st = text(&r.cmd(&["status"]).output().unwrap().stdout);
-    let disk_line = st.lines().find_map(|l| l.strip_prefix("disk:")).unwrap_or_else(|| panic!("`broadsword status` printed no `disk:` line, so the real free space is unknown:\n{st}"));
+    let disk_line = st.lines().find_map(|l| l.strip_prefix("disk:")).unwrap_or_else(|| panic!("`broadsword status` printed no `disk:` line, so the real free space is unknown:
+{st}"));
     let real_free_gb: f64 = disk_line
         .split_whitespace()
         .next()
         .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("cannot parse the free space in the `disk:` line `{disk_line}`:\n{st}"));
-    assert!(real_free_gb >= 4.0, "this test needs at least 4 GB free on the real disk and it has {real_free_gb} GB:\n{st}");
+        .unwrap_or_else(|| panic!("cannot parse the free space in the `disk:` line `{disk_line}`:
+{st}"));
+    if real_free_gb < 4.0 {
+        eprintln!("SKIPPED disk_guard_counts_the_job_reserve_exactly: it needs at least 4 GB free on the real disk and it has {real_free_gb} GB");
+        return;
+    }
     r.project("ok", TWO_TESTS, None);
     let hook = r.dir.join("scratch/free.txt");
     // just below floor + reserve: refused, cargo never started

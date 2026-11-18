@@ -227,14 +227,14 @@ fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     assert!(rec.contains(&format!("task = {t1}")) && rec.contains("checkpoint = refs/broadsword/checkpoints/"), "{rec}");
     let o = r.ok(&["run", "proj", "--", list]);
     assert!(!o.stdout.contains("only-here.txt"), "without --task it ran in the main checkout: {}", o.stdout);
-    assert_eq!(r.note(), None, "`run` leaves no note: nothing vouches for the build folder");
+    assert_eq!(r.note().as_deref(), Some("run:projects/proj"), "`run` leaves a `run:` note: it names the folder but vouches for nothing");
 }
 
 /// Blocker 2: `run <project> -- cargo build` in a worktree puts the worktree's binary in the shared folder. `run` does not
-/// parse the command; it forgets the notes of the folder's packages, so `install` (which needs the note `.`/main) refuses
-/// and the next build cleans and records the main checkout. Without this the note kept saying main.
+/// parse the command; it marks the notes of the folder's packages `run:<folder>`, so `install` (which needs exactly `.`/main)
+/// refuses and the next build in another folder cleans and records its own. Without this the note kept saying main.
 #[test]
-fn run_that_builds_in_a_worktree_makes_the_note_unknown_so_the_next_build_cleans() {
+fn run_that_builds_in_a_worktree_marks_the_note_as_a_run_so_the_next_build_elsewhere_cleans() {
     let r = Root::new("runbuild", 120);
     let t1 = r.task("a", "MARK-t1");
     r.ok(&["build", "proj"]);
@@ -244,9 +244,9 @@ fn run_that_builds_in_a_worktree_makes_the_note_unknown_so_the_next_build_cleans
     let o = r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--offline", "--target-dir", &target]);
     assert_eq!(r.probe(), "MARK-t1", "the run command really did put the worktree's binary in the shared folder:
 {}{}", o.stdout, o.stderr);
-    assert_eq!(r.note(), None, "the note no longer vouches for main (the install rule refuses a missing note)");
+    assert_eq!(r.note().as_deref(), Some(format!("run:worktrees/proj/{t1}").as_str()), "the note no longer vouches for main, and is never installable");
     let o = r.ok(&["build", "proj"]);
-    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("no record"), "{}", o.stdout);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains(&format!("last built from worktrees/proj/{t1}")), "{}", o.stdout);
     assert_eq!(r.probe(), "MARK-main");
     assert_eq!(r.note().as_deref(), Some("projects/proj"));
 }
@@ -268,7 +268,34 @@ fn run_after_another_worktrees_build_tests_its_own_code_not_the_other_binary() {
     assert!(o.stdout.contains("cleaned `markprobe`"), "run prepared the build folder before its command: {}", o.stdout);
     assert!(o.stdout.contains("test result: ok") && o.stdout.contains("the_binary_is_this_checkouts_binary"), "B's test ran and passed against B's own binary: {}\n{}", o.stdout, o.stderr);
     assert_eq!(r.probe(), "MARK-t2", "the binary in the shared folder is B's: the run tested B's code");
-    assert_eq!(r.note(), None, "a `run` build is still never installable: no note vouches for it");
+    assert_eq!(r.note().as_deref(), Some(format!("run:worktrees/proj/{t2}").as_str()), "a `run` build is still never installable: the note is a `run:` note");
+}
+
+/// The blocker of the first review: every `run` after another `run` in the same folder used to clean the package, so
+/// `run -- cargo build` followed by `run -- <the built program>` deleted the program before the second command started.
+/// Same folder now means no clean; the note stays a `run:` note throughout, so `install` still refuses it.
+#[test]
+fn a_second_run_in_the_same_folder_cleans_nothing_and_the_built_file_survives() {
+    let r = Root::new("runrun", 120);
+    let target = r.dir.join("build").to_string_lossy().replace('\\', "/");
+    let o = r.ok(&["run", "proj", "--", "cargo", "build", "--offline", "--target-dir", &target]);
+    assert!(o.stdout.contains("cleaned `markprobe`"), "the first run had no note, so it prepared the folder: {}", o.stdout);
+    assert_eq!(r.probe(), "MARK-main");
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    // the second command only checks that the built file is still there
+    let check = if cfg!(windows) { format!("if exist \"{}\" (exit 0) else (exit 7)", exe.display()) } else { format!("test -f '{}'", exe.display()) };
+    let o = r.ok(&["run", "proj", "--", &check]);
+    assert!(!o.stdout.contains("cleaned"), "no clean in the same folder: {}", o.stdout);
+    assert!(exe.is_file(), "the program built by the first run is still there");
+    assert_eq!(r.note().as_deref(), Some("run:projects/proj"));
+    // a build in the same folder afterwards needs no clean either, and its note is plain (vouched) again
+    let o = r.ok(&["build", "proj"]);
+    assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+    // and a run after that goes back to a `run:` note without a clean
+    let o = r.ok(&["run", "proj", "--", &check]);
+    assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
+    assert_eq!(r.note().as_deref(), Some("run:projects/proj"));
 }
 
 /// `run` holds the build lock for its whole command.

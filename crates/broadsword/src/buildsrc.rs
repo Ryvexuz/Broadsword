@@ -14,6 +14,10 @@
 //! written leaves the new source named and nothing stale. Writing the note after the build instead could leave a new
 //! binary under an old note, which is exactly the hazard.
 //!
+//! A `run` job (arbitrary command, may build anything) writes the note `run:<folder>` instead: the same folder part, so a
+//! later job in that folder needs no clean, but never exactly `.`, so `install` refuses it. A build, test or check in the
+//! same folder turns the note back into the plain folder (cargo then rebuilds what is out of date and vouches for it).
+//!
 //! Clean, note and build are one step across processes: the job holds `state/build.lock` (an OS file lock, lock.rs) for
 //! all of its cargo steps. Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
 //! own source over the folder before job 2's cargo step runs.
@@ -196,20 +200,15 @@ pub fn clean_command(cfg: &Config, dir: &Path, package: &str) -> Result<Command,
     Ok(c)
 }
 
-/// Mark every package of `dir` as "built by someone unknown" by deleting its note (a missing note means unknown, so the
-/// next build/test/check cleans it and `install` refuses). Used after a `run` job, whose command may have run cargo.
-/// Best effort and never fatal: cargo metadata failing (not a cargo folder) means there is nothing to name. Returns lines
-/// for the job's output.
-pub fn forget_notes(cfg: &Config, dir: &Path) -> Vec<String> {
-    let Ok(packages) = packages_of(dir) else { return Vec::new() };
-    let mut lines = Vec::new();
-    for p in packages.iter().filter(|p| valid_package(p)) {
-        let path = notes_dir(cfg).join(p);
-        if path.exists() && std::fs::remove_file(&path).is_ok() {
-            lines.push(format!("build-source note of `{p}` cleared: a `run` command may have built it, so the next build/test/check will clean it and `install` will refuse until a `broadsword build`"));
-        }
-    }
-    lines
+/// The prefix of a note written by a `run` job: `run:<folder>`. A `run` command may build anything, so nothing vouches for
+/// what it left in the build folder (`install` refuses any note but exactly `.`), but it was run in `<folder>`, so a later
+/// job in the same folder needs no clean (the binary there is that folder's own, or a stale one only the next build in
+/// another folder would have to clean).
+pub const RUN_NOTE_PREFIX: &str = "run:";
+
+/// The folder a note names, with the `run:` prefix removed.
+pub fn note_folder(note: &str) -> &str {
+    note.strip_prefix(RUN_NOTE_PREFIX).unwrap_or(note)
 }
 
 /// What `prepare` did, one line each, for the job's output and log.
@@ -217,46 +216,55 @@ pub struct Prepared {
     pub lines: Vec<String>,
 }
 
-/// Make the shared build folder safe to build `dir` into: for every package of `dir` whose note is not `source`, clean that
-/// package's artifacts, then record `source` for it. The caller holds the build lock. Err = nothing may be built (the
-/// message says why and what to do).
+/// Make the shared build folder safe to build `dir` into: for every package of `dir` whose note names another folder (or is
+/// missing), clean that package's artifacts, then record `source` for it. A note `run:<source>` (a `run` in this same folder)
+/// needs no clean; it is rewritten to plain `source`, because the cargo step that follows rebuilds what is out of date and
+/// vouches for it. The caller holds the build lock. Err = nothing may be built (the message says why and what to do).
 pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, String> {
-    prepare_packages(cfg, dir, source, packages_of(dir)?)
+    prepare_packages(cfg, dir, source, packages_of(dir)?, false)
 }
 
 /// The preparation a `run` job makes before its command (the command may be `cargo test`, which would otherwise test the
-/// binary another checkout left in the shared build folder): the same clean as `prepare`, then the notes of the folder's
-/// packages are forgotten again, because the command may build anything and nothing may vouch for the result (`install`
-/// refuses, and the next build, test or check cleans). `run` runs arbitrary commands, so a folder whose packages cannot be
-/// listed (a broken Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped.
-/// A `cargo clean` that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
+/// binary another checkout left in the shared build folder): the same clean as `prepare` for a package whose note names
+/// another folder or is missing, then the note becomes `run:<source>`, because the command may build anything and nothing
+/// may vouch for the result (`install` refuses). Same folder: no clean, so `run -- cargo build` followed by `run -- <the
+/// built exe>` keeps the exe. `run` runs arbitrary commands, so a folder whose packages cannot be listed (a broken
+/// Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped. A `cargo clean`
+/// that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
 pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
-    let mut lines = match packages_of(dir) {
-        Ok(packages) => prepare_packages(cfg, dir, source, packages)?.lines,
-        Err(e) => vec![format!("build source: not checked (the stale-binary protection is skipped for this run): {e}")],
-    };
-    lines.extend(forget_notes(cfg, dir));
-    Ok(lines)
+    match packages_of(dir) {
+        Ok(packages) => Ok(prepare_packages(cfg, dir, source, packages, true)?.lines),
+        Err(e) => Ok(vec![format!("build source: not checked (the stale-binary protection is skipped for this run): {e}")]),
+    }
 }
 
-fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>) -> Result<Prepared, String> {
-    let stale: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).filter(|(_, n)| n.as_deref() != Some(source)).collect();
+fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>, as_run: bool) -> Result<Prepared, String> {
+    let notes: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).collect();
+    let stale: Vec<(String, Option<String>)> = notes.iter().filter(|(_, n)| n.as_deref().map(note_folder) != Some(source)).cloned().collect();
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
+    let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
     for (p, was) in &stale {
         let out = clean_command(cfg, dir, p)?.output().map_err(|e| format!("cannot start `cargo clean -p {p}`: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "`cargo clean -p {p}` failed in {}: {}\nnothing was built. The old copy of `{p}` in the build folder could not be removed; on Windows a binary that is running cannot be deleted, so stop whatever runs it (run the installed copy under install_dir, not the one in the build folder) and repeat",
+                "`cargo clean -p {p}` failed in {}: {}
+nothing was built. The old copy of `{p}` in the build folder could not be removed; on Windows a binary that is running cannot be deleted, so stop whatever runs it (run the installed copy under install_dir, not the one in the build folder) and repeat",
                 dir.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        write_note(cfg, p, source)?;
+        write_note(cfg, p, &wanted)?;
         lines.push(match was {
-            Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {w}); its other packages and all dependencies were kept"),
+            Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {}); its other packages and all dependencies were kept", note_folder(w)),
             None => format!("cleaned `{p}` in the shared build folder (no record of what built it); its dependencies were kept"),
         });
+    }
+    // same folder: no clean; only the note's kind may change (run -> vouched by a build step, or a build -> run)
+    for (p, was) in &notes {
+        if was.as_deref().map(note_folder) == Some(source) && was.as_deref() != Some(wanted.as_str()) {
+            write_note(cfg, p, &wanted)?;
+        }
     }
     Ok(Prepared { lines })
 }
@@ -269,6 +277,9 @@ pub fn check_installable(cfg: &Config) -> Result<(), String> {
     let pkg = env!("CARGO_PKG_NAME");
     match read_note(cfg, pkg) {
         Some(s) if s == MAIN_SOURCE => Ok(()),
+        Some(run) if run.starts_with(RUN_NOTE_PREFIX) => Err(format!(
+            "refusing to install: the last job to touch the `{pkg}` binary in the build folder was a `run` ({run}), and a `run` command may have built anything. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
+        )),
         Some(other) => Err(format!(
             "refusing to install: the `{pkg}` binary in the build folder was last built from `{other}`, not from the main checkout. The installed copy runs the pause hook and the MCP server for everyone, so it must never be a task worktree's experiment. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
         )),
@@ -448,6 +459,20 @@ mod tests {
         cfg.build_dir = parent;
         assert!(clean_command(&cfg, &d, "p").is_ok());
         let _ = std::fs::remove_dir(&link);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn run_notes_name_a_folder_but_are_never_installable() {
+        assert_eq!(note_folder("run:worktrees/p/t"), "worktrees/p/t");
+        assert_eq!(note_folder("."), ".");
+        let d = tmp("runnote");
+        let mut cfg = cfg_at(&d);
+        cfg.state_dir = d.join("state");
+        let pkg = env!("CARGO_PKG_NAME");
+        write_note(&cfg, pkg, "run:.").unwrap();
+        let e = check_installable(&cfg).unwrap_err();
+        assert!(e.contains("a `run`"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

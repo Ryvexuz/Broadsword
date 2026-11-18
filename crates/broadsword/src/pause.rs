@@ -1,4 +1,9 @@
 //! Pause file, alerts, resume decision and the PreToolUse hook decision.
+//!
+//! Known limit of the pause allow-list (`is_allowed_broadsword_command`): the program is matched by FILE NAME only, so any
+//! path whose last part is `broadsword` or `broadsword.exe` passes while paused (for example `scratch/x/broadsword.exe cleanup`).
+//! A binary planted under that name before the pause could therefore run. The rule is kept as is: the installed copy's
+//! path differs per machine and root, and the subcommand and the absence of chaining are still enforced.
 
 use crate::config::{Config, GB};
 use std::io::Write;

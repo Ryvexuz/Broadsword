@@ -164,6 +164,13 @@ fn install_refuses_a_binary_last_built_from_a_worktree_and_a_missing_record() {
     // another folder is no better than a worktree
     r.set_note("projects/broadsword");
     assert_eq!(r.run(&r.exe(), &["install"]).status.code(), Some(1));
+    // a `run` in the main checkout (which may have built anything) is never installable, even though it names main
+    r.set_note("run:.");
+    let o = r.run(&r.exe(), &["install"]);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("refusing to install") && err.contains("a `run`"), "{err}");
+    assert!(!r.target().exists());
     // no note at all: nothing proves it was main's
     fs::remove_file(r.dir.join("state/build-sources/broadsword")).unwrap();
     let o = r.run(&r.exe(), &["install"]);
