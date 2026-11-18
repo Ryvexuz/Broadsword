@@ -17,3 +17,7 @@ He also mentioned a cheap OpenAI model, "Terra 6.1", described as slightly worse
 Related: [[broadsword-source-docs]]
 
 **Direction, 2026-11-18:** "once we get the gpt ones tested, we can outsource a lot more to gpt and that way we can keep you as the orchestrator for longer as well." Once the benchmarks and shadow verdicts show which GPT models are trustworthy, move routine coding, reviewing and records work to GPT through Codex, on the ChatGPT allowance ([[openai-weekly-before-api]]). That saves the Claude plan for orchestration. Evidence comes first: the shadow verdicts ([[adjudicate-shadow-findings]]) and a GPT coder trial on a real task, reviewed by Claude.
+
+**Lazlo's picks, 2026-11-18 (from his own use):**
+- For coding: gpt-6.1-terra on "ultra" (whether that is reasoning effort or a speed tier is unconfirmed), gpt-6.1-sol at high, and Opus 5.5 at high.
+- gpt-6.2-astra is good in short bursts but drifts on long tasks. Give it sections; split a full sweep into 2 or 3 sectioned calls.
