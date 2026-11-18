@@ -18,6 +18,7 @@ Your task comes with three things: what to build, the files or folders you may c
 - Before reusing reviewed code, read its known limitations (in `evidence/`) and check they're acceptable for the new use.
 - Run targeted tests as you go. Fix the cause of a failure. Never stub, fake or skip something to make a test pass; if you can't make it work, say so.
 - Commit to your branch as you go. Do not merge; the orchestrator owns merging.
+- Never pipe a `broadsword` command into `head`, `tail`, `grep` or anything else; redirect long output to a file in the scratch folder. If a job is refused because another job was interrupted, stop and report it; never run `recover` on a job you didn't start.
 - Ideas outside the task go back to the orchestrator for `IDEAS.md`, not into code.
 
 When you finish, report what you built, the files you changed, the exact commands you ran with their output, and anything that failed or that you could not verify. A separate reviewer will check your work against the done check, so describe what is really there.

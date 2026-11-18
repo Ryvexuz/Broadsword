@@ -21,6 +21,7 @@ Every area is in scope (rendering, 3D creation, physics, games, CAD, media), as 
 - **Review:** plan for at least two review passes per milestone; a first-pass FAIL is normal. When a finding breaks a rule that must always hold, the fix enforces that rule in one place, not only for the reported case.
 - **Resources:** follow the Disk rules below. Never delete work, history or failure evidence.
 - **Ask first:** before spending money, using credentials or network services, publishing, or deleting anything outside the scratch area.
+- **Retrospective:** after each milestone, add a short entry to `RETRO.md`: what went wrong, why, and what changes so it doesn't happen again; and the same for speed and cost. Each change goes where it is enforced (Broadsword's code, a role file, `SPEC_CHECKLIST.md`), not only into the notes, and the next retro checks whether it worked. When retros keep coming back empty, this rule can be dropped.
 - **Continuity:** commit often. End every session by updating `PROGRESS.md` and adding a `LAB_LOG.md` entry.
 - Keep this file in the repo as `AGENTS.md` with a CLAUDE.md next to it containing one line, @AGENTS.md, so Claude Code and any other tool loads these rules at startup.
 

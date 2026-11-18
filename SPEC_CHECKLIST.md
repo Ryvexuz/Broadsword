@@ -10,6 +10,7 @@ In Stage 2, naming these cases in the spec up front let milestones pass review o
 - **Claim:** the exact files and folders the coder may change. Anything else is out of bounds.
 - **Starting point:** which commit the work must start from. Tell the coder to check it and fast-forward if needed.
 - **Build route:** how to build and test, either `broadsword build|test|check` or the documented exception. Also how to confirm that the binary in the shared build folder is the one just built.
+- **Examples are examples:** a list in a brief is either marked "for example" or is the complete rule. Reviewers read an unmarked list as complete. [Stage 3 m4: a correct `max_speed()` call was rejected because the brief listed some public functions in parentheses.]
 - **What not to touch:** real repos, `projects/*`, Claude Code settings, the network, the real `.env`.
 
 ## Risk checks: name each one that applies
@@ -21,7 +22,8 @@ In Stage 2, naming these cases in the spec up front let milestones pass review o
 | Locks and concurrency | Use OS file locks (`File::try_lock`), never stale-lock takeover. Keep slow work outside the lock. Add a gated race test, plus a mutation check showing the test fails without the lock. | S3 m1; S3 m2 |
 | Reusing reviewed code | Re-read the reused code's known limitations against the new requirement. | S3 m1 |
 | Secrets | Protect them where they enter a child process: scrub the environment by name and by value. Redact before content reaches a model or a log. Never follow redirects with credentials. | S2 m3 |
-| Settings | Every limit is a required key in `broadsword.toml`. No silent defaults, no hard-coded numbers. | S1 m3; S3 m1 |
+| Settings | Every limit is a required key in `broadsword.toml`. No silent defaults, no hard-coded numbers. Every setting is read by code, with a test that fails if it is ignored. | S1 m3; S3 m1; S3 m4 `max_agents` |
+| Output streams | A closed stdout or stderr must never kill a job (the crate's print macros already drop write errors; never `unwrap` a write to stdout). | S3 m4 `\| head` |
 | Test-only hooks in the real binary | Limit them to scratch, print TEST HOOK ACTIVE, cap them, and make sure they can only make a guard stricter. | S1 m3; S3 m1 |
 | Output an AI reads | Descriptions, exit codes and flags must match the binary. Exit codes are tested through the real binary. Hints such as `destructive` and `idempotent` must be true. | S1 m5; S3 m2 `task_done` |
 | Protocol streams | stdout carries protocol only. Notifications and responses get no reply. Set size and depth limits. | S2 m1 |
