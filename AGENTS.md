@@ -29,7 +29,7 @@ Every area is in scope (rendering, 3D creation, physics, games, CAD, media), as 
   - a change that can be reverted, and is reverted if the next retro shows it hurt;
   - a line in that session's report.
 
-  Some rules stay Lazlo's and are never changed this way: Ask first, Secrets, never deleting work or history, Done means verified (no faked tests), and an independent review before every merge. The review's form may change; its existence may not.
+  Some rules stay Lazlo's and are never changed this way: Ask first, Secrets, never deleting work or history, Done means verified (no faked tests), and an independent review before every merge. The review's form may change; its existence may not. Claude fast mode stays off unless Lazlo turns it on himself, whatever a price comparison shows.
 - **Continuity:** commit often. End every session by updating `PROGRESS.md` and adding a `LAB_LOG.md` entry.
 - Keep this file in the repo as `AGENTS.md` with a CLAUDE.md next to it containing one line, @AGENTS.md, so Claude Code and any other tool loads these rules at startup.
 
