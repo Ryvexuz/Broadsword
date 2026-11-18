@@ -32,6 +32,7 @@ mod queue;
 mod recover;
 mod record;
 mod reviewer;
+mod scrub;
 mod sys;
 mod task;
 mod tools;

@@ -20,6 +20,8 @@
 
 use crate::config::Config;
 use crate::json::{self, J};
+use crate::reviewer::Secrets;
+use crate::scrub;
 use crate::sys;
 use crate::tools::{self, Inputs, Ty, Val};
 use std::collections::VecDeque;
@@ -81,7 +83,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
 /// Where to send diagnostics besides stderr. Best effort: a missing log never stops the server.
-pub struct Log(Option<File>);
+pub struct Log(Option<File>, Option<Secrets>);
 
 impl Log {
     pub fn open(cfg: Option<&Config>) -> Log {
@@ -90,15 +92,24 @@ impl Log {
             fs::create_dir_all(&dir).ok()?;
             OpenOptions::new().create(true).append(true).open(dir.join("mcp.log")).ok()
         });
-        Log(file)
+        Log(file, None)
     }
 
     #[cfg(test)]
     pub fn none() -> Log {
-        Log(None)
+        Log(None, None)
+    }
+
+    /// From now on every line is redacted with these (every `.env` value becomes `[REDACTED]`) before it is written anywhere.
+    fn set_secrets(&mut self, s: Secrets) {
+        self.1 = Some(s);
     }
 
     fn line(&mut self, msg: &str) {
+        let msg = &match &self.1 {
+            Some(s) => s.redact(msg),
+            None => msg.to_string(),
+        };
         eprintln!("broadsword mcp: {msg}");
         if let Some(f) = &mut self.0 {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -671,6 +682,7 @@ impl<W: Write> Server<'_, W> {
     fn run_child(&mut self, id: &J, p: &Prepared, cfg: &Config, exe: &std::path::Path) -> Result<Ran, String> {
         let mut cmd = Command::new(exe);
         cmd.args(&p.args).current_dir(&cfg.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        scrub::apply(&mut cmd, &cfg.root); // the tool child gets the scrubbed environment (scrub.rs), never the server's own
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -733,6 +745,10 @@ impl<W: Write> Server<'_, W> {
         }
         let (stdout, stdout_cut) = out_tail.lock().map(|t| t.text()).unwrap_or_default();
         let (stderr, stderr_cut) = err_tail.lock().map(|t| t.text()).unwrap_or_default();
+        // Redact after the whole output is collected, so a secret at a chunk boundary is still found.
+        let secrets = scrub::secrets(&cfg.root);
+        let (stdout, stderr) = (secrets.redact(&stdout), secrets.redact(&stderr));
+        self.log.set_secrets(secrets);
         Ok(Ran::Done(Captured {
             code: if timed_out { None } else { exited.and_then(|(c, _)| c) },
             stdout,
@@ -774,10 +790,24 @@ impl<W: Write> Server<'_, W> {
         let (method, id) = (msg.get("method").and_then(J::str), msg.get("id"));
         match (method, id) {
             (Some("notifications/cancelled"), None) => {
-                if msg.get("params").and_then(|p| p.get("requestId")) == Some(running) {
+                let target = msg.get("params").and_then(|p| p.get("requestId"));
+                if target == Some(running) {
                     return Side::Cancel;
                 }
-                self.log.line("notifications/cancelled for a request that is not running: ignored");
+                // A request that is queued but not yet running is removed from the queue; as the spec says, it gets no response.
+                let queued = target.and_then(|t| {
+                    self.pending.iter().position(|e| {
+                        let Event::Line(b) = e else { return false };
+                        let m = std::str::from_utf8(b).ok().and_then(|t| json::parse(t.trim()).ok());
+                        m.is_some_and(|m| m.get("method").is_some() && m.get("id") == Some(t))
+                    })
+                });
+                if let Some(i) = queued {
+                    self.pending.remove(i);
+                    self.log.line("notifications/cancelled for a queued request: removed from the queue, it will not run, no response sent");
+                    return Side::Nothing;
+                }
+                self.log.line("notifications/cancelled for a request that is neither running nor queued (unknown id): ignored");
                 Side::Nothing
             }
             (Some("ping"), Some(_)) => {

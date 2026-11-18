@@ -8,6 +8,8 @@ use crate::buildsrc;
 use crate::config::Config;
 use crate::git;
 use crate::pause;
+use crate::reviewer::Secrets;
+use crate::scrub;
 use crate::record::{self, Record};
 use crate::sys;
 use crate::worktree::{self, JobDirError};
@@ -209,7 +211,9 @@ pub struct StepRun {
 
 type Log = Arc<Mutex<std::fs::File>>;
 
-fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>>>>) {
+/// Every line is redacted (every `.env` value becomes `[REDACTED]`) before it reaches the terminal, the job log or the kept
+/// output. Per line: a secret split across two lines is a known limit.
+fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>>>>, secrets: Arc<Secrets>) {
     let mut r = std::io::BufReader::new(src);
     let mut buf = Vec::new();
     loop {
@@ -217,6 +221,13 @@ fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>
         match r.read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
+        }
+        {
+            let text = String::from_utf8_lossy(&buf);
+            let red = secrets.redact(&text);
+            if red != text {
+                buf = red.into_bytes();
+            }
         }
         if to_stderr {
             let _ = std::io::stderr().write_all(&buf);
@@ -251,6 +262,7 @@ pub fn run_child(
     free: &mut dyn FnMut() -> u64,
     poll: Duration,
     on_spawn: &mut dyn FnMut(u32),
+    secrets: &Arc<Secrets>,
 ) -> Result<StepRun, String> {
     let start = Instant::now();
     let mut child = cmd
@@ -263,12 +275,12 @@ pub fn run_child(
     let kept = Arc::new(Mutex::new(Vec::new()));
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let t_out = {
-        let (l, k) = (Arc::clone(log), Arc::clone(&kept));
-        std::thread::spawn(move || tee(out, false, l, Some(k)))
+        let (l, k, sc) = (Arc::clone(log), Arc::clone(&kept), Arc::clone(secrets));
+        std::thread::spawn(move || tee(out, false, l, Some(k), sc))
     };
     let t_err = {
-        let l = Arc::clone(log);
-        std::thread::spawn(move || tee(err, true, l, None))
+        let (l, sc) = (Arc::clone(log), Arc::clone(secrets));
+        std::thread::spawn(move || tee(err, true, l, None, sc))
     };
     let mut next_poll = Instant::now() + poll;
     let outcome = loop {
@@ -568,6 +580,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     info.id = Some(job_id.clone());
     info.log = Some(log_path.clone());
     let panic_hook = panic_hook_active(cfg);
+    let secrets = Arc::new(scrub::secrets(&cfg.root));
     // From here the record exists: a panic must leave a truthful record (see the handling after this block).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     if let Some(old) = &spec.resumed_from {
@@ -690,6 +703,8 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         };
         // The one place every job's child gets the shared build folder: cargo steps, and any `cargo ...` inside `run`
         // (a worktree's .cargo/config.toml with a relative target-dir would otherwise build inside the worktree).
+        // The same place gives the child the scrubbed environment (`scrub.rs`): no secret-named variable, nothing holding a `.env` value.
+        scrub::apply(&mut cmd, &cfg.root);
         cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
         let mut spawn_err: Option<String> = None;
         let mut on_spawn = |pid: u32| {
@@ -702,7 +717,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                 panic!("test hook: panic in job after its child started");
             }
         };
-        let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn) {
+        let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("broadsword: {e}");

@@ -225,3 +225,51 @@ fn same_second_jobs_keep_separate_logs() {
     }
     assert_eq!(r.job_logs().len(), 3, "{:?}", r.job_logs());
 }
+
+/// Make `projects/<name>` a Git repository with one commit (`run` refuses a project without a checkpoint to roll back to).
+fn git_init(p: &Path) {
+    fs::write(p.join(".gitignore"), "target\n").unwrap();
+    for args in [&["init", "-q"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["config", "core.autocrlf", "false"], &["add", "-A"], &["commit", "-q", "-m", "init"]] {
+        assert!(Command::new("git").args(args).current_dir(p).output().unwrap().status.success(), "git {args:?}");
+    }
+}
+
+#[test]
+fn a_run_job_gets_the_scrubbed_environment_and_a_redacted_log() {
+    let r = Root::new("scrub", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    git_init(&r.dir.join("projects/p"));
+    // a FAKE .env in this throwaway root (never the real one) and a parent environment that also carries its value
+    fs::write(r.dir.join(".env"), "FAKE_TOKEN=zzsecretvalue123\n").unwrap();
+    let print_env: &[&str] = if cfg!(windows) { &["run", "p", "--", "set"] } else { &["run", "p", "--", "env"] };
+    let mut c = r.cmd(print_env);
+    c.env("SOME_API_KEY", "zzsecretvalue123").env("CONTAINS_IT", "prefix-zzsecretvalue123-suffix").env("HARMLESS", "ok").env_remove("OPENAI_API_KEY");
+    let out = c.output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
+    assert!(so.lines().any(|l| l.trim_end() == "HARMLESS=ok"), "a harmless variable must reach the child: {so}");
+    assert!(!so.contains("SOME_API_KEY"), "a secret-named variable must not reach the child: {so}");
+    assert!(!so.contains("CONTAINS_IT"), "a variable holding a .env value must not reach the child: {so}");
+    assert!(!so.contains("zzsecretvalue123"), "{so}");
+    assert!(so.lines().any(|l| l.starts_with("CARGO_TARGET_DIR=")), "the shared build folder is still set: {so}");
+    let logs = r.job_logs();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let log = fs::read_to_string(&logs[0]).unwrap();
+    assert!(!log.contains("zzsecretvalue123") && !log.contains("SOME_API_KEY"), "the job log must hold no secret: {log}");
+}
+
+#[test]
+fn job_output_that_prints_a_dotenv_value_is_redacted_in_the_log_and_on_the_terminal() {
+    let r = Root::new("redact", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    git_init(&r.dir.join("projects/p"));
+    fs::write(r.dir.join(".env"), "FAKE_TOKEN=zzsecretvalue123\n").unwrap();
+    let show: &[&str] = if cfg!(windows) { &["run", "p", "--", "type", "..\\..\\.env"] } else { &["run", "p", "--", "cat", "../../.env"] };
+    let out = r.run(show);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
+    assert!(so.contains("[REDACTED]"), "{so}");
+    assert!(!so.contains("zzsecretvalue123"), "{so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("[REDACTED]") && !log.contains("zzsecretvalue123"), "{log}");
+}

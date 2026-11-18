@@ -79,7 +79,12 @@ struct Server {
 
 impl Server {
     fn start(root: Root) -> Server {
-        let mut child = Command::new(BIN).arg("mcp").current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        Server::start_env(root, &[])
+    }
+
+    /// `envs` are added to the server's environment (the test process's own stays).
+    fn start_env(root: Root, envs: &[(&str, &str)]) -> Server {
+        let mut child = Command::new(BIN).arg("mcp").envs(envs.iter().copied()).env_remove("OPENAI_API_KEY").current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let stdin = child.stdin.take();
         let out = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -432,4 +437,79 @@ fn the_pause_hook_lets_read_only_mcp_tools_through() {
         assert_eq!(hook(&format!("mcp__broadsword__{blocked}")), 2, "{blocked} is blocked while paused");
     }
     assert_eq!(hook("mcp__other__status"), 2);
+}
+
+fn print_env_args() -> &'static str {
+    if cfg!(windows) {
+        r#"["set"]"#
+    } else {
+        r#"["env"]"#
+    }
+}
+
+#[test]
+fn the_tool_child_gets_a_scrubbed_environment_and_its_output_is_redacted() {
+    let root = Root::new("scrub", 600, 1024);
+    root.project("p", PASSING, true);
+    fs::write(root.dir.join(".env"), "FAKE_TOKEN=zzsecretvalue123\n").unwrap(); // a fake .env in the throwaway root
+    let dir = root.dir.clone();
+    let mut s = Server::start_env(root, &[("SOME_API_KEY", "zzsecretvalue123"), ("CONTAINS_IT", "prefix-zzsecretvalue123-suffix"), ("HARMLESS", "ok")]);
+    s.init("2025-06-18");
+    // the job's own environment: the harmless variable arrives, the secrets do not
+    let r = s.tool(2, "run", &format!(r#"{{"project":"p","command":{}}}"#, print_env_args()));
+    let t = text(&r);
+    assert_eq!(exit_code(&r), "0", "{t}");
+    assert!(t.lines().any(|l| l.trim_end() == "HARMLESS=ok"), "{t}");
+    assert!(!t.contains("SOME_API_KEY") && !t.contains("CONTAINS_IT") && !t.contains("zzsecretvalue123"), "{t}");
+    // a command that prints the .env file: the value comes back redacted
+    let show = if cfg!(windows) { r#"["type","..\\..\\.env"]"# } else { r#"["cat","../../.env"]"# };
+    let r = s.tool(3, "run", &format!(r#"{{"project":"p","command":{show}}}"#));
+    let t = text(&r);
+    assert_eq!(exit_code(&r), "0", "{t}");
+    assert!(t.contains("[REDACTED]"), "{t}");
+    assert!(!t.contains("zzsecretvalue123"), "{t}");
+    assert!(!structured(&r).to_json().contains("zzsecretvalue123"), "structuredContent must be redacted too");
+    assert_eq!(s.finish(), 0);
+    // nothing written under this root's scratch holds the value: not the MCP log, not a job log
+    fn scan(d: &Path, hits: &mut Vec<PathBuf>) {
+        for e in fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                scan(&p, hits);
+            } else if fs::read(&p).is_ok_and(|b| String::from_utf8_lossy(&b).contains("zzsecretvalue123")) {
+                hits.push(p);
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    scan(&dir.join("scratch"), &mut hits);
+    assert!(hits.is_empty(), "files under scratch hold the secret: {hits:?}");
+}
+
+#[test]
+fn a_cancel_removes_a_queued_call_and_an_unknown_id_is_ignored() {
+    let root = Root::new("qcancel", 600, 1024);
+    root.project("p", PASSING, true);
+    let dir = root.dir.clone();
+    let mut s = Server::start(root);
+    s.init("2025-06-18");
+    s.send(&format!(r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"run","arguments":{{"project":"p","command":{}}}}}}}"#, slow_command()));
+    // queued behind the running call, then cancelled before it could start
+    s.send(r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"check","arguments":{"project":"p"}}}"#);
+    s.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8,"reason":"test"}}"#);
+    s.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4242,"reason":"never seen"}}"#);
+    std::thread::sleep(Duration::from_secs(3)); // let the server read all of it while 7 runs
+    s.send(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#);
+    assert_eq!(s.rpc(10, "ping", "{}").get("result"), Some(&J::Obj(vec![])));
+    assert_eq!(s.finish(), 0);
+    let ids: Vec<String> = s.all.lock().unwrap().iter().filter_map(|l| parse(l).unwrap().get("id").map(J::to_json)).collect();
+    assert!(!ids.contains(&"7".to_string()) && !ids.contains(&"8".to_string()), "a cancelled request gets no response: {ids:?}");
+    let log = fs::read_to_string(dir.join("scratch/logs/mcp.log")).unwrap();
+    assert!(log.contains("queued request: removed from the queue"), "{log}");
+    assert!(log.contains("unknown id): ignored"), "{log}");
+    // the check never ran: no job log for it (the cancelled `run` may have left its own)
+    let jobs: Vec<String> = fs::read_dir(dir.join("scratch/logs/jobs")).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(jobs.iter().all(|n| !n.contains("-check")), "{jobs:?}");
+    let recs: Vec<String> = fs::read_dir(dir.join("state/jobs")).into_iter().flatten().flatten().map(|e| fs::read_to_string(e.path()).unwrap_or_default()).collect();
+    assert!(recs.iter().all(|r| !r.lines().any(|l| l.trim() == "kind = check")), "no job record for a check: {recs:?}");
 }

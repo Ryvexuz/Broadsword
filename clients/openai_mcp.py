@@ -268,17 +268,26 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-SECRET_SUFFIXES = ("_API_KEY", "_KEY", "_TOKEN", "_SECRET")
+# The rule for "this variable name carries a secret". It MUST match `secret_name` in crates/broadsword/src/reviewer.rs (the one
+# Rust rule, also used by crates/broadsword/src/scrub.rs for every job and tool child). Change both together.
+SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PAT", "_PASSWORD", "_PASS")
+SECRET_CONTAINS = ("_CREDENTIAL", "_AUTH")
+SECRET_BARE = ("API_KEY", "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS")
+
+
+def secret_name(name: str) -> bool:
+    n = name.upper()
+    return n.endswith(SECRET_SUFFIXES) or any(c in n for c in SECRET_CONTAINS) or n in SECRET_BARE
 
 
 def child_env(environ=None) -> dict:
-    """A copy of the environment without secrets: OPENAI_API_KEY and anything named *_API_KEY, *_TOKEN, *_SECRET.
-    Variables whose VALUE contains a loaded secret are dropped whatever their name. The server (and every tool it runs, including `run`) gets this, so the model cannot read the key from it."""
+    """A copy of the environment without secrets: every variable whose name looks like a secret (`secret_name`, e.g. OPENAI_API_KEY,
+    *_TOKEN, *_SECRET, *_PASSWORD). Variables whose VALUE contains a loaded secret are dropped whatever their name. The server (and every tool it runs, including `run`) gets this, so the model cannot read the key from it."""
     environ = os.environ if environ is None else environ
     secrets = [x for x in _SECRETS if x]
     return {
         k: v for k, v in environ.items()
-        if k.upper() != "OPENAI_API_KEY" and not k.upper().endswith(SECRET_SUFFIXES) and not any(x in v for x in secrets)
+        if not secret_name(k) and not any(x in v for x in secrets)
     }
 
 

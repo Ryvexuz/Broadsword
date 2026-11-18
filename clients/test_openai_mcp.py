@@ -124,6 +124,8 @@ class RootCase(unittest.TestCase):
             raise unittest.SkipTest(f"{MAIN_EXE} not installed: run `broadsword install` first")
         cls.root = MAIN_ROOT / "scratch" / f"m3-test-{uuid.uuid4().hex[:8]}"
         (cls.root / "build" / "bin").mkdir(parents=True)
+        # cargo refuses to clean a build folder without this tag file (a real one has it from its first build), and a check cleans first
+        (cls.root / "build" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n", encoding="utf-8")
         shutil.copy(HERE.parent / "broadsword.toml", cls.root / "broadsword.toml")
         shutil.copy(MAIN_EXE, cls.root / "build" / "bin" / MAIN_EXE.name)
         proj = cls.root / "projects" / "tiny"
@@ -198,7 +200,7 @@ class EndToEnd(RootCase):
         req = fake.requests[0]["json"]
         self.assertEqual(req["model"], "gpt-test-1")
         names = sorted(t["function"]["name"] for t in req["tools"])
-        self.assertEqual(names, ["build", "check", "jobs", "projects", "status", "test", "tools"])
+        self.assertEqual(names, ["build", "check", "jobs", "projects", "queue_list", "queue_show", "status", "task_check", "task_list", "task_show", "test", "tools", "worktree_list"])
         self.assertNotIn("watch", names)
         self.assertIn("model=gpt-test-1", r.stdout)
 
@@ -473,7 +475,7 @@ class ServerLifecycle(RootCase):
     def test_default_tools_come_from_read_only_hints_and_watch_is_never_offered(self):
         with oc.McpServer(self.exe, self.root, 30) as s:
             tools = s.start()
-        self.assertEqual(sorted(oc.default_allow(tools)), ["build", "check", "jobs", "projects", "status", "test", "tools"])
+        self.assertEqual(sorted(oc.default_allow(tools)), ["build", "check", "jobs", "projects", "queue_list", "queue_show", "status", "task_check", "task_list", "task_show", "test", "tools", "worktree_list"])
         for n in ("run", "recover", "abandon", "cleanup", "resume", "install", "watch"):
             self.assertNotIn(n, oc.default_allow(tools) if n != "watch" else [t["name"] for t in oc.select_tools(tools, None)[0]])
         offered, warnings = oc.select_tools(tools, ["watch", "status"])
@@ -559,6 +561,13 @@ class Units(unittest.TestCase):
     def test_child_env_drops_key_token_and_secret_variables(self):
         env = {"OPENAI_API_KEY": "a", "openai_api_key": "b", "ANTHROPIC_API_KEY": "c", "GH_TOKEN": "d", "x_secret": "e", "PATH": "p", "HOME": "h", "KEYBOARD": "k"}
         self.assertEqual(oc.child_env(env), {"PATH": "p", "HOME": "h", "KEYBOARD": "k"})
+
+    def test_secret_name_rule_matches_the_rust_rule(self):
+        # the cases of `secret_name` in crates/broadsword/src/reviewer.rs
+        for yes in ("OPENAI_API_KEY", "x_key", "GH_TOKEN", "MY_SECRET", "GITHUB_PAT", "DB_PASSWORD", "DB_PASS", "AWS_CREDENTIALS", "X_AUTH_HEADER", "API_KEY", "token", "SECRET", "PAT", "PASSWORD", "PASS"):
+            self.assertTrue(oc.secret_name(yes), yes)
+        for no in ("PATH", "HOME", "KEYBOARD", "PASSENGER", "TOKENS", "AUTHOR", "PATHEXT", "SECRETARY"):
+            self.assertFalse(oc.secret_name(no), no)
 
     def test_retry_delay_respects_retry_after(self):
         self.assertEqual(oc.retry_delay({"Retry-After": "7"}, 0, 1.0), 7.0)
