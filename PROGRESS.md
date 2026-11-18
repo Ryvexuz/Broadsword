@@ -62,6 +62,10 @@ Stage 0 is still untagged; see Unfinished.
 
 ## Unfinished
 
+- **Planned process experiments** (run alongside Stage 4; each gets a row in the improvement ledger in `RETRO.md`):
+  - **Reviewer canary:** every few merges, queue a known planted bug and record whether the reviewer catches it, to track catch rate per model over time. Once Lazlo's OpenAI models are linked, run the same canaries across Claude and OpenAI models and effort levels, reusing `bench/reviewer/`.
+  - **Handoff test:** a fresh agent resumes from `PROGRESS.md` alone; record what it got wrong or had to ask.
+  - **In progress:** an interrupted `run` blocks only its own folder, plus a panic guard for jobs (task `t-20261118-034915`).
 - **Next:** the OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 starts only after that.
 - **Stage 0 close-out.** Confirm in a new session started from the app that task-router no longer loads, then tag `stage-0-done`.
 - **Reviewer benchmark, OpenAI half.** Needs a small chat-completions runner, and Lazlo's models list. "Terra 6.1" is unverified.

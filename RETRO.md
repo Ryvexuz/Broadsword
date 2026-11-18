@@ -2,7 +2,7 @@
 
 After each milestone: what went wrong, why, and what changes, then the same for speed and cost. This is the rule in `AGENTS.md`.
 
-A change counts only once it is enforced somewhere: Broadsword's code, a role file in `.claude/agents/`, or `SPEC_CHECKLIST.md`. Each retro starts by checking whether the previous retro's changes worked. Once retros keep coming back empty, the rule can be dropped.
+A change counts only once it is enforced somewhere: Broadsword's code, a role file in `.claude/agents/`, or `SPEC_CHECKLIST.md`. Each retro starts by checking whether the previous retro's changes worked, including whether any of them hindered things (see the improvement ledger). Once retros keep coming back empty, the rule can be dropped.
 
 ## Portable lessons, for any project
 
@@ -40,8 +40,36 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 **Process**
 18. **A fix counts only once something enforces it:** code, a role file or a checklist. A note alone is forgotten by the next session. [S3]
 19. **Push long runs, such as full test suites and reviews, into the background,** and keep working. The orchestrator is the bottleneck, not the coders. [S3]
+20. **Track whether each process change helps or hurts,** with a measure and a watch-for-harm signal, and revert the ones that hinder. A process only gets lighter if changes can be taken back out. [S3]
 
 ---
+
+## Improvement ledger
+
+Every process change goes here, with what it should improve and how we'll know. Each retro marks each open row:
+- **helped:** keep it.
+- **no effect:** keep it if it costs nothing; otherwise drop it.
+- **hindered:** it made work slower, costlier, or caused false failures. Fix it or revert it, and say which.
+
+A change can help one thing and hurt another, for example faster reviews but more false rejections. Record both. Nothing on this list is permanent.
+
+| Since | Change | Should improve | Measured by | Watch for harm | Status |
+| --- | --- | --- | --- | --- | --- |
+| S1 | Independent reviewer, two passes planned per milestone | Bugs caught before merge | Real defects found per review pass | Rounds that only find style nits | helped (S1–S3) |
+| S2 | `SPEC_CHECKLIST.md` risk table | First-pass review results | Review passes per milestone | Briefs so long that coders miss the point | helped (S2–S3) |
+| S3 m3 | Review tier: Haiku for low risk, Opus for high | Review cost | `scripts/review_costs.py` | Bugs Haiku misses that Opus would catch; false rejections | open (1 false rejection so far, caused by a brief) |
+| S3 m4 | Small one-file or two-file tasks | Coder tokens per task | Coder tokens from agent reports | Too many tiny tasks, more orchestration than coding | helped (72k vs 250–400k) |
+| S3 m4 | Coders never pipe Broadsword output; never `recover` another agent's job | No project-wide blocks | Refused jobs per milestone | Coders unable to inspect long output | open |
+| S3 m4 | Example lists in briefs say "for example" | No false rejections from wording | Rejections whose cause is the brief | — | open |
+| S3 m4 | Every setting must be read by code, with a test | No dead settings | Review findings of unused settings | Test overhead for trivial settings | open |
+| S3 | Retro after each milestone | Repeat mistakes, speed and cost | Repeats of a mistake already in a retro | Retro time growing past its value | open |
+| S3 | Portable playbook loaded in every project | Lessons reach other projects | A lesson applied, or ignored, in another project | Rules that don't fit other projects causing friction there | open (not yet used outside Broadsword) |
+| S3 | `templates/brief.md`, `templates/coder-prompt.md` | Time to write a brief; brief errors | Orchestrator time per brief; rejections caused by briefs | A template followed by rote, so missing task-specific cases | open |
+| S3 | Done checks written as commands | One reading of "done" | Disputes or rework over what "done" meant | Checks that miss what can't be expressed as a command | open |
+| S3 | `scripts/review_costs.py` | Exact cost numbers in retros | Whether retros use it | — | open |
+| S3 | An interrupted run blocks only its own folder; panic guard for jobs | Blast radius of one agent's crash | Agents blocked by another agent's job | A half-changed folder that something outside it depends on | in progress |
+| planned | Reviewer canary (planted bugs every few merges, across models once OpenAI is linked) | Knowing the reviewer still works, and which model is worth its price | Catch rate and cost per model | Canary cost or noise outweighing its value | planned |
+| planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
 
