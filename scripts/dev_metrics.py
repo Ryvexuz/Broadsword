@@ -24,7 +24,19 @@ import subprocess
 import sys
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+def main_root():
+    """The main checkout, where state/ and projects/ live, even when this script runs from a task worktree."""
+    here = pathlib.Path(__file__).resolve().parent
+    try:
+        common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=30).stdout.strip()
+        if common:
+            return pathlib.Path(common).parent
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return here.parent
+
+
+ROOT = main_root()
 
 
 def fields(path):
