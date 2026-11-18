@@ -218,3 +218,20 @@ openai:gpt-6.1-terra  default  12/12        13/13        14/14        19/19     
 - Repeat runs (5x) for consistency, starting with the gpt-6.2 models and a stable comparison.
 - Re-run the errored models with the Responses API and a per-model token cap.
 - Benchmark the `fast` and `flex` tiers.
+
+## Single-bug extra lines, blind-labelled (added 2026-11-18)
+
+The other-BLOCKING lines from gpt-6-astra (6), gpt-6.1-terra (17) and gpt-6.2-astra (20) were shuffled with the model names hidden. A Sonnet labeller judged each against its diff (raw: `state/bench-results/extra-lines/`).
+
+```
+model          lines  real-bug  hardening  restates-known  false  unsure  worth adopting
+gpt-6-astra      6       3         1           0            1      1          5
+gpt-6.1-terra   17       8         4           2            3      0         12
+gpt-6.2-astra   20      10         6           2            2      0         14
+```
+
+- **None were style flags.** The extra lines were mostly real defects in those old first-pass commits.
+- **Five of the six false alarms came from the harness:** the case diffs left out `broadsword.toml`, so reviewers reported missing settings. Fixing that is task `t-20261118-141428`.
+- **These models' "other BLOCKING" counts mostly reflect thoroughness, not noise.**
+- **The labeller is one Claude model.** Its real-bug calls are claims until each is checked against main (same task).
+

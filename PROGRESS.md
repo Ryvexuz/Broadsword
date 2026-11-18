@@ -141,6 +141,11 @@ Process items:
    - a Codex backend for the benchmarks;
    - the tp8 price comparison. It only informs Lazlo; Claude fast mode stays off regardless.
 
+   - `t-20261118-141428`: GPT reviewers' 43 extra findings on the single-bug cases, blind-labelled:
+     - 21 real bugs, 11 hardening, 4 restating the known bug, 6 false, 1 unsure, and 0 style;
+     - 5 of the false ones were caused by the harness leaving `broadsword.toml` out of the diffs.
+     Check which bugs are still on main and file fixes.
+   - `t-20261118-141428-2`: cost to completion per model (Lazlo's rule: total cost until done, not per call).
    Then the benchmark follow-ups: the credit-blocked OpenAI rows through Codex, Responses API models, per-model token caps, 5x consistency on the gpt-6.2 models, an instruction-following test, a drift test, and labelling the extra single-bug lines.
    **Then move work to GPT** (Lazlo, 2026-11-18): this keeps the Claude plan for orchestration. Once the shadow verdicts and the benchmark re-runs show which GPT models to trust:
    - add a `codex` coder route: `codex exec` with write access inside the task's own worktree only, on the ChatGPT allowance;
