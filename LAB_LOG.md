@@ -6,7 +6,7 @@ One entry per session, newest first. At the end of each stage, three lessons for
 
 - **Stage:** 4 (v1 built, audit pending).
 - **Models:** Opus 5.5 orchestrator; Sonnet coders (tp1, Codex-first wrapper); Opus queue reviewer; gpt-5.6-sol shadow reviewer.
-- **tp1 scoped checks:** parked after two Opus FAILs on an unmeasurable done check (see RETRO). Codex-first wrapper: rejected by Opus (Windows timeout kill, double budget, unparseable run); fix round started.
+- **tp1 scoped checks:** parked after two Opus FAILs on an unmeasurable done check (see RETRO). Codex-first wrapper: merged as `92d5c7c` after one fix round (Opus FAILed the first on a Windows process-tree timeout, a doubled time budget and unparseable output reported as success). A real smoke call answered with `backend: codex` on the ChatGPT plan; the first shadowed merge through Codex is the next one. Known minor: `OPENAI_API_KEY` still reaches the codex child's environment.
 - **Git:** plain commits, then `git push origin` for main, tags and the two project branches (Lazlo's standing OK), as an off-drive backup before the move.
 - **Lesson:** a done check must be measurable by someone before the merge. If only the installed tool can measure it, the brief has to give a route, or every review fails.
 
