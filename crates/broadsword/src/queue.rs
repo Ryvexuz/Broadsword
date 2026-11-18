@@ -214,12 +214,34 @@ fn process_secrets(cfg: &Config) -> reviewer::Secrets {
 
 // ---- add --------------------------------------------------------------------------------
 
-/// A brief file may not be a secrets file, and must be a small UTF-8 text file.
+/// A folder of the config (`state_dir`, `build_dir`), resolved the way `canon_root` was: through the canonical root, and fully
+/// canonical when it exists (a junction inside it then resolves too).
+fn canon_inside(cfg: &Config, canon_root: &Path, dir: &Path) -> PathBuf {
+    let joined = canon_root.join(dir.strip_prefix(&cfg.root).unwrap_or(dir));
+    std::fs::canonicalize(&joined).unwrap_or(joined)
+}
+
+/// A brief file must be a small UTF-8 text file INSIDE the root (after canonicalising, so `..` and links count), not inside
+/// `state_dir` (queue records, job logs) or `build_dir`, and not a secrets file (checked on the name given and on the resolved name).
+/// A brief is stored, shown and sent to a model, so it may never be any file the caller can read.
 fn read_brief(cfg: &Config, path: &str) -> Result<String, String> {
-    let p = Path::new(path);
     if crate::git::is_secret_file(path) {
         return Err(format!("`{path}` looks like an .env file; a brief is sent to a model and secrets must never be"));
     }
+    let real = std::fs::canonicalize(path).map_err(|e| format!("cannot read the brief file `{path}`: {e}"))?;
+    let canon_root = std::fs::canonicalize(&cfg.root).map_err(|e| format!("cannot resolve the project root: {e}"))?;
+    if !real.starts_with(&canon_root) {
+        return Err(format!("the brief `{path}` is outside the project root; a brief must be a file inside the root (it is sent to a model)"));
+    }
+    for (name, dir) in [("state_dir", &cfg.state_dir), ("build_dir", &cfg.build_dir)] {
+        if real.starts_with(canon_inside(cfg, &canon_root, dir)) {
+            return Err(format!("the brief `{path}` is inside {name}; queue records, job logs and build output are never briefs (they are sent to a model)"));
+        }
+    }
+    if crate::git::is_secret_file(&real.to_string_lossy()) {
+        return Err(format!("`{path}` resolves to an .env file ({}); a brief is sent to a model and secrets must never be", real.display()));
+    }
+    let p = real.as_path();
     let meta = std::fs::metadata(p).map_err(|e| format!("cannot read the brief file `{path}`: {e}"))?;
     let max = cfg.reviewer_brief_max_kb * 1024;
     if !meta.is_file() || meta.len() > max {
@@ -863,7 +885,8 @@ impl<'a> Run<'a> {
     fn s_review(&mut self) -> R<()> {
         self.set_step("review")?;
         if !self.e.get("verdict").is_empty() {
-            return self.log("review", "the verdict is already recorded (this run resumed): the reviewer is not asked again");
+            self.log("review", "the verdict is already recorded (this run resumed): the reviewer is not asked again")?;
+            return self.recorded_verdict_ok();
         }
         let (dir, branch) = (self.dir.clone(), self.branch());
         let model = reviewer_model_for(self.cfg, self.e.get("risk")).to_string();
@@ -939,6 +962,26 @@ impl<'a> Run<'a> {
         Err(self.end(REJECTED, &format!("the `{model}` reviewer FAILED it: {why}. The task is still running and its worktree is kept: fix, commit, and queue it again with `queue add`. Full review: {file}"), EXIT_REJECTED))
     }
 
+    /// A verdict is already recorded (a resumed run). Returns Ok only for a PASS on exactly the checked commit; anything else ends
+    /// the entry the way a fresh run would, so no resumed entry can be stuck `running` (which would block `queue run` for all):
+    /// not PASS -> `rejected` exactly as a fresh FAIL (task running, worktree kept, `queue add` works again);
+    /// a PASS without a recorded reviewed or checked commit, or for another commit -> `stale` (`queue run --entry` starts a fresh attempt).
+    fn recorded_verdict_ok(&mut self) -> R<()> {
+        let id = self.e.id().to_string();
+        if self.e.get("verdict") != "PASS" {
+            let model = self.e.get("reviewer_model").to_string();
+            let file = self.e.get("review_file").to_string();
+            let blocking = self.e.get("blocking").replace('\n', "; ");
+            let why = if blocking.is_empty() { format!("verdict `{}`", self.e.get("verdict")) } else { blocking };
+            return Err(self.end(REJECTED, &format!("the `{model}` reviewer FAILED it: {why}. The task is still running and its worktree is kept: fix, commit, and queue it again with `queue add`. Full review: {file}"), EXIT_REJECTED));
+        }
+        let (checked, reviewed) = (self.e.get("checked_tip").to_string(), self.e.get("reviewed_tip").to_string());
+        if checked.is_empty() || reviewed.is_empty() || checked != reviewed {
+            return Err(self.end(STALE, &format!("the recorded PASS does not name the checked commit (checked `{}`, reviewed `{}`), so it cannot be trusted; nothing was merged. Run `queue run --entry {id}` to check and review it again", short(&checked), short(&reviewed)), EXIT_RETRY));
+        }
+        Ok(())
+    }
+
     /// The review file: header lines, then the reviewer's raw output. Returns its path relative to root. Written atomically.
     #[allow(clippy::too_many_arguments)]
     fn write_review(&mut self, model: &str, tip: &str, base: &str, prompt_bytes: usize, cli: &reviewer::Cli, r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
@@ -983,12 +1026,23 @@ impl<'a> Run<'a> {
         let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
         let reviewed = self.e.get("reviewed_tip").to_string();
         let base = self.e.get("base_head").to_string();
-        if reviewed.is_empty() || base.is_empty() || self.e.get("verdict") != "PASS" {
-            return Err(self.internal("the merge step was reached without a recorded PASS for a reviewed commit; refusing to merge"));
+        // A resume at this step skips the review step: the recorded state is judged here, and every bad state ENDS the entry
+        // (`rejected` or `stale`), never leaves it `running` where it would block `queue run` for every other entry.
+        if self.e.get("verdict") != "PASS" {
+            self.recorded_verdict_ok()?; // always an Err here: rejected
         }
-        if self.e.get("checked_tip") != reviewed {
-            return Err(self.internal(&format!("the merge step was reached with a reviewed commit ({}) that is not the commit the check passed on ({}); refusing to merge", short(&reviewed), short(self.e.get("checked_tip")))));
+        if reviewed.is_empty() || base.is_empty() || self.e.get("checked_tip") != reviewed {
+            return Err(self.end(STALE, &format!("the merge step was reached without a recorded PASS for the checked commit (reviewed `{}`, checked `{}`, base `{}`); nothing was merged. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(self.e.get("checked_tip")), short(&base), self.e.id()), EXIT_RETRY));
         }
+        // A stand-in reviewer (a scratch test hook) may only merge into a project that itself lives in scratch.
+        let cli_path = self.e.get("reviewer_cli").to_string();
+        if self.e.get("test_hook") == "true" {
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if !canon(&dir).starts_with(canon(&self.cfg.scratch_dir)) {
+                return Err(self.blocked(&format!("the review was made by a TEST HOOK reviewer ({cli_path}), not a real one, and project folder {} is outside scratch_dir; a stand-in review never merges into a real project; nothing merged", dir.display())));
+            }
+        }
+        println!("queue entry {}: merging after a {} review through reviewer CLI {}", self.e.id(), if self.e.get("test_hook") == "true" { "TEST HOOK" } else { "real" }, if cli_path.is_empty() { "(none recorded)" } else { &cli_path });
         let main_branch = self.g(wtgit::current_branch(&dir))?;
         if main_branch.as_deref() != Some(self.e.get("main_branch")) {
             let now = main_branch.unwrap_or_else(|| "a detached HEAD".into());
@@ -1028,7 +1082,8 @@ impl<'a> Run<'a> {
             return Err(self.internal(&format!("after `git merge --ff-only` main's HEAD is {} but the reviewed commit is {}; main was {} before; look at the project", short(&after), short(&reviewed), short(&head))));
         }
         self.e.set("main_sha", after.clone());
-        self.log("merge", &format!("fast-forwarded `{}` from {} to {}", self.e.get("main_branch"), short(&head), short(&after)))
+        let note = format!("fast-forwarded `{}` from {} to {}; reviewed through CLI {} (test_hook: {})", self.e.get("main_branch"), short(&head), short(&after), if cli_path.is_empty() { "(none recorded)" } else { &cli_path }, self.e.get("test_hook"));
+        self.log("merge", &note)
     }
 
     // -- step 6: main check -----------------------------------------------------------------
