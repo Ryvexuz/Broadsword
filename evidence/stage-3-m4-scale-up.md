@@ -37,7 +37,9 @@ probe exit=3
 broadsword: cannot start t-20261118-023322-5: 4 tasks are running, the max_agents cap in broadsword.toml is 4: ...
 probe exit=3
 ```
-The cap was raised to 4 in `4349051`.
+The cap was raised to 4 in `4349051`. Both probe tasks were then abandoned (`task abandon`), so they hold no slots or claims.
+
+"Coder jobs" in the table below counts Broadsword jobs (test and run) per coder. There was one coder agent per task, so 7 coders in all.
 
 ## The tasks
 

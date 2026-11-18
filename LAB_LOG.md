@@ -2,6 +2,31 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Stage 3, milestone 4: scale-up test (max_agents 3, then 4)
+
+**Models and roles**
+- Claude Opus 5.5 as orchestrator (main session): spec, task split, merges, Broadsword fixes, done check, records.
+- 7 Sonnet coders, one per task, about 72k tokens each.
+- Haiku as the reviewer in the merge queue: 8 reviews, about $0.002 each (one task failed once, then passed).
+- 2 headless Opus reviews of the Broadsword fixes: about $0.19 (`max_agents` cap) and $0.21 (closed-stdout fix).
+
+**What went wrong and what fixed it**
+- **`max_agents` was never enforced.** The setting was in `broadsword.toml`, but no code read it, so raising it would have tested nothing. Fixed in `16c9279`: `task start` refuses with exit 3 at the cap, across all projects. Then the cap was raised to 4 in `4349051`.
+- **`| head` killed Broadsword mid-job and blocked every agent on the project.** A coder ran a job piped into `head`. The closed pipe panicked the supervisor, the record stayed `running`, and new jobs were refused until `recover`. The same coder was blocked four times, the physics-doc coder's only test run was refused, and the queue's check for the CSV task exited 3 with nothing changed. The affected coders stopped and reported, and nobody ran `recover` on another agent's job. The orchestrator confirmed the worktree was clean, ran `recover --abandon`, and re-ran the blocked checks without pipes. Root fix in `b578103`: crate-wide non-panicking print macros, with a test that fails without the fix.
+- **An ambiguous brief caused a false Haiku rejection.** The brief listed public API items in parentheses, and the reviewer read the list as complete, so it rejected a call to `max_speed()`. The code was right. The brief now says "anything `pub` in src/lib.rs (for example ...)", and the same commit passed on re-queue.
+
+**Rough cost and time**
+- About 7 minutes of agent wall clock for both rounds (02:30 to 02:37 UTC). Each round's first start to last merge: 2 min 27 s at cap 3, 3 min 20 s at cap 4.
+- Coders: about 72k Sonnet tokens each. Reviews: about $0.002 each in Haiku, plus the two Opus reviews above.
+
+**Git commands used, beyond a plain commit**
+- `git worktree list`: lists the worktrees Git knows about, so a leftover one would show. Run on crash-sim after the scale-up: it listed only the main checkout at `9f1b5fc`, and `git branch` showed only `main`, so no worktree or task branch was left.
+- Broadsword's queue ran `git rebase <main HEAD>` and `git merge --ff-only <sha>`, as explained in the milestone 3 entry. Each task's `task done` also removed its worktree and branch, through `git worktree remove` and `git branch -d` as before.
+
+**One lesson about AI development**
+
+At small scale, the shared-resource failure was not build contention. It was a shared failure state: one agent's crashed job blocked everyone. Scale-up exposes blast radius before it exposes throughput, so the test for the next cap should be about what one failure can stop, not only how fast agents finish.
+
 ## 2026-11-18 — Stage 3, milestone 3: reviewer step and merge queue
 
 **Models and roles**
