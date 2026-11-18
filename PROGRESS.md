@@ -37,6 +37,8 @@ Stage 0 is still untagged; see Unfinished.
 - **Agent cap (`max_agents`).** `task start` refuses with exit 3 when `max_agents` tasks are already `running`, across all projects. A refused start changes nothing. The check runs under the board's OS file lock, in the same step as the claim check. The cap is set to 4 in `broadsword.toml`. Lowering it leaves running tasks alone.
   - Tested at caps of 3 and 4 on the real board, with an 8-process race. Exactly 3 win each round, and the losers exit 3.
 - **An interrupted `run` blocks only its own folder** (`ba03a84`): another agent's worktree, or main, keeps working. Records without a `source` still block the whole project. A panic inside a job kills its verified child; a build, test or check is then marked `failed`, while a `run` stays interrupted, so `recover` offers the rollback.
+- **Secrets stay out of Git** (`f660c76`, audit finding B1): checkpoints never store `.env*` files, and only `run` jobs take a checkpoint. The 23 refs that held `.env` were deleted and the objects pruned (Lazlo approved this on 2026-11-18); no `refs/broadsword/*` object holds a secret now. The key never left this machine. Lazlo will rotate it when convenient.
+- **Full audit, 2026-11-18:** `evidence/full-review-2026-11-18.md`. B1 is fixed. The 17 serious and 14 minor findings are still open, and they are fixed through the queue before Stage 4 code.
 - **`run` uses the shared build folder** (`d23b969`): every job's child gets `CARGO_TARGET_DIR` at one spawn site.
 - **Closed stdout no longer kills Broadsword.** Crate-wide, `println!`, `print!`, `eprintln!` and `eprint!` are shadowed with versions that drop write errors instead of panicking (`b578103`). Before the fix, `| head` made a job panic mid-run and left its record `running`, which blocked new jobs on that project until `recover`.
 - **`task start --worktree`** gives a task its own Git worktree in `worktrees/<project>/<id>`, on branch `task/<id>`, based on the project's current main.
@@ -60,7 +62,7 @@ Stage 0 is still untagged; see Unfinished.
 - **Server:** `broadsword mcp` runs from `build/bin/`.
 - **OpenAI client:** `clients/openai_mcp.py`.
 - **Building:** after changing Broadsword's code, run `broadsword build broadsword` from `build/bin/` or a copy (a running `build/debug` exe cannot be cleaned, so it is not built from there). Then run `build/debug/broadsword.exe install`. No plain cargo, and no timestamp touching.
-- **Tests:** 355 Broadsword tests pass, run through `broadsword test broadsword`. The queue has 40 of them, using a fake reviewer.
+- **Tests:** 362 Broadsword tests pass, run through `broadsword test broadsword`. The queue has 40 of them, using a fake reviewer.
 
 ## Unfinished
 

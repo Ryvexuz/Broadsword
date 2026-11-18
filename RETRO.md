@@ -80,9 +80,39 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | planned | Reviewer canary (planted bugs every few merges, across models once OpenAI is linked) | Knowing the reviewer still works, and which model is worth its price | Catch rate and cost per model | Canary cost or noise outweighing its value | planned |
 | S3 audit | Full independent audit at every stage end, before the tag | Cross-cutting bugs, false claims, rules not in force | Blocking and serious findings per audit (S0–3: 1 and 17) | Audit cost (about 334k tokens) outweighing what it finds | open |
 | S3 audit | All code reaches main through the merge queue, the orchestrator's included | Review independence that is recorded and enforced | Commits on main without a queue entry | Slower small fixes | open |
+| S3 audit | Secret files (`.env*`) never stored in checkpoints; only `run` takes a checkpoint | No key in Git objects; faster build, test and check jobs | Objects holding a secret blob under `refs/broadsword/*` (now 0) | Lost rollback protection for tracked files named `.env*` (Opus minor) | done (`f660c76`) |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
+
+---
+
+## Audit fix B1: secrets out of checkpoints (2026-11-18)
+
+### Did the last changes work?
+
+- **Through the queue:** the orchestrator's own change went through it for the first time (the new no-exemption rule). Opus passed it, for $0.38.
+- **Done-check output in the brief:** the done-check output went into the brief before queueing (the new rule), and the coder ran the suite in the foreground and reported a real result (the template fix). No hand-back rounds.
+- **Standing rules in the brief:** the brief named the rules the change touches. The hard case it called out, a rollback deleting a secret that was excluded from capture, is now covered by tests.
+
+### What went wrong
+
+| What | Why | What changes | Where it's enforced |
+| --- | --- | --- | --- |
+| Two more `.env` refs appeared after the audit: 23, not the 21 approved. | The merge queue's checks still ran the old installed binary until the fix was installed. | Delete by rule ("every ref holding a secret file"), not by an old count, and install the fix before cleaning up. | This retro; the ref list was re-derived before deleting |
+| The worktree was kept again because tests left scratch folders inside it. | Tests that create scratch roots don't always remove them (audit minor 4). | Already in IDEAS. Second time it has cost a manual clean-up, so it moves up the list. | `IDEAS.md` |
+
+### Speed and cost
+
+- **Coder:** about 174k Sonnet tokens and 8 minutes, with 8 jobs, none refused.
+- **Opus review:** $0.38.
+- **Clean-up:** deleting the refs and pruning the objects took seconds.
+- **Side effect:** build, test and check jobs no longer capture ignored files, which earlier cost up to about 29 s per job on large trees, so jobs get faster.
+
+### Carry into the next milestone
+
+1. The Opus minors on this change are in IDEAS.md: an index ref can hold a staged `.env`; `.env*` also covers unrelated files such as `.envoy.yaml`; and old-record reporting.
+2. Fix the remaining audit findings through the queue before Stage 4 code.
 
 ---
 

@@ -2,6 +2,32 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Audit fix B1: secrets out of checkpoints
+
+**Models and roles**
+- Opus orchestrator.
+- Sonnet coder: about 174k tokens.
+- Opus reviewer in the queue: $0.38, PASS.
+
+**What went wrong and what fixed it**
+- The full audit found that every job checkpoint stored `.env` as a Git object.
+- The fix: secret files are never captured, restored or deleted, and only `run` takes a checkpoint.
+- 23 refs held `.env`, 2 more than the audit counted, because the queue still used the old binary. All 23 were deleted with Lazlo's approval.
+
+**Git commands used, beyond a plain commit**
+- `git update-ref refs/broadsword/kept/stash-20261117-cac61fd cac61fd`: gave a dropped coder stash commit a name, so the prune below could not delete that work.
+- `git update-ref -d <ref>`, once for each of the 23 refs: deleted a ref. The commit it pointed to, and the `.env` blob inside, became unreachable.
+- `git reflog expire --expire-unreachable=now --all`: dropped reflog entries that could still have kept those objects alive.
+- `git gc --prune=now`: removed unreachable objects from the object store immediately, instead of after the usual two weeks. Afterwards, `git cat-file -e <blob>` confirmed the `.env` blob was gone.
+
+**Rough cost and time**
+- About 15 minutes of agent time.
+- $0.38 of review.
+
+**One lesson about AI development**
+
+When you clean up after a bug, re-derive what to clean from the rule ("every ref holding a secret"), not from the count in the report. The bug kept running between the report and the fix.
+
 ## 2026-11-18 — Stage 3 close-out: two reviewer models
 
 **Models and roles**

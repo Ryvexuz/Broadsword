@@ -25,3 +25,9 @@ Ideas outside the current stage go here, not into code. Each one names the stage
 - **Stage 3 (crash sim):** `--summary` prints nothing when a run aborts mid-way (CSV mode prints the partial rows); decide and document. tests/summary.rs compares against values rounded from the CSV text, which could disagree with the binary's direct formatting in rare edge cases (Opus reviewer minors).
 - **Stage 3 (follow-up):** the panic guard runs after the build lock is released by unwinding. For a moment, another job can take the lock while the panicked job's child still runs. Kill the child before the lock guard drops (Opus minor, `ba03a84`).
 - **Stage 3 (follow-up):** a bad or unknown `--task` on a project with an interrupted run gives exit 3 "interrupted run" instead of the real error. Resolve the task before the guard (Opus minor).
+- **Audit follow-up (Opus minors on `f660c76`):**
+  - `refs/broadsword/index/<id>` keeps the real index tree, so a `.env` that a `run` job staged would become reachable there. Filter secret paths out of the stored index tree too.
+  - `.env*` also matches unrelated files such as `.envoy.yaml` and `.environment`, which then lose rollback protection. Consider exactly `.env` and `.env.<name>`.
+  - An old record whose `ignored_skipped` names `.env` still reports it as not restored.
+  - `secret_skipped` is `|`-joined, so a file name containing `|` or a newline corrupts the record (as `ignored_skipped` already can).
+- **Audit follow-up:** tests that create scratch roots must remove them. Leftovers block worktree removal; this has happened twice now. Move this up.
