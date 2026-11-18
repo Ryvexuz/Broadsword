@@ -66,4 +66,11 @@ Ideas outside the current stage go here, not into code. Each one names the stage
   - Compare gpt-6.2-astra, the sol models and a Claude model, to get a drift curve per model.
 - **Bench:** `bench/coder` records an API error (for example HTTP 429, no credits) as `format_failure`, so a refused call scores 0% instead of being excluded as an error. Map provider errors to `is_error`, and have score.py exclude them, as reviewer/score.py now does.
   Also: the OpenAI account ran out of credits on 2026-11-18 during the coding run. Every later 6.x coding row needs a re-run after credits are added.
+- **Use Lazlo's spare ChatGPT weekly allowance instead of API credits (after the move):** OpenAI's Codex CLI can sign in with a ChatGPT account, so its usage counts against the ChatGPT plan, and `codex exec` runs it headless. That mirrors how Broadsword uses the Claude Code CLI with the Claude plan.
+  - Steps:
+    1. Lazlo installs the Codex CLI and signs in himself.
+    2. Test one review through `codex exec`: which models are offered, the output format, how plan limits behave under a burst.
+    3. If it works, add a `codex` reviewer backend (a wrapper like `clients/openai_review.py` that prints the Claude-style JSON) and a benchmark provider.
+  - Check ChatGPT's terms for scripted use first.
+  - Keep the API key only for what the CLI can't do.
 
