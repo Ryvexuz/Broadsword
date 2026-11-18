@@ -85,3 +85,19 @@ The job record is `20261117-202537-crash-sim-check  done`, and the crash sim's `
 6. During an install there is a short window where `build/bin/broadsword.exe` is missing. The hook falls back to `build/debug/`.
 7. A timed-out or cancelled job's record stays `running`. The next job auto-recovers it, as documented.
 8. The supported protocol versions are still unchecked against the live spec.
+
+## Stricter re-run (2026-11-18, after audit S10)
+
+A headless Claude Code session (model `claude-haiku-5-5`) was started from a folder outside the project, so it had no `CLAUDE.md` and no project files. It used a temporary MCP config that starts `buildinroadsword.exe mcp` in the root. All Broadsword tools were allowed (`--allowedTools mcp__broadsword`), and its built-in tools were off. The prompt named neither a tool nor the project:
+
+> You have an MCP server connected. Find out what it can do, then use it to build and test the crash simulator it manages, and tell me in two lines whether that worked.
+
+Result: 4 turns, $0.0066. The server log shows `tools/call projects`, then `status`, then `check` (exit 0), and job record `20261118-053737-crash-sim-check` exists. The session's answer:
+
+> The Broadsword MCP server offers project-scoped build, test, check and run jobs, a job log with recovery, disk and RAM status, a task board with claims and worktrees, and a queue that reviews and merges task branches. It manages two projects: `broadsword` and `crash-sim`.
+>
+> It worked: `check crash-sim` built the project and ran all 40 tests, which passed with 0 failures (job `20261118-053737-crash-sim-check`).
+>
+> Yes, the build and test both succeeded. The build step reported "Finished in 0.01s" because the artifacts were already current, so no fresh compile happened, but the test binaries ran and all 40 passed.
+
+This meets Stage 2 done check 1 as worded: a session that had never seen the project connected, found the tools and ran a crash-sim build with no interface open.
