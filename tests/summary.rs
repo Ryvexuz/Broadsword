@@ -12,15 +12,15 @@ fn summary(args: &[&str]) -> String {
     String::from_utf8(o.stdout).unwrap()
 }
 
-/// (first contact t or None, peak strain, final center_y) from the CSV of the same options.
-fn from_csv(args: &[&str]) -> (Option<String>, String, String) {
+/// ((t, min_y) of every CSV row, peak strain, final center_y) from the CSV of the same options.
+fn from_csv(args: &[&str]) -> (Vec<(f64, f64)>, String, String) {
     let o = run(args);
     assert!(o.status.success());
     let text = String::from_utf8(o.stdout).unwrap();
     let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
-    let contact = rows.iter().find(|r| r[1].parse::<f64>().unwrap() <= 0.0).map(|r| r[0].to_string());
+    let samples = rows.iter().map(|r| (r[0].parse::<f64>().unwrap(), r[1].parse::<f64>().unwrap())).collect();
     let peak = rows.iter().map(|r| r[3].parse::<f64>().unwrap()).fold(f64::MIN, f64::max);
-    (contact, format!("{peak:.6}"), format!("{:.4}", rows.last().unwrap()[2].parse::<f64>().unwrap()))
+    (samples, format!("{peak:.6}"), format!("{:.4}", rows.last().unwrap()[2].parse::<f64>().unwrap()))
 }
 
 fn parse(line: &str) -> (String, String, String) {
@@ -55,17 +55,23 @@ fn short_run_never_touches_ground() {
 fn values_match_the_csv_run() {
     for args in [vec![], vec!["--duration", "0.1"], vec!["--duration", "2", "--drop-height", "3", "--no-tilt"]] {
         let (c, p, y) = parse(&summary(&args));
-        let (cc, cp, cy) = from_csv(&args);
-        // The summary time comes from the substep loop, so it is never later than the first
-        // CSV sample at or below ground. It can be much earlier: a node can touch and bounce
-        // clear between samples (default run: 0.639 s against 0.65 s; flat 3 m drop: 0.782 s
-        // against 1.26 s, because the CSV samples miss the whole first touchdown).
-        match cc {
-            None => assert!(c == "none" || c.parse::<f64>().is_ok(), "{args:?}"),
-            Some(cc) => {
-                let (c, cc): (f64, f64) = (c.parse().unwrap(), cc.parse().unwrap());
-                assert!(c <= cc + 1e-9, "{args:?}: summary {c} csv {cc}");
-            }
+        let (samples, cp, cy) = from_csv(&args);
+        // The summary time comes from the substep loop. Every CSV sample strictly before it
+        // must be above ground, and it must fall inside the output step that follows the last
+        // such sample (dt = 0.01 in all these runs). So a contact time that is too early, too
+        // late or invented fails. It can still be much earlier than the first CSV sample at
+        // or below ground: a node can touch and bounce clear between samples (default run:
+        // 0.639 s against 0.65 s; flat 3 m drop: 0.782 s against 1.26 s).
+        let dt = 0.01;
+        if c == "none" {
+            assert!(samples.iter().all(|s| s.1 > 0.0), "{args:?}: summary says none but the CSV touches ground");
+        } else {
+            let c: f64 = c.parse().unwrap();
+            let before: Vec<&(f64, f64)> = samples.iter().filter(|s| s.0 < c - 1e-9).collect();
+            assert!(before.iter().all(|s| s.1 > 0.0), "{args:?}: CSV touches ground before summary time {c}");
+            let last = before.last().expect("contact at t = 0 is not expected here").0;
+            assert!(c >= last && c <= last + dt + 1e-9, "{args:?}: summary {c} not within one step after sample {last}");
+            assert!(c <= samples.last().unwrap().0 + 1e-9, "{args:?}: summary {c} is after the last row");
         }
         assert_eq!(p, cp, "{args:?}");
         assert_eq!(y, cy, "{args:?}");

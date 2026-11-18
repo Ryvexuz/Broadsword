@@ -16,14 +16,17 @@ fn total(sim: &Sim) -> f64 {
     k + p + e
 }
 
-/// (a) After the output step in which the first contact happens, total energy never
-/// rises above its value at that step. In the real default run the largest rise is
-/// exactly 0 J (energy at impact is about 186 J and only falls afterwards), so the bound
-/// is a tight 0.01 J, about 5e-5 of the impact energy: enough for rounding, far below
-/// any real energy gain from a bad contact or friction rule.
+/// (a) From the substep of first contact on, total energy never rises above its value at
+/// that substep. The sim is stepped one physics substep at a time (dt = h = 1 ms, one
+/// substep per advance, the same physics as the default run) and energy is sampled after
+/// every substep, including the first contact ones. Measured on the default drop:
+/// the energy at the first contact substep is 188.74 J and the largest rise after it is
+/// -2.80 J (negative: every later substep is below it, so energy only falls). The bound
+/// is a tight 0.01 J, about 5e-5 of the impact energy:
+/// enough for rounding, far below any real energy gain from a bad contact or friction rule.
 #[test]
 fn energy_never_rises_after_impact() {
-    let cfg = Config::default();
+    let cfg = Config { dt: 0.001, substeps: 1, duration: 5.0, ..Config::default() };
     let steps = (cfg.duration / cfg.dt).round() as u64;
     let mut sim = Sim::new(cfg);
     let mut at_impact: Option<f64> = None;
@@ -40,7 +43,8 @@ fn energy_never_rises_after_impact() {
             None => {}
         }
     }
-    assert!(at_impact.is_some() && after > 100, "no impact, or too few steps after it ({after})");
+    eprintln!("energy at impact {:?} J, worst rise {worst_rise} J over {after} substeps", at_impact);
+    assert!(at_impact.is_some() && after > 1000, "no impact, or too few substeps after it ({after})");
     assert!(worst_rise < 0.01, "energy rose by {worst_rise} J after impact");
 }
 

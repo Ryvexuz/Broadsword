@@ -13,9 +13,9 @@ pub const NODE_MASS: f64 = 1.0;
 /// (see max_stable_step), so at the default 1 ms substep omega*dt is about 0.40, well under
 /// the symplectic Euler stability limit of 2.
 pub const BEAM_STIFFNESS: f64 = 20_000.0;
-/// Axial damping (N*s/m). Damps impact ringing within the 5 s run;
-/// c*h/m = 0.02 per 1 ms substep, far below the explicit-damping limit of 0.25
-/// (see DAMPING_STABILITY_LIMIT).
+/// Axial damping (N*s/m). Damps impact ringing within the 5 s run. It lowers the stable
+/// step: the coupled limit (see `stable_step_limit`) is 0.0041 s at 20, against 0.005 s
+/// undamped, and `validate` enforces it.
 pub const BEAM_DAMPING: f64 = 20.0;
 /// Fraction of downward speed returned on ground contact.
 pub const RESTITUTION: f64 = 0.5;
@@ -29,7 +29,10 @@ pub const MAX_STRAIN_LIMIT: f64 = 0.5;
 /// Initial tilt in degrees about x and z when tilt is on.
 pub const TILT_DEG: f64 = 5.0;
 
-/// Largest physics step (s) that keeps symplectic Euler stable for the constants above.
+/// Largest physics step (s) that keeps symplectic Euler stable for the constants above,
+/// ignoring damping (a conservative stiffness-only bound). `validate` still checks it
+/// as well as `stable_step_limit`: Gershgorin holds for any deformed shape, whereas
+/// `stable_step_limit` uses the stiffest mode of the rest shape.
 ///
 /// Each node has 7 beams, so by Gershgorin the stiffness matrix has largest
 /// eigenvalue <= 2 * 7 * k / m, i.e. omega_max <= sqrt(14 k / m) (about 529 rad/s;
@@ -45,57 +48,70 @@ pub fn max_stable_step() -> f64 {
 /// gamma = 8 c / m. (Checked numerically in tests/stability.rs.)
 pub const STIFFEST_MODE_EIGENVALUE: f64 = 8.0;
 
-/// Explicit damping is stable only while c*h/m stays below this.
+/// Which condition of `stable_step_limit` sets the limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// h^2 w2 + 2 h g < 4: spring and damper together (the stiffness limit is this
+    /// condition with g = 0).
+    Coupled,
+    /// 0 < h g < 2: the damper alone. For w2 > 0 the coupled condition is always the
+    /// tighter one, so this binds only when there is no spring.
+    DamperAlone,
+}
+
+/// Largest step h (s), exclusive, for which the stiffest damped mode of the cube is stable
+/// under this code's integrator, for beam stiffness `k`, damping `c` and node mass `m`.
+/// Returns the limit and the condition that sets it.
 ///
 /// Derivation. In a mode with spring rate w2 = omega^2 and damping rate g = gamma, one
-/// symplectic Euler step of this code (velocity first, then position with the new
-/// velocity) is
+/// symplectic Euler step (velocity first, then position with the new velocity) is
 ///     v' = (1 - h g) v - h w2 x,      x' = x + h v'
-/// a 2x2 map with determinant 1 - h g and trace 2 - h g - h^2 w2. By the Jury criterion
-/// it is stable iff  |det| < 1,  tr < 1 + det  and  -tr < 1 + det, that is
-///     0 < h g < 2     and     h^2 w2 + 2 h g < 4.
-/// For the stiffest mode g = 8 c / m, so the first condition (pure damping, no spring)
-/// is 8 c h / m < 2, i.e. c*h/m < 0.25. The audit's 0.25 is right; the old 1.0 was the
-/// single-spring value (g = c/m) and ignored that the cube's stiffest mode is damped
-/// eight times as hard. The second condition couples spring and damper; it allows
-/// h <= about 0.0041 s for the current constants, which is looser than `max_stable_step`
-/// (0.0038 s), so the c*h/m < 0.25 condition is the binding damping one and the
-/// coupled one is implied by `validate` (see `coupled_stability_limit`).
+/// a 2x2 map with determinant 1 - h g and trace 2 - h g - h^2 w2. By the Jury criterion it
+/// is stable iff  |det| < 1,  tr < 1 + det  and  -tr < 1 + det, that is
+///     (A) 0 < h g < 2     and     (B) h^2 w2 + 2 h g < 4.
+/// For the stiffest mode w2 = 8 k / m and g = 8 c / m. The largest h meeting (B) is the
+/// positive root h = (-g + sqrt(g^2 + 4 w2)) / w2. At h = 2/g, (B) reads 4 w2/g^2 + 4 < 4,
+/// which is false for w2 > 0, so the root is always below 2/g: (B) binds whenever there is
+/// a spring, and (A) only when w2 = 0 (then the limit is 2/g, or unbounded if g = 0 too).
 ///
-/// With the current constants the stiffness limit still always fails first:
-/// c*h/m = 0.25 needs h = 0.0125 s but `max_stable_step` is 0.0038 s (c*h/m = 0.076
-/// there). `damping_limit_error` is therefore not reachable through `validate`; it is
-/// tested directly, and it starts to matter only if BEAM_DAMPING is raised past about 66.
-pub const DAMPING_STABILITY_LIMIT: f64 = 2.0 / STIFFEST_MODE_EIGENVALUE;
-
-/// Exact stability limit (s) of the stiffest damped mode: the positive root of
-/// h^2 w2 + 2 h g = 4 with w2 = 8 k / m and g = 8 c / m.
-pub fn coupled_stability_limit() -> f64 {
-    let w2 = STIFFEST_MODE_EIGENVALUE * BEAM_STIFFNESS / NODE_MASS;
-    let g = STIFFEST_MODE_EIGENVALUE * BEAM_DAMPING / NODE_MASS;
-    (-g + (g * g + 4.0 * w2).sqrt()) / w2
-}
-
-/// The damping number c*h/m for physics step `h`.
-pub fn damping_number(h: f64) -> f64 {
-    BEAM_DAMPING * h / NODE_MASS
-}
-
-/// Largest physics step (s) with c*h/m below `DAMPING_STABILITY_LIMIT`.
-pub fn max_damping_step() -> f64 {
-    DAMPING_STABILITY_LIMIT * NODE_MASS / BEAM_DAMPING
-}
-
-/// Error text if step `h` breaks the damping limit, else None.
-pub fn damping_limit_error(h: f64) -> Option<String> {
-    let n = damping_number(h);
-    if n >= DAMPING_STABILITY_LIMIT {
-        Some(format!(
-            "physics step h = dt/substeps = {h:.6} s gives damping number c*h/m = {n:.4}, which must stay below {DAMPING_STABILITY_LIMIT} (c = {BEAM_DAMPING}, m = {NODE_MASS}); raise --substeps or lower --dt"
-        ))
+/// Damping makes the limit tighter than the undamped 2/omega. With today's constants
+/// (k = 20000, m = 1) the limit is 0.005 s at c = 0 and 0.0041 s at c = 20; it falls below
+/// the Gershgorin bound `max_stable_step()` (0.00378 s) once c is above about 28.3, so
+/// the damping limit is real: a c between 28 and 66 would pass a separate c*h/m < 0.25 test
+/// and still blow up. `Config::validate` therefore enforces this coupled condition itself.
+pub fn stable_step_limit_with_cause(k: f64, c: f64, m: f64) -> (f64, Binding) {
+    let w2 = STIFFEST_MODE_EIGENVALUE * k / m;
+    let g = STIFFEST_MODE_EIGENVALUE * c / m;
+    let damper_alone = if g > 0.0 { 2.0 / g } else { f64::INFINITY };
+    // Same root as (-g + sqrt(g^2 + 4 w2)) / w2, written without cancellation.
+    let coupled = if w2 > 0.0 { 4.0 / (g + (g * g + 4.0 * w2).sqrt()) } else { f64::INFINITY };
+    if damper_alone < coupled {
+        (damper_alone, Binding::DamperAlone)
     } else {
-        None
+        (coupled, Binding::Coupled)
     }
+}
+
+/// The limit of `stable_step_limit_with_cause`, without the cause.
+pub fn stable_step_limit(k: f64, c: f64, m: f64) -> f64 {
+    stable_step_limit_with_cause(k, c, m).0
+}
+
+/// Error text if step `h` is not below `stable_step_limit(k, c, m)`, else None. One message
+/// naming h, the limit and the condition that binds. `Config::validate` calls it with the
+/// real constants; it takes them as arguments so any constants can be tested.
+pub fn damped_step_error(h: f64, k: f64, c: f64, m: f64) -> Option<String> {
+    let (limit, binding) = stable_step_limit_with_cause(k, c, m);
+    if h < limit {
+        return None;
+    }
+    let which = match binding {
+        Binding::Coupled => "h^2*w2 + 2*h*g < 4 (spring and damper together)",
+        Binding::DamperAlone => "0 < h*g < 2 (damper alone)",
+    };
+    Some(format!(
+        "physics step h = dt/substeps = {h:.6} s reaches the damped stability limit {limit:.6} s, set by {which} with w2 = 8k/m, g = 8c/m (k = {k}, c = {c}, m = {m}); raise --substeps or lower --dt"
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +153,7 @@ impl Config {
                 (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
             ));
         }
-        if let Some(e) = damping_limit_error(h) {
+        if let Some(e) = damped_step_error(h, BEAM_STIFFNESS, BEAM_DAMPING, NODE_MASS) {
             return Err(e);
         }
         Ok(())

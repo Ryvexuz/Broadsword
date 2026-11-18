@@ -38,10 +38,12 @@ Constants (stiffness, damping, restitution, friction) are at the top of
 
 - The run aborts with a message on stderr and exit code 1 if a node goes
   non-finite or max strain passes 50%. Rows already computed are still printed.
-- A physics step `dt / substeps` above the stable limit (about 3.8 ms, derived
-  from the beam stiffness and node mass in `max_stable_step()`) is refused up front, and so is `c*h/m` of 0.25 or more (`DAMPING_STABILITY_LIMIT`;
-with the current constants the stiffness limit always trips first). See
-`docs/PHYSICS.md`.
+- A physics step `h = dt / substeps` is refused up front in two cases: above the
+  stiffness-only bound (about 3.8 ms, `max_stable_step()`; exactly equal is accepted,
+  the test is `>`), or at or above the damped stability limit of the stiffest mode
+  (`stable_step_limit()`, about 4.1 ms with the current constants; exactly equal is
+  refused, the test is `>=`). With the current constants the first trips first. See
+  `docs/PHYSICS.md`.
 - The step count is `round(duration / dt)`, so with a `--dt` that does not divide
   the duration the last row can end up to dt/2 away from it (`--dt 0.006` ends at 4.998).
 - Ground friction is a linear drag on horizontal speed (starter simplification,

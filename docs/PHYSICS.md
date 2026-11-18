@@ -60,15 +60,16 @@ A spring with angular frequency `omega` = sqrt(k/m) is stable under symplectic E
 
 ### The damping limit
 
-`validate()` also checks the damping condition, `damping_limit_error(h)`: `BEAM_DAMPING * h / NODE_MASS` must stay below `DAMPING_STABILITY_LIMIT` = 0.25. Derivation, for the code's own update (`vel` first, then `pos` with the new `vel`):
+Damping lowers the stable step, and `validate()` enforces the combined condition itself through `damped_step_error(h, k, c, m)`, which uses `stable_step_limit(k, c, m)`. Derivation, for the code's own update (`vel` first, then `pos` with the new `vel`):
 
 1. In one vibration mode with spring rate `w2` (omega squared) and damping rate `g`, a step is `v' = (1 - h*g) v - h*w2 x`, `x' = x + h v'`. Its determinant is `1 - h*g` and its trace is `2 - h*g - h^2*w2`.
-2. The Jury stability test gives two conditions: `0 < h*g < 2` and `h^2*w2 + 2*h*g < 4`.
-3. Every beam's damper acts along the same direction as its spring, so the damping matrix is the stiffness matrix times `c/k`. The stiffest mode has eigenvalue 8 (`omega^2 = 8k/m`, 400 rad/s; checked numerically by `stiffest_mode_eigenvalue_is_eight`), so there `g = 8c/m`.
-4. First condition: `8*c*h/m < 2`, so `c*h/m < 0.25`. The earlier value of 1.0 was the single-spring figure (`g = c/m`) and was wrong for the cube. The audit's 0.25 is confirmed.
-5. Second condition (spring and damper together): `160000*h^2 + 320*h < 4`, so `h < 0.0041 s` (`coupled_stability_limit()`). This is looser than `max_stable_step()` (0.0038 s), so any step `validate()` accepts also meets it.
+2. The Jury stability test gives two conditions: (A) `0 < h*g < 2` and (B) `h^2*w2 + 2*h*g < 4`.
+3. Every beam's damper acts along the same direction as its spring, so the damping matrix is the stiffness matrix times `c/k`. The stiffest mode has eigenvalue 8 (`omega^2 = 8k/m`, 400 rad/s; checked numerically by `stiffest_mode_eigenvalue_is_eight`), so there `w2 = 8k/m` and `g = 8c/m`.
+4. The largest `h` meeting (B) is the positive root `h = (-g + sqrt(g^2 + 4*w2)) / w2`. At `h = 2/g`, (B) would read `4*w2/g^2 + 4 < 4`, which is false when `w2 > 0`, so that root is always below `2/g`: (B) binds whenever there is a spring, and (A) only if `w2 = 0`. `stable_step_limit` returns the smaller of the two and says which binds; `validate()` refuses `h >= limit` with a message naming h, the limit and the binding condition.
+5. Numbers for `k = 20000`, `m = 1`: `160000*h^2 + 16*c*h = 4`. The limit is 0.00500 s at `c = 0` (the undamped `2/omega`), 0.00410 s at `c = 20` (today's `BEAM_DAMPING`), 0.00339 s at `c = 40`, and falls with c.
+6. The old separate test `c*h/m < 0.25` is only condition (A) for the damper alone. It is not enough: it is much looser than (B). At `c = 40` the old checks accepted `h = 0.0036 s`, but the limit is 0.003385 s and the stiffest mode diverges (`old_separate_checks_accepted_an_unstable_step_at_c_40`). An earlier version of this document wrongly said damping would only matter past `c` of about 66; it matters from about 28.
 
-With the current constants the stiffness limit always fails first: `c*h/m` is 0.076 at the stiffness limit, and 0.25 would need `h = 0.0125 s`. So no config reaches the damping error through `validate()` today; it is tested directly, and the numbers are tested on a single damped oscillator stepped with the same integrator (`tests/stability.rs`): bounded 2% below each limit, unbounded 2% above. It would start to matter if `BEAM_DAMPING` were raised past about 66.
+`max_stable_step()` (0.00378 s) is kept, and `validate()` checks it too: it is a stiffness-only Gershgorin bound that holds for any deformed shape, while the stiffest-mode limit uses the rest-shape eigenvalue 8. With today's constants the coupled limit at `c = 20` is 0.0041 s, above 0.00378 s, so the Gershgorin bound trips first and the coupled error is not reachable through `validate()` today. The two cross at `c` of about 28.3: above that, the coupled limit is the tighter one. `damped_step_error` takes `k`, `c` and `m` as arguments so it is tested for other constants (`tests/stability.rs`), and the limit is checked on a single damped oscillator stepped with the same integrator: bounded just below it, unbounded just above, for `c` = 0, 20, 40, 66 and 200.
 
 ## CSV output
 
