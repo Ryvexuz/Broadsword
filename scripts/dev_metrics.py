@@ -142,7 +142,11 @@ def main():
         es = sorted(by_task.get(t.get("id"), []), key=lambda e: num(e.get("created")) or 0)
         ok = [e for e in es if e.get("status") in ("merged", "merged_check_failed")]
         merged += 1 if ok else 0
-        times = commit_times(t.get("project"), ok[-1].get("base_head"), ok[-1].get("main_sha")) if ok else []
+        # The coder's commits: from the merged entry if there is one, else from the newest entry that recorded a tip
+        # (a rejected or abandoned task still had coding time and handoff waits; that is the waste worth seeing).
+        src = ok[-1] if ok else next((e for e in reversed(es) if e.get("base_head") and (e.get("checked_tip") or e.get("rebased_tip"))), None)
+        tip = (src.get("main_sha") if ok else (src.get("checked_tip") or src.get("rebased_tip"))) if src else None
+        times = commit_times(t.get("project"), src.get("base_head"), tip) if src else []
         last = times[-1] if times else None
         q0 = num(es[0].get("created")) if es else None
         q1 = max((num(e.get("ended")) or 0 for e in es), default=0) or None
