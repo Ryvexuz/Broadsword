@@ -35,7 +35,8 @@ for f in sorted(out.glob("*.json")):
     rows.append(dict(case=r["case"], model=r["model"], effort=r["effort"], verdict=verdict, caught=bool(caught),
                      minor_only=bool(minor_hit) and not caught, known_fp=len(known_fp), other=len(other),
                      n_block=len(blocking), cost=r.get("cost_usd") or 0, wall=r["wall_s"], tin=tok_in,
-                     tout=u.get("output_tokens") or 0, err=r.get("is_error") or r.get("exit") != 0))
+                     tout=u.get("output_tokens") or 0, err=r.get("is_error") or r.get("exit") != 0,
+                     error_text=str(r.get("error") or "(no error text)")))
 
 print(f"{'case':<9} {'model':<7} {'effort':<8} {'verdict':<8} {'caught':<7} {'minor':<6} {'kFP':<4} {'other':<6} {'cost$':<7} {'secs':<6} {'in_tok':<7} {'out_tok'}")
 for x in sorted(rows, key=lambda x: (x["case"], x["model"], x["effort"])):
@@ -43,11 +44,27 @@ for x in sorted(rows, key=lambda x: (x["case"], x["model"], x["effort"])):
           f"{'yes' if x['minor_only'] else '':<6} {x['known_fp']:<4} {x['other']:<6} {x['cost']:<7.3f} {x['wall']:<6} {x['tin']:<7} {x['tout']}"
           + ("  ERROR" if x["err"] else ""))
 print()
-agg = defaultdict(lambda: dict(n=0, caught=0, minor=0, kfp=0, other=0, cost=0.0, wall=0.0))
+# Errored runs (is_error or non-zero exit) are not review results: they are left out of n, caught,
+# minor, FP and avg secs, and reported separately. Their cost is real spend, so it stays in cost $.
+agg = defaultdict(lambda: dict(n=0, caught=0, minor=0, kfp=0, other=0, cost=0.0, wall=0.0, errors=0))
 for x in rows:
     a = agg[(x["model"], x["effort"])]
+    a["cost"] += x["cost"]
+    if x["err"]:
+        a["errors"] += 1
+        continue
     a["n"] += 1; a["caught"] += x["caught"]; a["minor"] += x["minor_only"]; a["kfp"] += x["known_fp"]
-    a["other"] += x["other"]; a["cost"] += x["cost"]; a["wall"] += x["wall"]
-print(f"{'model':<7} {'effort':<8} {'caught':<8} {'minor-only':<11} {'known FP':<9} {'other blk':<10} {'cost $':<8} {'avg secs'}")
+    a["other"] += x["other"]; a["wall"] += x["wall"]
+errored = [x for x in rows if x["err"]]
+# The errors column is shown only when some run errored, so output without errors is unchanged.
+ecol = f" {'errors'}" if errored else ""
+print(f"{'model':<7} {'effort':<8} {'caught':<8} {'minor-only':<11} {'known FP':<9} {'other blk':<10} {'cost $':<8} {'avg secs'}{ecol}")
 for (m, e), a in sorted(agg.items()):
-    print(f"{m:<7} {e:<8} {a['caught']}/{a['n']:<6} {a['minor']:<11} {a['kfp']:<9} {a['other']:<10} {a['cost']:<8.3f} {a['wall']/a['n']:.0f}")
+    avg = f"{a['wall']/a['n']:.0f}" if a["n"] else "-"
+    print(f"{m:<7} {e:<8} {a['caught']}/{a['n']:<6} {a['minor']:<11} {a['kfp']:<9} {a['other']:<10} {a['cost']:<8.3f} {avg}"
+          + (f"{'':<{9 - len(avg)}}{a['errors']}" if errored else ""))
+if errored:
+    print()
+    print("errored runs (excluded from caught x/n):")
+    for x in sorted(errored, key=lambda x: (x["case"], x["model"], x["effort"])):
+        print(f"  {x['case']} {x['model']} {x['effort']}: {x['error_text']}")
