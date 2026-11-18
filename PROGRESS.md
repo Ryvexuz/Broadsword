@@ -36,6 +36,8 @@ Stage 0 is still untagged; see Unfinished.
   - Under gated races of 2, 8 and 16 processes, exactly one wins.
 - **Agent cap (`max_agents`).** `task start` refuses with exit 3 when `max_agents` tasks are already `running`, across all projects. A refused start changes nothing. The check runs under the board's OS file lock, in the same step as the claim check. The cap is set to 4 in `broadsword.toml`. Lowering it leaves running tasks alone.
   - Tested at caps of 3 and 4 on the real board, with an 8-process race. Exactly 3 win each round, and the losers exit 3.
+- **An interrupted `run` blocks only its own folder** (`ba03a84`): another agent's worktree, or main, keeps working. Records without a `source` still block the whole project. A panic inside a job kills its verified child; a build, test or check is then marked `failed`, while a `run` stays interrupted, so `recover` offers the rollback.
+- **`run` uses the shared build folder** (`d23b969`): every job's child gets `CARGO_TARGET_DIR` at one spawn site.
 - **Closed stdout no longer kills Broadsword.** Crate-wide, `println!`, `print!`, `eprintln!` and `eprint!` are shadowed with versions that drop write errors instead of panicking (`b578103`). Before the fix, `| head` made a job panic mid-run and left its record `running`, which blocked new jobs on that project until `recover`.
 - **`task start --worktree`** gives a task its own Git worktree in `worktrees/<project>/<id>`, on branch `task/<id>`, based on the project's current main.
   - `task done` removes the worktree and branch once they are merged and clean. Ignored files such as `.env` block removal.
@@ -58,14 +60,13 @@ Stage 0 is still untagged; see Unfinished.
 - **Server:** `broadsword mcp` runs from `build/bin/`.
 - **OpenAI client:** `clients/openai_mcp.py`.
 - **Building:** after changing Broadsword's code, run `broadsword build broadsword` from `build/bin/` or a copy (a running `build/debug` exe cannot be cleaned, so it is not built from there). Then run `build/debug/broadsword.exe install`. No plain cargo, and no timestamp touching.
-- **Tests:** 346 Broadsword tests pass, run through `broadsword test broadsword`. The queue has 40 of them, using a fake reviewer.
+- **Tests:** 355 Broadsword tests pass, run through `broadsword test broadsword`. The queue has 40 of them, using a fake reviewer.
 
 ## Unfinished
 
 - **Planned process experiments** (run alongside Stage 4; each gets a row in the improvement ledger in `RETRO.md`):
   - **Reviewer canary:** every few merges, queue a known planted bug and record whether the reviewer catches it, to track catch rate per model over time. Once Lazlo's OpenAI models are linked, run the same canaries across Claude and OpenAI models and effort levels, reusing `bench/reviewer/`.
   - **Handoff test:** a fresh agent resumes from `PROGRESS.md` alone; record what it got wrong or had to ask.
-  - **In progress:** an interrupted `run` blocks only its own folder, plus a panic guard for jobs (task `t-20261118-034915`).
 - **Next:** the OpenAI half of the reviewer benchmark, when Lazlo sends the models list. Stage 4 starts only after that.
 - **Stage 0 close-out.** Confirm in a new session started from the app that task-router no longer loads, then tag `stage-0-done`.
 - **Reviewer benchmark, OpenAI half.** Needs a small chat-completions runner, and Lazlo's models list. "Terra 6.1" is unverified.

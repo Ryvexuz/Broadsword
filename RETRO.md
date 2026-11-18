@@ -41,6 +41,9 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 18. **A fix counts only once something enforces it:** code, a role file or a checklist. A note alone is forgotten by the next session. [S3]
 19. **Push long runs, such as full test suites and reviews, into the background,** and keep working. The orchestrator is the bottleneck, not the coders. [S3]
 20. **Track whether each process change helps or hurts,** with a measure and a watch-for-harm signal, and revert the ones that hinder. A process only gets lighter if changes can be taken back out. [S3]
+21. **A subagent cannot wait for its own background jobs.** Tell it to run long checks in the foreground and to read the result before it reports. Otherwise it hands back unverified work. [S3]
+22. **Enforce an environment rule where the process is spawned,** not in each command builder. A rule set in two builders was missed by a third path. [S3]
+23. **Write code files with an editor tool, not through shell heredocs.** Shell quoting silently changes backslashes and quotes. [S3]
 
 ---
 
@@ -59,19 +62,64 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S2 | `SPEC_CHECKLIST.md` risk table | First-pass review results | Review passes per milestone | Briefs so long that coders miss the point | helped (S2–S3) |
 | S3 m3 | Review tier: Haiku for low risk, Opus for high | Review cost | `scripts/review_costs.py` | Bugs Haiku misses that Opus would catch; false rejections | open (1 false rejection so far, caused by a brief) |
 | S3 m4 | Small one-file or two-file tasks | Coder tokens per task | Coder tokens from agent reports | Too many tiny tasks, more orchestration than coding | helped (72k vs 250–400k) |
-| S3 m4 | Coders never pipe Broadsword output; never `recover` another agent's job | No project-wide blocks | Refused jobs per milestone | Coders unable to inspect long output | open |
+| S3 m4 | Coders never pipe Broadsword output; never `recover` another agent's job | No project-wide blocks | Refused jobs per milestone | Coders unable to inspect long output | helped: 0 refused jobs, and the coder redirected to files and read them |
 | S3 m4 | Example lists in briefs say "for example" | No false rejections from wording | Rejections whose cause is the brief | — | open |
 | S3 m4 | Every setting must be read by code, with a test | No dead settings | Review findings of unused settings | Test overhead for trivial settings | open |
 | S3 | Retro after each milestone | Repeat mistakes, speed and cost | Repeats of a mistake already in a retro | Retro time growing past its value | open |
 | S3 | Portable playbook loaded in every project | Lessons reach other projects | A lesson applied, or ignored, in another project | Rules that don't fit other projects causing friction there | open (not yet used outside Broadsword) |
-| S3 | `templates/brief.md`, `templates/coder-prompt.md` | Time to write a brief; brief errors | Orchestrator time per brief; rejections caused by briefs | A template followed by rote, so missing task-specific cases | open |
-| S3 | Done checks written as commands | One reading of "done" | Disputes or rework over what "done" meant | Checks that miss what can't be expressed as a command | open |
-| S3 | `scripts/review_costs.py` | Exact cost numbers in retros | Whether retros use it | — | open |
-| S3 | An interrupted run blocks only its own folder; panic guard for jobs | Blast radius of one agent's crash | Agents blocked by another agent's job | A half-changed folder that something outside it depends on | in progress |
+| S3 | `templates/brief.md`, `templates/coder-prompt.md` | Time to write a brief; brief errors | Orchestrator time per brief; rejections caused by briefs | A template followed by rote, so missing task-specific cases | mixed: the coder followed the rules (redirected output, never piped, claims kept). But my brief's "run the suite in the background" made it hand back before seeing its result. Fixed: both templates now say to run it in the foreground |
+| S3 | Done checks written as commands | One reading of "done" | Disputes or rework over what "done" meant | Checks that miss what can't be expressed as a command | helped: it was clear which line was unrun, and I ran it. No disputes |
+| S3 | `scripts/review_costs.py` | Exact cost numbers in retros | Whether retros use it | — | helped: used for this retro's figures |
+| S3 | An interrupted run blocks only its own folder; panic guard for jobs | Blast radius of one agent's crash | Agents blocked by another agent's job | A half-changed folder that something outside it depends on | done (`ba03a84`); measure in Stage 4 |
+| S3 | Every job child gets `CARGO_TARGET_DIR` at one spawn site | No private build folders in worktrees | Stray `build/` or `target/` in worktrees at removal | — | done (`d23b969`) |
 | planned | Reviewer canary (planted bugs every few merges, across models once OpenAI is linked) | Knowing the reviewer still works, and which model is worth its price | Catch rate and cost per model | Canary cost or noise outweighing its value | planned |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
+
+---
+
+## Stage 3 follow-up: scoped blocking, panic guard, shared build folder for `run` (2026-11-18)
+
+### Did the last changes work?
+
+The ledger above has the detail. In short:
+- **Helped:**
+  - the no-pipe rule (0 refused jobs);
+  - done checks written as commands (it was clear what was unrun);
+  - `review_costs.py`.
+- **Mixed:** the templates. Their rules were followed, but my brief told the coder to run the suite in the background, which made it hand back unverified. That is the first change caught hindering, and it's fixed.
+- **No false rejections:** Opus passed the change first time.
+
+### What went wrong
+
+| What | Why | What changes | Where it's enforced |
+| --- | --- | --- | --- |
+| The coder handed back twice before its test run finished. | My brief said to run the 3-minute suite in the background; a subagent's turn ends and it can't wait for its own job. | Run the suite in the foreground, read the result, then report. | `templates/coder-prompt.md`, `templates/brief.md` |
+| Two of the coder's new tests had wrong expectations: a second record from the test's own setup, and a tracked file that is restored, not deleted. | They were written without being run, the same cause as above. | Targeted test runs first, then the full suite once. | `templates/coder-prompt.md` |
+| `broadsword run -- cargo test` in a worktree built a private 90 MB `build/`. The queue then kept the worktree, with nothing lost. | `CARGO_TARGET_DIR` was set only in the cargo-step builder. `run` had its own builder, and the repo's relative `target-dir` resolved inside the worktree. | Set it once, where every job's child is spawned. A test fails without it. | Code (`d23b969`) |
+| A cross-worktree test flaked. | Its fake "dead" job used the pid of an exited process, and Windows reused the pid. Opus had flagged this as a minor. | Fake records carry an impossible `pid_start`. | Code (tests) |
+| A bash heredoc ate a backslash in a Rust test, and another heredoc failed to parse. | Shell quoting inside heredocs. | Write code and scripts with the Edit or Write tools, then run them. | Portable lesson 23; check next retro |
+
+### Speed
+
+- **Coder:** about 4.5 minutes for a larger task (recovery code, 6 files).
+- **Orchestrator:** most of the time went to 5 full-suite runs (about 3 minutes each), plus 2 targeted mutation runs. Three of those full runs existed only because of the test-expectation bugs.
+- **Change:** targeted tests through `broadsword run ... cargo test --test <name> <filter>` before any full run. It's in the coder template.
+
+### Cost
+
+- **Coder:** about 152k Sonnet tokens. That's twice a one-file task, as expected for 6 files.
+- **Reviews:** Opus $0.31 (the largest diff yet) and Haiku $0.0027. Total across all queue reviews so far: $0.42 (`scripts/review_costs.py`).
+- **Waste:** 3 extra full-suite runs, and one coder hand-back round.
+
+### Carry into the next milestone
+
+1. Coders run the full suite in the foreground and report its result. Check: no unverified hand-backs.
+2. Targeted tests before the full suite. Check: full-suite runs per task.
+3. No code written through heredocs. Check: no quoting damage.
+4. Stage 4: watch whether the scoped block ever lets a half-changed worktree hurt something outside it (the ledger's watch-for-harm column).
+5. Opus minors left in IDEAS.md: the build lock is released before the panicked child is killed (a short window), and a bad `--task` gives exit 3 instead of 2 when the project has an interrupted run.
 
 ---
 

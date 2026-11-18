@@ -19,9 +19,9 @@ Ideas outside the current stage go here, not into code. Each one names the stage
 - **Stage 3:** make `fake_claude` test-only instead of a product `[[bin]]`. It is built into `build/debug` now, and it is guarded, but it should not ship.
 - **Stage 3:** the queue's check should run from a clean export of the checked commit, not the live worktree. An edit made and undone during the check leaves the tip unchanged, so the check may have run on uncommitted files.
 - **Stage 2/3:** an `openai` reviewer backend for the queue, with the model picked from the bench results.
-- **Stage 3 (milestone 4):** scope an interrupted job's block to its own source folder (worktree), not the whole project, so one agent's crashed job doesn't stop other agents' worktrees.
-- **Stage 3 (milestone 4):** add a drop guard or `catch_unwind` around the job body that marks the record failed on any panic, so no panic leaves a job `running` (Opus reviewer minor).
 - **Stage 3 (milestone 4):** make the closed-stdout test more robust: a child that writes for longer, and assert the log has output written after the reader closed.
 - **Stage 3 (milestone 4):** in briefs, never give a parenthesised API list without "for example"; reviewers read it as exhaustive.
 - **Stage 3 (milestone 4):** add a clippy deny for `dbg!`, and a check against `std::println!` paths, which bypass the non-panicking macros.
 - **Stage 3 (crash sim):** `--summary` prints nothing when a run aborts mid-way (CSV mode prints the partial rows); decide and document. tests/summary.rs compares against values rounded from the CSV text, which could disagree with the binary's direct formatting in rare edge cases (Opus reviewer minors).
+- **Stage 3 (follow-up):** the panic guard runs after the build lock is released by unwinding. For a moment, another job can take the lock while the panicked job's child still runs. Kill the child before the lock guard drops (Opus minor, `ba03a84`).
+- **Stage 3 (follow-up):** a bad or unknown `--task` on a project with an interrupted run gives exit 3 "interrupted run" instead of the real error. Resolve the task before the guard (Opus minor).

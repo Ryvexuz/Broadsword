@@ -15,6 +15,8 @@ Do not edit any other file. If the task needs one, stop and report it.
 
 **If a check genuinely fails:** do not loosen it. Report the configuration and numbers.
 
+**Build route:** say how long the full suite takes, and that the coder runs it in the foreground and reads the result (never "run it in the background": a subagent cannot wait for its own background job).
+
 **Done check (each line is a command and what it must show):**
 1. `broadsword test <project> --task <id>` → `test: ok`, including the new tests <name them if known>
 2. `broadsword run <project> --task <id> -- <command>` → <expected output, exit code>
