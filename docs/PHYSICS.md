@@ -56,7 +56,19 @@ A spring with angular frequency `omega` = sqrt(k/m) is stable under symplectic E
     omega_max <= sqrt(14 * BEAM_STIFFNESS / NODE_MASS) = sqrt(280000) = about 529 rad/s
     max_stable_step() = 2 / omega_max = about 0.00378 s
 
-`Config::validate()` refuses to run when `dt / substeps` is larger than `max_stable_step()`, and tells you to raise `--substeps` or lower `--dt`. It also rejects non-finite values, `dt <= 0`, `duration < 0`, `substeps < 1`, `drop_height < 0`, and `gravity <= 0`. The default 1 ms substep is about a quarter of the limit. The damper is separately stable as long as `BEAM_DAMPING * h / NODE_MASS` stays well below about 1; at the default it is 0.02. This damping condition is only described in a code comment, not checked by `validate()`.
+`Config::validate()` refuses to run when `dt / substeps` is larger than `max_stable_step()`, and tells you to raise `--substeps` or lower `--dt`. It also rejects non-finite values, `dt <= 0`, `duration < 0`, `substeps < 1`, `drop_height < 0`, and `gravity <= 0`. The default 1 ms substep is about a quarter of the limit.
+
+### The damping limit
+
+`validate()` also checks the damping condition, `damping_limit_error(h)`: `BEAM_DAMPING * h / NODE_MASS` must stay below `DAMPING_STABILITY_LIMIT` = 0.25. Derivation, for the code's own update (`vel` first, then `pos` with the new `vel`):
+
+1. In one vibration mode with spring rate `w2` (omega squared) and damping rate `g`, a step is `v' = (1 - h*g) v - h*w2 x`, `x' = x + h v'`. Its determinant is `1 - h*g` and its trace is `2 - h*g - h^2*w2`.
+2. The Jury stability test gives two conditions: `0 < h*g < 2` and `h^2*w2 + 2*h*g < 4`.
+3. Every beam's damper acts along the same direction as its spring, so the damping matrix is the stiffness matrix times `c/k`. The stiffest mode has eigenvalue 8 (`omega^2 = 8k/m`, 400 rad/s; checked numerically by `stiffest_mode_eigenvalue_is_eight`), so there `g = 8c/m`.
+4. First condition: `8*c*h/m < 2`, so `c*h/m < 0.25`. The earlier value of 1.0 was the single-spring figure (`g = c/m`) and was wrong for the cube. The audit's 0.25 is confirmed.
+5. Second condition (spring and damper together): `160000*h^2 + 320*h < 4`, so `h < 0.0041 s` (`coupled_stability_limit()`). This is looser than `max_stable_step()` (0.0038 s), so any step `validate()` accepts also meets it.
+
+With the current constants the stiffness limit always fails first: `c*h/m` is 0.076 at the stiffness limit, and 0.25 would need `h = 0.0125 s`. So no config reaches the damping error through `validate()` today; it is tested directly, and the numbers are tested on a single damped oscillator stepped with the same integrator (`tests/stability.rs`): bounded 2% below each limit, unbounded 2% above. It would start to matter if `BEAM_DAMPING` were raised past about 66.
 
 ## CSV output
 
@@ -78,4 +90,6 @@ After every output step (not every substep), `Sim::check()` fails the run if:
 - any node position or velocity component is NaN or infinite;
 - the max strain is NaN, or exceeds `MAX_STRAIN_LIMIT` = 0.5 (50%). The strain calculation propagates NaN, so a blown-up state can never read as 0.
 
-`run_checked` then stops and returns the good samples so far plus an error reading `unstable at t = ... s: ...`. A config refused by `validate()` returns no samples and the validation error. `run` is the same but panics on any error.
+Contact time is tracked separately, in the substep loop: `Sim::first_contact_s` is the time of the first substep at which any node is at or below the ground (0 if the cube starts there). `--summary` prints it, so it does not depend on the output sampling, which can miss a touchdown that begins and ends between two samples.
+
+`run_checked` then stops and returns the good samples so far plus an error reading `unstable at t = ... s: ...`. A config that `validate()` accepts can still abort here, for example `--gravity 5000` crushes the cube on impact (`tests/risky.rs`). A config refused by `validate()` returns no samples and the validation error. `run` is the same but panics on any error.

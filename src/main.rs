@@ -1,4 +1,4 @@
-use crash_sim::{run_checked, to_csv, Config};
+use crash_sim::{run_checked_with_contact, to_csv, Config};
 use std::io::Write;
 use std::process::exit;
 
@@ -33,12 +33,14 @@ fn main() {
             _ => usage(),
         }
     }
-    let (samples, result) = run_checked(&cfg);
+    let (samples, first_contact, result) = run_checked_with_contact(&cfg);
     if summary {
         if result.is_ok() {
             if let (Some(last), true) = (samples.last(), !samples.is_empty()) {
-                let contact = match samples.iter().find(|s| s.min_y <= 0.0) {
-                    Some(s) => format!("{:.4}", s.t),
+                // From the substep loop, not from the output samples, so a contact
+                // that starts and ends between two samples is still reported.
+                let contact = match first_contact {
+                    Some(t) => format!("{t:.4}"),
                     None => "none".to_string(),
                 };
                 let peak = samples.iter().map(|s| s.max_beam_strain).fold(f64::MIN, f64::max);

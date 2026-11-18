@@ -14,7 +14,8 @@ pub const NODE_MASS: f64 = 1.0;
 /// the symplectic Euler stability limit of 2.
 pub const BEAM_STIFFNESS: f64 = 20_000.0;
 /// Axial damping (N*s/m). Damps impact ringing within the 5 s run;
-/// c*dt/m = 0.02 per substep, far below the explicit-damping limit of about 1.
+/// c*h/m = 0.02 per 1 ms substep, far below the explicit-damping limit of 0.25
+/// (see DAMPING_STABILITY_LIMIT).
 pub const BEAM_DAMPING: f64 = 20.0;
 /// Fraction of downward speed returned on ground contact.
 pub const RESTITUTION: f64 = 0.5;
@@ -38,8 +39,42 @@ pub fn max_stable_step() -> f64 {
     2.0 / (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
 }
 
+/// Largest eigenvalue of the beam matrix of the cube, in units of the beam constant: the
+/// stiffest mode has omega^2 = 8 k / m (omega = 400 rad/s) and, because each beam's
+/// damper acts along the same direction as its spring, the same mode has damping rate
+/// gamma = 8 c / m. (Checked numerically in tests/stability.rs.)
+pub const STIFFEST_MODE_EIGENVALUE: f64 = 8.0;
+
 /// Explicit damping is stable only while c*h/m stays below this.
-pub const DAMPING_STABILITY_LIMIT: f64 = 1.0;
+///
+/// Derivation. In a mode with spring rate w2 = omega^2 and damping rate g = gamma, one
+/// symplectic Euler step of this code (velocity first, then position with the new
+/// velocity) is
+///     v' = (1 - h g) v - h w2 x,      x' = x + h v'
+/// a 2x2 map with determinant 1 - h g and trace 2 - h g - h^2 w2. By the Jury criterion
+/// it is stable iff  |det| < 1,  tr < 1 + det  and  -tr < 1 + det, that is
+///     0 < h g < 2     and     h^2 w2 + 2 h g < 4.
+/// For the stiffest mode g = 8 c / m, so the first condition (pure damping, no spring)
+/// is 8 c h / m < 2, i.e. c*h/m < 0.25. The audit's 0.25 is right; the old 1.0 was the
+/// single-spring value (g = c/m) and ignored that the cube's stiffest mode is damped
+/// eight times as hard. The second condition couples spring and damper; it allows
+/// h <= about 0.0041 s for the current constants, which is looser than `max_stable_step`
+/// (0.0038 s), so the c*h/m < 0.25 condition is the binding damping one and the
+/// coupled one is implied by `validate` (see `coupled_stability_limit`).
+///
+/// With the current constants the stiffness limit still always fails first:
+/// c*h/m = 0.25 needs h = 0.0125 s but `max_stable_step` is 0.0038 s (c*h/m = 0.076
+/// there). `damping_limit_error` is therefore not reachable through `validate`; it is
+/// tested directly, and it starts to matter only if BEAM_DAMPING is raised past about 66.
+pub const DAMPING_STABILITY_LIMIT: f64 = 2.0 / STIFFEST_MODE_EIGENVALUE;
+
+/// Exact stability limit (s) of the stiffest damped mode: the positive root of
+/// h^2 w2 + 2 h g = 4 with w2 = 8 k / m and g = 8 c / m.
+pub fn coupled_stability_limit() -> f64 {
+    let w2 = STIFFEST_MODE_EIGENVALUE * BEAM_STIFFNESS / NODE_MASS;
+    let g = STIFFEST_MODE_EIGENVALUE * BEAM_DAMPING / NODE_MASS;
+    (-g + (g * g + 4.0 * w2).sqrt()) / w2
+}
 
 /// The damping number c*h/m for physics step `h`.
 pub fn damping_number(h: f64) -> f64 {
@@ -47,9 +82,6 @@ pub fn damping_number(h: f64) -> f64 {
 }
 
 /// Largest physics step (s) with c*h/m below `DAMPING_STABILITY_LIMIT`.
-/// For the current constants (0.05 s) this is far above `max_stable_step`
-/// (about 0.0038 s), so `validate` always hits the stiffness limit first;
-/// this check is enforced separately and tested directly.
 pub fn max_damping_step() -> f64 {
     DAMPING_STABILITY_LIMIT * NODE_MASS / BEAM_DAMPING
 }
@@ -132,6 +164,10 @@ pub struct Sim {
     pub pos: Vec<Vec3>,
     pub vel: Vec<Vec3>,
     pub beams: Vec<Beam>,
+    /// Time (s) of the first physics substep at which any node was at or below the
+    /// ground (0.0 if the cube starts there); None until then. Set inside the substep
+    /// loop, so it cannot miss a contact that starts and ends between two output samples.
+    pub first_contact_s: Option<f64>,
     step: u64,
 }
 
@@ -168,7 +204,8 @@ impl Sim {
                 beams.push(Beam { a, b, rest: (pos[a] - pos[b]).length() });
             }
         }
-        Sim { cfg, pos, vel: vec![Vec3::ZERO; 8], beams, step: 0 }
+        let first_contact_s = if pos.iter().any(|p| p.y <= 0.0) { Some(0.0) } else { None };
+        Sim { cfg, pos, vel: vec![Vec3::ZERO; 8], beams, first_contact_s, step: 0 }
     }
 
     fn substep(&mut self, h: f64) {
@@ -234,8 +271,11 @@ impl Sim {
     /// Advance one output step (`substeps` physics substeps).
     pub fn advance(&mut self) {
         let h = self.cfg.dt / self.cfg.substeps as f64;
-        for _ in 0..self.cfg.substeps {
+        for k in 0..self.cfg.substeps {
             self.substep(h);
+            if self.first_contact_s.is_none() && self.pos.iter().any(|p| p.y <= 0.0) {
+                self.first_contact_s = Some(self.step as f64 * self.cfg.dt + (k + 1) as f64 * h);
+            }
         }
         self.step += 1;
     }
@@ -259,8 +299,15 @@ pub fn max_strain(beams: &[Beam], pos: &[Vec3]) -> f64 {
 /// The step count is `round(duration / dt)`, so the last row can differ from
 /// `duration` by up to dt/2 when dt does not divide it.
 pub fn run_checked(cfg: &Config) -> (Vec<Sample>, Result<(), String>) {
+    let (samples, _, res) = run_checked_with_contact(cfg);
+    (samples, res)
+}
+
+/// Like `run_checked`, but also returns `Sim::first_contact_s` as it stood when the run
+/// ended (at the abort if the run blew up).
+pub fn run_checked_with_contact(cfg: &Config) -> (Vec<Sample>, Option<f64>, Result<(), String>) {
     if let Err(e) = cfg.validate() {
-        return (Vec::new(), Err(e));
+        return (Vec::new(), None, Err(e));
     }
     let steps = (cfg.duration / cfg.dt).round() as u64;
     let mut sim = Sim::new(cfg.clone());
@@ -269,11 +316,11 @@ pub fn run_checked(cfg: &Config) -> (Vec<Sample>, Result<(), String>) {
     for _ in 0..steps {
         sim.advance();
         if let Err(e) = sim.check() {
-            return (out, Err(format!("unstable at t = {:.4} s: {e}", sim.sample().t)));
+            return (out, sim.first_contact_s, Err(format!("unstable at t = {:.4} s: {e}", sim.sample().t)));
         }
         out.push(sim.sample());
     }
-    (out, Ok(()))
+    (out, sim.first_contact_s, Ok(()))
 }
 
 /// Run the whole sim; panics if the config is refused or the sim blows up.

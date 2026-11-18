@@ -56,7 +56,17 @@ fn values_match_the_csv_run() {
     for args in [vec![], vec!["--duration", "0.1"], vec!["--duration", "2", "--drop-height", "3", "--no-tilt"]] {
         let (c, p, y) = parse(&summary(&args));
         let (cc, cp, cy) = from_csv(&args);
-        assert_eq!(c, cc.unwrap_or_else(|| "none".into()), "{args:?}");
+        // The summary time comes from the substep loop, so it is never later than the first
+        // CSV sample at or below ground. It can be much earlier: a node can touch and bounce
+        // clear between samples (default run: 0.639 s against 0.65 s; flat 3 m drop: 0.782 s
+        // against 1.26 s, because the CSV samples miss the whole first touchdown).
+        match cc {
+            None => assert!(c == "none" || c.parse::<f64>().is_ok(), "{args:?}"),
+            Some(cc) => {
+                let (c, cc): (f64, f64) = (c.parse().unwrap(), cc.parse().unwrap());
+                assert!(c <= cc + 1e-9, "{args:?}: summary {c} csv {cc}");
+            }
+        }
         assert_eq!(p, cp, "{args:?}");
         assert_eq!(y, cy, "{args:?}");
     }
@@ -75,4 +85,23 @@ fn invalid_option_prints_nothing() {
 fn default_output_is_still_csv() {
     let o = run(&["--duration", "0.1"]);
     assert!(String::from_utf8(o.stdout).unwrap().starts_with("t,min_y,center_y,max_beam_strain\n"));
+}
+
+#[test]
+fn contact_between_two_samples_is_reported() {
+    // At 0.64 s the cube touches down inside the last output step and its strain is non-zero,
+    // yet the last CSV sample is still above ground.
+    let (c, p, _) = parse(&summary(&["--duration", "0.64"]));
+    assert_ne!(c, "none");
+    assert_eq!(decimals(&c), 4);
+    assert!(c.parse::<f64>().unwrap() <= 0.64);
+    assert!(p.parse::<f64>().unwrap() > 0.0);
+}
+
+#[test]
+fn flat_drop_contact_time_matches_free_fall() {
+    // sqrt(2 * 3 / 9.81) = 0.7820 s; symplectic Euler is late by about h/2 (0.5 ms).
+    let (c, _, _) = parse(&summary(&["--duration", "2", "--drop-height", "3", "--no-tilt"]));
+    let c: f64 = c.parse().unwrap();
+    assert!((c - 0.7820).abs() < 0.002, "first contact {c}");
 }
