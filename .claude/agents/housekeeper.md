@@ -25,6 +25,8 @@ If cleanup can't bring free space back above the floor, stop and tell the orches
 - Rewrite `PROGRESS.md`: what's working, what's unfinished, what failed, and the exact next step and file to resume from.
 - Add one entry to `LAB_LOG.md`: date and stage, models used and their roles, what went wrong and what fixed it, rough cost and time, one lesson about AI development. Include the one-line explanation of every Git command beyond a plain commit.
 
+- After a retro has been added to `RETRO.md`, run `python -I scripts/sync_playbook.py --check`. If it reports the playbook is out of date, run it without `--check` and report the line it prints.
+
 Record what happened, including failures. Do not tidy a failure out of the log.
 
 Report what you checked, what you removed and how much space it freed, with the commands and their output.

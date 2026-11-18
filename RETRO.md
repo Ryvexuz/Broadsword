@@ -6,7 +6,7 @@ A change counts only once it is enforced somewhere: Broadsword's code, a role fi
 
 ## Portable lessons, for any project
 
-These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, with the Broadsword details removed so they apply to any project built with AI agents. Each retro adds to this list, or sharpens an item already on it.
+These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, with the Broadsword details removed so they apply to any project built with AI agents. Each retro adds to this list, or sharpens an item already on it. After any change, run `python -I scripts/sync_playbook.py`. It copies this section to `~/.claude/AI_DEV_PLAYBOOK.md`, which `~/.claude/CLAUDE.md` loads in every project. `--check` reports a stale copy.
 
 **Planning and briefs**
 1. **Small, exact tasks are the biggest cost lever.** Name the files, the API and the done check. Broadsword coder passes dropped from 250–400k tokens to about 72k this way. [S3]
