@@ -6,7 +6,9 @@ In Stage 2, naming these cases in the spec up front let milestones pass review o
 
 ## Every spec states
 
-- **Goal and done check,** in the plan's own words.
+Start from `templates/brief.md` for the brief and `templates/coder-prompt.md` for the coder's prompt. Both already carry the rules below that apply to every task.
+
+- **Goal and done check,** in the plan's own words. Write the done check as commands with the output each must show, so the coder, the reviewer and the orchestrator all run the same thing. If any part could be read two ways, say which reading is meant. [S3 close-out: "each reviewed by a different model" had two readings.]
 - **Claim:** the exact files and folders the coder may change. Anything else is out of bounds.
 - **Starting point:** which commit the work must start from. Tell the coder to check it and fast-forward if needed.
 - **Build route:** how to build and test, either `broadsword build|test|check` or the documented exception. Also how to confirm that the binary in the shared build folder is the one just built.
@@ -36,7 +38,7 @@ In Stage 2, naming these cases in the spec up front let milestones pass review o
 - **Review tier:**
   - High-risk changes get Opus as reviewer. High risk means deleting or rewriting files, locks, secrets, or anything that runs before or instead of a safety check.
   - Lower-risk changes get a cheaper reviewer from a different model family than the coder.
-  - Record which tier was used and whether it caught anything.
+  - Record which tier was used and whether it caught anything. `python -I scripts/review_costs.py` totals cost, passes and fails by model for the retro.
 - **Fix rounds:** start a fresh coder with a tight brief (the diff, the findings, the claim) instead of resuming a long-running coder whose context keeps growing.
 - **Tests:**
   - The coder writes physics, behaviour and race tests.
