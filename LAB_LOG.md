@@ -2,6 +2,49 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Stage 3, milestone 3: reviewer step and merge queue
+
+**Models and roles**
+- Claude Opus 5.5 as orchestrator (main session): spec, merge, done check, records.
+- Sonnet as coder, first pass, commit `965d52f`: about 384k tokens, 23 min.
+- Sonnet as a FRESH coder for the fix round, commit `671ca93`: about 250k tokens, 14 min. The same fresh coder made the follow-up `a173b7a`, about 3k more tokens.
+- Opus as reviewer of the queue code (high risk, because it merges and rebases). First pass FAIL, about 182k tokens. Second pass PASS, about 228k cumulative.
+- Haiku as the reviewer of the queue in the done check. The two real reviews cost $0.0014 and $0.0017.
+
+**What went wrong and what fixed it**
+- **Opus's first pass failed on three blockers and six minor points.**
+  - B1: a commit added between check and review could be merged unchecked. The reviewer reproduced it: it killed a run mid-review, committed non-compiling code, resumed, and the code landed on main.
+  - B2: `.env` values with ordinary names (`DB_PASSWORD`) reached the reviewer's prompt, and variables such as `GITHUB_PAT` reached its environment.
+  - B3: `BROADSWORD_REVIEWER_CLI` could point at the shipped fake reviewer silently. The reported model was never checked, and non-JSON output was parsed as a verdict.
+  - Minor, all fixed: an empty `BLOCKING:` header passed; no cap on review calls; the same task could be queued twice; model names were compared as raw text; check output was stored unredacted; an ignored `.env` blocked the queue permanently.
+  - The fix round fixed all of them. 12 of the new tests fail against the old code.
+- **The second pass re-ran the reproductions** and the attack attempts. One minor point remained: a copy of the fake reviewer outside the root passed as real. The follow-up fixed it.
+- **The done check caught the planted bug.** The planted commit passed all 12 tests, because the flag was parsed but never used. Haiku rejected it in about 11 s, with a finding that named the line. The fix passed review and merged.
+- **The merge kept the rejected commit in history.** Fast-forward merge put both `7ab23fc` (planted) and `9cd162f` (fix) on crash-sim main. The tree is correct, but the history contains a commit rejected on review. Recorded in `IDEAS.md`.
+- **Known limits, documented:** a secret split across two diff lines is not redacted, and a `.env` value that is also normal code is blanked everywhere. An edit made and undone during a check can leave the tip unchanged, so the check may have run on uncommitted files. Recorded in `IDEAS.md`.
+- **`claude` is not on PATH on this machine.** Real reviews need `BROADSWORD_REVIEWER_CLI` set to the install path.
+- **The coder's worktree again started on the Stage 0 commit,** the ninth time.
+
+**Rough cost and time**
+- About 2 h 15 min of wall time.
+- Subagent tokens: coder about 384k, fresh coder about 253k, Opus reviewer about 228k (cumulative). Real reviews in the done check: $0.0031 together.
+
+**Git commands used, beyond a plain commit**
+- Broadsword's queue code now runs these:
+  - `git rebase <main HEAD>`: replays the task branch onto current main.
+  - `git rebase --abort`: cancels a rebase that hit a conflict, so the branch is back at its tip.
+  - `git diff --name-only --diff-filter=U`: lists the files in conflict.
+  - `git diff <base>...<sha>`: the change the branch adds since it split from main. This is what the reviewer reads.
+  - `git merge --ff-only <sha>`: moves main to exactly that commit, with no merge commit, and fails if that is not possible.
+  - `git rev-list --count`: counts the commits in a range.
+  - `git rev-parse --git-path rebase-merge`: finds where Git keeps a rebase in progress, so a rebase left behind is detected.
+  - The pre-rebase tip is kept under `refs/broadsword/queue/<id>/pre-rebase`, and the ref is created only if it does not exist yet.
+- The orchestrator used `git merge --no-ff`, `git worktree remove` and `git branch -d`, as before.
+
+**One lesson about AI development**
+
+The planted bug passed every test and was caught by the cheapest reviewer, for a third of a cent, because the review saw the brief, the diff and the check output together. Tests prove what they test; review checks the change against what was asked. The expensive part was making the pipeline itself trustworthy. Opus found that it could merge an unchecked commit and leak secrets, the kind of failure that would have made every later review meaningless.
+
 ## 2026-11-17 — Between Stage 3 milestones 2 and 3: worktree builds
 
 **Models and roles**

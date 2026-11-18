@@ -15,3 +15,7 @@ Ideas outside the current stage go here, not into code. Each one names the stage
 - **Stage 3:** the junction tests in `tests/buildsrc.rs` leave dangling junctions behind when their scratch root is deleted. They should remove each link before deleting the folder.
 - **Stage 3:** `link_in_path` checks every parent up to the drive root, not only inside `root`. A reparse point above the project (for example a OneDrive-redirected Desktop, or an external drive mount) would make every clean refuse. Limit the check to `build_dir` and its parents inside `root`.
 - **Stage 3:** `forget_notes` does nothing, silently, if `cargo metadata` fails. For `run`, the forget before the command should fail loudly.
+- **Stage 3:** the queue could squash a task's commits into one reviewed commit before merging. Crash-sim's history now holds a commit rejected on review (`7ab23fc`), followed by its fix (`9cd162f`).
+- **Stage 3:** make `fake_claude` test-only instead of a product `[[bin]]`. It is built into `build/debug` now, and it is guarded, but it should not ship.
+- **Stage 3:** the queue's check should run from a clean export of the checked commit, not the live worktree. An edit made and undone during the check leaves the tip unchanged, so the check may have run on uncommitted files.
+- **Stage 2/3:** an `openai` reviewer backend for the queue, with the model picked from the bench results.
