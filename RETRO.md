@@ -44,6 +44,11 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 21. **A subagent cannot wait for its own background jobs.** Tell it to run long checks in the foreground and to read the result before it reports. Otherwise it hands back unverified work. [S3]
 22. **Enforce an environment rule where the process is spawned,** not in each command builder. A rule set in two builders was missed by a third path. [S3]
 23. **Write code files with an editor tool, not through shell heredocs.** Shell quoting silently changes backslashes and quotes. [S3]
+24. **Audit the whole project at every stage end, with a strong model that didn't build it.** Per-change reviews only see their diff, while the worst problems sit between features and rules. Fix the audit's blockers before tagging. [S3 audit]
+25. **Check every new feature against the standing rules it touches,** especially secrets, deletion and settings. A documented feature can quietly break a higher rule. [S3 audit]
+26. **Records drift toward over-claiming.** Write them from raw evidence and quote it, and have the audit check the claims. [S3 audit]
+27. **No exemptions for the orchestrator.** The strongest model is the one most tempted to skip the process it enforces. [S3 audit]
+28. **A rule without a mechanism is a wish.** Enforce each standing rule in code, a hook or a test, or label it "not yet in force". [S3 audit]
 
 ---
 
@@ -65,7 +70,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 m4 | Coders never pipe Broadsword output; never `recover` another agent's job | No project-wide blocks | Refused jobs per milestone | Coders unable to inspect long output | helped: 0 refused jobs, and the coder redirected to files and read them |
 | S3 m4 | Example lists in briefs say "for example" | No false rejections from wording | Rejections whose cause is the brief | — | open |
 | S3 m4 | Every setting must be read by code, with a test | No dead settings | Review findings of unused settings | Test overhead for trivial settings | open |
-| S3 | Retro after each milestone | Repeat mistakes, speed and cost | Repeats of a mistake already in a retro | Retro time growing past its value | open |
+| S3 | Retro after each milestone | Repeat mistakes, speed and cost | Repeats of a mistake already in a retro | Retro time growing past its value | warning: the audit found 9 of the last 10 commits were process. Stage 4 ships product; process work only fixes findings |
 | S3 | Portable playbook loaded in every project | Lessons reach other projects | A lesson applied, or ignored, in another project | Rules that don't fit other projects causing friction there | open (not yet used outside Broadsword) |
 | S3 | `templates/brief.md`, `templates/coder-prompt.md` | Time to write a brief; brief errors | Orchestrator time per brief; rejections caused by briefs | A template followed by rote, so missing task-specific cases | mixed: the coder followed the rules (redirected output, never piped, claims kept). But my brief's "run the suite in the background" made it hand back before seeing its result. Fixed: both templates now say to run it in the foreground |
 | S3 | Done checks written as commands | One reading of "done" | Disputes or rework over what "done" meant | Checks that miss what can't be expressed as a command | helped: it was clear which line was unrun, and I ran it. No disputes |
@@ -73,9 +78,49 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 | An interrupted run blocks only its own folder; panic guard for jobs | Blast radius of one agent's crash | Agents blocked by another agent's job | A half-changed folder that something outside it depends on | done (`ba03a84`); measure in Stage 4 |
 | S3 | Every job child gets `CARGO_TARGET_DIR` at one spawn site | No private build folders in worktrees | Stray `build/` or `target/` in worktrees at removal | — | done (`d23b969`) |
 | planned | Reviewer canary (planted bugs every few merges, across models once OpenAI is linked) | Knowing the reviewer still works, and which model is worth its price | Catch rate and cost per model | Canary cost or noise outweighing its value | planned |
+| S3 audit | Full independent audit at every stage end, before the tag | Cross-cutting bugs, false claims, rules not in force | Blocking and serious findings per audit (S0–3: 1 and 17) | Audit cost (about 334k tokens) outweighing what it finds | open |
+| S3 audit | All code reaches main through the merge queue, the orchestrator's included | Review independence that is recorded and enforced | Commits on main without a queue entry | Slower small fixes | open |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first
+
+---
+
+## Full review of Stages 0–3 by Fable (2026-11-18)
+
+Report: `evidence/full-review-2026-11-18.md`. It found 1 blocking, 17 serious and 14 minor issues. I checked the blocking finding and 3 serious ones myself, and all held.
+
+### Did the last changes work?
+
+- **Most changes held:**
+  - no coder piped output;
+  - the review costs were exact;
+  - done checks written as commands made it clear what was unrun.
+- **One rule failed in my own hands: independent review.** The reviewer found that I had merged my own three Broadsword fixes after a headless review outside the queue, so nothing recorded or enforced that the review happened.
+
+### What we learned
+
+| What | Why | What changes | Where it's enforced |
+| --- | --- | --- | --- |
+| **A whole-project review found what milestone reviews never could.** The `.env` key sat in 21 Git checkpoints; rules were not in force; claims were stronger than the evidence. | Each milestone review saw only its own diff. The secrets leak sat between a Stage 1 design (checkpoints save ignored files "so `.env` is restored") and the secrets rule from Stage 0. No single diff showed both. | A full independent audit at the end of every stage, before the tag. Its blocking findings must be fixed before tagging. | `AGENTS.md` (Review rule) |
+| **A design decision quietly broke a higher rule.** The checkpoint was documented as intentionally saving `.env`. | Nobody checked a new feature against the standing rules it touches. | Every spec names the standing rules it touches (secrets, deletion, settings), and the reviewer checks against them. | `SPEC_CHECKLIST.md` |
+| **Our own records over-claimed.** For example, "every Stage 2 milestone passed review on its first or second pass" was false; the "fresh session" test named the project in its prompt. | Records were written from memory and summaries (some by the Housekeeper), not checked against the raw evidence. | The stage-end audit checks claims against raw evidence. Records quote the evidence they rest on. | `AGENTS.md` (Review rule) |
+| **The orchestrator skipped the process it enforces on coders.** | No rule said the orchestrator's own code goes through the queue, and doing it directly was faster. | All code reaches main through the merge queue, the orchestrator's included. | `AGENTS.md` (Orchestration rule) |
+| **Rules were written but not in force,** such as automatic cleanup and phone alerts. Stage 1 was tagged anyway. | The rules were written in Stage 0, before the code existed. Nothing tied each rule to a mechanism. | Each standing rule is either enforced (code, hook or test) or marked "not yet in force" in `PROGRESS.md`. The audit checks this. | `AGENTS.md` (Done means verified) |
+| **A queue PASS can't confirm a done check:** the unreachable damping guard passed Haiku. | The reviewer sees the diff and test output, with no tools, so it cannot run anything. | Until the queue runs done-check commands itself, the orchestrator runs them before queueing and puts their output in the brief. | `SPEC_CHECKLIST.md` |
+
+### Speed and cost
+
+- **Fable, high effort:** about 334k tokens and 28 minutes for the main agent, plus 4 read-only sub-reviewers for breadth.
+- **The milestone reviews:** together they cost $0.42 and caught diff-level bugs.
+- **Lesson:** cheap per-change reviews and an expensive per-stage audit do different jobs. Neither replaces the other.
+- **Process weight:** the reviewer also pointed out that 9 of the last 10 commits are process, not product. That is the ledger's "retro time growing past its value" signal. **Change:** the next milestone must ship product (Stage 4). Process work only fixes audit findings and doesn't add new machinery.
+
+### Carry into the next milestone
+
+1. Fix the blocking finding (secrets in checkpoints) and the serious ones before Stage 4 code starts, through the queue.
+2. Stage 4 ends with the same full audit before its tag.
+3. No new process machinery in Stage 4 unless an audit finding needs it.
 
 ---
 
