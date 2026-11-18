@@ -12,8 +12,9 @@
 //! - FAKE_CLAUDE_COMMIT_IN: a folder (a git repo) in which it commits a file first, simulating the main branch moving while
 //!   the review runs.
 //! - FAKE_CLAUDE_EXIT: exit with that code and print nothing (a CLI that fails).
-//! - FAKE_CLAUDE_MODEL: the model name it reports in `modelUsage` (default: `claude-<the --model family>-4-5`, like the real CLI);
-//!   the value `none` leaves `modelUsage` out.
+//! - FAKE_CLAUDE_MODEL: the model name it reports in `modelUsage` (default: `fake-model`, so the fake never passes the
+//!   reviewer family check by itself); the value `auto` reports `claude-<the --model family>-4-5` like the real CLI, `none`
+//!   leaves `modelUsage` out.
 //! - FAKE_CLAUDE_PLAIN: print this plain text instead of the JSON (a program that is not the Claude CLI).
 
 use std::io::{Read, Write};
@@ -65,7 +66,11 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let asked = args.iter().position(|a| a == "--model").and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
-    let reported = std::env::var("FAKE_CLAUDE_MODEL").unwrap_or_else(|_| format!("claude-{asked}-4-5"));
+    let reported = match std::env::var("FAKE_CLAUDE_MODEL") {
+        Ok(m) if m == "auto" => format!("claude-{asked}-4-5"),
+        Ok(m) => m,
+        Err(_) => "fake-model".to_string(),
+    };
     let usage = if reported == "none" { String::new() } else { format!(",\"modelUsage\":{{\"{reported}\":{{}}}}") };
     let result = if input.contains("GARBAGE_REVIEW") {
         "Looks fine to me, nothing to add."

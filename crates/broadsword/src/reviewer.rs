@@ -17,6 +17,10 @@
 //!   by `[REDACTED]`; `.env` values shorter than `MIN_REDACT_LEN` are not (they would blank out ordinary words), and the queue
 //!   says how many were skipped.
 //!
+//! REDACTION LIMITS. Redaction is plain text replacement: (1) a secret split across two diff lines is not redacted; (2) a `.env`
+//! value that is also ordinary code or text (`REGION=return`) is blanked everywhere it appears, which hides that code from the
+//! reviewer. Keep `.env` values distinctive.
+//!
 //! THE REVIEWER PROGRAM. `resolve_cli` turns `BROADSWORD_REVIEWER_CLI` / `reviewer_cli` into an absolute path, which the queue
 //! prints and records on every review. A path outside the project root (the real Claude install) is normal; one inside the
 //! root's `scratch_dir` is the TEST HOOK (announced, `test_hook: true` in the review); any other path inside the root is refused,

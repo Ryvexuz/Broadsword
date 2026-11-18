@@ -106,7 +106,7 @@ impl Root {
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(BIN);
-        c.args(args).current_dir(&self.dir).stdin(Stdio::null()).env("BROADSWORD_REVIEWER_CLI", &self.fake).env("FAKE_CLAUDE_OUT_DIR", &self.fake_out);
+        c.args(args).current_dir(&self.dir).stdin(Stdio::null()).env("BROADSWORD_REVIEWER_CLI", &self.fake).env("FAKE_CLAUDE_OUT_DIR", &self.fake_out).env("FAKE_CLAUDE_MODEL", "auto");
         for (k, v) in env {
             c.env(k, v);
         }
@@ -823,6 +823,24 @@ fn output_that_is_not_the_cli_json_or_from_another_model_family_or_without_model
             assert!(review.contains("VERDICT: PASS"), "the raw text is kept: {review}");
         }
     }
+}
+
+#[test]
+fn the_fake_with_default_settings_from_outside_the_root_fails_the_family_check() {
+    let r = Root::new("fakedefault", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x
+", "task: new file");
+    let main_before = r.head();
+    let e = r.add(&id, "low", "sonnet");
+    let mut c = r.command(&["queue", "run"], &[("BROADSWORD_REVIEWER_CLI", FAKE)]);
+    c.env_remove("FAKE_CLAUDE_MODEL");
+    let o = c.output().unwrap();
+    let (code, err) = (o.status.code().unwrap(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert_eq!(code, 5, "{err}");
+    assert_eq!(r.status(&e), "rejected");
+    assert!(r.field(&e, "reason").contains("fake-model") && r.field(&e, "reason").contains("counts as FAIL"), "{}", r.field(&e, "reason"));
+    assert_eq!(r.head(), main_before);
 }
 
 // ---- M1, M2, M3, M4, M6 -----------------------------------------------------------------------
