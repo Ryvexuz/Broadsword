@@ -149,7 +149,7 @@ Process items:
    Then the benchmark follow-ups: the credit-blocked OpenAI rows through Codex, Responses API models, per-model token caps, 5x consistency on the gpt-6.2 models, an instruction-following test, a drift test, and labelling the extra single-bug lines.
    **astra as a merge reviewer** (Lazlo, 2026-11-18):
    1. Check that `codex exec -m gpt-6.2-astra` works on the plan; tonight's Codex checks covered sol, terra and 6.2-sol only.
-   2. Make gpt-6.2-astra the shadow reviewer (`shadow_reviewer_model`), or alternate it with gpt-5.6-sol by entry, so both get real-merge data.
+   2. Lazlo used astra through ChatGPT yesterday, so it should run. Run **both** gpt-5.6-sol and gpt-6.2-astra as shadow reviewers on every merge, as a contest for the reviewer job (task `t-20261118-142614`, after tp1/tp2 and the adjudication task).
    3. After about 15 to 20 shadowed merges with verdicts, compare with the gating reviewers (Haiku for low risk, Opus for high):
       - real bugs caught;
       - false alarms that would have blocked a merge;
