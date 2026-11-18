@@ -6,8 +6,23 @@
 Coder tokens are not recorded by Broadsword; the orchestrator notes them from each agent's report.
 """
 import pathlib
+import subprocess
 import sys
 from collections import defaultdict
+
+
+def main_root() -> pathlib.Path:
+    """The main checkout, where state/ lives, even when this script runs from a task worktree.
+    Exits loudly if it can't be found: a report read from the wrong folder would be silently wrong."""
+    here = pathlib.Path(__file__).resolve().parent
+    try:
+        common = subprocess.run(["git", "-C", str(here), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"review_costs: cannot run git to find the main checkout ({e})")
+    root = pathlib.Path(common).parent if common else None
+    if root is None or not (root / "broadsword.toml").is_file() or not (root / "state" / "queue").is_dir():
+        raise SystemExit(f"review_costs: no Broadsword main checkout with state/queue found (git said {common!r})")
+    return root
 
 
 def header(text: str) -> dict:
@@ -23,7 +38,7 @@ def main() -> int:
     since = None
     if "--since" in sys.argv:
         since = sys.argv[sys.argv.index("--since") + 1]
-    root = pathlib.Path(__file__).resolve().parent.parent
+    root = main_root()
     rows = []
     for f in sorted((root / "state" / "queue").glob("*.review")):
         h = header(f.read_text(encoding="utf-8", errors="replace"))
