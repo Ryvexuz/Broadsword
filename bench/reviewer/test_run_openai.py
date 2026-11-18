@@ -1,6 +1,7 @@
 """Tests for run_openai.py. No real network: a fake OpenAI server runs on 127.0.0.1 in a thread.
 
-Run (from bench/reviewer/):  env -u OPENAI_API_KEY python -I -B -m unittest -v test_run_openai
+Run (from bench/reviewer/):  env -u OPENAI_API_KEY python -I -B -m unittest discover -s . -p test_run_openai.py -v
+(plain `-m unittest test_run_openai` cannot find the module under -I)
 
 The key below is fake. Every run passes --root to a throwaway folder, so the real root .env is never read.
 Fake cases (cases.json plus a diff) live in a temp folder; score.py is copied next to them and run there.
@@ -55,7 +56,7 @@ class Fake:
 
 
 def ok_body(text=REVIEW, model="gpt-fake-2026-01-01"):
-    return {"model": model, "choices": [{"message": {"role": "assistant", "content": text}}],
+    return {"model": model, "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}}
 
 
@@ -131,6 +132,58 @@ class RunOpenAI(unittest.TestCase):
         self.assertIn("c1", p.stdout)
         self.assertIn("YES", p.stdout)  # the review flags the bug as BLOCKING
         self.assertNotIn("ERROR", p.stdout)
+
+    def _body(self, content, finish, usage=None):
+        return {"model": "gpt-fake", "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": finish}],
+                "usage": usage or {"prompt_tokens": 1000, "completion_tokens": 16000}}
+
+    def test_length_with_empty_content_is_an_error(self):
+        f = Fake([(200, self._body("", "length"))])
+        self.addCleanup(f.close)
+        code, so, _ = self.run_it(f)
+        self.assertEqual(code, 1)
+        r = self.record()
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["exit"], 1)
+        self.assertIn("finish_reason='length'", r["error"])
+        self.assertIn("16000", r["error"])  # token usage named
+        self.assertIn("ERROR", so)
+
+    def test_empty_content_with_stop_is_an_error(self):
+        f = Fake([(200, self._body("", "stop"))])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f)
+        self.assertEqual(code, 1)
+        r = self.record()
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["exit"], 1)
+        self.assertIn("empty answer", r["error"])
+        self.assertIn("finish_reason='stop'", r["error"])
+
+    def test_truncated_text_with_length_is_an_error(self):
+        f = Fake([(200, self._body("VERDICT: FAIL\nBLOCKING: cut off", "length"))])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f)
+        self.assertEqual(code, 1)
+        self.assertTrue(self.record()["is_error"])
+
+    def test_normal_stop_answer_still_passes(self):
+        f = Fake([(200, self._body(REVIEW, "stop"))])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f)
+        self.assertEqual(code, 0)
+        r = self.record()
+        self.assertEqual((r["exit"], r["is_error"], r["result"]), (0, False, REVIEW))
+        self.assertNotIn("error", r)
+
+    def test_response_without_choices_is_a_per_case_error(self):
+        f = Fake([(200, {"model": "gpt-fake", "choices": [{"finish_reason": "stop"}]})])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f)
+        self.assertEqual(code, 1)
+        r = self.record()
+        self.assertTrue(r["is_error"])
+        self.assertIn("no message", r["error"])  # rejected by openai_mcp.chat_completion, recorded per case
 
     def test_429_then_200_is_retried(self):
         f = Fake([(429, {"error": {"message": "slow down"}}), (200, ok_body())])

@@ -23,6 +23,7 @@ From `bench/reviewer/`, with `<model>` the name Lazlo gives. Output goes in the 
 - Optional trailing case ids run only those cases, e.g. `... default a19ee1a fd98728`.
 - Prices are never guessed: without both `--price-in` and `--price-out`, `cost_usd` is null.
 - `--timeout`, `--max-tokens`, `--retries`, `--backoff` have defaults shown in `--help`.
+- A 200 answer that is empty or whose `finish_reason` is not `stop` (e.g. `length`: reasoning used up `--max-tokens`) is recorded as an error (`is_error: true`, `exit: 1`, `error` naming the finish_reason and usage), never as an empty review. `score.py` prints such rows with `ERROR` but still counts them in the run total as not caught, so read the ERROR rows before comparing; raise `--max-tokens` and rerun them.
 - `model_used` in each result is the response's `model` field; check it matches the model asked for.
 - Copy results worth keeping into `evidence/`; scratch can be wiped.
 

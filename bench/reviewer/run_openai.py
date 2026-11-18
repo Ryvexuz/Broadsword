@@ -144,16 +144,29 @@ def main(argv=None):
             error = f"unexpected {type(e).__name__}: {oc.redact(e)}"[:500]
         dt = time.time() - t0
         usage = normalize_usage((raw or {}).get("usage"))
+        text = ""
         if raw is not None:
-            msg = raw["choices"][0]["message"]
-            text = msg.get("content") or ""
-            refusal = msg.get("refusal")
-            if not text and refusal:
+            try:
+                choice = raw["choices"][0]
+                msg = choice["message"]
+                text = msg.get("content") or ""
+                finish = choice.get("finish_reason")
+                refusal = msg.get("refusal")
+            except (KeyError, IndexError, TypeError, AttributeError) as e:
                 text = ""
-                error = f"the model refused: {refusal}"
-            rec_error = bool(error)
-        else:
-            text, rec_error = "", True
+                error = f"malformed response, no choices[0].message ({type(e).__name__})"
+            else:
+                if not isinstance(text, str):
+                    text = ""
+                    error = "malformed response: message content is not text"
+                elif not text.strip() and refusal:
+                    text = ""
+                    error = f"the model refused: {refusal}"
+                elif finish != "stop" or not text.strip():
+                    why = "empty answer" if not text.strip() else "incomplete answer"
+                    error = (f"{why}: finish_reason={finish!r}, usage={json.dumps((raw.get('usage') or {}), sort_keys=True)}"
+                             + (" (the reasoning probably used up max_completion_tokens; raise --max-tokens)" if finish == "length" else ""))
+        rec_error = bool(error) or raw is None
         rec = {"case": c["id"], "model": args.model, "effort": args.effort, "wall_s": round(dt, 1),
                "exit": 1 if rec_error else 0, "cost_usd": cost_usd(usage, args.price_in, args.price_out),
                "usage": usage, "result": text, "is_error": rec_error,
