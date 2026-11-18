@@ -9,8 +9,8 @@ use vec3::Vec3;
 
 pub const GRAVITY: f64 = 9.81;
 pub const NODE_MASS: f64 = 1.0;
-/// Beam stiffness (N/m). The highest cube mode is roughly sqrt(10 k / m), about
-/// 400 rad/s, so at the default 1 ms substep omega*dt is about 0.40, well under
+/// Beam stiffness (N/m). The highest cube mode is sqrt(8 k / m) = 400 rad/s
+/// (see max_stable_step), so at the default 1 ms substep omega*dt is about 0.40, well under
 /// the symplectic Euler stability limit of 2.
 pub const BEAM_STIFFNESS: f64 = 20_000.0;
 /// Axial damping (N*s/m). Damps impact ringing within the 5 s run;
@@ -36,6 +36,34 @@ pub const TILT_DEG: f64 = 5.0;
 /// This is a conservative bound, no extra margin needed.
 pub fn max_stable_step() -> f64 {
     2.0 / (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
+}
+
+/// Explicit damping is stable only while c*h/m stays below this.
+pub const DAMPING_STABILITY_LIMIT: f64 = 1.0;
+
+/// The damping number c*h/m for physics step `h`.
+pub fn damping_number(h: f64) -> f64 {
+    BEAM_DAMPING * h / NODE_MASS
+}
+
+/// Largest physics step (s) with c*h/m below `DAMPING_STABILITY_LIMIT`.
+/// For the current constants (0.05 s) this is far above `max_stable_step`
+/// (about 0.0038 s), so `validate` always hits the stiffness limit first;
+/// this check is enforced separately and tested directly.
+pub fn max_damping_step() -> f64 {
+    DAMPING_STABILITY_LIMIT * NODE_MASS / BEAM_DAMPING
+}
+
+/// Error text if step `h` breaks the damping limit, else None.
+pub fn damping_limit_error(h: f64) -> Option<String> {
+    let n = damping_number(h);
+    if n >= DAMPING_STABILITY_LIMIT {
+        Some(format!(
+            "physics step h = dt/substeps = {h:.6} s gives damping number c*h/m = {n:.4}, which must stay below {DAMPING_STABILITY_LIMIT} (c = {BEAM_DAMPING}, m = {NODE_MASS}); raise --substeps or lower --dt"
+        ))
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +104,9 @@ impl Config {
  "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s, k = {BEAM_STIFFNESS}); raise --substeps or lower --dt",
                 (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
             ));
+        }
+        if let Some(e) = damping_limit_error(h) {
+            return Err(e);
         }
         Ok(())
     }
