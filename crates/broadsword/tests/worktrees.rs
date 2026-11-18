@@ -887,7 +887,7 @@ impl Root {
         let dir = self.dir.join("state/jobs");
         fs::create_dir_all(&dir).unwrap();
         let src = source.map(|s| format!("source = {s}\n")).unwrap_or_default();
-        let body = format!("id = {id}\nproject = p\nkind = run\n{src}task = {task}\nstatus = running\npid = {}\ncheckpoint = pending\n", dead_pid());
+        let body = format!("id = {id}\nproject = p\nkind = run\n{src}task = {task}\nstatus = running\npid = {}\npid_start = 1\ncheckpoint = pending\n", dead_pid()); // pid_start = 1: a reused pid belongs to a process with another start time, so the record still reads as dead
         fs::write(dir.join(format!("{id}.rec")), body).unwrap();
         id
     }
@@ -1007,4 +1007,19 @@ fn a_run_job_that_panics_stays_running_and_blocks_only_its_own_folder() {
     assert_eq!(read(r.wt(&b).join("a.txt")), "one\n", "the other worktree is untouched");
     assert_eq!(r.status_in_record(&id), "rolled_back");
     assert_eq!(r.run_echo(Some(&a)).code, 0);
+}
+
+/// A `run` job's command sees CARGO_TARGET_DIR = the main root's shared build folder, so a `cargo ...` inside `run` from
+/// a worktree never builds into the worktree (found when `run -- cargo test` in a Broadsword worktree made its own build/).
+#[test]
+fn a_run_job_in_a_worktree_uses_the_shared_build_folder() {
+    let r = Root::new("runtarget");
+    let a = r.started("a");
+    let o = r.run(&["run", "p", "--task", &a, "--", "echo", "TD=%CARGO_TARGET_DIR%"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let td = o.stdout.lines().find_map(|l| l.trim().strip_prefix("TD=")).unwrap_or_else(|| panic!("no TD= line: {}", o.stdout)).trim().to_string();
+    let want = r.dir.join("build");
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    assert_eq!(norm(&td), norm(&want.to_string_lossy()), "run must point cargo at the main root's build folder");
+    assert!(!r.wt(&a).join("build").join("debug").exists());
 }

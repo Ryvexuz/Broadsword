@@ -295,14 +295,14 @@ pub fn run_child(
     Ok(StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() })
 }
 
-/// `cargo <sub> --offline` in `project_dir` with the shared build folder.
-fn cargo_command(cfg: &Config, project_dir: &Path, sub: &str) -> Command {
+/// `cargo <sub> --offline` in `project_dir` (the caller sets the shared build folder).
+fn cargo_command(project_dir: &Path, sub: &str) -> Command {
     let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    c.arg(sub).arg("--offline").current_dir(project_dir).env("CARGO_TARGET_DIR", &cfg.build_dir);
+    c.arg(sub).arg("--offline").current_dir(project_dir);
     c
 }
 
-/// An arbitrary command line run through the system shell in `project_dir`.
+/// An arbitrary command line run through the system shell in `project_dir` (the caller sets the shared build folder).
 fn shell_command(project_dir: &Path, line: &str) -> Command {
     #[cfg(windows)]
     let mut c = {
@@ -677,10 +677,13 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         if let Ok(mut f) = log.lock() {
             let _ = writeln!(f, "=== {step} {name} ({}) ===", pause::now_string());
         }
-        let cmd = match (&spec.command, *step) {
+        let mut cmd = match (&spec.command, *step) {
             (Some(line), "run") => shell_command(&project_dir, line),
-            _ => cargo_command(cfg, &project_dir, step),
+            _ => cargo_command(&project_dir, step),
         };
+        // The one place every job's child gets the shared build folder: cargo steps, and any `cargo ...` inside `run`
+        // (a worktree's .cargo/config.toml with a relative target-dir would otherwise build inside the worktree).
+        cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
         let mut spawn_err: Option<String> = None;
         let mut on_spawn = |pid: u32| {
             rec.set("child_pid", pid.to_string());
