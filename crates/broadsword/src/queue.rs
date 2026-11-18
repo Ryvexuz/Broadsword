@@ -827,7 +827,7 @@ impl<'a> Run<'a> {
     fn s_check(&mut self) -> R<()> {
         self.set_step("check")?;
         let (project, task_id) = (self.e.get("project").to_string(), self.e.get("task").to_string());
-        if let Some(code) = tools::guard_refusal(self.cfg, &project) {
+        if let Some(code) = tools::guard_refusal(self.cfg, &project, Some(&task_id)) {
             return Err(self.blocked(&format!("the check was refused before it started (exit {code}; the reason is printed above, e.g. Broadsword paused or an interrupted run to recover); nothing changed")));
         }
         println!("queue entry {}: check {project} --task {task_id}", self.e.id());
@@ -1041,7 +1041,7 @@ impl<'a> Run<'a> {
         let loud = |code: String, extra: &str| {
             format!("commit {sha} is ALREADY on `{mb}` of project `{project}`, and `check {project}` there did not pass ({code}){extra}. Main was NOT reset or reverted. A human decides: fix forward, or `git revert` the commit. The task was NOT marked done and its worktree is kept")
         };
-        if let Some(code) = tools::guard_refusal(self.cfg, &project) {
+        if let Some(code) = tools::guard_refusal(self.cfg, &project, None) {
             return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("the check was refused before it started, exit {code}"), ""), EXIT_MERGED_BAD));
         }
         println!("queue entry {}: check {project} (the main checkout)", self.e.id());

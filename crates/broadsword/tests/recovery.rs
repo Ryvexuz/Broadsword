@@ -508,3 +508,32 @@ fn closed_stdout_never_leaves_a_job_running() {
     let again = r.run(&["run", "p", "--", "cmd", "/C", "echo", "ok"]);
     assert_eq!(again.status.code(), Some(0), "the next job on the project is not refused: {}", String::from_utf8_lossy(&again.stderr));
 }
+
+/// A panic inside a build/test/check job kills its verified child tree and leaves the record `failed` with a note naming
+/// the panic. The test hook (gate file inside the root's scratch folder) makes the job panic after its child started; a
+/// build script that sleeps keeps that child alive long enough to prove it is killed.
+#[test]
+fn a_check_job_that_panics_ends_failed_and_its_child_is_gone() {
+    let r = Root::new("panickill");
+    r.project("", false);
+    let p = r.project_dir();
+    fs::write(p.join("build.rs"), "fn main() { std::thread::sleep(std::time::Duration::from_secs(120)); }\n").unwrap();
+    fs::write(p.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[workspace]\n").unwrap();
+    let gate = r.dir.join("scratch/panic.gate");
+    // without the gate file the hook does nothing: the env var alone is ignored
+    let out = Command::new(BIN).args(["run", "p", "--", "echo", "hi"]).env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate).current_dir(&r.dir).stdin(Stdio::null()).output().unwrap();
+    assert!(!text(&out.stderr).contains("TEST HOOK ACTIVE") && !text(&out.stderr).contains("PANIC"), "the hook is ignored without its gate file: {}", text(&out.stderr));
+    fs::write(&gate, "").unwrap();
+    let out = Command::new(BIN).args(["check", "p"]).env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate).current_dir(&r.dir).stdin(Stdio::null()).output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{so}{se}");
+    assert!(se.contains("TEST HOOK ACTIVE") && se.contains("PANIC in job"), "{se}");
+    let pid = so.split("killing orphaned process tree (pid ").nth(1).and_then(|t| t.split(')').next()).unwrap_or_else(|| panic!("the child must have been killed: {so}")).to_string();
+    wait_until("the child to be gone", 10, || !pid_alive(&pid));
+    let rec = r.only_record();
+    assert_eq!(Root::field(&rec, "status"), "failed", "{rec}");
+    assert!(Root::field(&rec, "failure_reason").contains("panicked") && Root::field(&rec, "failure_reason").contains("test hook"), "{rec}");
+    assert_eq!(Root::field(&rec, "child_pid"), "");
+    // a failed record blocks nothing, and recover has nothing to do for it
+    assert!(text(&r.run(&["recover"]).stdout).contains("nothing to do"));
+}

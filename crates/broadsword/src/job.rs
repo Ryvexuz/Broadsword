@@ -26,6 +26,26 @@ pub const EXIT_DISK_DROPPED: u8 = 4;
 /// Test-only hook, see `hooked_free_source`. The long name is deliberate: it cannot be set by accident.
 pub const TEST_FREE_HOOK_ENV: &str = "BROADSWORD_INTERNAL_TEST_FREE_BYTES_FILE";
 
+/// Test-only hook, see `panic_hook_active`: makes a job panic right after its child has started.
+pub const TEST_PANIC_HOOK_ENV: &str = "BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB";
+
+/// TEST ONLY: the env var `BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB` names a gate file; when that file exists inside this
+/// root's scratch folder, the job panics after its child has started (to test the panic guard). Without the file, or
+/// with a file outside scratch, it does nothing. Use is announced on stderr. It can only make a job fail, never pass.
+fn panic_hook_active(cfg: &Config) -> bool {
+    let Ok(v) = std::env::var(TEST_PANIC_HOOK_ENV) else { return false };
+    let gate = PathBuf::from(&v);
+    let inside = match (gate.parent().and_then(|p| p.canonicalize().ok()), cfg.scratch_dir.canonicalize()) {
+        (Some(p), Ok(s)) => p.starts_with(s),
+        _ => false,
+    };
+    if !inside || !gate.is_file() {
+        return false;
+    }
+    eprintln!("broadsword: TEST HOOK ACTIVE: the job panics after its child started (gate file {v})");
+    true
+}
+
 // ---- projects ---------------------------------------------------------------------------
 
 /// Known project names: `broadsword` plus every folder in `projects_dir` holding a Cargo.toml.
@@ -431,6 +451,18 @@ pub fn job_folder(cfg: &Config, name: &str, task: Option<&str>) -> Result<PathBu
     }
 }
 
+/// The source folder (relative to root, as job records store it in `source`) a job of `name` for `task` runs in. The ONE
+/// place it is worked out: the job itself and the interrupted-run block (`recover::blocked_by_interrupted_run`) both use it.
+pub fn job_source(cfg: &Config, name: &str, task: Option<&str>) -> Result<String, String> {
+    let dir = job_folder(cfg, name, task).map_err(|(_, m)| m)?;
+    buildsrc::rel_source(cfg, &dir)
+}
+
+/// The text of a panic payload.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "(no message)".into())
+}
+
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
 /// before the first step (when the project is a Git repo), and runs the steps.
 /// The build lock, held until the job function returns. For `run`, dropping it first marks the notes of the folder's
@@ -473,7 +505,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             return code;
         }
     };
-    let source = match buildsrc::rel_source(cfg, &project_dir) {
+    let source = match job_source(cfg, &spec.name, spec.task.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("broadsword: {e}");
@@ -535,6 +567,9 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     let job_id = rec.id().to_string();
     info.id = Some(job_id.clone());
     info.log = Some(log_path.clone());
+    let panic_hook = panic_hook_active(cfg);
+    // From here the record exists: a panic must leave a truthful record (see the handling after this block).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     if let Some(old) = &spec.resumed_from {
         // Hand over before running: the old record now points at this job.
         let path = record::jobs_dir(cfg).join(format!("{old}.rec"));
@@ -653,6 +688,9 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             if let Err(e) = save_record(&rec) {
                 spawn_err = Some(e);
             }
+            if panic_hook {
+                panic!("test hook: panic in job after its child started");
+            }
         };
         let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn) {
             Ok(r) => r,
@@ -704,6 +742,42 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         EXIT_FAILED
     };
     end(&mut rec, if all_ok { record::DONE } else { record::FAILED }, code)
+    }));
+    match result {
+        Ok(code) => code,
+        Err(payload) => {
+            let why = panic_text(&*payload);
+            eprintln!("broadsword: PANIC in job {job_id} ({kind} {name}): {why}");
+            // A panic in the guard itself must not hide the original panic (already printed above).
+            let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recover_after_panic(&mut rec, kind, &why);
+            }));
+            if guarded.is_err() {
+                eprintln!("broadsword: the panic guard itself panicked while handling the job's panic ({why}); job {job_id}'s record may be left `running`: see `broadsword jobs` and `broadsword recover`");
+            }
+            EXIT_FAILED
+        }
+    }
+}
+
+/// After a panic in a job: kill its child tree (only if it is verifiably the recorded process, the same check as `recover`),
+/// then a build, test or check is marked `failed` with a note; a `run` stays `running` with no live Broadsword pid, so the
+/// normal interrupted-run path offers rollback (it may have half-changed files).
+fn recover_after_panic(rec: &mut Record, kind: &str, why: &str) {
+    crate::recover::kill_orphan(rec);
+    if kind == "run" {
+        rec.set("pid", ""); // this process lives on only to report; the record must read as interrupted, not as a live job
+        rec.set("child_pid", "");
+        rec.set("child_start", "");
+        rec.set("panic", why);
+        if let Err(e) = save_record(rec) {
+            eprintln!("broadsword: ERROR: {e}");
+        }
+        eprintln!("broadsword: this run job may have changed files: run `broadsword recover` to roll it back, or `broadsword recover --abandon {}`", rec.id());
+    } else {
+        rec.set("failure_reason", format!("Broadsword panicked while running this job: {why}"));
+        end(rec, record::FAILED, EXIT_FAILED);
+    }
 }
 
 #[cfg(test)]

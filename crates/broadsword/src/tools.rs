@@ -346,7 +346,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs on that project are refused. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the whole working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs in the same source folder (the main checkout, or that task's worktree) are refused; jobs in other worktrees of the project are not. A panic inside a `run` job (a Broadsword bug) leaves it interrupted the same way, after killing its command. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
         params: &[
             PROJECT,
             TASK,
@@ -362,7 +362,7 @@ pub static TOOLS: &[Tool] = &[
             ExitDoc { code: "0", meaning: "the command exited 0" },
             ExitDoc { code: "1", meaning: "the command exited 1 or failed without a usable code, or Broadsword could not set the job up (log or record could not be written)" },
             ExitDoc { code: "2", meaning: "Broadsword: unknown project name, or with `task` no task with that id; or the command itself exited 2" },
-            ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run on this project still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project); or the command itself exited 3" },
+            ExitDoc { code: "3", meaning: "Broadsword refused to start (paused or not enough free disk; project is not a Git repository or no checkpoint could be taken; an earlier interrupted run in the same source folder still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project); or the command itself exited 3" },
             ExitDoc { code: "4", meaning: "Broadsword killed the command because free disk fell below the floor, and is now paused; or the command itself exited 4" },
             ExitDoc { code: "N", meaning: "any other number is the command's own exit code. HOW TO TELL: Broadsword's own verdict is the last `run:` line (`run: ok` or `run: FAILED (exit N)`) after the final `--- summary ---` line on stdout; the command may print a fake one itself, so only the last counts. If there is no such line, Broadsword itself stopped the job (the reason is on stderr, starting `broadsword:`) and the code is one of 1-4 as documented for build; only then is `recover` possibly relevant" },
         ],
@@ -399,13 +399,13 @@ pub static TOOLS: &[Tool] = &[
             if command.is_empty() {
                 return Err("missing required input `command`".into());
             }
-            Ok(guarded(cfg, project, || job::cmd_run(cfg, project, i.str("task"), &command)))
+            Ok(guarded(cfg, project, i.str("task"), || job::cmd_run(cfg, project, i.str("task"), &command)))
         },
     },
     Tool {
         name: "recover",
         summary: "Clean up after a crash: resume interrupted builds/tests, roll back interrupted runs.",
-        description: "Finds every job whose Broadsword process died while it was running. build, test and check jobs are resumed from the step they were on, at most max_resumes times in a row. An interrupted `run` job is rolled back: the project's files are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost. Use it after a crash, a reboot or a message that a project is blocked by an interrupted run. It changes files in the affected project and may rebuild, so it can take a while. Jobs still genuinely running are left alone. Every build, test, check and run already does the safe half (resume, never roll back) automatically before it starts.",
+        description: "Finds every job whose Broadsword process died while it was running. build, test and check jobs are resumed from the step they were on, at most max_resumes times in a row. An interrupted `run` job is rolled back: the project's files are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost. Use it after a crash, a reboot or a message that a source folder is blocked by an interrupted run. It changes files in the affected project and may rebuild, so it can take a while. Jobs still genuinely running are left alone. Every build, test, check and run already does the safe half (resume, never roll back) automatically before it starts.",
         params: &[],
         outputs: "One block per interrupted job saying what was done, or `recover: nothing to do`. Problems are listed on stderr as NEEDS ATTENTION with the job ids.",
         exit_codes: &[
@@ -427,7 +427,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "abandon",
         summary: "Give up on one interrupted job without touching any project file.",
-        description: "Marks a dead, interrupted job as abandoned so that new jobs on its project are no longer refused, without restoring any files. Use it only when rolling back with `recover` is not wanted or not possible, for example when the work done by an interrupted `run` should be kept and inspected by hand. The job's record and every Git ref stay, and the output prints commands to see what was saved. It refuses a job that is still running or already finished. It changes one job record.",
+        description: "Marks a dead, interrupted job as abandoned so that new jobs in its source folder are no longer refused, without restoring any files. Use it only when rolling back with `recover` is not wanted or not possible, for example when the work done by an interrupted `run` should be kept and inspected by hand. The job's record and every Git ref stay, and the output prints commands to see what was saved. It refuses a job that is still running or already finished. It changes one job record.",
         params: &[Param {
             name: "id",
             ty: Ty::String,
@@ -1124,7 +1124,7 @@ const JOB_EXITS: &[ExitDoc] = &[
     ExitDoc { code: "0", meaning: "every step succeeded" },
     ExitDoc { code: "1", meaning: "a step failed (see the log), or the job could not be set up (log or record could not be written; or `cargo metadata` or `cargo clean -p` failed, so the shared build folder could not be made safe and nothing was built)" },
     ExitDoc { code: "2", meaning: "unknown project name (stderr lists the known projects), or with `task` no task with that id" },
-    ExitDoc { code: "3", meaning: "refused, nothing built or cleaned: Broadsword is paused, free disk minus the reserve is below the floor, an earlier interrupted run on this project still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project; or the build lock was not free within build_lock_wait_seconds (`build folder busy`: repeat later)" },
+    ExitDoc { code: "3", meaning: "refused, nothing built or cleaned: Broadsword is paused, free disk minus the reserve is below the floor, an earlier interrupted run in the same source folder still needs `recover`; with `task`: the task is not `running`, has no finished worktree, belongs to another project, or its folder is not really a git worktree of the project; or the build lock was not free within build_lock_wait_seconds (`build folder busy`: repeat later)" },
     ExitDoc { code: "4", meaning: "killed: free disk fell below the floor while the job ran, and Broadsword is now paused" },
 ];
 
@@ -1260,20 +1260,21 @@ fn cmd_resume(cfg: &Config, force: bool) -> Result<ExitCode, String> {
 }
 
 /// Run a job after the automatic recovery step. A job is refused (exit 3) while an interrupted `run` job
-/// on the same project still waits for `broadsword recover`, because it may have left files half changed.
-fn guarded(cfg: &Config, project: &str, job: impl FnOnce() -> ExitCode) -> ExitCode {
-    match guard_refusal(cfg, project) {
+/// in the same source folder still waits for `broadsword recover`, because it may have left files half changed.
+fn guarded(cfg: &Config, project: &str, task: Option<&str>, job: impl FnOnce() -> ExitCode) -> ExitCode {
+    match guard_refusal(cfg, project, task) {
         Some(code) => ExitCode::from(code),
         None => job(),
     }
 }
 
 /// The recovery step every job starts with (also used by the merge queue before its check jobs): `Some(exit code)` when the
-/// job must be refused, with the reason already printed.
-pub fn guard_refusal(cfg: &Config, project: &str) -> Option<u8> {
+/// job must be refused, with the reason already printed. `task` is the job's `--task` (`None` = the project's main checkout):
+/// an interrupted run blocks only jobs in its own source folder (see `recover::blocked_by_interrupted_run`).
+pub fn guard_refusal(cfg: &Config, project: &str, task: Option<&str>) -> Option<u8> {
     let _ = recover::recover(cfg, recover::Mode::Auto); // kills orphans, resumes read-only jobs; never rolls back
-    if let Some(id) = recover::blocked_by_interrupted_run(cfg, project) {
-        eprintln!("broadsword: refusing to start: job {id} (run {project}) was interrupted and may have changed files; run `broadsword recover` first (or `broadsword recover --abandon {id}` to give up on it)");
+    if let Some((id, source)) = recover::blocked_by_interrupted_run(cfg, project, task) {
+        eprintln!("broadsword: refusing to start: job {id} (run {project}, source folder {source}) was interrupted and may have changed files in that folder; run `broadsword recover` first (or `broadsword recover --abandon {id}` to give up on it)");
         return Some(job::EXIT_REFUSED);
     }
     None
@@ -1281,7 +1282,7 @@ pub fn guard_refusal(cfg: &Config, project: &str) -> Option<u8> {
 
 fn job_tool(cfg: &Config, kind: &str, i: &Inputs) -> Result<ExitCode, String> {
     let project = i.require("project")?;
-    Ok(guarded(cfg, project, || job::cmd_job(cfg, kind, project, i.str("task"))))
+    Ok(guarded(cfg, project, i.str("task"), || job::cmd_job(cfg, kind, project, i.str("task"))))
 }
 
 /// The command line of a build, test or check call: `<kind> <project> [--task <id>]`.

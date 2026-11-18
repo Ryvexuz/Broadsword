@@ -868,3 +868,140 @@ fn the_worktree_tools_work_over_mcp() {
     let o = r.run(&["tools", "worktree_list", "--json"]);
     assert!(o.stdout.contains("\"readOnlyHint\": true"), "{}", o.stdout);
 }
+
+// ---- an interrupted `run` blocks only the source folder it worked in --------------------------------------------------
+
+/// A pid that belonged to a process that has already exited.
+fn dead_pid() -> u32 {
+    let mut c = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+impl Root {
+    /// A `run` job record left behind by a crashed broadsword (its pid is dead). `source` is the folder the job ran in as
+    /// the record stores it (`None` = an older record with no `source` line at all). Returns the record's id.
+    fn interrupted_run(&self, n: u32, task: &str, source: Option<&str>) -> String {
+        let id = format!("20260101-00000{n}-p-run");
+        let dir = self.dir.join("state/jobs");
+        fs::create_dir_all(&dir).unwrap();
+        let src = source.map(|s| format!("source = {s}\n")).unwrap_or_default();
+        let body = format!("id = {id}\nproject = p\nkind = run\n{src}task = {task}\nstatus = running\npid = {}\ncheckpoint = pending\n", dead_pid());
+        fs::write(dir.join(format!("{id}.rec")), body).unwrap();
+        id
+    }
+
+    fn run_echo(&self, task: Option<&str>) -> Out {
+        match task {
+            Some(t) => self.run(&["run", "p", "--task", t, "--", "echo", "hi"]),
+            None => self.run(&["run", "p", "--", "echo", "hi"]),
+        }
+    }
+
+    fn status_in_record(&self, id: &str) -> String {
+        let text = fs::read_to_string(self.dir.join(format!("state/jobs/{id}.rec"))).unwrap();
+        text.lines().find_map(|l| l.strip_prefix("status = ")).unwrap_or("").to_string()
+    }
+}
+
+#[test]
+fn an_interrupted_run_in_one_worktree_blocks_only_that_worktree() {
+    let r = Root::new("blockscope");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let id = r.interrupted_run(1, &a, Some(&format!("worktrees/p/{a}")));
+    // another worktree of the same project is not blocked
+    let o = r.run_echo(Some(&b));
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    // the main checkout is not blocked
+    let o = r.run_echo(None);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    // the interrupted run's own folder is: every kind of job, naming the job, the folder and both recover commands
+    for args in [vec!["run", "p", "--task", &a, "--", "echo", "hi"], vec!["check", "p", "--task", &a], vec!["build", "p", "--task", &a], vec!["test", "p", "--task", &a]] {
+        let o = r.run(&args);
+        assert_eq!(o.code, 3, "{args:?}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains(&id) && o.stderr.contains(&format!("worktrees/p/{a}")), "{}", o.stderr);
+        assert!(o.stderr.contains("broadsword recover") && o.stderr.contains(&format!("recover --abandon {id}")), "{}", o.stderr);
+    }
+    assert_eq!(r.status_in_record(&id), "running", "the automatic recovery never rolls a run back");
+}
+
+#[test]
+fn an_interrupted_run_on_main_blocks_main_but_not_a_worktree() {
+    let r = Root::new("blockmain");
+    let a = r.started("a");
+    let id = r.interrupted_run(1, "", Some("projects/p"));
+    let o = r.run_echo(Some(&a));
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let o = r.run_echo(None);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains(&id) && o.stderr.contains("projects/p"), "{}", o.stderr);
+    let o = r.run(&["check", "p"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+}
+
+#[test]
+fn a_record_without_a_source_line_still_blocks_the_whole_project() {
+    let r = Root::new("blockold");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let id = r.interrupted_run(1, "", None);
+    for task in [Some(a.as_str()), Some(b.as_str()), None] {
+        let o = r.run_echo(task);
+        assert_eq!(o.code, 3, "{task:?}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains(&id), "{}", o.stderr);
+    }
+}
+
+#[test]
+fn abandoning_the_interrupted_run_of_one_worktree_lets_its_jobs_run_again() {
+    let r = Root::new("blockabandon");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let id_a = r.interrupted_run(1, &a, Some(&format!("worktrees/p/{a}")));
+    let id_b = r.interrupted_run(2, &b, Some(&format!("worktrees/p/{b}")));
+    assert_eq!(r.run_echo(Some(&a)).code, 3);
+    assert_eq!(r.run_echo(Some(&b)).code, 3);
+    let o = r.run(&["recover", "--abandon", &id_a]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status_in_record(&id_a), "abandoned");
+    let o = r.run_echo(Some(&a));
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.run_echo(Some(&b)).code, 3, "B's own interrupted run still blocks B ({id_b})");
+}
+
+#[test]
+fn a_run_job_that_panics_stays_running_and_blocks_only_its_own_folder() {
+    let r = Root::new("panicrun");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let gate = r.dir.join("scratch/panic.gate");
+    fs::write(&gate, "").unwrap();
+    let line = "echo changed> a.txt & ping -n 30 127.0.0.1 >nul";
+    let o = Command::new(BIN)
+        .args(["run", "p", "--task", &a, "--", line])
+        .env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate)
+        .current_dir(&r.dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let (so, se) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+    assert_eq!(o.status.code(), Some(1), "{so}{se}");
+    assert!(se.contains("TEST HOOK ACTIVE") && se.contains("PANIC in job"), "{se}");
+    assert!(so.contains("killing orphaned process tree"), "the verified child is killed: {so}");
+    assert!(se.contains("broadsword recover"), "prints the recover hint: {se}");
+    let id = fs::read_dir(r.dir.join("state/jobs")).unwrap().flatten().next().unwrap().file_name().to_string_lossy().trim_end_matches(".rec").to_string();
+    assert_eq!(r.status_in_record(&id), "running", "a panicked run is left running so recover offers the rollback");
+    let rec = fs::read_to_string(r.dir.join(format!("state/jobs/{id}.rec"))).unwrap();
+    assert!(rec.contains(&format!("source = worktrees/p/{a}")) && rec.contains("panic = ") && rec.contains("test hook"), "{rec}");
+    // the panicked run's pid is gone from the record, so it reads as interrupted even while this process were alive
+    assert!(rec.lines().any(|l| l == "pid = " || l == "pid ="), "{rec}");
+    // blocks its own folder only
+    assert_eq!(r.run_echo(Some(&a)).code, 3);
+    assert_eq!(r.run_echo(Some(&b)).code, 0);
+    assert_eq!(r.run_echo(None).code, 0);
+    // recover rolls the worktree back as before
+    assert!(r.wt(&a).join("a.txt").exists());
+    let o = r.run(&["recover"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(!r.wt(&a).join("a.txt").exists(), "rolled back in its own worktree: {}", o.stdout);
+    assert_eq!(r.status_in_record(&id), "rolled_back");
+    assert_eq!(r.run_echo(Some(&a)).code, 0);
+}
