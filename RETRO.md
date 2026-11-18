@@ -90,6 +90,8 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S3 audit | Work ahead: a coder starts the next non-overlapping task while the queue checks and reviews | Pipeline idle (62%) and handoff waits (up to 9 min) | `scripts/dev_metrics.py` idle share and handoff column | Wasted work when ahead work depends on an unmerged change; more rebase conflicts | helped: idle 62% → 47%, coder use 28% → 56%, no wasted ahead work; harm seen: brief files written into main blocked a merge (fixed: `state/backlog/`) |
 | S3 audit | `scripts/dev_metrics.py`: throughput, idle time and model use | Seeing where time goes | Whether retros use it | Logging agent runs by hand (`state/agent-runs.tsv`) gets skipped | open |
 | S3 audit | `max_agents` raised 4 → 6 so the backlog's Python benchmark tasks run beside the Rust ones | Backlog wait; pipeline idle | Open tasks waiting while slots are full; `dev_metrics.py` idle share | Build-lock waits (already 10 min once at 4 agents), RAM (15 GB machine) | open |
+| S4 | Shadow second reviewer (gpt-5.6-sol), recorded only | Learn whether a GPT reviewer catches what Claude misses, at what cost and time | `scripts/shadow_report.py` agreement and unique findings | Shadow time making entries stale (Opus minor); OpenAI spend | open |
+| S4 | Blind re-labelling for benchmark scores (anonymised, shuffled lines) | Fair scores despite wording differences | Score changes vs the pattern scorer (gpt-6.2-sol 5 → 9) | The labeller is a Claude model, so a contestant (it was blinded) | helped |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
 
 ## Retros, newest first

@@ -41,6 +41,7 @@ The push at session end brings all three up to date.
   - `max_agents` running (now 6);
   - an overlapping claim.
 - **Merge queue** (`broadsword queue`): rebase, then check, then an independent review (Haiku for low risk, Opus for high), then `--ff-only` to the exact reviewed commit, then a check on main, then `task done`.
+  - **Shadow second reviewer** (`bb7375c`, Lazlo's choice of shadow mode): gpt-5.6-sol reviews the same prompt through `clients/openai_review.py`. Its verdict, blocking lines, tokens and time are recorded in the entry and in `<entry>.shadow.review`, and it never gates a merge. `scripts/shadow_report.py` compares the two reviewers. A live call was checked (key from `.env`, gpt-5.6-sol correctly FAILed a broken `add`). The first real shadowed merge is still to come.
   - A recorded FAIL followed by a crash now ends `rejected`; it no longer wedges the queue.
   - A scratch-hook review can never merge a real project.
   - A brief must be a file inside the root that isn't a secret file.
@@ -62,7 +63,7 @@ The push at session end brings all three up to date.
   - the pause hook fails closed and allows only exact broadsword commands;
   - hard-coded limits are now required settings;
   - a test fails if any setting is unread.
-- **Tests:** 415 Broadsword tests pass. crash-sim has 54 tests (main `abe471c`). The renderer has 77 (master `30c92c4`).
+- **Tests:** 422 Broadsword tests pass. crash-sim has 54 tests (main `abe471c`). The renderer has 77 (master `30c92c4`).
 - **Process:**
   - a retro after each milestone (`RETRO.md`), with an improvement ledger that tracks harm;
   - a portable playbook synced to every project on this PC (`~/.claude/AI_DEV_PLAYBOOK.md`);
@@ -76,31 +77,17 @@ The push at session end brings all three up to date.
 
 ## Benchmarks (provisional)
 
-All raw results are in `state/bench-results/` (not in Git; see Next step). The scorer's patterns undercount, so the hard-case numbers must be hand-checked and re-scored before anyone quotes them.
-
-- **Hard review case** (bugs caught as BLOCKING, out of 12):
-
-| Model | Caught |
-| --- | --- |
-| Sonnet 5.5, high effort | 10 |
-| gpt-5.6-sol | 9 |
-| Fable 5.2 | 9 |
-| Opus 5.5 | 9 |
-| Haiku 5.5 | 7–8 |
-| Sonnet 4.5 | 6 |
-| Opus 4.5 | 5 |
-| o3 | 5 |
-| Haiku 4.5 | 4 |
-| GPT-4.1 | 2 |
-| GPT-4.1-mini | 1 |
-
-  No model flagged a decoy. GPT-4o and GPT-4o-mini errored.
-- **Single-bug cases:** gpt-5.6-sol caught 4 of 5, the same as Opus 5.5 earlier. It missed only the silent-NaN case, which no model catches from the diff alone.
-- **Model probe:** `claude-opus-4-1` silently runs as Opus 5.5, so it is left out. `claude-sonnet-4` is retired.
-- **Still running at session end, or not run yet:** the rest of the OpenAI models on all three benchmarks, and the Claude coding runs past configuration 6 of 10.
+Full tables are in `evidence/benchmarks-2026-11-18.md`: hard case blind re-scored, single-bug cases, coding, and service tiers. In brief:
+- **Hard review case** (12 bugs): Sonnet 5.5 at high effort caught 10. gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol, gpt-6.2-sol, gpt-6-astra, gpt-6.2-astra, gpt-6.1-terra, Fable, Opus 5.5 and Sonnet 5.5 at default caught 9 each. The older Claude 4.5 models caught 4 to 6, and the GPT-4 generation 0 to 2. No model flagged a decoy.
+- **Coding** (97 hidden tests):
+  - 100%: Haiku, Sonnet, Opus at default, Fable at high, and gpt-6.1-terra;
+  - 80%: Fable at default, Opus at high, and o3;
+  - older OpenAI models 26% to 66%.
+- **Consistency is untested.** One model scored 5/5 and then 4/5 on the same set. Repeat runs come next.
 
 ## Unfinished
 
+- **Benchmark runs still going at session end:** the Claude coding and reviewer run (from configuration 8 of 10), the OpenAI reviewer run, and the OpenAI coding run. They write results as they go. Before unplugging the drive, stop them (close the Claude app or end the session); anything unfinished is simply re-run next time.
 - **Merge two finished tasks** once the benchmark runs no longer use their worktrees:
   - the hard case `t-20261118-075707`: fix the joined `catch` regex that crashes the old `score.py`, then send it through the queue;
   - the coding benchmark `t-20261118-080157`: send it through the queue.
@@ -124,6 +111,6 @@ All raw results are in `state/bench-results/` (not in Git; see Next step). The s
 
 ## Next step
 
-1. **Re-score the hard case by hand** (no re-runs), then write `evidence/benchmarks-2026-11-18.md` with the full table: Claude and OpenAI, review and coding, tokens and cost where prices are known.
+1. **Benchmarks:** finish the unfinished OpenAI coding runs, re-run the errored models (Responses API, per-model token cap), run 5x consistency on the gpt-6.2 models and a stable comparison, benchmark the `fast`/`flex` tiers, and update `evidence/benchmarks-2026-11-18.md`. The hard case is already blind re-scored.
 2. **Merge the two benchmark tasks** (see Unfinished).
 3. **Run the Stage 4 v1 audit,** then tag.

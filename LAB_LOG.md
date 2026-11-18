@@ -2,6 +2,14 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-18 — Late session: RAM gate, shadow reviewer, benchmark results
+
+- **Merged through the queue:** the RAM gate (`10e9120`, Opus PASS first time) and the shadow second reviewer (`bb7375c`, Opus PASS first time).
+- **Benchmarks:** 40 configurations on the hard case, blind re-scored; the OpenAI half of the single-bug cases; coding runs for Claude and part of OpenAI. All in `evidence/benchmarks-2026-11-18.md`.
+- **Service-tier probe:** `fast` works through the API; `ultrafast` is refused.
+- **Git:** plain commits, plus `git push origin main` and the two project branches (Lazlo's standing OK from tonight).
+- **Lesson:** a benchmark score is only as fair as its scorer. Blind re-labelling moved one model from 5 to 9. Never compare models on a scorer you haven't checked against real outputs.
+
 ## 2026-11-18 — Audit fixes, Stage 4 v1, work-ahead backlog, model benchmarks
 
 **Models and roles**
