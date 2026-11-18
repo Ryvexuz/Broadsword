@@ -14,7 +14,7 @@ Every area is in scope (rendering, 3D creation, physics, games, CAD, media), as 
 
 - **Orchestration:** a strong model handles architecture, hard bugs, integration and major decisions. Cheaper models handle routine code, tests and docs. An independent reviewer checks work before it merges. All code reaches main through the merge queue, the orchestrator's own included.
 - **Parallel work:** each agent works in its own Git worktree and branch. Don't wait on unrelated tasks. One agent owns merging.
-- **Work ahead:** keep a backlog of ready tasks: open tasks on the board, each with a brief in `backlog/<task id>.md`. Whenever a coder slot is free, start the next ready task whose claims are free, even while merges or reviews are still running. Finished work waiting for review is fine; an idle coder slot with a ready task is not.
+- **Work ahead:** keep a backlog of ready tasks: open tasks on the board, each with a brief in `state/backlog/<task id>.md` (outside Git, so writing a brief never dirties a main checkout the merge queue is using). Whenever a coder slot is free, start the next ready task whose claims are free, even while merges or reviews are still running. Finished work waiting for review is fine; an idle coder slot with a ready task is not.
 - **Scope:** work only on the current stage. Ideas for later go in `IDEAS.md`, not into code.
 - **Done means verified:** a stage is finished only when its done check passes and the evidence (commands and output) is saved. Passing tests is not the same as delivering the capability.
 - **Testing:** run targeted tests while working and the full suite before merging. Fix causes, not symptoms. Never stub or fake anything to make a test pass.
