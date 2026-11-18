@@ -15,7 +15,11 @@ cargo test --offline
 
 Flags: `--duration <s>` (5), `--dt <s>` output step (0.01), `--substeps <n>`
 physics substeps per output step (10), `--drop-height <m>` height of the lowest
-corner (2), `--gravity <m/s^2>` gravitational acceleration, for example 1.62 for the Moon (9.81), `--no-tilt` (default start has a 5 degree tilt about x and z).
+corner (2), `--gravity <m/s^2>` gravitational acceleration, for example 1.62 for the Moon (9.81), `--no-tilt` (default start has a 5 degree tilt about x and z),
+`--summary` print one line instead of the CSV:
+`first_contact_s=<s>,peak_strain=<x>,final_center_y=<m>` (first sample with
+`min_y <= 0`, or `none`; largest `max_beam_strain`; last `center_y`). It combines
+with the other flags; errors still print nothing on stdout and exit non-zero.
 
 ## Output columns
 
