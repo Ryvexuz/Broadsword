@@ -38,9 +38,17 @@ Broadsword is portable by design: every path is relative to the project root, an
 
 ## The 128 GB unified-memory PC
 
-That PC (a GMKtec mini PC, probably the X3, with an OCuLink port; confirm the exact model on it) has 128 GB shared between the CPU and the GPU, and the split (for example 64/64) is set in that PC's BIOS (the UMA frame buffer or GPU memory size setting). It is quick to change, so pick the split that fits the work at the time. It may be on an auto mode. Usually that means the GPU gets a small fixed share, and Windows lends it more system RAM on demand, so most of the 128 GB shows up as system RAM. Task Manager shows this as a small "dedicated" and a large "shared" GPU memory. If so, the RAM gate already counts what the GPU borrows, because it measures used RAM. Confirm on the PC before relying on it. Windows only reports the CPU's share as RAM.
+That PC is a GMKtec mini PC, probably the EVO-X3; confirm the model on it. Its published specs:
+- an AMD Ryzen AI Max+ 395, with 16 cores and 32 threads;
+- a Radeon 8060S integrated GPU (40 CUs);
+- 128 GB of soldered LPDDR5X-8000, of which up to 96 GB can go to the GPU;
+- two PCIe 4.0 M.2 slots;
+- USB4;
+- OCuLink with PCIe x4 for an external GPU (not hot-plug).
+
+Its 128 GB is shared between the CPU and the GPU, and the split (for example 64/64) is set in that PC's BIOS (the UMA frame buffer or GPU memory size setting). It is quick to change, so pick the split that fits the work at the time. It may be on an auto mode. Use the USB4 port for the project drive, the fastest external link it has. Usually that means the GPU gets a small fixed share, and Windows lends it more system RAM on demand, so most of the 128 GB shows up as system RAM. Task Manager shows this as a small "dedicated" and a large "shared" GPU memory. If so, the RAM gate already counts what the GPU borrows, because it measures used RAM. Confirm on the PC before relying on it. Windows only reports the CPU's share as RAM.
 
 1. **Check the split.** Task Manager → Performance: Memory shows the system share and GPU shows the dedicated share. Or run `systeminfo | findstr Memory`.
 2. **What Broadsword needs:** coders, cargo builds and test runs use system RAM. The GPU share only matters for local models (Stage 2's optional local model) and later GPU rendering. With no local model planned yet, a system-heavy split such as 96/32 runs more agents. Keep a big GPU share only if a local model is coming soon. Lazlo decides. Its OCuLink port could later take an external GPU for local models or the path tracer. That is an idea, not a plan.
 3. **The RAM gate adapts by itself:** `ram_warn_percent` is a percentage of the RAM Windows reports, so it is right for any split.
-4. **Raise `max_agents`** in `broadsword.toml` from 6 once the first merges on that PC are clean. Watch the RAM gate and build-lock waits as it goes up.
+4. **Raise `max_agents`** in `broadsword.toml` from 6 once the first merges on that PC are clean. With 32 threads, cargo builds share the cores, so the build-lock wait is the limit to watch, not RAM. Watch the RAM gate and build-lock waits as it goes up.
