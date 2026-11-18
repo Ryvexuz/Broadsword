@@ -28,7 +28,7 @@ impl Root {
              scratch_max_age_hours = 24\n\
              disk_check_every_seconds = 60\n\
              log_max_mb = 50\n\
-             ram_warn_percent = 90\n\
+             ram_warn_percent = 100\n\
              cpu_warn_percent = 90\n\
              alert_command = \"\"\n\
              scratch_dir = \"scratch\"\n\

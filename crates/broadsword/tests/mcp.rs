@@ -16,7 +16,7 @@ impl Root {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("scratch")).unwrap();
         let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-                    ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
+                    ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
                     state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
                     checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
