@@ -15,7 +15,7 @@ cargo test --offline
 
 Flags: `--duration <s>` (5), `--dt <s>` output step (0.01), `--substeps <n>`
 physics substeps per output step (10), `--drop-height <m>` height of the lowest
-corner (2), `--no-tilt` (default start has a 5 degree tilt about x and z).
+corner (2), `--gravity <m/s^2>` gravitational acceleration, for example 1.62 for the Moon (9.81), `--no-tilt` (default start has a 5 degree tilt about x and z).
 
 ## Output columns
 

@@ -49,11 +49,13 @@ pub struct Config {
     pub drop_height: f64,
     pub tilt: bool,
     pub edge: f64,
+    /// Gravitational acceleration in m/s^2 (Earth 9.81, Moon 1.62, Mars 3.71).
+    pub gravity: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { duration: 5.0, dt: 0.01, substeps: 10, drop_height: 2.0, tilt: true, edge: 1.0 }
+        Config { duration: 5.0, dt: 0.01, substeps: 10, drop_height: 2.0, tilt: true, edge: 1.0, gravity: GRAVITY }
     }
 }
 
@@ -62,9 +64,10 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         let ok = self.dt.is_finite() && self.dt > 0.0;
         if !(ok && self.duration.is_finite() && self.duration >= 0.0 && self.substeps >= 1
-            && self.drop_height.is_finite() && self.drop_height >= 0.0)
+            && self.drop_height.is_finite() && self.drop_height >= 0.0
+            && self.gravity.is_finite() && self.gravity > 0.0)
         {
-            return Err("dt must be > 0, duration >= 0, substeps >= 1, drop-height >= 0 (all finite)".into());
+            return Err("dt must be > 0, duration >= 0, substeps >= 1, drop-height >= 0, gravity > 0 (all finite)".into());
         }
         let h = self.dt / self.substeps as f64;
         let limit = max_stable_step();

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::process::exit;
 
 fn usage() -> ! {
-    eprintln!("usage: crash-sim [--duration <s>] [--dt <s>] [--substeps <n>] [--drop-height <m>] [--no-tilt]");
+    eprintln!("usage: crash-sim [--duration <s>] [--dt <s>] [--substeps <n>] [--drop-height <m>] [--gravity <m/s^2>] [--no-tilt]");
     exit(2)
 }
 
@@ -26,6 +26,7 @@ fn main() {
             "--dt" => cfg.dt = num(&mut args, "--dt"),
             "--substeps" => cfg.substeps = num(&mut args, "--substeps"),
             "--drop-height" => cfg.drop_height = num(&mut args, "--drop-height"),
+            "--gravity" => cfg.gravity = num(&mut args, "--gravity"),
             "--no-tilt" => cfg.tilt = false,
             _ => usage(),
         }

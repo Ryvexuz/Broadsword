@@ -206,3 +206,14 @@ fn non_dividing_dt_ends_at_nearest_whole_step() {
     let last = s.last().unwrap().t;
     assert!((last - 5.0).abs() <= 0.003 + 1e-9, "last t {last}");
 }
+
+#[test]
+fn gravity_must_be_positive_and_finite() {
+    use crash_sim::Config;
+    assert!(Config::default().validate().is_ok());
+    assert_eq!(Config::default().gravity, 9.81);
+    for g in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(Config { gravity: g, ..Config::default() }.validate().is_err(), "gravity {g} accepted");
+    }
+    assert!(Config { gravity: 1.62, ..Config::default() }.validate().is_ok());
+}
