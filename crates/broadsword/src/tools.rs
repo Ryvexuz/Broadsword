@@ -346,7 +346,7 @@ pub static TOOLS: &[Tool] = &[
     Tool {
         name: "run",
         summary: "Run any shell command inside a project, protected by a Git checkpoint.",
-        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. SECRET FILES ARE NEVER SAVED: any file whose name starts with `.env` (`.env`, `.env.local`, `sub/.env`, `.envrc`; any depth, any letter case) is not stored in the checkpoint, and rollback never restores, overwrites or deletes it, so after a rollback it keeps whatever bytes it has then; the job record lists such files by name only (`secret_skipped`). Other git-ignored files are saved (up to checkpoint_ignored_max_mb) and restored. If Broadsword is killed mid-run, the next `recover` rolls the files back to the checkpoint, and until then new jobs in the same source folder (the main checkout, or that task's worktree) are refused; jobs in other worktrees of the project are not. A panic inside a `run` job (a Broadsword bug) leaves it interrupted the same way, after killing its command. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
+        description: "Runs an arbitrary command line in the project's folder through the shell, as a recorded job. Because the command may change files, the project must be a Git repository: Broadsword first saves a checkpoint of the working tree (refs/broadsword/checkpoints/<job id>) and refuses to run without one. SECRET FILES ARE NEVER SAVED: any file whose name starts with `.env` (`.env`, `.env.local`, `sub/.env`, `.envrc`; any depth, any letter case) is not stored in the checkpoint, and rollback never restores, overwrites or deletes it, so after a rollback it keeps whatever bytes it has then; the job record lists such files by name only (`secret_skipped`). Other git-ignored files are saved (up to checkpoint_ignored_max_mb) and restored. If Broadsword is killed mid-run, `recover <job id>` rolls that one run's files back to the checkpoint (plain `recover` only lists it, and no other job's files are touched), and until then new jobs in the same source folder (the main checkout, or that task's worktree) are refused; jobs in other worktrees of the project are not. A panic inside a `run` job (a Broadsword bug) leaves it interrupted the same way, after killing its command. It has the same disk guard and low-disk kill as `build`, and can run as long as the command does; over MCP the call blocks until the command ends (one call at a time) and is killed after the mcp_call_timeout_seconds setting (1800 s as shipped), returning isError with no exit code. Because the command's own exit code is passed through, exit codes 1-4 are ambiguous on their own: see the exit codes below for how to tell Broadsword's refusals from the command's result. Use it for project-specific commands such as running a simulation; prefer `build`, `test` or `check` for those. WITH `task` (see `build`) the command runs in that task's worktree folder instead of the main checkout, and the checkpoint and any rollback are of that worktree; `project` must be the task's project. SHARED BUILD FOLDER: a `run` does not parse the command, so it cannot know whether it builds. It therefore takes the build lock (state/build.lock, waiting up to build_lock_wait_seconds, then exit 3 `build folder busy`) for the whole command, so no build, test or check job interleaves with it, and when the command ends (and also before it starts, in case Broadsword is killed) it deletes the build-source notes of every package in the folder it ran in, marking them as built by an unknown source. Nothing in the build folder is deleted by `run` itself; but the next build, test or check of such a package first cleans it (`cargo clean -p`) and rebuilds, and `install` refuses until a proper `broadsword build` of the main checkout.",
         params: &[
             PROJECT,
             TASK,
@@ -404,25 +404,62 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "recover",
-        summary: "Clean up after a crash: resume interrupted builds/tests, roll back interrupted runs.",
-        description: "Finds every job whose Broadsword process died while it was running. build, test and check jobs are resumed from the step they were on, at most max_resumes times in a row. An interrupted `run` job is rolled back: the project's files are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost; secret files (names starting with `.env`) are not part of any checkpoint and are left exactly as they are. Use it after a crash, a reboot or a message that a source folder is blocked by an interrupted run. It changes files in the affected project and may rebuild, so it can take a while. Jobs still genuinely running are left alone. Every build, test, check and run already does the safe half (resume, never roll back) automatically before it starts.",
-        params: &[],
-        outputs: "One block per interrupted job saying what was done, or `recover: nothing to do`. Problems are listed on stderr as NEEDS ATTENTION with the job ids.",
+        summary: "Clean up after a crash: resume interrupted builds/tests; list interrupted runs, or roll back ONE named run.",
+        description: "Finds every job whose Broadsword process died while it was running. build, test and check jobs are resumed from the step they were on, at most max_resumes times in a row, and a verified orphaned child process is killed. An interrupted `run` job may have changed files, and an agent may still be working in that folder, so a rollback happens ONLY for the job you name. Called with no `id` and no `all`, it does the automatic part above and then only LISTS each interrupted `run` job (id, project, source folder, start time and the exact command to roll it back); it changes no project file and exits 1 while any is listed. With `id` it rolls back exactly that one interrupted `run` job: the files of its source folder are restored to the Git checkpoint taken before it started, and the partial work is saved under refs/broadsword/ first, so nothing is lost; secret files (names starting with `.env`) are not part of any checkpoint and are left exactly as they are. Other interrupted runs are left alone and still listed. It refuses (exit 2, nothing changed) an id that is not an interrupted `run` job, or whose Broadsword process is still alive. With `all` it rolls back EVERY interrupted `run` job in every folder: use it only when the user says so, never while any agent may still be editing a worktree. Every build, test, check and run already does the safe half (resume, never roll back, never list) automatically before it starts. Rolling back changes files in the affected source folder and may take a while. Jobs still genuinely running are left alone.",
+        params: &[
+            Param {
+                name: "id",
+                ty: Ty::String,
+                required: false,
+                description: "The exact id of one interrupted `run` job to roll back (see the list this tool prints, or the `jobs` tool). Without it nothing is rolled back. Not together with `all`.",
+            },
+            Param {
+                name: "all",
+                ty: Ty::Boolean,
+                required: false,
+                description: "Roll back EVERY interrupted `run` job in every source folder, including worktrees. Default false. Dangerous: use only when the user explicitly asks. Not together with `id`.",
+            },
+        ],
+        outputs: "One block per interrupted job saying what was done (for an interrupted `run` without `id`: its id, source folder, start time and the command to roll it back), or `recover: nothing to do`. Problems and unrolled runs are listed on stderr as NEEDS ATTENTION with the job ids.",
         exit_codes: &[
-            ExitDoc { code: "0", meaning: "nothing to do, or every interrupted job was recovered" },
-            ExitDoc { code: "1", meaning: "a job needs attention (could not be rolled back or reached max_resumes), a resumed job failed, or another recovery holds the lock" },
+            ExitDoc { code: "0", meaning: "nothing to do, or everything asked for was recovered (the named run was rolled back; with `all`, every interrupted run was)" },
+            ExitDoc { code: "1", meaning: "without `id` or `all`: at least one interrupted `run` job is listed and NOT rolled back; or a job needs attention (could not be rolled back or reached max_resumes), a resumed job failed, or another recovery holds the lock" },
+            ExitDoc { code: "2", meaning: "refused, nothing changed: `id` is not a job record, not a `run` job, not `running`, or its Broadsword is still alive; or both `id` and `all` were given" },
         ],
         read_only: false,
         long_running: true,
         changes_files: true,
         destructive: true,
         idempotent: true,
-        cli: "broadsword recover",
-        cli_examples: &["recover"],
-        parse: |a| (a == ["recover"]).then(Inputs::default),
+        cli: "broadsword recover [--all | <job id>]",
+        cli_examples: &["recover", "recover --all", "recover some-id"],
+        parse: |a| match a {
+            ["recover"] => Some(Inputs::default()),
+            ["recover", "--all"] => Some(Inputs::default().with("all", Val::Bool(true))),
+            ["recover", "--all", id] if !id.starts_with('-') => Some(Inputs::default().with("id", Val::Str((*id).into())).with("all", Val::Bool(true))), // refused by the handler (exit 2), never run
+            ["recover", id] if !id.starts_with('-') => Some(Inputs::default().with("id", Val::Str((*id).into()))),
+            _ => None,
+        },
         mcp_callable: true,
-        to_args: |_| vec!["recover".into()],
-        handler: |cfg, _| Ok(recover::recover(cfg, recover::Mode::Explicit)),
+        to_args: |i| {
+            let mut v = vec!["recover".to_string()];
+            if i.bool("all") {
+                v.push("--all".into());
+            }
+            if let Some(id) = i.str("id") {
+                v.push(id.into());
+            }
+            v
+        },
+        handler: |cfg, i| match (i.str("id"), i.bool("all")) {
+            (Some(_), true) => {
+                eprintln!("broadsword: give either `id` (roll back one run) or `all`, not both");
+                Ok(ExitCode::from(2))
+            }
+            (Some(id), false) => Ok(recover::recover_one(cfg, id)),
+            (None, true) => Ok(recover::recover(cfg, recover::Mode::All)),
+            (None, false) => Ok(recover::recover(cfg, recover::Mode::List)),
+        },
     },
     Tool {
         name: "abandon",
@@ -1274,7 +1311,7 @@ fn guarded(cfg: &Config, project: &str, task: Option<&str>, job: impl FnOnce() -
 pub fn guard_refusal(cfg: &Config, project: &str, task: Option<&str>) -> Option<u8> {
     let _ = recover::recover(cfg, recover::Mode::Auto); // kills orphans, resumes read-only jobs; never rolls back
     if let Some((id, source)) = recover::blocked_by_interrupted_run(cfg, project, task) {
-        eprintln!("broadsword: refusing to start: job {id} (run {project}, source folder {source}) was interrupted and may have changed files in that folder; run `broadsword recover` first (or `broadsword recover --abandon {id}` to give up on it)");
+        eprintln!("broadsword: refusing to start: job {id} (run {project}, source folder {source}) was interrupted and may have changed files in that folder; run `broadsword recover {id}` first to roll it back (only if nobody is still working in that folder), or `broadsword recover --abandon {id}` to give up on it");
         return Some(job::EXIT_REFUSED);
     }
     None
@@ -1619,6 +1656,8 @@ mod tests {
             ("watch", Inputs::default()),
             ("projects", Inputs::default()),
             ("recover", Inputs::default()),
+            ("recover", Inputs::default().with("all", Val::Bool(true))),
+            ("recover", Inputs::default().with("id", s("20261117-120000-ab12"))),
             ("jobs", Inputs::default()),
             ("install", Inputs::default()),
             ("resume", Inputs::default()),
@@ -1748,7 +1787,7 @@ mod tests {
     fn every_cli_command_maps_to_an_entry() {
         // Every form the CLI accepted before the registry existed, plus the new `tools`; `hook` is the one exception.
         let forms = [
-            "status", "cleanup", "watch", "resume", "resume --force", "projects", "build p", "test p", "check p", "run p -- cmd a b", "recover", "recover --abandon id",
+            "status", "cleanup", "watch", "resume", "resume --force", "projects", "build p", "test p", "check p", "run p -- cmd a b", "recover", "recover --all", "recover some-id", "recover --abandon id",
             "recover --list", "jobs", "tools", "tools x", "tools --json", "install",
         ];
         for f in forms {

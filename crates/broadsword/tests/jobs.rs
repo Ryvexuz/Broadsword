@@ -217,6 +217,30 @@ fn test_hook_cannot_defeat_the_real_disk_guard() {
 }
 
 #[test]
+fn disk_guard_counts_the_job_reserve_exactly() {
+    // floor 1 GB + reserve 2 GB: a job may start only when free space is at least 3 GB. The hook value is used
+    // for every sample (the last one repeats), and it can only lower the real free space, so this needs a disk
+    // with more than 3 GB free (the real guard would otherwise refuse the second run for a different reason).
+    const GB: u64 = 1024 * 1024 * 1024;
+    let r = Root::new("reserve", 1, 2);
+    r.project("ok", TWO_TESTS, None);
+    let hook = r.dir.join("scratch/free.txt");
+    // just below floor + reserve: refused, cargo never started
+    fs::write(&hook, (3 * GB - 1).to_string()).unwrap();
+    let out = r.cmd(&["build", "ok"]).env(HOOK, &hook).output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(3), "stdout: {so}\nstderr: {se}");
+    assert!(se.contains("refusing to start") && se.contains("reserve"), "{se}");
+    assert!(!r.dir.join("build").exists(), "cargo must not have run");
+    // exactly floor + reserve: allowed, the job runs and ends ok
+    fs::write(&hook, (3 * GB).to_string()).unwrap();
+    let out = r.cmd(&["build", "ok"]).env(HOOK, &hook).output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
+    assert!(so.contains("build: ok"), "{so}");
+}
+
+#[test]
 fn same_second_jobs_keep_separate_logs() {
     let r = Root::new("logs", 1, 0);
     r.project("ok", TWO_TESTS, None);

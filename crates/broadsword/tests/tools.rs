@@ -93,7 +93,7 @@ fn usage_lists_every_tool_and_exits_64() {
     let o = r.run(&["bogus"]);
     assert_eq!(code(&o), 64);
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
-    for w in ["status", "cleanup", "watch", "resume [--force]", "projects", "build <project> [--task <id>]", "test <project> [--task <id>]", "check <project> [--task <id>]", "run <project> [--task <id>] -- <command...>", "recover", "recover --abandon <id>", "jobs", "tools", "hook pre-tool"] {
+    for w in ["status", "cleanup", "watch", "resume [--force]", "projects", "build <project> [--task <id>]", "test <project> [--task <id>]", "check <project> [--task <id>]", "run <project> [--task <id>] -- <command...>", "recover [--all | <job id>]", "recover --abandon <id>", "jobs", "tools", "hook pre-tool"] {
         assert!(err.contains(w), "usage lacks `{w}`:\n{err}");
     }
 }
@@ -240,6 +240,17 @@ fn recover_and_abandon_exit_codes() {
     assert_eq!(code(&r.run(&["recover", "--abandon", "20260101-000001-g-check"])), 0);
     // recover: 1 when a run job cannot be rolled back
     rec("20260101-000002-g-run", "run", "refs/broadsword/checkpoints/does-not-exist");
+    // plain recover lists it (1, nothing rolled back); recover <id> and recover --all try the rollback and fail (1);
+    // an id that is not an interrupted run is refused (2)
     let o = r.run(&["recover"]);
     assert_eq!(code(&o), 1, "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("broadsword recover 20260101-000002-g-run"));
+    let o = r.run(&["recover", "20260101-000002-g-run"]);
+    assert_eq!(code(&o), 1, "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("NEEDS ATTENTION"));
+    let o = r.run(&["recover", "--all"]);
+    assert_eq!(code(&o), 1, "{}", String::from_utf8_lossy(&o.stderr));
+    let o = r.run(&["recover", "20260101-000001-g-check"]); // abandoned above: not an interrupted run
+    assert_eq!(code(&o), 2, "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(code(&r.run(&["recover", "no-such-job"])), 2);
 }

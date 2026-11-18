@@ -10,6 +10,22 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
 
+// The product's own process-identity code, so the test cleanup applies the very same exact-match rule.
+#[allow(dead_code)]
+#[path = "../src/sys.rs"]
+mod sys;
+
+/// Kill the process tree of a recorded child pid, but only if the live process is verifiably the recorded one:
+/// its creation time must equal the recorded `child_start` exactly (`sys::exact_match`). A record without a start
+/// time, or a pid that now belongs to another process, is never killed.
+fn kill_recorded_if_same(rec: &str) {
+    let (pid, start) = (Root::field(rec, "child_pid"), Root::field(rec, "child_start"));
+    let Ok(pid) = pid.parse::<u32>() else { return };
+    if sys::exact_match(start.parse::<u64>().ok(), sys::process_state(pid)) {
+        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+    }
+}
+
 struct Root {
     dir: PathBuf,
     children: Vec<Child>,
@@ -145,10 +161,7 @@ impl Drop for Root {
         }
         // orphans recorded by a crashed job
         for (_, rec) in self.records() {
-            let pid = Root::field(&rec, "child_pid");
-            if !pid.is_empty() {
-                let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid]).output();
-            }
+            kill_recorded_if_same(&rec);
         }
         std::thread::sleep(Duration::from_millis(300));
         let _ = fs::remove_dir_all(&self.dir);
@@ -217,14 +230,23 @@ fn kill_mid_run_job_then_recover_rolls_back_and_keeps_partial_work() {
     kill_hard(bs_pid);
     assert!(pid_alive(&child), "the orphaned command should still be running after the crash");
 
-    let out = r.run(&["recover"]);
+    // plain `recover` only lists the interrupted run (and kills its verified orphan): no file changes, exit 1
+    let listed = r.run(&["recover"]);
+    assert_eq!(listed.status.code(), Some(1), "{}{}", text(&listed.stdout), text(&listed.stderr));
+    assert!(text(&listed.stdout).contains(&format!("broadsword recover {id}")), "{}", text(&listed.stdout));
+    assert!(text(&listed.stdout).contains("killing orphaned process tree"), "{}", text(&listed.stdout));
+    assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap().trim(), "changed", "plain recover must not roll back");
+    assert!(p.join("new.txt").exists(), "plain recover must not roll back");
+    assert_eq!(Root::field(&r.only_record(), "status"), "running");
+    r.children.clear();
+
+    let out = r.run(&["recover", &id]);
     let so = text(&out.stdout);
     println!("{so}{}", text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{so}");
-    assert!(so.contains("killing orphaned process tree"), "{so}");
     assert!(so.contains("rolled back"), "{so}");
     assert!(so.contains("git -C"), "tells how to see the partial work: {so}");
-    wait_until("orphan to die", 10, || !pid_alive(&child));
+    wait_until("orphan to die", 10, || !pid_alive(&child)); // killed by the plain recover above
 
     // working tree is back at the checkpoint state; HEAD and the index are untouched
     assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap(), "original\n");
@@ -363,7 +385,7 @@ fn kill_mid_run_restores_ignored_files_but_never_touches_secret_files() {
     let id = Root::field(&rec, "id");
     assert_eq!(Root::field(&rec, "secret_skipped"), ".env", "the record lists the secret file by name: {rec}");
     kill_hard(bs_pid);
-    let out = r.run(&["recover"]);
+    let out = r.run(&["recover", &id]);
     let so = text(&out.stdout);
     println!("{so}");
     assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
@@ -438,7 +460,8 @@ fn rollback_keeps_a_deleted_secret_file_deleted() {
         r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && !p.join(".env").exists() && fs::read_to_string(p.join("tracked.txt")).unwrap().trim() == "changed"
     });
     kill_hard(bs_pid);
-    let out = r.run(&["recover"]);
+    let id = Root::field(&r.only_record(), "id");
+    let out = r.run(&["recover", &id]);
     let so = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
     assert!(!p.join(".env").exists(), "a secret file the job deleted is not recreated");
@@ -478,7 +501,9 @@ fn auto_recover_does_not_roll_back_and_refuses_new_jobs_on_that_project() {
     assert!(p.join("new.txt").exists(), "auto-recover must not touch the working tree");
     assert_eq!(Root::field(&r.only_record(), "status"), "running");
     wait_until("orphan to be killed by auto-recover", 10, || !pid_alive(&child));
-    let out = r.run(&["recover"]);
+    let id = Root::field(&r.only_record(), "id");
+    assert!(se.contains(&format!("broadsword recover {id}")), "the refusal names the exact command: {se}");
+    let out = r.run(&["recover", &id]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
     assert!(!p.join("new.txt").exists());
     assert_eq!(Root::field(&r.only_record(), "status"), "rolled_back");
@@ -515,7 +540,7 @@ fn unverifiable_child_pids_are_not_killed() {
     }
     let out = r.run(&["recover"]);
     let so = text(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "the two interrupted runs are listed, not rolled back: {so}{}", text(&out.stderr));
     assert!(so.contains("NOT killed"), "{so}");
     assert!(pid_alive(&a.to_string()) && pid_alive(&b.to_string()), "neither process may be killed");
 }
@@ -527,7 +552,7 @@ fn failed_rollback_exits_nonzero_and_names_the_job() {
     r.project("", true);
     let dead = dead_pid().to_string();
     r.fake_record("20260101-000001-p-run", &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("checkpoint", "refs/broadsword/checkpoints/does-not-exist")]);
-    let out = r.run(&["recover"]);
+    let out = r.run(&["recover", "20260101-000001-p-run"]);
     assert_eq!(out.status.code(), Some(1));
     let se = text(&out.stderr);
     assert!(se.contains("NEEDS ATTENTION") && se.contains("20260101-000001-p-run"), "{se}");

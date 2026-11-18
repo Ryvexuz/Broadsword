@@ -921,7 +921,7 @@ fn an_interrupted_run_in_one_worktree_blocks_only_that_worktree() {
         let o = r.run(&args);
         assert_eq!(o.code, 3, "{args:?}: {}{}", o.stdout, o.stderr);
         assert!(o.stderr.contains(&id) && o.stderr.contains(&format!("worktrees/p/{a}")), "{}", o.stderr);
-        assert!(o.stderr.contains("broadsword recover") && o.stderr.contains(&format!("recover --abandon {id}")), "{}", o.stderr);
+        assert!(o.stderr.contains(&format!("broadsword recover {id}")) && o.stderr.contains(&format!("recover --abandon {id}")), "the refusal names the exact commands: {}", o.stderr);
     }
     assert_eq!(r.status_in_record(&id), "running", "the automatic recovery never rolls a run back");
 }
@@ -1001,12 +1001,134 @@ fn a_run_job_that_panics_stays_running_and_blocks_only_its_own_folder() {
     // a.txt is tracked ("one\n"); the panicked run overwrote it
     let read = |p: PathBuf| fs::read_to_string(p).unwrap().replace("\r\n", "\n");
     assert_eq!(read(r.wt(&a).join("a.txt")).trim(), "changed");
-    let o = r.run(&["recover"]);
+    let o = r.run(&["recover", &id]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(read(r.wt(&a).join("a.txt")), "one\n", "rolled back in its own worktree: {}", o.stdout);
     assert_eq!(read(r.wt(&b).join("a.txt")), "one\n", "the other worktree is untouched");
     assert_eq!(r.status_in_record(&id), "rolled_back");
     assert_eq!(r.run_echo(Some(&a)).code, 0);
+}
+
+impl Root {
+    /// Run a `run` job in task `task`'s worktree that overwrites a.txt and is then left interrupted by the panic test hook
+    /// (a real checkpoint, a real change, a dead broadsword). Returns its job id.
+    fn panicked_run(&self, task: &str) -> String {
+        let before: Vec<String> = self.job_ids();
+        let gate = self.dir.join("scratch/panic.gate");
+        fs::write(&gate, "").unwrap();
+        let o = Command::new(BIN)
+            .args(["run", "p", "--task", task, "--", "echo changed> a.txt & ping -n 30 127.0.0.1 >nul"])
+            .env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate)
+            .current_dir(&self.dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(&gate);
+        assert_eq!(o.status.code(), Some(1), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let id = self.job_ids().into_iter().find(|i| !before.contains(i)).expect("the panicked run left a record");
+        assert_eq!(self.status_in_record(&id), "running");
+        id
+    }
+
+    fn job_ids(&self) -> Vec<String> {
+        fs::read_dir(self.dir.join("state/jobs")).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().trim_end_matches(".rec").to_string()).collect()
+    }
+
+    fn a_txt(&self, task: &str) -> String {
+        fs::read_to_string(self.wt(task).join("a.txt")).unwrap().trim().to_string()
+    }
+}
+
+/// Audit S1: a manual rollback reverts only the job it names. Two interrupted runs in two worktrees; plain `recover`
+/// lists them and changes no file; `recover <id-A>` rolls back A only; B is left alone and still listed; the automatic
+/// recovery before a job never rolls anything back.
+#[test]
+fn recover_with_an_id_rolls_back_only_that_run_and_plain_recover_changes_no_file() {
+    let r = Root::new("recone");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let (id_a, id_b) = (r.panicked_run(&a), r.panicked_run(&b));
+    assert_eq!((r.a_txt(&a).as_str(), r.a_txt(&b).as_str()), ("changed", "changed"));
+
+    // the automatic recovery that every job runs first (here: a job in the main checkout) never rolls back
+    assert_eq!(r.run_echo(None).code, 0);
+    assert_eq!((r.a_txt(&a).as_str(), r.a_txt(&b).as_str()), ("changed", "changed"), "auto recovery must not roll back");
+    assert_eq!((r.status_in_record(&id_a).as_str(), r.status_in_record(&id_b).as_str()), ("running", "running"));
+
+    // plain `recover`: lists both with their source folder and the command, changes no file, exits non-zero
+    let o = r.run(&["recover"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    for (id, t) in [(&id_a, &a), (&id_b, &b)] {
+        assert!(o.stdout.contains(&format!("job {id}")) && o.stdout.contains(&format!("worktrees/p/{t}")), "{}", o.stdout);
+        assert!(o.stdout.contains(&format!("broadsword recover {id}")), "{}", o.stdout);
+        assert!(o.stderr.contains(id.as_str()), "{}", o.stderr);
+    }
+    assert!(o.stdout.contains("started:"), "{}", o.stdout);
+    assert_eq!((r.a_txt(&a).as_str(), r.a_txt(&b).as_str()), ("changed", "changed"), "plain recover must change no file");
+    assert_eq!((r.status_in_record(&id_a).as_str(), r.status_in_record(&id_b).as_str()), ("running", "running"));
+
+    // recover <id-A>: only A
+    let o = r.run(&["recover", &id_a]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.a_txt(&a), "one", "A is rolled back: {}", o.stdout);
+    assert_eq!(r.a_txt(&b), "changed", "B's folder is not touched");
+    assert_eq!((r.status_in_record(&id_a).as_str(), r.status_in_record(&id_b).as_str()), ("rolled_back", "running"));
+    assert!(!o.stdout.contains(&id_b), "B is not even mentioned by a rollback of A: {}", o.stdout);
+
+    // B is still listed, A no longer is
+    let o = r.run(&["recover"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains(&format!("broadsword recover {id_b}")) && !o.stdout.contains(&id_a), "{}", o.stdout);
+    assert_eq!(r.a_txt(&b), "changed");
+    let o = r.run(&["recover", &id_b]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.a_txt(&b), "one");
+}
+
+/// `recover --all` keeps the old all-at-once behaviour for a human who means it.
+#[test]
+fn recover_all_rolls_back_every_interrupted_run() {
+    let r = Root::new("recall");
+    let (a, b) = (r.started("a"), r.started("b"));
+    let (id_a, id_b) = (r.panicked_run(&a), r.panicked_run(&b));
+    let o = r.run(&["recover", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!((r.a_txt(&a).as_str(), r.a_txt(&b).as_str()), ("one", "one"));
+    assert_eq!((r.status_in_record(&id_a).as_str(), r.status_in_record(&id_b).as_str()), ("rolled_back", "rolled_back"));
+}
+
+/// `recover <id>` is refused (exit 2, nothing changed) for anything that is not an interrupted `run`: no such record, a
+/// check job, an already finished record, a run whose broadsword is still alive, and `--all` together with an id.
+#[test]
+fn recover_with_an_id_refuses_anything_but_an_interrupted_run() {
+    let r = Root::new("recrefuse");
+    let a = r.started("a");
+    let id = r.panicked_run(&a);
+    let rec_path = |i: &str| r.dir.join(format!("state/jobs/{i}.rec"));
+    let jobs = r.dir.join("state/jobs");
+    let alive = format!("id = 20260101-000009-p-run\nproject = p\nkind = run\nsource = worktrees/p/{a}\ntask = {a}\nstatus = running\npid = {}\ncheckpoint = pending\n", std::process::id());
+    fs::write(jobs.join("20260101-000009-p-run.rec"), &alive).unwrap(); // this very test process: alive
+    fs::write(jobs.join("20260101-000008-p-check.rec"), format!("id = 20260101-000008-p-check\nproject = p\nkind = check\nstatus = running\npid = {}\nstep = build\n", dead_pid())).unwrap();
+    fs::write(jobs.join("20260101-000007-p-run.rec"), format!("id = 20260101-000007-p-run\nproject = p\nkind = run\nstatus = done\npid = {}\ncheckpoint = none\n", dead_pid())).unwrap();
+    let snapshot = |ids: &[&str]| ids.iter().map(|i| fs::read_to_string(rec_path(i)).unwrap()).collect::<Vec<_>>();
+    let ids = [id.as_str(), "20260101-000009-p-run", "20260101-000008-p-check", "20260101-000007-p-run"];
+    let before = snapshot(&ids);
+    for (arg, why) in [
+        ("20260101-000009-p-run", "still running"),
+        ("20260101-000008-p-check", "only an interrupted `run`"),
+        ("20260101-000007-p-run", "only an interrupted `run`"),
+        ("no-such-job", "no job record"),
+        ("../x", "not a job id"),
+    ] {
+        let o = r.run(&["recover", arg]);
+        assert_eq!(o.code, 2, "{arg}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains(why), "{arg}: {}", o.stderr);
+    }
+    assert_eq!(snapshot(&ids), before, "a refusal changes no record");
+    assert_eq!(r.a_txt(&a), "changed", "a refusal changes no file");
+    let o = r.run(&["recover", "--all", &id]);
+    assert_eq!(o.code, 2, "--all together with an id is refused, nothing rolled back: {}{}", o.stdout, o.stderr);
+    assert_eq!(r.a_txt(&a), "changed");
+    assert_eq!(r.status_in_record(&id), "running");
 }
 
 /// A `run` job's command sees CARGO_TARGET_DIR = the main root's shared build folder, so a `cargo ...` inside `run` from

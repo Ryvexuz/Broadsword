@@ -11,15 +11,19 @@
 //!   under `refs/broadsword/interrupted/<id>/<attempt>` (old record -> `rolled_back`). Nothing is deleted.
 //!
 //! A record whose Broadsword is still alive is another job genuinely running and is left alone.
-//! Only an explicit `broadsword recover` rolls back. The automatic recovery before a job
-//! (`Mode::Auto`) kills orphans and resumes read-only jobs, but for an interrupted `run` job it only
-//! says so, and `blocked_by_interrupted_run` then stops new jobs in that run's own source folder until it is recovered.
+//! A rollback reverts files, and an agent may still be working in that folder, so it only ever happens on request, for the
+//! job named: `broadsword recover <job id>` rolls back exactly that one interrupted `run`; `broadsword recover --all` rolls
+//! back every one (a human who means it). Plain `broadsword recover` (`Mode::List`) does the automatic part and only LISTS
+//! interrupted `run` jobs, with the command to roll each back; it changes no project file. The automatic recovery before
+//! a job (`Mode::Auto`) likewise kills orphans and resumes read-only jobs but never rolls back, and
+//! `blocked_by_interrupted_run` then stops new jobs in that run's own source folder until it is recovered.
 //! A lock file (`state/recover.lock`) keeps two recovers from working at the same time.
 
 use crate::config::Config;
 use crate::git;
 use crate::job::{self, JobSpec};
 use crate::lock::{self, Lock};
+use crate::pause;
 use crate::record::{self, Record};
 use crate::sys;
 use std::process::ExitCode;
@@ -27,9 +31,11 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// `broadsword recover`: does everything, including rolling back `run` jobs.
-    Explicit,
-    /// Before a job starts: never rolls anything back.
+    /// `broadsword recover --all`: does everything, including rolling back EVERY interrupted `run` job.
+    All,
+    /// `broadsword recover`: the automatic part, then lists interrupted `run` jobs; never rolls back.
+    List,
+    /// Before a job starts: never rolls anything back, prints no list.
     Auto,
 }
 
@@ -71,7 +77,7 @@ pub fn blocked_by_interrupted_run(cfg: &Config, project: &str, task: Option<&str
     record::load_all(&record::jobs_dir(cfg))
         .into_iter()
         .find(|r| r.get("project") == project && interrupted_run(r) && blocks_source(r.get("source"), mine.as_deref()))
-        .map(|r| (r.id().to_string(), if r.get("source").is_empty() { "unknown (older record: the whole project)".to_string() } else { r.get("source").to_string() }))
+        .map(|r| (r.id().to_string(), shown_source(&r)))
 }
 
 /// Does an interrupted run recorded with `recorded` (its source folder, possibly empty) block a job running in `mine`?
@@ -124,6 +130,7 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
     let mut resumed_failed = false;
     let mut attention: Vec<String> = Vec::new();
     let mut any = false;
+    let mut listed: Vec<String> = Vec::new();
     for mut r in record::load_all(&record::jobs_dir(cfg)) {
         if r.status() != record::RUNNING {
             continue;
@@ -139,14 +146,15 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
         let kind = r.get("kind").to_string();
         let project = r.get("project").to_string();
         if kind == "run" {
-            if mode == Mode::Auto {
-                println!("  this run job may have changed files: run `broadsword recover` to roll it back, or `broadsword recover --abandon {id}` (new jobs in the same folder of `{project}` are refused until then)");
-                continue;
-            }
-            for entry in std::fs::read_dir(&cfg.state_dir).into_iter().flatten().flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&format!("tmp-index-{id}")) {
-                    let _ = std::fs::remove_file(entry.path()); // this dead job's leftovers only
+            if mode != Mode::All {
+                if mode == Mode::List {
+                    let started = r.get_num("started").map(pause::format_utc).unwrap_or_else(|| "unknown".into());
+                    println!("  source folder: {}", shown_source(&r));
+                    println!("  started: {started}");
+                    listed.push(id.clone());
                 }
+                println!("  this run job may have changed files, so nothing was changed: roll it back with `broadsword recover {id}`, or give up on it with `broadsword recover --abandon {id}` (new jobs in the same folder of `{project}` are refused until then)");
+                continue;
             }
             if let Err(e) = rollback_run(cfg, &mut r, &project) {
                 eprintln!("  {e}");
@@ -193,14 +201,68 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
         println!("recover: nothing to do");
     }
     if !attention.is_empty() {
-        eprintln!("broadsword: NEEDS ATTENTION: {} could not be recovered automatically (see above). Records and refs are kept and the work saved under refs/broadsword/ is intact; fix the cause and run `broadsword recover` again, or `broadsword recover --abandon <id>`", attention.join(", "));
+        eprintln!("broadsword: NEEDS ATTENTION: {} could not be recovered automatically (see above). Records and refs are kept and the work saved under refs/broadsword/ is intact; fix the cause and run `broadsword recover <id>` again, or `broadsword recover --abandon <id>`", attention.join(", "));
+        return ExitCode::from(1);
+    }
+    if !listed.is_empty() {
+        eprintln!("broadsword: NEEDS ATTENTION: {} interrupted run job(s) were NOT rolled back (no file was changed): {}. Roll one back with `broadsword recover <id>` (only if nobody is still working in its source folder), or give up on it with `broadsword recover --abandon <id>`", listed.len(), listed.join(", "));
         return ExitCode::from(1);
     }
     ExitCode::from(u8::from(resumed_failed))
 }
 
+fn shown_source(r: &Record) -> String {
+    if r.get("source").is_empty() { "unknown (older record: the whole project)".to_string() } else { r.get("source").to_string() }
+}
+
+/// `broadsword recover <id>`: roll back exactly this one interrupted `run` job and nothing else. Anything else (no such
+/// record, not a `run`, not running, its Broadsword still alive) is refused with exit 2 and changes nothing.
+pub fn recover_one(cfg: &Config, id: &str) -> ExitCode {
+    let refuse = |why: String| {
+        eprintln!("broadsword: refusing to recover `{id}`: {why}");
+        ExitCode::from(2)
+    };
+    if id.is_empty() || record::sanitize(id) != id {
+        return refuse("not a job id (see `broadsword jobs`)".into());
+    }
+    let _lock = match acquire(cfg, Duration::from_secs(5)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("broadsword: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let path = record::jobs_dir(cfg).join(format!("{id}.rec"));
+    let mut r = match record::load(&path) {
+        Ok(r) if r.id() == id => r,
+        _ => return refuse("no job record with that exact id (see `broadsword jobs`)".into()),
+    };
+    if r.status() != record::RUNNING || r.get("kind") != "run" {
+        return refuse(format!("it is a `{}` job with status `{}`: only an interrupted `run` job can be rolled back", r.get("kind"), r.status()));
+    }
+    if broadsword_alive(&r) {
+        return refuse(format!("its broadsword (pid {}) is still running, so the job is not interrupted; nothing was changed", r.get("pid")));
+    }
+    println!("recovering job {id}: run {} was interrupted (broadsword pid {} is gone)", r.get("project"), r.get("pid"));
+    kill_orphan(&r);
+    let project = r.get("project").to_string();
+    match rollback_run(cfg, &mut r, &project) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("  {e}");
+            eprintln!("broadsword: NEEDS ATTENTION: {id} could not be rolled back (see above). Records and refs are kept and the work saved under refs/broadsword/ is intact; fix the cause and run `broadsword recover {id}` again, or `broadsword recover --abandon {id}`");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), String> {
     let id = r.id().to_string();
+    for entry in std::fs::read_dir(&cfg.state_dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&format!("tmp-index-{id}")) {
+            let _ = std::fs::remove_file(entry.path()); // this dead job's leftovers only
+        }
+    }
     let task = Some(r.get("task").to_string()).filter(|t| !t.is_empty());
     // A run that ran in a task's worktree is rolled back THERE: its checkpoint is of that folder, never of the main checkout.
     let dir = job::job_folder(cfg, project, task.as_deref()).map_err(|(_, e)| format!("cannot roll back {id}: {e}; record left as running"))?;
