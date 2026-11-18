@@ -217,3 +217,18 @@ fn gravity_must_be_positive_and_finite() {
     }
     assert!(Config { gravity: 1.62, ..Config::default() }.validate().is_ok());
 }
+
+#[test]
+fn lower_gravity_makes_the_cube_fall_more_slowly() {
+    use crash_sim::{run_checked, Config};
+    // Time of first ground contact (min_y reaches 0) for a run; free fall from 2 m takes sqrt(2h/g).
+    let first_contact = |g: f64| {
+        let (samples, res) = run_checked(&Config { gravity: g, ..Config::default() });
+        res.expect("stable run");
+        samples.iter().find(|s| s.min_y <= 1e-9).map(|s| s.t).expect("cube reaches the ground")
+    };
+    let (earth, moon) = (first_contact(9.81), first_contact(1.62));
+    assert!((earth - (2.0 * 2.0 / 9.81f64).sqrt()).abs() < 0.03, "earth contact at {earth}");
+    assert!((moon - (2.0 * 2.0 / 1.62f64).sqrt()).abs() < 0.05, "moon contact at {moon}");
+    assert!(moon > 2.0 * earth, "moon contact {moon} should be well after earth contact {earth}");
+}

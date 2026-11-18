@@ -141,7 +141,7 @@ impl Sim {
     }
 
     fn substep(&mut self, h: f64) {
-        let mut force = vec![Vec3::new(0.0, -GRAVITY * NODE_MASS, 0.0); self.pos.len()];
+        let mut force = vec![Vec3::new(0.0, -self.cfg.gravity * NODE_MASS, 0.0); self.pos.len()];
         for bm in &self.beams {
             let d = self.pos[bm.b] - self.pos[bm.a];
             let len = d.length();
