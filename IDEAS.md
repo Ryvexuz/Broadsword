@@ -73,4 +73,14 @@ Ideas outside the current stage go here, not into code. Each one names the stage
     3. If it works, add a `codex` reviewer backend (a wrapper like `clients/openai_review.py` that prints the Claude-style JSON) and a benchmark provider.
   - Check ChatGPT's terms for scripted use first.
   - Keep the API key only for what the CLI can't do.
+  - **Confirmed 2026-11-18:**
+    - The Codex CLI 0.170.0 is installed (`npm install -g @openai/codex`, Lazlo approved) and signed in with ChatGPT (`codex login status`: "Logged in using ChatGPT").
+    - `codex exec -m <model> --sandbox read-only --ephemeral --skip-git-repo-check -o <answer file> -` with the prompt on stdin answered small reviews correctly through gpt-5.6-sol, gpt-6.1-terra and gpt-6.2-sol in 8 to 12 s, while the API account had no credits, so it draws on the ChatGPT plan.
+    - Each call carries about 18.5k input tokens of Codex agent instructions (mostly cached).
+    - Lazlo's Codex config points at an MCP server on 127.0.0.1:8000 that isn't running (a harmless error line).
+  - **Next:**
+    - a `clients/codex_review.py` wrapper printing the Claude-style JSON;
+    - a `shadow_reviewer = "codex"` option;
+    - a `codex` provider for both benchmarks;
+    - re-run the credit-blocked OpenAI rows through it.
 

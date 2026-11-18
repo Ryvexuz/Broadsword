@@ -27,7 +27,8 @@ Broadsword is portable by design: every path is relative to the project root, an
    - Then run `build/bin/broadsword.exe test broadsword`, which should show all tests passing.
 5. **Restore the playbook.** Run `python -I scripts/sync_playbook.py`. It writes the playbook into this PC's `~/.claude/AI_DEV_PLAYBOOK.md`. Then copy `state/claude-memory/CLAUDE.md` to `~/.claude/CLAUDE.md` if that file doesn't exist yet.
 6. **Restore Claude's notes.** Claude Code keys its project memory to the folder path, so at a new path it starts empty. The notes from the old PC are in `state/claude-memory/`. In the first session, ask Claude to read them and save them into its memory again.
-7. **The `.env` file** moves with the drive. If this PC has its own `OPENAI_API_KEY` in its environment, the OpenAI client warns when that key and the `.env` key differ.
+7. **OpenAI through ChatGPT:** run `npm install -g @openai/codex`, then `codex login` (use `--device-auth` if no browser opens). It is needed for the `codex` reviewer and benchmark backend.
+8. **The `.env` file** moves with the drive. If this PC has its own `OPENAI_API_KEY` in its environment, the OpenAI client warns when that key and the `.env` key differ.
 
 ## Machine-dependent settings
 

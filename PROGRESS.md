@@ -106,7 +106,7 @@ Full tables are in `evidence/benchmarks-2026-11-18.md`: hard case blind re-score
 5. `t-20261118-095351-2`: test binaries run in parallel (after 3).
 6. `t-20261118-095351-3`: a price comparison for paid speed tiers. **No fast tier and no Claude fast mode until Lazlo decides on it.**
 
-7. **After the move:** check the OpenAI Platform billing and usage (the API credit balance is separate from ChatGPT). Then try the Codex CLI signed in with ChatGPT, so shadow reviews and benchmarks use the spare weekly allowance (see IDEAS).
+7. **Use the ChatGPT allowance:** the Codex CLI is installed and signed in with ChatGPT, and `codex exec` reviews through gpt-5.6-sol, terra and 6.2-sol work on the plan, not API credits. Next: a `codex` backend for the shadow reviewer and the benchmarks (see IDEAS), then re-run the credit-blocked OpenAI rows. On a new PC: `npm install -g @openai/codex`, then `codex login` (or `codex login --device-auth`). Separately, Lazlo will check the Platform billing after the move.
 
 Process items:
 - The orchestrator gets out of the critical path: a Sonnet drafts briefs from a short spec, the Housekeeper writes records while the pipeline runs.
