@@ -17,9 +17,11 @@ Per task:
   queue      first queue entry created -> last entry ended, with the check, review and main-check time inside it
 Window (first task created -> last task ended):
   throughput  merged tasks per hour of the window
-  busy        share of the window with at least one task running (agents had work)
+  busy        share of the window with at least one task running (agents had work). A task that exists but has
+              not started, or was abandoned before starting, is waiting: that time counts as idle on purpose
   idle        share with no task running (nothing in progress: the pipeline was empty)
-  jobs        share with at least one Broadsword job running (the machine was building or testing)
+  jobs        share with at least one Broadsword job running (the machine was building or testing); a job left
+              `running` by a crash counts until it is recovered, and such jobs are listed in the warnings
 Models (same window, by date for agent runs):
   runs, active time, tokens and review cost per model and role; utilisation = active time / window
 """
@@ -83,16 +85,23 @@ def steps(entry):
     return out
 
 
+WARNINGS = []  # printed at the end: a missing number is shown as `-` and explained here, never silently
+
+
 def commit_times(project, base, tip):
     """Author times of the commits in base..tip, i.e. when the coder committed (a rebase keeps author time)."""
     repo = ROOT if project == "broadsword" else ROOT / "projects" / project
     if not base or not tip:
         return []
     try:
-        out = subprocess.run(["git", "-C", str(repo), "log", "--format=%at", f"{base}..{tip}"], capture_output=True, text=True, timeout=30).stdout.split()
-    except (OSError, subprocess.TimeoutExpired):
+        res = subprocess.run(["git", "-C", str(repo), "log", "--format=%at", f"{base}..{tip}"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        WARNINGS.append(f"git log failed in {repo.name} for {base[:10]}..{tip[:10]}: {e}")
         return []
-    return sorted(int(t) for t in out if t.isdigit())
+    if res.returncode != 0:
+        WARNINGS.append(f"git log failed in {repo.name} for {base[:10]}..{tip[:10]}: {res.stderr.strip()[:200]}")
+        return []
+    return sorted(int(t) for t in res.stdout.split() if t.isdigit())
 
 
 def dur(s):
@@ -180,7 +189,8 @@ def main():
         if a and b:
             jobs.append((a, b))
         elif a and r.get("status") == "running":
-            jobs.append((a, now))  # still running (or interrupted and not yet recovered)
+            jobs.append((a, now))  # still running, or interrupted and not yet recovered
+            WARNINGS.append(f"job {p.stem} is recorded as running; it is counted up to now")
     busy = covered(task_spans, lo, hi)
     job_time = covered(jobs, lo, hi)
     print()
@@ -191,6 +201,8 @@ def main():
     print(f"jobs        {job_time / window:5.1%}  at least one Broadsword job running")
     models(entries, since, lo, hi, window)
     print("not recorded: build-lock wait inside a job; the orchestrator's own tokens (see the app's usage card)")
+    for w in WARNINGS:
+        print(f"warning: {w}")
     return 0
 
 
@@ -218,7 +230,7 @@ def models(entries, since, lo, hi, window):
             cost = float(e.get("cost_usd") or 0)
         except ValueError:
             cost = 0.0
-        if e.get("verdict"):
+        if e.get("verdict") or secs:  # a review that ran but never reached a verdict (timeout, stale) still used the model
             add(e.get("reviewer_model"), "reviewer", secs, tokens, cost)
     log = ROOT / "state" / "agent-runs.tsv"
     if log.is_file():
