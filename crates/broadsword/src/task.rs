@@ -336,6 +336,36 @@ pub fn wait_for_gate(cfg: &Config, env: &str, what: &str) {
     }
 }
 
+/// Test-only hook for the RAM line of `start`: names a file inside scratch holding a percentage (e.g. `95`). The reading
+/// used is `max(hook, real)`, so the hook can only make RAM look fuller (stricter), never emptier. Files outside scratch
+/// and unparsable values are ignored; use is announced on stderr. The long name is deliberate.
+pub const TEST_RAM_HOOK_ENV: &str = "BROADSWORD_INTERNAL_TEST_RAM_USED_PERCENT_FILE";
+
+/// (percent of RAM used, free bytes), from `sys::ram()` raised by the test hook if one is set.
+fn ram_used_percent(cfg: &Config) -> Result<(f64, u64), String> {
+    let r = crate::sys::ram()?;
+    if r.total == 0 {
+        return Err("the OS reported 0 bytes of RAM".into());
+    }
+    let mut used = (r.total - r.avail.min(r.total)) as f64 * 100.0 / r.total as f64;
+    if let Ok(v) = std::env::var(TEST_RAM_HOOK_ENV) {
+        let path = PathBuf::from(&v);
+        let inside = match (path.canonicalize(), cfg.scratch_dir.canonicalize()) {
+            (Ok(p), Ok(s)) => p.starts_with(s),
+            _ => false,
+        };
+        if inside {
+            eprintln!("broadsword: TEST HOOK ACTIVE: RAM use is read from {v} (never below the real reading)");
+            if let Some(h) = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<f64>().ok()) {
+                used = used.max(h);
+            }
+        } else {
+            eprintln!("broadsword: ignoring {TEST_RAM_HOOK_ENV}: file is not inside the scratch folder");
+        }
+    }
+    Ok((used, r.avail))
+}
+
 pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCode {
     let owner = owner.trim();
     if owner.is_empty() || owner.contains(['\n', '\r']) {
@@ -358,6 +388,14 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             Ok(a) => a,
             Err(e) => return fail(EXIT_ERROR, format!("cannot read the board, so nothing was started: {e}")),
         };
+        // The memory line: no new agent while RAM use is at or above ram_warn_percent. Fails closed if RAM can't be read.
+        match ram_used_percent(cfg) {
+            Err(e) => return fail(EXIT_CONFLICT, format!("cannot start {id}: RAM could not be read, so the ram_warn_percent check cannot be made: {e}")),
+            Ok((used, free)) if used >= cfg.ram_warn_percent as f64 => {
+                return fail(EXIT_CONFLICT, format!("cannot start {id}: RAM is {used:.0}% used ({} free), at or above ram_warn_percent {}; start it when memory frees up", pause::gb(free), cfg.ram_warn_percent));
+            }
+            Ok(_) => {}
+        }
         // The agent cap: one running task is one agent at work. Counted under the board lock, across every project.
         let running: Vec<&Record> = all.iter().filter(|o| o.status() == RUNNING).collect(); // this task is still `open` here
         if running.len() as u64 >= cfg.max_agents {

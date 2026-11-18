@@ -44,7 +44,7 @@ impl Root {
         }
         let toml = format!(
             "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 90\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
+             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
              state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
              checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = {}\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
@@ -630,4 +630,80 @@ fn eight_gated_starts_never_exceed_a_cap_of_three() {
             }
         }
     }
+}
+
+// ---- the RAM line (ram_warn_percent) ------------------------------------------------------
+// Every test root sets ram_warn_percent = 100, so the real RAM level (which may be above 90% on this machine) never
+// refuses an unrelated start. The hook can only RAISE the reading, so the refusal cases use hook values at or above the
+// line and the "no refusal" cases use no hook, or a hook that must be ignored.
+
+const RAM_HOOK_ENV: &str = "BROADSWORD_INTERNAL_TEST_RAM_USED_PERCENT_FILE";
+
+fn set_warn(r: &Root, pct: u64) {
+    let p = r.dir.join("broadsword.toml");
+    let t: String = fs::read_to_string(&p).unwrap().lines().map(|l| if l.starts_with("ram_warn_percent") { format!("ram_warn_percent = {pct}\n") } else { format!("{l}\n") }).collect();
+    assert_eq!(t.matches(&format!("ram_warn_percent = {pct}\n")).count(), 1);
+    fs::write(p, t).unwrap();
+}
+
+fn start_with_ram_hook(r: &Root, id: &str, hook_file: &Path) -> Out {
+    let o = r.cmd(&["task", "start", id, "--owner", "coder-1"]).env(RAM_HOOK_ENV, hook_file).output().unwrap();
+    Out { code: o.status.code().unwrap(), stdout: String::from_utf8_lossy(&o.stdout).into_owned(), stderr: String::from_utf8_lossy(&o.stderr).into_owned() }
+}
+
+#[test]
+fn start_refuses_when_ram_is_at_or_above_the_warning_line() {
+    let r = Root::new("ram95");
+    set_warn(&r, 90);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let hook = r.dir.join("scratch").join("ram.txt");
+    fs::write(&hook, "95").unwrap();
+    let o = start_with_ram_hook(&r, &a, &hook);
+    assert_eq!(o.code, 3, "{}", o.stderr);
+    assert!(o.stderr.contains("TEST HOOK ACTIVE"), "{}", o.stderr);
+    assert!(o.stderr.contains("RAM is ") && o.stderr.contains("% used") && o.stderr.contains("ram_warn_percent 90") && o.stderr.contains("memory frees up"), "{}", o.stderr);
+    // The reading is max(hook, real): at least the hooked 95, whatever the machine really uses.
+    let pct: u64 = o.stderr.split("RAM is ").nth(1).unwrap().split('%').next().unwrap().trim().parse().unwrap();
+    assert!(pct >= 95, "{}", o.stderr);
+    assert_eq!(r.status_of(&a), "open", "a refused start changes nothing");
+    assert!(!r.list(&["--status", "running"]).iter().any(|l| l.contains(&a)), "the refused task must not be running");
+}
+
+#[test]
+fn start_succeeds_below_the_ram_line() {
+    let r = Root::new("ramok");
+    // The line is 100 and the hook says 50: RAM is below it whatever the real level is (short of exactly 100%).
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let hook = r.dir.join("scratch").join("ram.txt");
+    fs::write(&hook, "50").unwrap();
+    let o = start_with_ram_hook(&r, &a, &hook);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(r.status_of(&a), "running");
+}
+
+#[test]
+fn a_ram_hook_value_below_the_real_reading_cannot_weaken_the_guard() {
+    let r = Root::new("ramlow");
+    // A line of 1% is below any real RAM use; a hook claiming 0% must not make the start pass.
+    set_warn(&r, 1);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let hook = r.dir.join("scratch").join("ram.txt");
+    fs::write(&hook, "0").unwrap();
+    let o = start_with_ram_hook(&r, &a, &hook);
+    assert_eq!(o.code, 3, "{}", o.stderr);
+    assert!(o.stderr.contains("ram_warn_percent 1"), "{}", o.stderr);
+    assert_eq!(r.status_of(&a), "open");
+}
+
+#[test]
+fn a_ram_hook_file_outside_scratch_is_ignored() {
+    let r = Root::new("ramout");
+    // Line 100, hook 100: honoured it would refuse; ignored (outside scratch) the real reading (below 100) lets it start.
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let hook = r.dir.join("ram-outside.txt");
+    fs::write(&hook, "100").unwrap();
+    let o = start_with_ram_hook(&r, &a, &hook);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("ignoring") && !o.stderr.contains("TEST HOOK ACTIVE"), "{}", o.stderr);
+    assert_eq!(r.status_of(&a), "running");
 }
