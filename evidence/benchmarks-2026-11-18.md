@@ -65,6 +65,12 @@ gpt-5.5-pro       default      0/12        0          0       0           0     
 
 ## 2. Single-bug review cases (5 real first-pass bugs from Broadsword's history)
 
+**Credits:** the OpenAI account ran out of credits near the end of this run.
+- chat-latest and the five pro models made no successful call (the pro models also need the Responses API).
+- gpt-6.2-sol lost 1 of its 5 cases.
+- Errored calls are excluded from `caught x/n`, so every shown score is over the cases that really ran.
+- The hard case finished before credits ran out.
+
 Columns: caught as BLOCKING; MINOR only; known false positives; other BLOCKING lines (not hand-checked); cost; average seconds; errors.
 
 ```
