@@ -129,6 +129,23 @@ impl Inputs {
     }
 }
 
+/// The one place that keeps a caller's string value from becoming a command-line option of the child: every
+/// string parameter of every tool becomes a bare argument in `to_args`, so a value starting with `-` (`--all`,
+/// `--worktree`) would be read as a flag. Also refuses NUL and line breaks. Array parameters (the `run`
+/// command) are meant to be arguments and are exempt. The MCP server calls this before `to_args`.
+pub fn check_string_inputs(tool: &Tool, inputs: &Inputs) -> Result<(), String> {
+    for p in tool.params.iter().filter(|p| p.ty == Ty::String) {
+        let Some(v) = inputs.str(p.name) else { continue };
+        if v.starts_with('-') {
+            return Err(format!("argument `{}` must not start with `-`: it would be read as a command-line option, not as a value; got {v:?}", p.name));
+        }
+        if v.contains(['\0', '\n', '\r']) {
+            return Err(format!("argument `{}` must not contain a NUL or a line break", p.name));
+        }
+    }
+    Ok(())
+}
+
 // ---- the table --------------------------------------------------------------------------
 
 const PROJECT: Param = Param {
@@ -430,7 +447,7 @@ pub static TOOLS: &[Tool] = &[
         long_running: true,
         changes_files: true,
         destructive: true,
-        idempotent: true,
+        idempotent: false, // `recover <id>` refuses a second call (the run is then rolled back)
         cli: "broadsword recover [--all | <job id>]",
         cli_examples: &["recover", "recover --all", "recover some-id"],
         parse: |a| match a {
@@ -454,6 +471,10 @@ pub static TOOLS: &[Tool] = &[
         handler: |cfg, i| match (i.str("id"), i.bool("all")) {
             (Some(_), true) => {
                 eprintln!("broadsword: give either `id` (roll back one run) or `all`, not both");
+                Ok(ExitCode::from(2))
+            }
+            (Some(id), false) if id.starts_with('-') || crate::record::sanitize(id) != id => {
+                eprintln!("broadsword: `{id}` is not a valid job id; nothing was rolled back");
                 Ok(ExitCode::from(2))
             }
             (Some(id), false) => Ok(recover::recover_one(cfg, id)),
@@ -1645,6 +1666,37 @@ mod tests {
         let w = find("watch").unwrap();
         assert!(w.description.contains("NOT AVAILABLE OVER MCP") && w.description.contains("mcp_callable"));
         assert!(flags_text(w).contains("not-callable-over-mcp"));
+    }
+
+    #[test]
+    fn mcp_string_values_that_look_like_options_are_refused_naming_the_parameter() {
+        use crate::mcp::{prepare_call, Reject};
+        let refused = |call: &str, param: &str| {
+            let params = parse(call).unwrap();
+            match prepare_call(Some(&params)) {
+                Err(Reject::Tool(m)) => assert!(m.contains(&format!("`{param}`")), "{call}: {m}"),
+                other => panic!("{call} must be refused as a tool error, got {other:?}"),
+            }
+        };
+        refused(r#"{"name":"recover","arguments":{"id":"--all"}}"#, "id");
+        refused(r#"{"name":"recover","arguments":{"id":"-x"}}"#, "id");
+        refused(r#"{"name":"task_start","arguments":{"id":"--worktree","owner":"o"}}"#, "id");
+        refused(r#"{"name":"task_start","arguments":{"id":"t-1","owner":"--worktree"}}"#, "owner");
+        refused(r#"{"name":"build","arguments":{"project":"--x"}}"#, "project");
+        refused(r#"{"name":"build","arguments":{"project":"p","task":"--x"}}"#, "task");
+        refused(r#"{"name":"abandon","arguments":{"id":"--all"}}"#, "id");
+        refused(r#"{"name":"recover","arguments":{"id":"a\nb"}}"#, "id");
+        refused(r#"{"name":"recover","arguments":{"id":"a\u0000b"}}"#, "id");
+        // the `run` command array is meant to be arguments: leading dashes stay allowed there
+        let ok = prepare_call(Some(&parse(r#"{"name":"run","arguments":{"project":"p","command":["cargo","--version"]}}"#).unwrap())).unwrap();
+        assert_eq!(ok.args, ["run", "p", "--", "cargo", "--version"]);
+        // a plain id still passes
+        assert!(prepare_call(Some(&parse(r#"{"name":"recover","arguments":{"id":"20261117-120000-ab12"}}"#).unwrap())).is_ok());
+    }
+
+    #[test]
+    fn recover_is_not_marked_idempotent_because_a_second_rollback_is_refused() {
+        assert!(!find("recover").unwrap().idempotent);
     }
 
     #[test]

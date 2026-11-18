@@ -1117,7 +1117,7 @@ fn recover_with_an_id_refuses_anything_but_an_interrupted_run() {
         ("20260101-000008-p-check", "only an interrupted `run`"),
         ("20260101-000007-p-run", "only an interrupted `run`"),
         ("no-such-job", "no job record"),
-        ("../x", "not a job id"),
+        ("../x", "not a valid job id"),
     ] {
         let o = r.run(&["recover", arg]);
         assert_eq!(o.code, 2, "{arg}: {}{}", o.stdout, o.stderr);

@@ -254,3 +254,53 @@ fn recover_and_abandon_exit_codes() {
     assert_eq!(code(&o), 2, "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(code(&r.run(&["recover", "no-such-job"])), 2);
 }
+
+#[test]
+fn recover_refuses_an_id_that_is_not_a_job_id_with_exit_2() {
+    let r = Root::new("badid", 1);
+    r.project("g", ONE_TEST, true);
+    for bad in ["a/b", "a b", "..", "x.rec"] {
+        let o = r.run(&["recover", bad]);
+        assert_eq!(code(&o), 2, "{bad}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(String::from_utf8_lossy(&o.stderr).contains("not a valid job id"), "{bad}");
+    }
+}
+
+/// An MCP `recover` call with `id: "--all"` must not become `recover --all`: it is refused, and an interrupted run
+/// stays exactly as it was (still `running`, not rolled back).
+#[test]
+fn an_mcp_option_like_id_is_refused_and_changes_nothing() {
+    use std::io::Write;
+    let r = Root::new("mcpinject", 1);
+    r.project("g", ONE_TEST, true);
+    let mut c = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+    let dead = c.id().to_string();
+    c.wait().unwrap();
+    let jobs = r.dir.join("state/jobs");
+    fs::create_dir_all(&jobs).unwrap();
+    let rec = jobs.join("20260101-000002-g-run.rec");
+    fs::write(&rec, format!("id = 20260101-000002-g-run\nproject = g\nkind = run\nstatus = running\npid = {dead}\ncheckpoint = refs/broadsword/checkpoints/does-not-exist\n")).unwrap();
+    let before = fs::read_to_string(&rec).unwrap();
+    let mut child = Command::new(BIN).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    {
+        let mut si = child.stdin.take().unwrap();
+        let lines = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recover","arguments":{"id":"--all"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_start","arguments":{"id":"--worktree","owner":"o"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"build","arguments":{"project":"--x"}}}"#,
+        ];
+        for l in lines {
+            writeln!(si, "{l}").unwrap();
+        }
+    } // stdin closed: the server answers what it has and exits
+    let o = child.wait_with_output().unwrap();
+    let so = String::from_utf8_lossy(&o.stdout);
+    for id in [2, 3, 4] {
+        let line = so.lines().find(|l| l.contains(&format!("\"id\":{id},"))).unwrap_or_else(|| panic!("no response {id}: {so}"));
+        assert!(line.contains("\"isError\":true") && line.contains("must not start with"), "{line}");
+    }
+    assert_eq!(fs::read_to_string(&rec).unwrap(), before, "the interrupted run's record must not change");
+    assert!(!r.dir.join("state/tasks").exists() || fs::read_dir(r.dir.join("state/tasks")).unwrap().next().is_none(), "no task may be started");
+}

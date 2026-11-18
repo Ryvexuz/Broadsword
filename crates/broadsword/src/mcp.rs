@@ -287,6 +287,7 @@ pub fn prepare_call(params: Option<&J>) -> Result<Prepared, Reject> {
         )));
     }
     let inputs = validate_args(tool, members).map_err(Reject::Tool)?;
+    tools::check_string_inputs(tool, &inputs).map_err(Reject::Tool)?;
     let args = (tool.to_args)(&inputs);
     // Whatever was accepted must come back as this very tool from the command line, or the child would run something else.
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1022,7 +1023,7 @@ mod tests {
         let m = tool_msg(prep(r#"{"name":"build","arguments":{"project":"a","project":"b"}}"#));
         assert!(m.contains("more than once"), "{m}");
         let m = tool_msg(prep(r#"{"name":"tools","arguments":{"name":"--json"}}"#));
-        assert!(m.contains("cannot be passed"), "{m}");
+        assert!(m.contains("argument `name` must not start with `-`"), "{m}");
     }
 
     #[test]

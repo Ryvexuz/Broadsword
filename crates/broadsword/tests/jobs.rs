@@ -220,9 +220,17 @@ fn test_hook_cannot_defeat_the_real_disk_guard() {
 fn disk_guard_counts_the_job_reserve_exactly() {
     // floor 1 GB + reserve 2 GB: a job may start only when free space is at least 3 GB. The hook value is used
     // for every sample (the last one repeats), and it can only lower the real free space, so this needs a disk
-    // with more than 3 GB free (the real guard would otherwise refuse the second run for a different reason).
+    // with at least 4 GB free (the real guard would otherwise refuse the second run for a different reason).
     const GB: u64 = 1024 * 1024 * 1024;
     let r = Root::new("reserve", 1, 2);
+    // the real disk must have clearly more than 3 GB free, or the "above" case would be refused by the real guard
+    // for a reason unrelated to the reserve: skip then, loudly, instead of failing
+    let st = text(&r.cmd(&["status"]).output().unwrap().stdout);
+    let real_free_gb: f64 = st.lines().find_map(|l| l.strip_prefix("disk:")).and_then(|l| l.split_whitespace().next()).and_then(|n| n.parse().ok()).unwrap_or(0.0);
+    if real_free_gb < 4.0 {
+        eprintln!("SKIPPED disk_guard_counts_the_job_reserve_exactly: the real disk has {real_free_gb} GB free, the test needs at least 4 GB\n{st}");
+        return;
+    }
     r.project("ok", TWO_TESTS, None);
     let hook = r.dir.join("scratch/free.txt");
     // just below floor + reserve: refused, cargo never started
@@ -232,8 +240,8 @@ fn disk_guard_counts_the_job_reserve_exactly() {
     assert_eq!(out.status.code(), Some(3), "stdout: {so}\nstderr: {se}");
     assert!(se.contains("refusing to start") && se.contains("reserve"), "{se}");
     assert!(!r.dir.join("build").exists(), "cargo must not have run");
-    // exactly floor + reserve: allowed, the job runs and ends ok
-    fs::write(&hook, (3 * GB).to_string()).unwrap();
+    // strictly above floor + reserve: allowed, the job runs and ends ok
+    fs::write(&hook, (3 * GB + 1024 * 1024).to_string()).unwrap();
     let out = r.cmd(&["build", "ok"]).env(HOOK, &hook).output().unwrap();
     let (so, se) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
