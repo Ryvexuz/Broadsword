@@ -1,0 +1,10 @@
+[package]
+name = "render"
+version = "0.1.0"
+edition = "2021"
+description = "Broadsword's renderer: a std-only software rasterizer into a framebuffer, golden-image tests, and a Win32 window to show it"
+
+[dependencies]
+
+# Own workspace so Cargo does not attach this crate to the Broadsword workspace above it.
+[workspace]
