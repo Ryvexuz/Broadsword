@@ -1,0 +1,10 @@
+# Settings for bench/coder. Every key is required; the scripts never fall back to a default.
+# Paths are relative to the Broadsword root (the folder holding build/bin/broadsword.exe).
+
+broadsword_exe = "build/bin/broadsword.exe"   # the stable Broadsword binary that runs cargo
+broadsword_project = "broadsword"             # project name given to `broadsword run`
+work_dir = "scratch/coder-bench"              # temp crates, harness lock and logs live here
+test_timeout_seconds = 10                     # one test that runs longer than this fails
+harness_timeout_seconds = 900                 # the whole harness run (build + tests); killed past this
+model_timeout_seconds = 900                   # run.py kills one model call that runs longer than this
+lock_wait_seconds = 1800                     # wait this long for another harness run on the same task
