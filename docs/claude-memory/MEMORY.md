@@ -1,4 +1,5 @@
 - [Broadsword source docs](broadsword-source-docs.md) — Claude Docs links behind AGENTS.md, DEVELOPMENT_PLAN.md and CAPABILITY_ROADMAP.md, and how to refresh them
 - [Retro after each milestone](retro-after-each-milestone.md) — RETRO.md entry per milestone: wrong/why/fix plus speed and cost, enforced not just noted
 - [Benchmark runs approved](benchmark-runs-approved.md) — run every model (old/new, Claude/OpenAI) on reviewer benchmarks without asking; report cost
+- [Fast modes need a price check](fast-modes-need-price-check.md) — no paid speed tiers (OpenAI fast, Claude /fast) until a price comparison; orchestrator fast mode off
 - [Model budget routing](model-budget-routing.md) — OpenAI budget resets whenever Lazlo wants, Claude's doesn't; use either as fits, no fixed rule

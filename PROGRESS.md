@@ -97,6 +97,19 @@ Full tables are in `evidence/benchmarks-2026-11-18.md`: hard case blind re-score
 - **`IDEAS.md`:** the Opus minors from tonight's merges, plus queue improvements: `queue run --all`, attributes from the reviewed commit, and skipping the main re-check when main is exactly the checked commit (a speed-versus-safety decision for Lazlo).
 - **Not running yet:** automatic `watch`, phone alerts and `cargo-sweep`. These need Lazlo's OK.
 
+## Throughput backlog (Lazlo approved all on 2026-11-18; briefs in `state/backlog/<task id>.md`)
+
+1. `t-20261118-095350`: queue checks scoped to the diff (Python-only diffs skip the Rust suite).
+2. `t-20261118-095350-2`: after a fast-forward to the checked commit, a quick build on main, with the full suite hourly (Lazlo's middle ground).
+3. `t-20261118-095350-3`: the build lock covers compiling only; tests run from copied binaries.
+4. `t-20261118-095351`: `queue run --all`, with the next entry's check overlapping the current review.
+5. `t-20261118-095351-2`: test binaries run in parallel (after 3).
+6. `t-20261118-095351-3`: a price comparison for paid speed tiers. **No fast tier and no Claude fast mode until Lazlo decides on it.**
+
+Process items:
+- The orchestrator gets out of the critical path: a Sonnet drafts briefs from a short spec, the Housekeeper writes records while the pipeline runs.
+- On the 128 GB PC, raise `max_agents`; the RAM gate is a percentage, so it adapts.
+
 ## Failed (tonight, all recorded in RETRO.md and LAB_LOG.md)
 
 - **The orchestrator moved main during queue runs three times,** each time making an entry blocked or stale. Rule: touch main only when the queue is idle; backlog briefs now live outside Git.

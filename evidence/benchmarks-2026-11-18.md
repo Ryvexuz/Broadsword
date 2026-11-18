@@ -156,9 +156,10 @@ claude:sonnet  default  12/12        13/13        14/14        19/19       20/20
 claude:sonnet  high     12/12        13/13        14/14        19/19       20/20        19/19        97/97 100%  0        0       $0.143  101s
 ```
 
-OpenAI (the main run was still in progress at session end; gpt-6.1-terra was run separately):
+OpenAI (all 30 models; gpt-6.1-terra also ran separately, last line):
 ```
 model                 effort   01-duration  02-ring-buf  03-merge-in  04-ttl-lru  05-expressi  06-line-dif  score      compile  format  cost  time
+openai:chat-latest    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
 openai:gpt-4.1        default  11/12        13/13        14/14        0/19        0/20         0/19         38/97 39%  3        0       n/a   50s 
 openai:gpt-4.1-mini   default  10/12        13/13        14/14        0/19        0/20         0/19         37/97 38%  3        0       n/a   128s
 openai:gpt-4o         default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   2s  
@@ -166,11 +167,27 @@ openai:gpt-4o-mini    default  0/12         0/13         0/14         0/19      
 openai:gpt-5          default  12/12        0/13         14/14        19/19       0/20         19/19        64/97 66%  2        0       n/a   861s
 openai:gpt-5-mini     default  10/12        13/13        14/14        0/19        20/20        0/19         57/97 59%  2        0       n/a   334s
 openai:gpt-5-nano     default  0/12         0/13         14/14        18/19       13/20        19/19        64/97 66%  2        0       n/a   551s
+openai:gpt-5-pro      default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
 openai:gpt-5.1        default  11/12        0/13         14/14        0/19        0/20         0/19         25/97 26%  4        0       n/a   105s
 openai:gpt-5.2        default  11/12        13/13        14/14        0/19        0/20         19/19        57/97 59%  1        0       n/a   132s
+openai:gpt-5.2-pro    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   46s 
 openai:gpt-5.3-codex  default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   1s  
+openai:gpt-5.4        default  11/12        13/13        14/14        19/19       20/20        12/19        89/97 92%  0        0       n/a   70s 
 openai:gpt-5.4-mini   default  10/12        13/13        14/14        19/19       13/20        19/19        88/97 91%  0        0       n/a   29s 
 openai:gpt-5.4-nano   default  11/12        13/13        14/14        16/19       0/20         19/19        73/97 75%  1        0       n/a   64s 
+openai:gpt-5.4-pro    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   40s 
+openai:gpt-5.5        default  12/12        13/13        14/14        19/19       0/20         0/19         58/97 60%  2        2       n/a   140s
+openai:gpt-5.5-pro    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-5.6-luna   default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-5.6-sol    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-5.6-terra  default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6-astra    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6-luna     default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6-sol      default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6.1-sol    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6.1-terra  default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   39s 
+openai:gpt-6.2-astra  default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   40s 
+openai:gpt-6.2-sol    default  0/12         0/13         0/14         0/19        0/20         0/19         0/97 0%    6        6       n/a   40s 
 openai:o3             default  11/12        13/13        14/14        19/19       16/20        5/19         78/97 80%  0        0       n/a   216s
 openai:gpt-6.1-terra  default  12/12        13/13        14/14        19/19       20/20        19/19        97/97 100%  0        0       n/a   148s
 ```
@@ -193,4 +210,3 @@ openai:gpt-6.1-terra  default  12/12        13/13        14/14        19/19     
 - Repeat runs (5x) for consistency, starting with the gpt-6.2 models and a stable comparison.
 - Re-run the errored models with the Responses API and a per-model token cap.
 - Benchmark the `fast` and `flex` tiers.
-- Finish the OpenAI coding run.
