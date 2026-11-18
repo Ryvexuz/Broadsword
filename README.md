@@ -7,3 +7,61 @@ All drawing happens in software, into an in-memory framebuffer. Because of that:
 - **a window is only a viewer:** a small Win32 window displays the framebuffer.
 
 Build and test it only through Broadsword: `broadsword test render`.
+
+## What it does
+
+- `Framebuffer`: `0x00RRGGBB` pixels, `clear`, bounds-checked `set`, an exact integer Bresenham `line` (both
+  endpoints included, clipped to the buffer), `point` (a filled square), `to_ppm` (binary P6) and `from_ppm`.
+  A zero-sized framebuffer is an error from `Framebuffer::new`, not a panic.
+- `Vec3`, `Mat4` (look-at, perspective), private to this crate.
+- `Camera`: position, yaw, pitch, field of view, aspect, near, far, and fly speeds. `view_proj()`,
+  `project(world, width, height)`, and `fly(&FlyInput, dt)`, a pure function with no clock or window.
+  Yaw 0 looks down -Z; positive yaw turns toward +X.
+- `draw_line_3d` clips each line against the near and far planes before projecting, so a line passing behind
+  the camera draws correctly. `draw_point_3d` draws a point if it is in the depth range.
+- `wire_cube(center, size, rotation_y)`: the 12 edges of a cube.
+- Screen coordinate `s` lights pixel `round(s)`, so the image centre of a 160 pixel wide image is x = 80.0.
+
+## The viewer (Windows)
+
+```
+broadsword run render -- cargo run --offline --release --example spin
+```
+
+Controls: W/S forward/back, A/D left/right, E/Q up/down, arrow keys turn and look, Esc or the close box quits.
+Keys only count while the window has focus.
+
+For a headless timing run that opens no window:
+
+```
+broadsword run render -- cargo run --offline --release --example spin -- --frames 120
+```
+
+It renders 120 frames of a 640x480 scene, prints the average frame time and exits 0. `--width` and `--height`
+change the size.
+
+`tests/window_smoke.rs` opens the real window far off every monitor and without activation, presents 3 frames
+and closes it. It never takes focus.
+
+## Golden images
+
+`tests/golden.rs` renders each scene and compares it byte for byte with `tests/golden/<name>.ppm`.
+
+- **Mismatch:** the test fails with the number of differing pixels and their bounding box, and writes
+  `tests/golden/<name>.actual.ppm` (git-ignored). Open it in any image viewer or diff it against the golden file.
+- **Missing golden file:** the test fails (it never passes silently), writes the `.actual.ppm`, and says how to accept it.
+- **Accepting a change** is always by hand: check the `.actual.ppm` is right, then copy it over `<name>.ppm`.
+  Nothing accepts automatically. Say in the commit why the image changed.
+
+Scenes are chosen so the maths can be checked independently: `tests/behaviour.rs` holds hand-derived numbers
+(for example where the cube's 8 corners must land) alongside the hard cases (lines outside or through the
+camera, zero length, camera inside the cube, a 1x1 buffer).
+
+The images assume `f32` sine and cosine give the same results on the machine; if a golden test fails
+on a new platform with a pixel or two different, that is why.
+
+## Not done yet
+
+- No filled triangles, no shading, no lights, no depth buffer, no textures, no text.
+- Lines are one pixel wide and not anti-aliased; colours are not blended.
+- The viewer is Win32 only and its window cannot be resized.
