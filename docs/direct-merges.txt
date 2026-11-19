@@ -8,7 +8,7 @@
 
 # 2026-11-19, two commits the orchestrator made directly. cfadd9e: its own commit message says "Lazlo's decision". eafe80a: its commit message does not say who approved it; the approval (Lazlo chose "Fable review" in the session) is in state/staging/direct-merges/nb06-eafe80a.md, which is outside Git, and a LAB_LOG.md entry for it is still to be committed.
 broadsword | cfadd9e4ddc2 | Lazlo (per the commit message) | broadsword.toml shadow_reviewer = off, a safety stop for audit finding A6 | commit message of cfadd9e
-broadsword | eafe80abf17f | Lazlo ("Fable review" choice, per the orchestrator's record) | nb-06 scripts/baseline.py merged on one Fable 5.2 review (PASS on 8b77662) after four haiku queue FAILs with new non-regression points | state/staging/direct-merges/nb06-eafe80a.md (outside Git; LAB_LOG.md entry to follow)
+broadsword | eafe80abf17f | Lazlo ("Fable review" choice, per the orchestrator's record) | nb-06 scripts/baseline.py merged on one Fable 5.2 review (PASS on 8b77662) after four haiku queue FAILs with new non-regression points | evidence/direct-merges/nb06-eafe80a.md (committed in 4d49571)
 
 # 2026-11-18: scripts/dev_metrics.py, five commits merged with `git merge --ff-only` after refuted Haiku FAILs, on Lazlo's rule "If you're confident it's wrong just take the file". The audit finding A4 lists them; the last Haiku FAIL was on b9ae9e5 (q-20261118-074036). The author was the orchestrator.
 broadsword | e188dd40831d | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
@@ -21,4 +21,6 @@ broadsword | b9ae9e5913a9 | general rule, not a per-commit approval: Lazlo's "If
 broadsword | f3bdd38c3c8e | Lazlo ("outside the queue, per Lazlo", per IDEAS.md:41) | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
 broadsword | ec7a4796d371 | Lazlo ("outside the queue, per Lazlo", per IDEAS.md:41) | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
 
-
+# 2026-11-19: two 2026-11-18 orchestrator commits made outside the queue, approved by Lazlo after an independent Sonnet 5.5 review (both PASS); the review is in evidence/direct-merges/approvals-2026-11-19.md.
+broadsword | f4123a1a350d | Lazlo ("approve both direct commits after a Sonnet review", 2026-11-19) | broadsword.toml max_agents 4 -> 6 (ledger row RETRO.md); Sonnet 5.5 review PASS | evidence/direct-merges/approvals-2026-11-19.md
+render | 41849306f4d6 | Lazlo ("approve both direct commits after a Sonnet review", 2026-11-19) | render .gitattributes `*.ppm binary` for the golden images; Sonnet 5.5 review PASS | evidence/direct-merges/approvals-2026-11-19.md
