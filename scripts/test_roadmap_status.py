@@ -176,6 +176,53 @@ class T(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("1 done", out)
 
+    def test_escaping_paths_are_unverified(self):
+        # The outside targets exist, so only the containment rule can reject them.
+        outside = self.root.parent / "outside-roadmap-test.txt"
+        outside.write_text("x", encoding="utf-8")
+        try:
+            forms = [r"..\outside-roadmap-test.txt", "../outside-roadmap-test.txt", r"a\..\..\outside-roadmap-test.txt",
+                     r"\Windows\win.ini", "/Windows/win.ini", r"\\server\share\x", "//server/share/x",
+                     r"C:\Windows\win.ini", "C:win.ini", str(outside), "..", "real.txt/../../outside-roadmap-test.txt"]
+            for f in forms:
+                code, out = self.run_script(self.with_row("0.1", status="in progress", ev=f"`file:{f}`"))
+                self.assertEqual(code, 1, f)
+                self.assertIn("UNVERIFIED", out, f)
+            # the same forms as the repo part of a commit item
+            for f in (r"..\x", r"\Windows", r"C:\x", "../x"):
+                code, out = self.run_script(self.with_row("0.1", status="in progress", ev=f"`commit:{f}@{self.sha}`"))
+                self.assertEqual(code, 1, f)
+        finally:
+            outside.unlink()
+
+    def test_symlink_or_junction_out_of_root_is_refused(self):
+        outside = pathlib.Path(tempfile.mkdtemp(dir=scratch_base(), prefix="test-roadmap-out-"))
+        try:
+            (outside / "t.txt").write_text("x", encoding="utf-8")
+            link = self.root / "lnk"
+            try:
+                os.symlink(outside, link, target_is_directory=True)
+            except OSError:
+                if os.name == "nt":
+                    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True, capture_output=True)
+                else:
+                    raise
+            code, out = self.run_script(self.with_row("0.1", status="in progress", ev="`file:lnk/t.txt`"))
+            self.assertEqual(code, 1)
+            self.assertIn("UNVERIFIED", out)
+        finally:
+            import shutil
+            if (self.root / "lnk").exists():
+                os.rmdir(self.root / "lnk") if (self.root / "lnk").is_junction() or (self.root / "lnk").is_symlink() else None
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_malformed_part2_row_exits_2(self):
+        cap = CAP.replace("| 0.2 Math | Stuff | Tests pass |", "| 0.2 Math | Stuff |")
+        (self.root / "CAPABILITY_ROADMAP.md").write_text(cap, encoding="utf-8")
+        code, out = self.run_script()
+        self.assertEqual(code, 2, out)
+        self.assertIn("node 0.2", out)
+
     def test_not_started_must_not_cite_evidence(self):
         code, out = self.run_script(self.with_row("0.1", ev="`file:real.txt`"))
         self.assertEqual(code, 1)

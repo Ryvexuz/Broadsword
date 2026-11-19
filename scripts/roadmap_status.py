@@ -13,7 +13,7 @@ Exit 0 and `roadmap: ok, N nodes` when:
       `commit:<repo>@<sha>`    the same, in the repo at <repo> (for example projects/render)
     "done" also needs at least one `tag:` item. A status whose evidence is missing or does not check out is reported as
     UNVERIFIED and makes the exit code 1; it is never counted as done.
-Exit 1 with one line per problem otherwise. No network, no model calls.
+Exit 1 with one line per problem otherwise; exit 2 when a Part 2 node row is malformed (not three cells). No network, no model calls.
 """
 import sys
 
@@ -23,6 +23,10 @@ import argparse
 import pathlib
 import re
 import subprocess
+
+class MalformedRow(Exception):
+    """A Part 2 node row that cannot be read; the script exits 2."""
+
 
 STATUSES = ("not started", "in progress", "done")
 NODE_RE = re.compile(r"^\d+\.\d+$")
@@ -55,8 +59,10 @@ def capability_nodes(text):
             continue
         cells = table_cells(line)
         m = re.match(r"^(\d+\.\d+) (.+)$", cells[0])
-        if not m or len(cells) != 3:
+        if not m:
             continue
+        if len(cells) != 3:
+            raise MalformedRow(f"CAPABILITY_ROADMAP Part 2 row for node {m.group(1)} has {len(cells)} cells, not 3: {line[:80]!r}")
         name = re.split(r" \(| \\\[", m.group(2))[0].strip()
         if m.group(1) in nodes:
             raise ValueError(f"CAPABILITY_ROADMAP lists node {m.group(1)} twice")
@@ -122,9 +128,20 @@ def main_checkout(root):
     return pathlib.Path(r.stdout.strip()).parent
 
 
-def safe_rel(p):
-    pp = pathlib.PurePosixPath(p)
-    return bool(p) and not pp.is_absolute() and ".." not in pp.parts and not re.match(r"^[A-Za-z]:", p)
+def inside(base, rel):
+    """The path rel under base if it is a plain relative path that resolves inside base, else None.
+    Refuses empty, absolute, backslash-rooted, drive-letter and UNC paths and any '..' in either separator."""
+    if not rel or rel.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", rel):
+        return None
+    if ".." in re.split(r"[/\\]", rel):
+        return None
+    try:
+        full = (base / rel).resolve()
+        if not full.is_relative_to(base.resolve()):
+            return None
+    except (OSError, ValueError):
+        return None
+    return full
 
 
 def git_ok(repo, *args):
@@ -135,11 +152,15 @@ def check_evidence(item, root, main):
     """Return None when the evidence item checks out, else a reason."""
     kind, _, value = item.partition(":")
     if kind == "file":
-        if not safe_rel(value):
-            return f"path {value!r} is not a relative path inside the repo"
+        found = False
         for base in dict.fromkeys((root, main)):
-            if (base / value).exists():
-                return None
+            full = inside(base, value)
+            if full is not None:
+                found = True
+                if full.exists():
+                    return None
+        if not found:
+            return f"path {value!r} is not a relative path inside the repo"
         return f"file {value} does not exist"
     if kind == "tag":
         r = subprocess.run(["git", "-C", str(root), "tag", "--list", value], capture_output=True, text=True)
@@ -150,11 +171,11 @@ def check_evidence(item, root, main):
             repo_rel, sha = "", value
         if not re.fullmatch(r"[0-9a-f]{7,40}", sha):
             return f"commit id {sha!r} is not a hex sha"
-        if repo_rel and not safe_rel(repo_rel):
+        if repo_rel and not any(inside(b, repo_rel) for b in (root, main)):
             return f"repo path {repo_rel!r} is not a relative path inside the repo"
         for base in dict.fromkeys((root, main)):
-            repo = base / repo_rel if repo_rel else base
-            if repo.is_dir() and git_ok(repo, "cat-file", "-e", sha + "^{commit}") \
+            repo = inside(base, repo_rel) if repo_rel else base
+            if repo is not None and repo.is_dir() and git_ok(repo, "cat-file", "-e", sha + "^{commit}") \
                     and git_ok(repo, "merge-base", "--is-ancestor", sha, "HEAD"):
                 return None
         return f"commit {value} is not reachable from HEAD"
@@ -237,6 +258,9 @@ def main():
             return 1
     try:
         problems, unverified, n, counts = check(root, capability, roadmap)
+    except MalformedRow as e:
+        print(f"roadmap: FAILED, {e}")
+        return 2
     except ValueError as e:
         print(f"roadmap: FAILED, {e}")
         return 1
