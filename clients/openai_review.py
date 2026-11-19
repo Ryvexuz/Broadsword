@@ -5,6 +5,9 @@ The queue runs it as:  python -I -B clients/openai_review.py -p --system-prompt 
 `result` (the answer text), `is_error`, `total_cost_usd` (null unless prices are configured), `usage` and `modelUsage` (keyed by
 the model the API says answered). Exit code 0 or 1. The key is never printed.
 
+Codex runs with NO tool that can read a file or run a command (CODEX_NO_TOOLS_ARGS, docs/SHADOW_SANDBOX.md, proven by
+scripts/shadow_canary.py); an answer whose event stream shows any tool use is discarded ("codex_items" lists what was seen).
+
 Path order: the Codex CLI first (ChatGPT plan, `codex exec ... --json -o <file> -`, prompt on stdin, fresh temp folder); if it is missing
 or fails, the API below answers and the output records "backend": "api" plus "codex_error". A codex answer has "backend": "codex",
 "model_reported": false (codex does not name the model) and a null cost. It needs USERPROFILE/HOME/APPDATA/PATH for its sign-in;
@@ -134,6 +137,77 @@ def settings_of(environ):
 # The API fallback needs at least this many seconds; with less it fails with a clear error instead of starting a doomed call.
 MIN_API_SECONDS = 5.0
 
+# THE ONE PLACE codex's tool access is set (audit A6, docs/SHADOW_SANDBOX.md). The reviewed diff is untrusted text, so the model
+# must not be able to read any file: `--sandbox read-only` alone still lets its shell read every file by absolute path (canary
+# 2026-11-19). These flags take away every tool that can read a file or run a command, and `--strict-config` makes codex refuse to
+# start if a later version stops knowing any of them (it errors on an unknown -c key or feature name), so they can never
+# silently stop applying. What remains (codex 0.170.0, `codex debug prompt-input`): the code-mode `exec` (a V8 isolate with no
+# file system or network) whose only nested tools are apply_patch (writes only, refused by the read-only sandbox) and MCP
+# resource readers (no MCP server is configured), plus wait / request_user_input and the multi-agent tools (sub-agents get this
+# same configuration).
+CODEX_NO_TOOLS_ARGS = (
+    "--sandbox", "read-only",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--ignore-user-config",  # no user MCP servers (the Node REPL), plugins, notify hooks or project trust; sign-in still works
+    "--ignore-rules",  # no execpolicy .rules files
+    "--strict-config",
+    "--disable", "shell_tool",
+    "--disable", "unified_exec",
+    "--disable", "view_image",  # reads image files
+    "--disable", "apps",
+    "--disable", "plugins",
+    "--disable", "remote_plugin",
+    "--disable", "browser_use",
+    "--disable", "browser_use_external",
+    "--disable", "in_app_browser",
+    "--disable", "computer_use",
+    "--disable", "image_generation",
+    "--disable", "multi_agent",
+    "--disable", "multi_agent_v2",
+    "--disable", "sleep_tool",
+    "--disable", "goals",
+    "--disable", "tool_suggest",
+    "--disable", "skill_search",
+    "--disable", "skill_mcp_dependency_install",
+    "--disable", "hooks",
+    "--disable", "memories",
+    "--disable", "workspace_dependencies",
+    "-c", 'web_search="disabled"',
+    "-c", "project_doc_max_bytes=0",  # no AGENTS.md from the working folder or its parents
+    "-c", 'approval_policy="never"',  # nothing is ever approved
+)
+
+# The --json items a tool-free answer may contain. An MCP call is labelled `mcp_tool_call:<server>/<tool>`; the two allowed ones
+# are codex's built-in resource LISTINGS, which answer `[]` because no MCP server is configured (the model calls them when asked
+# to read a file; canary diagnostic 2026-11-19). Any other item (a command, a file change, read_mcp_resource, any other MCP or
+# sub-agent call, a web search...) means the model reached a tool: the answer is discarded and the call fails (a tripwire for a
+# codex update that brings a tool back).
+TOOL_FREE_ITEMS = frozenset({
+    "agent_message",
+    "reasoning",
+    "error",  # codex's own notices, such as "Falling back from WebSockets to HTTPS transport"
+    "mcp_tool_call:codex/list_mcp_resources",
+    "mcp_tool_call:codex/list_mcp_resource_templates",
+})
+
+
+def codex_item_types(stdout: str) -> list:
+    """Every item in codex's --json event stream, as sorted labels: the item type, or `mcp_tool_call:<server>/<tool>`."""
+    seen = set()
+    for line in (stdout or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and str(ev.get("type", "")).startswith("item.") and isinstance(ev.get("item"), dict):
+            item = ev["item"]
+            kind = str(item.get("type"))
+            if kind == "mcp_tool_call":
+                kind = f"{kind}:{item.get('server')}/{item.get('tool')}"
+            seen.add(kind)
+    return sorted(seen)
+
 
 def kill_tree(p) -> None:
     """Kill the process and everything it started. On Windows codex is a codex.cmd, so killing only the pid leaves the node
@@ -184,9 +258,13 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
     budget = min(timeout * share, deadline - time.monotonic())
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
-        cmd = [exe, "exec", "-m", args.model, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", str(answer), "-"]
+        cmd = [exe, "exec", "-m", args.model, *CODEX_NO_TOOLS_ARGS, "--json", "-o", str(answer), "-"]
         child = codex_env(environ, oc.find_main_root(HERE))
         code, stdout, stderr = run_with_deadline(cmd, text_in, work, child, budget)
+        items = codex_item_types(stdout)
+        tools = [t for t in items if t not in TOOL_FREE_ITEMS]
+        if tools:
+            raise oc.Fail(f"codex used a tool ({', '.join(tools)}); its answer is discarded")
         if code != 0:
             raise oc.Fail(f"codex exited with code {code}: {(stderr or '').strip()[-200:]}")
         text = answer.read_text(encoding="utf-8", errors="replace") if answer.is_file() else ""
@@ -212,6 +290,7 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
         "modelUsage": {args.model: {"inputTokens": tin, "outputTokens": tout}},
         "model_reported": False,
         "backend": "codex",
+        "codex_items": items,
     }
 
 

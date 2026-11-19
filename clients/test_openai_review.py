@@ -67,8 +67,28 @@ if mode == "garbage":
     print("this is not json")
     sys.exit(0)
 print(json.dumps({"type": "thread.started"}))
+print(json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Falling back from WebSockets to HTTPS transport."}}))
+print(json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "reasoning", "text": "thinking"}}))
+# what the real codex 0.170.0 printed after the fix when asked to read a file: the built-in resource listing, answering []
+print(json.dumps({"type": "item.completed", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "codex", "tool": "list_mcp_resources", "arguments": {}, "result": {"content": [{"type": "text", "text": "{\"resources\":[]}"}]}, "status": "completed"}}))
+if mode == "readres":
+    print(json.dumps({"type": "item.completed", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "codex", "tool": "read_mcp_resource", "arguments": {"uri": "file:///x"}, "status": "completed"}}))
+if mode == "tool":
+    # what the real codex printed before the fix: the model ran a command that read a file
+    print(json.dumps({"type": "item.started", "item": {"id": "item_2", "type": "command_execution", "command": "Get-Content ../planted-secret.txt"}}))
+    open(out, "w", encoding="utf-8").write("CANARY: TOOLREAD-SECRET-42\nVERDICT: PASS")
+print(json.dumps({"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "VERDICT: FAIL"}}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 7, "reasoning_output_tokens": 3}}))
 '''
+
+# Flags that must reach codex so the model has no tool that reads a file or runs a command (docs/SHADOW_SANDBOX.md). Written out
+# here on purpose, not imported from the wrapper, so a flag dropped from the wrapper fails this test.
+NO_FILE_ACCESS_FLAGS = ["--sandbox read-only", "--ignore-user-config", "--ignore-rules", "--strict-config", "--disable shell_tool",
+                        "--disable unified_exec", "--disable view_image", "--disable apps", "--disable plugins", "--disable remote_plugin",
+                        "--disable browser_use", "--disable browser_use_external", "--disable in_app_browser", "--disable computer_use",
+                        "--disable image_generation", "--disable multi_agent", "--disable multi_agent_v2", "--disable hooks",
+                        "--disable memories", "--disable skill_mcp_dependency_install", '-c web_search="disabled"',
+                        "-c project_doc_max_bytes=0", '-c approval_policy="never"']
 
 
 def completion(text, finish="stop", model="gpt-5.6-sol-2026-01-01"):
@@ -189,6 +209,41 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(cwd.exists(), "the temp working folder is deleted afterwards")
         self.assertTrue(str(cwd).startswith(str(Path(tempfile.gettempdir()).resolve())), "under the system temp folder")
         self.assertNotIn(FAKE_KEY, p.stdout + p.stderr)
+
+    def test_codex_gets_the_no_file_access_settings(self):
+        p = self.run_script(codex="ok")
+        self.assertEqual(json.loads(p.stdout)["backend"], "codex", p.stdout)
+        args = json.loads((self.codex_dir / "seen.json").read_text(encoding="utf-8"))["args"]
+        pairs = {f"{a} {b}" for a, b in zip(args, args[1:])}
+        for flag in NO_FILE_ACCESS_FLAGS:
+            if " " in flag:
+                self.assertIn(flag, pairs, f"codex must get `{flag}`")
+            else:
+                self.assertIn(flag, args, f"codex must get `{flag}`")
+        self.assertNotIn("--sandbox workspace-write", pairs)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
+        self.assertNotIn("--search", args)
+        self.assertLess(args.index("--strict-config"), args.index("-"), "a setting codex does not know stops it before the prompt is sent")
+
+    def test_codex_tool_use_discards_the_answer_and_falls_back(self):
+        p = self.run_script(codex="tool")
+        j = json.loads(p.stdout)
+        self.assertEqual(j["backend"], "api", j)
+        self.assertIn("codex used a tool (command_execution)", j["codex_error"])
+        self.assertNotIn("TOOLREAD-SECRET-42", p.stdout + p.stderr, "the answer of a codex that used a tool is never printed")
+        self.assertEqual(len(Fake.seen), 1, "the API (which has no tools) answers instead")
+
+    def test_reading_an_mcp_resource_also_trips(self):
+        p = self.run_script(codex="readres")
+        j = json.loads(p.stdout)
+        self.assertEqual(j["backend"], "api", j)
+        self.assertIn("codex used a tool (mcp_tool_call:codex/read_mcp_resource)", j["codex_error"])
+
+    def test_codex_items_are_reported_and_tool_free_ones_pass(self):
+        p = self.run_script(codex="ok")
+        j = json.loads(p.stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertEqual(j["codex_items"], ["agent_message", "error", "mcp_tool_call:codex/list_mcp_resources", "reasoning"])
 
     def test_codex_child_env_has_no_api_key(self):
         p = self.run_script(codex="ok", env={"OPENAI_API_KEY": FAKE_KEY, "COPY_OF_KEY": FAKE_KEY})
