@@ -3,8 +3,11 @@
 //! Simple on purpose: spring-damper beams, symplectic Euler, y = 0 ground with
 //! restitution and friction. Std only, deterministic (no RNG, fixed step order).
 
+pub mod format;
 pub mod solver;
 pub mod vec3;
+
+pub use format::{Body, ParseError};
 
 use solver::{Solver, State, SymplecticEuler};
 use vec3::Vec3;
