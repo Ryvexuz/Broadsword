@@ -1,5 +1,22 @@
 # Progress
 
+## PAUSE HANDOFF (2026-11-19, about 23:02 UTC, Lazlo's restart: read this first)
+
+Paused by the inbox item 2026-11-19T22:56Z. State at pause: queue idle (0 queued, 0 running), no broadsword/cargo/rustc process, no build or recover lock held, no coder or ahead agent running, the inbox loop deleted, the queue driver and the RAM/CPU sampler stopped. max_agents = 14 (step 2 of the slot climb; not stepped to 18: about 7 merges/h vs 8.44/h at 10, see state/pc-progress.md).
+
+**Resume in this order:**
+1. Log `RESUMED <UTC>` in state/pc-progress.md, mark the 22:56Z PAUSE item [x] in state/pc-inbox.md, read the inbox.
+2. Re-add the 9 queue entries cancelled for the pause, in this order (list in state/staging/records/pause-requeue-2026-11-19.tsv: entry, task, risk, coder): `broadsword queue add <task> --risk <risk> --coder <coder> --brief scratch/briefs/<task>.md` (if scratch/briefs was wiped, copy state/backlog/<task>.md there first). Then start ONE queue driver (set BROADSWORD_REVIEWER_CLI per command).
+3. Resume the two paused coders from their briefs' "## Paused (2026-11-19)" sections: tp3 fix round t-20261118-095350-3 (WIP 32797d3: scrub via one cargo factory, cargo test order; next: full suite twice, lock-wait re-measure, then queue --risk high, Opus) and n20-23 menu t-20261119-223123-9 (WIP c769207; next: fails-before, full suite, final commit).
+4. Fix round for nb-21 t-20261119-171333-19 (rejected 23:00Z by haiku, q-20261119-222244: claim-breach path when codex errors; read the .review/.shadow.review, apply rule 34 if the points refute).
+5. Restart the inbox loop (every 5 min) and the sampler (scratch/scale/sampler.ps1 -> a new sys-*.csv).
+
+**Approved by Lazlo, not yet acted on:** the n20-02 follow-up may read public pages (Euro NCAP, IIHS, SAE, OLC papers, steel data; no accounts or fees, report anything paywalled) to verify the 9 unverified V-figures; Lazlo is checking the NHTSA public-domain wording in a browser.
+
+**Waiting work:** about 17 patches staged as ahead-work in state/staging/ (ledger state/staging/AHEAD.md); most sit on tp3's first tip d30c74e and need porting onto tp3's fixed tip. The merge train (t-20261119-222633) waits for tp3, tp4, nb-17, nb-18. Trial T1 boarded (t-20261119-222633-2); T2-T5 wait for T1's verdict. Six GPT trial-coder batch tasks wait for nb-21. 8 roadmap briefs boarded, not started. state/cleanup-pending.md (32 lines) awaits Lazlo's yes; scratch/autoclean.py runs every 2 h.
+
+---
+
 Rewritten at the end of each session. Last updated 2026-11-19, about 21:30 UTC, on the EVO-X3 PC (the PC session). The session covered: the work-ahead batch (46 briefs boarded), Lazlo's model routing, the Stage 4 v1 audit and close, a Secrets fix to the Codex shadow, the secret-file rule, the max_agents scale-up test, and many tooling merges. Step by step log: `state/pc-progress.md` (outside Git). Lazlo steers through `state/pc-inbox.md`: read it after every step.
 
 ## Moving to another drive or PC
