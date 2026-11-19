@@ -347,3 +347,56 @@ fn a_stream_of_a_secret_file_is_a_secret() {
     }
     assert_unreachable_from_broadsword_refs(&p, &blob);
 }
+
+/// Re-review finding (fail-open past MAX_PATH): in a folder deeper than 260 characters the long name of `KEYS.TXT` (a
+/// short name an admin gave `.env` with `fsutil file setshortname`) and of `ENV~1` must still be found, and a file whose
+/// long name cannot be found is a secret. Staged under those names, the secret bytes must never reach a
+/// `refs/broadsword/*` ref.
+#[cfg(windows)]
+#[test]
+fn a_short_name_of_a_secret_in_a_folder_past_max_path_is_a_secret() {
+    const TEST: &str = "a_short_name_of_a_secret_in_a_folder_past_max_path_is_a_secret";
+    let r = Root::new("deep");
+    let p = r.project();
+    git(&p, &["config", "core.longpaths", "true"]);
+    // Made in a short folder (fsutil cannot name a `\\?\` path), then the folder is moved deep: short names move with it.
+    fs::create_dir_all(p.join("z")).unwrap();
+    fs::create_dir_all(p.join("y")).unwrap();
+    fs::write(p.join("z").join(".env"), "API_KEY=sk-fake-deep-custom-short-name\n").unwrap();
+    fs::write(p.join("y").join(".env"), "API_KEY=sk-fake-deep-env-tilde-alias\n").unwrap();
+    let custom = Command::new("fsutil").args(["file", "setshortname"]).arg(p.join("z").join(".env")).arg("KEYS.TXT").output().expect("fsutil");
+    if !custom.status.success() {
+        say_skipped(TEST, &format!("`fsutil file setshortname` is not permitted here (it needs admin rights and 8.3 names on the volume): {}", text(&custom.stdout).trim()));
+        return;
+    }
+    let Some(tilde) = short_name(&p.join("y").join(".env")) else {
+        say_skipped(TEST, &format!("the volume holding {} gives files no 8.3 short names", p.display()));
+        return;
+    };
+    let deep_rel = vec!["d".repeat(60); 5].join("/");
+    let deep = p.join(&deep_rel);
+    fs::create_dir_all(&deep).unwrap();
+    fs::rename(p.join("z"), deep.join("z")).unwrap();
+    fs::rename(p.join("y"), deep.join("y")).unwrap();
+    let (keys, alias) = (format!("{deep_rel}/z/KEYS.TXT"), format!("{deep_rel}/y/{tilde}"));
+    assert!(p.join(&keys).display().to_string().len() > 300, "the path really is past MAX_PATH");
+    assert_eq!(fs::read_to_string(p.join(&keys)).unwrap(), "API_KEY=sk-fake-deep-custom-short-name\n", "KEYS.TXT is .env");
+    git(&p, &["update-index", "--add", &keys, &alias]);
+    let blobs: Vec<String> = [&keys, &alias].iter().map(|f| git(&p, &["hash-object", "--no-filters", f])).collect();
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    for s in [&keys, &alias] {
+        assert!(Root::field(&rec, "secret_skipped").split('|').any(|f| f == s.as_str()), "{s} is listed as a secret: {rec}");
+    }
+    for rf in [format!("refs/broadsword/checkpoints/{id}"), format!("refs/broadsword/index/{id}")] {
+        let paths = tree_paths(&p, &rf);
+        assert!(!paths.iter().any(|f| f == &keys || f == &alias), "no short name of a secret in {rf}: {paths:?}");
+        assert!(paths.iter().any(|f| f == "tracked.txt"), "{paths:?}");
+    }
+    for h in &blobs {
+        assert_unreachable_from_broadsword_refs(&p, h);
+    }
+}

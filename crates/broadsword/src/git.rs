@@ -79,17 +79,37 @@ fn looks_like_short_name(name: &str) -> bool {
     }
 }
 
-/// The long (real) name of the last part of `p` as the file system has it, if `p` exists. On Windows this is
-/// `GetLongPathNameW`, which turns an 8.3 alias (`ENV~1`) into the name it stands for (`.env`) and does not follow links.
+/// `p` as an absolute `\\?\` path (`\\?\UNC\` for a share), NUL-terminated, so a Win32 call is not cut at MAX_PATH.
+/// `std::path::absolute` (GetFullPathNameW) first resolves `.`/`..`, turns `/` into `\` and drops trailing dots and spaces,
+/// which a `\\?\` path would otherwise keep literally.
+#[cfg(windows)]
+fn verbatim_wide(p: &Path) -> Option<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let abs: Vec<u16> = std::path::absolute(p).ok()?.as_os_str().encode_wide().collect();
+    let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    let mut out = if abs.starts_with(&w(r"\\?\")) || abs.starts_with(&w(r"\\.\")) {
+        abs
+    } else if abs.starts_with(&w(r"\\")) {
+        [w(r"\\?\UNC\"), abs[2..].to_vec()].concat()
+    } else {
+        [w(r"\\?\"), abs].concat()
+    };
+    out.push(0);
+    Some(out)
+}
+
+/// The long (real) name of the last part of `p` as the file system has it, if `p` exists and it can be resolved. On
+/// Windows this is `GetLongPathNameW` on the `\\?\` form of the path (any length), which turns an 8.3 alias (`ENV~1`, or a
+/// short name an admin set, like `KEYS.TXT`) into the name it stands for (`.env`) and does not follow links.
 #[cfg(windows)]
 fn long_name(p: &Path) -> Option<String> {
     use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
     #[link(name = "kernel32")]
     extern "system" {
         fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
     }
-    let wide: Vec<u16> = p.as_os_str().encode_wide().map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c }).chain(Some(0)).collect();
+    let wide = verbatim_wide(p)?;
     let mut buf = vec![0u16; 512];
     loop {
         // SAFETY: `wide` is NUL-terminated and `buf` holds `buf.len()` u16s; the call writes at most that many.
@@ -101,7 +121,10 @@ fn long_name(p: &Path) -> Option<String> {
             buf.truncate(n);
             break;
         }
-        buf.resize(n + 1, 0); // too small: `n` is the size needed
+        if n > 32_768 + 8 {
+            return None; // more than any Windows path can hold: never trusted
+        }
+        buf.resize(n + 1, 0); // too small: `n` is the size needed (with its NUL); retry with that size
     }
     let long = OsString::from_wide(&buf).to_string_lossy().into_owned();
     long.rsplit(['/', '\\']).next().map(str::to_string)
@@ -114,9 +137,9 @@ fn long_name(p: &Path) -> Option<String> {
 
 /// THE one rule for what a secret file is: `path` (relative to `base`; `/` and a backslash separate folders) is a secret
 /// when the last part's name is a secret name (`is_secret_name`), OR, when it exists on disk, the long name the file system
-/// has for it is one (so `ENV~1`, the 8.3 alias of `.env`, is a secret), OR it is shaped like an 8.3 alias
-/// (`looks_like_short_name`) and its long name cannot be found (strict: a missing alias may stand for a secret).
-/// A FOLDER named `.env` (a Python venv) does not make its files secret.
+/// has for it is one (so `ENV~1`, the 8.3 alias of `.env`, is a secret), OR it exists but its long name cannot be resolved
+/// (fail closed), OR it is shaped like an 8.3 alias (`looks_like_short_name`) and does not exist (strict: a missing alias
+/// may stand for a secret). A FOLDER named `.env` (a Python venv) does not make its files secret.
 ///
 /// Every place that captures, restores, deletes or lists files calls this function: checkpoint capture (`capture`), the
 /// stored index trees (`secret_free_tree`, and the index entries rollback keeps), rollback (`changes`, `Guard`) and,
@@ -136,7 +159,8 @@ pub fn is_secret_in(base: &Path, path: &str) -> bool {
     let on_disk = if parent.is_empty() { base.join(file) } else { base.join(parent).join(file) };
     match long_name(&on_disk) {
         Some(long) => is_secret_name(&long),
-        None => name.split(':').any(looks_like_short_name),
+        // Cannot resolve: a file that exists is a secret (its real name is unknown), a missing one only if alias-shaped.
+        None => std::fs::symlink_metadata(&on_disk).is_ok() || name.split(':').any(looks_like_short_name),
     }
 }
 
@@ -1115,6 +1139,33 @@ mod tests {
             assert!(safe_rel(bad).is_err(), "{bad}");
         }
         assert!(safe_rel("sub/ok.txt").is_ok());
+    }
+
+    /// Past MAX_PATH the long name is still resolved (the `\\?\` form), so an ordinary deep file is NOT made a secret by the
+    /// fail-closed branch, and a deep `.env` is found under its 8.3 alias.
+    #[cfg(windows)]
+    #[test]
+    fn long_names_resolve_past_max_path() {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch");
+        let base = scratch.join(format!("git-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let deep_rel = vec!["e".repeat(60); 5].join("/");
+        let deep = base.join(&deep_rel);
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("ordinary.txt"), "x").unwrap();
+        fs::write(deep.join(".env"), "SECRET=deep").unwrap();
+        assert!(deep.join("ordinary.txt").display().to_string().len() > 300);
+        assert_eq!(long_name(&deep.join("ordinary.txt")).as_deref(), Some("ordinary.txt"), "resolved, not given up on");
+        assert!(!is_secret_in(&base, &format!("{deep_rel}/ordinary.txt")));
+        match long_name(&deep.join("ENV~1")) {
+            Some(long) => assert_eq!(long, ".env"),
+            None => {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "SKIPPED long_names_resolve_past_max_path (alias part): the volume gives no 8.3 names");
+            }
+        }
+        assert!(is_secret_in(&base, &format!("{deep_rel}/ENV~1")), "an alias is a secret whether or not it resolves");
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// Paths in a tree, recursively.
