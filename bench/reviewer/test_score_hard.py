@@ -126,8 +126,8 @@ class ScoreHard(unittest.TestCase):
             other_file = "src/log.rs" if bug["file"] != "src/log.rs" else "src/paths.rs"
             moved = line.replace(bug["file"], other_file)
             self.assertEqual(score_hard.score_text(moved, CASE)["caught"], [], moved)
-            same_file = [i for i in CASE["bugs"] + CASE["decoys"] if i["file"] == bug["file"] and i["id"] != bid]
-            if same_file:  # a number that points at another item of the same file moves the finding there
+            same_file = [i for i in CASE["decoys"] if i["file"] == bug["file"]]
+            if same_file:  # a number that points at a decoy of the same file moves the finding there
                 far = re.sub(r"\.rs:\d+", ".rs:%d" % same_file[0]["lines"][0], line)
                 self.assertEqual(score_hard.score_text(far, CASE)["caught"], [], far)
             nofile = re.sub(r"src/\w+\.rs(:\d+)?", "the code", line)
@@ -138,6 +138,16 @@ class ScoreHard(unittest.TestCase):
         self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b07"])
         line = self.BUG_LINES["b01"].replace("src/config.rs:63", "src/config.rs:55-58")
         self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b01"])
+
+    def test_b04_is_credited_where_the_secret_is_logged_too(self):
+        line = "BLOCKING: src/lib.rs:25 - Queue::open logs the whole Config with {:?}, which writes api_token in plain text to the log."
+        self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b04"])
+        line = line.replace("lib.rs:25", "lib.rs:45")  # at decoy d1
+        self.assertEqual(score_hard.score_text(line, CASE)["caught"], [])
+
+    def test_a_number_at_another_bug_does_not_lose_a_correct_finding(self):
+        line = self.BUG_LINES["b08"].replace("store.rs:162", "store.rs:158")
+        self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b08"])
 
     def test_review_examples_tightened(self):
         # b09: LockGuard on another topic; b11: a log.rs comment line; b12: config.rs's cast

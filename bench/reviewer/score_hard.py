@@ -11,8 +11,8 @@ Per review:
   alarms, so they are checked by hand (-v prints them).
 Location rule (the one place that keeps bugs and decoys apart): a line counts for a bug or decoy only if it names that
 item's file (`src/log.rs`, `src/retry.rs`, ...) and its line number (`file:N` or `file:N-M`), if given, is not at a
-DIFFERENT item of that file (within LINE_SLACK of that item's `lines`). A number that points at no item is not held
-against the finding, because reviewers' line numbers are often far off. Only then is the item's `catch` regex applied. A line with no file counts for
+DECOY of that file (within LINE_SLACK of the decoy's `lines`), unless it is the item's own place. Numbers that point at
+another bug or at nothing are not held against the finding, because reviewers' line numbers are often far off. Only then is the item's `catch` regex applied. A line with no file counts for
 nothing (it is "other"). A line without a number counts for every item in its file whose wording matches.
 Items can still overlap where their locations do and the wording is loose (b08 and b09 share store.rs:157-169); the
 tests in test_score_hard.py check that no sample line credits two items, so that is enforced, not assumed.
@@ -62,15 +62,17 @@ def _overlaps(item, a, z):
 
 
 def at_item(line, item, case):
-    """The finding names the item's file, and its line number does not point at a different item of that file.
-    Reviewers often give line numbers that are off by a lot, so a number that points at no item at all is not held
-    against the finding; the wording then decides."""
+    """The finding names the item's file (or one of its `also_files`: where the bug shows up as well as where it is
+    written, e.g. b04's secret is logged in lib.rs) and its line number, if given, is not at a DECOY of that file.
+    Reviewers' line numbers are often far off and bugs share a file, so a number that points at another bug, or at
+    no item, is not held against the finding: the wording decides (the tests check the wording of bugs in one
+    file is disjoint). A number that points at a decoy is held against it, so a decoy false alarm never credits a bug."""
     f, a, z = parse_loc(line)
-    if f is None or f != _basename(item["file"]):
+    if f is None or f not in [_basename(p) for p in [item["file"]] + item.get("also_files", [])]:
         return False
-    if a is None or _overlaps(item, a, z):
+    if a is None or _overlaps(item, a, z) or item in case["decoys"]:
         return True
-    return not any(_basename(i["file"]) == f and _overlaps(i, a, z) for i in case["bugs"] + case["decoys"])
+    return not any(_basename(d["file"]) == f and _overlaps(d, a, z) for d in case["decoys"])
 
 
 def matches(line, item, case):
