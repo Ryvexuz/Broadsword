@@ -707,7 +707,9 @@ pub fn rollback(
 
     let apply = || -> Result<Rollback, String> {
     let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
-    let mut secret_skipped = Vec::new();
+    // Every secret file in the folder right now (this attempt's capture lists them by name only, before any blob is made:
+    // tracked, untracked or ignored, the job's new ones included) is left exactly as it is, and named.
+    let mut secret_skipped = cap.secret_skipped.clone();
     let main = changes(dir, &cap.tree, &ckpt_tree, &mut secret_skipped)?;
     let ignored = match (checkpoint_ignored_ref, &cap.ignored_tree) {
         (Some(r), now) => {

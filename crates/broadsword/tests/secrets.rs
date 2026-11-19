@@ -543,3 +543,42 @@ fn secret_names_with_a_pipe_and_a_newline_round_trip_through_the_record_and_reco
     assert!(staged.split('\0').any(|f| f == ".env.a|b") && staged.split('\0').any(|f| f == ".env.c\nd"), "index entries kept: {staged:?}");
     r.children.clear();
 }
+
+/// Shadow finding on q-20261119-211149: secret files the interrupted job CREATED (one ignored by a `.env.*` rule, one not
+/// ignored) are left exactly as they are by rollback, and `recover` names both, not only the ones the checkpoint saw.
+#[test]
+fn recover_names_secret_files_the_job_created() {
+    let mut r = Root::new("jobmade");
+    let p = r.project();
+    fs::write(p.join(".gitignore"), ".env.*\n!.env.new\n").unwrap();
+    git(&p, &["add", ".gitignore"]);
+    git(&p, &["commit", "-q", "-m", "ignore .env.* except .env.new"]);
+    let line = if cfg!(windows) {
+        "echo changed> tracked.txt & echo API_KEY=sk-fake-job-made-1> .env.job & echo API_KEY=sk-fake-job-made-2> .env.new & ping -n 30 127.0.0.1 >nul"
+    } else {
+        "echo changed > tracked.txt; echo API_KEY=sk-fake-job-made-1 > .env.job; echo API_KEY=sk-fake-job-made-2 > .env.new; sleep 30"
+    };
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have made both secret files", 90, || {
+        let recs = r.records();
+        recs.len() == 1 && !Root::field(&recs[0], "child_pid").is_empty() && p.join(".env.job").exists() && fs::read_to_string(p.join(".env.new")).is_ok_and(|s| s.contains("made-2"))
+    });
+    assert_eq!(text(&git_out(&p, &["check-ignore", ".env.job"]).stdout).trim(), ".env.job", ".env.job is ignored");
+    assert!(!git_out(&p, &["check-ignore", ".env.new"]).status.success(), ".env.new is not ignored");
+    let before: Vec<Vec<u8>> = [".env.job", ".env.new"].iter().map(|f| fs::read(p.join(f)).unwrap()).collect();
+    let id = Root::field(&r.only_record(), "id");
+    kill_hard(bs_pid);
+    let out = r.run(&["recover", &id]);
+    let so = text(&out.stdout);
+    println!("{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap(), "original\n", "tracked files are restored");
+    let after: Vec<Vec<u8>> = [".env.job", ".env.new"].iter().map(|f| fs::read(p.join(f)).unwrap()).collect();
+    assert_eq!(after, before, "both secrets are left exactly as they are");
+    let named: Vec<&str> = so.lines().filter_map(|l| l.split_once("secret file left exactly as it is (a rollback never restores, overwrites or deletes one): ").map(|(_, n)| n)).collect();
+    for f in [".env.job", ".env.new"] {
+        assert!(named.contains(&f), "{f} is named: {so}");
+    }
+    assert!(!so.contains("sk-fake-job-made"), "names only, never content: {so}");
+    r.children.clear();
+}
