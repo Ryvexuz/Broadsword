@@ -501,11 +501,26 @@ class CompareTests(unittest.TestCase):
             self.assertEqual(self.verdict(rows, m), "NOISE", m)
         self.assertEqual(overall, "NOISE")
 
-    def test_a_change_from_zero_is_noise_not_worse(self):
+    def test_a_harm_counter_rising_from_zero_is_worse(self):
         rows, overall = bl.compare(self.base(20, 3.0, main_check_failed=0), self.base(20, 3.0, main_check_failed=1), 5, 10)
         row = next(r for r in rows if r[0] == "main_check_failed")
+        self.assertEqual((row[4], row[5]), ("WORSE", "from 0"))
+        self.assertEqual(overall, "WORSE")
+
+    def test_harm_from_zero_beats_a_big_gain_elsewhere(self):
+        b = self.base(20, 3.0, reverted_or_reopened=0, main_check_failed=0, lead_median_s=1000)
+        a = self.base(20, 3.0, reverted_or_reopened=4, main_check_failed=3, lead_median_s=800)
+        rows, overall = bl.compare(b, a, 5, 10)
+        self.assertEqual(self.verdict(rows, "lead_median_s"), "BETTER")
+        self.assertEqual(self.verdict(rows, "reverted_or_reopened"), "WORSE")
+        self.assertEqual(overall, "WORSE")
+
+    def test_a_counter_falling_to_zero_or_a_share_from_zero_is_not_worse(self):
+        rows, overall = bl.compare(self.base(20, 3.0, main_check_failed=2, idle_share=0.0),
+                                   self.base(20, 3.0, main_check_failed=0, idle_share=0.2), 5, 10)
+        self.assertEqual(self.verdict(rows, "main_check_failed"), "BETTER")
+        row = next(r for r in rows if r[0] == "idle_share")
         self.assertEqual((row[4], row[5]), ("NOISE", "before is 0, no relative change"))
-        self.assertEqual(overall, "NOISE")
 
     def test_unknown_metric_is_bad_input(self):
         with self.assertRaises(bl.InputError):
@@ -583,6 +598,16 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("after.json", res.stderr)
         self.assertIn("lead_median_s", res.stderr)
+
+    def test_malformed_merged_with_coder_run_is_bad_input(self):
+        self.r.put_baseline("before", 20, 3.0)
+        for bad in ("many", True, 1.5):
+            self.r.put_baseline("after", 20, 3.0, samples={"merged_with_coder_run": bad})
+            res = self.r.run("compare", "before", "after", "--min-samples", "5", "--noise", "10")
+            self.assertEqual(res.returncode, 1, f"{bad!r}: {res.stdout}")
+            self.assertIn("after.json", res.stderr)
+            self.assertIn("merged_with_coder_run", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
 
     def test_cli_prints_both_sides_notes(self):
         self.r.put_baseline("before", 20, 3.0, notes=["lower bound here"])

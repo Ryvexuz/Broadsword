@@ -517,6 +517,9 @@ def validate_baseline(data, path):
     mt = data["samples"].get("merged_tasks")
     if isinstance(mt, bool) or not isinstance(mt, int):
         bad("`samples.merged_tasks` missing or not a whole number")
+    mc = data["samples"].get("merged_with_coder_run")
+    if mc is not None and (isinstance(mc, bool) or not isinstance(mc, int)):
+        bad("`samples.merged_with_coder_run` is not a whole number")
     missing = [m for m in METRICS if m not in LATER_METRICS and m not in data["metrics"]]
     if missing:
         bad(f"`metrics` lacks {', '.join(missing)}")
@@ -641,6 +644,9 @@ def compare(before, after, min_samples, noise, metrics=None):
             verdict, reason = "NOISE", f"fewer than {min_samples} merged tasks (before {nb}, after {na})"
         elif m == "coder_tokens_per_merged" and (cb < min_samples or ca < min_samples):
             verdict, reason = "NOISE", f"fewer than {min_samples} merged tasks with a coder run (before {cb}, after {ca})"
+        elif change is None and unit == "count" and a > b:
+            # A harm counter (reverts, failed main checks) rising from 0 is real harm, whatever --noise says.
+            verdict, reason = "WORSE", "from 0"
         elif change is None:
             verdict, reason = "NOISE", "before is 0, no relative change"
         elif abs(change) <= noise:
