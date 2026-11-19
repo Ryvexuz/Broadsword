@@ -49,7 +49,12 @@ d = os.path.dirname(os.path.abspath(__file__))
 mode = open(os.path.join(d, "mode"), encoding="utf-8").read().strip()
 args = sys.argv[1:]
 stdin = sys.stdin.read()
-json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd(), "env": dict(os.environ)}, open(os.path.join(d, "seen.json"), "w", encoding="utf-8"))
+sys.stdout.reconfigure(encoding="utf-8")  # codex writes UTF-8; raw U+2028 must survive
+catalog = None
+for a in args:
+    if a.startswith("model_catalog_json='") and a.endswith("'"):
+        catalog = json.load(open(a[len("model_catalog_json='"):-1], encoding="utf-8"))
+json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd(), "env": dict(os.environ), "catalog": catalog}, open(os.path.join(d, "seen.json"), "w", encoding="utf-8"))
 sys.stderr.write("unrelated MCP connection error\n")
 if mode == "fail":
     sys.exit(1)
@@ -69,8 +74,16 @@ if mode == "garbage":
 print(json.dumps({"type": "thread.started"}))
 print(json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Falling back from WebSockets to HTTPS transport."}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "reasoning", "text": "thinking"}}))
-# what the real codex 0.170.0 printed after the fix when asked to read a file: the built-in resource listing, answering []
-print(json.dumps({"type": "item.completed", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "codex", "tool": "list_mcp_resources", "arguments": {}, "result": {"content": [{"type": "text", "text": "{\"resources\":[]}"}]}, "status": "completed"}}))
+if mode == "mcplist":
+    # what codex 0.170.0 printed with b640db9's flags: the built-in resource listing, answering []
+    print(json.dumps({"type": "item.completed", "item": {"id": "item_4", "type": "mcp_tool_call", "server": "codex", "tool": "list_mcp_resources", "arguments": {}, "result": {"content": [{"type": "text", "text": "{\"resources\":[]}"}]}, "status": "completed"}}))
+if mode == "u2028":
+    # a tool item whose text holds raw U+2028 / U+2029 / U+0085 (codex does not escape them): str.splitlines() cut it apart
+    print(json.dumps({"type": "item.started", "item": {"id": "item_6", "type": "command_execution", "command": "type x y z\u0085w"}}, ensure_ascii=False))
+if mode == "u2028ok":
+    print(json.dumps({"type": "item.completed", "item": {"id": "item_7", "type": "reasoning", "text": "a b c\u0085d"}}, ensure_ascii=False))
+if mode == "newevent":
+    print(json.dumps({"type": "turn.tool_call", "name": "something new"}))
 if mode == "readres":
     print(json.dumps({"type": "item.completed", "item": {"id": "item_5", "type": "mcp_tool_call", "server": "codex", "tool": "read_mcp_resource", "arguments": {"uri": "file:///x"}, "status": "completed"}}))
 if mode == "tool":
@@ -83,12 +96,15 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "cache
 
 # Flags that must reach codex so the model has no tool that reads a file or runs a command (docs/SHADOW_SANDBOX.md). Written out
 # here on purpose, not imported from the wrapper, so a flag dropped from the wrapper fails this test.
-NO_FILE_ACCESS_FLAGS = ["--sandbox read-only", "--ignore-user-config", "--ignore-rules", "--strict-config", "--disable shell_tool",
-                        "--disable unified_exec", "--disable view_image", "--disable apps", "--disable plugins", "--disable remote_plugin",
-                        "--disable browser_use", "--disable browser_use_external", "--disable in_app_browser", "--disable computer_use",
-                        "--disable image_generation", "--disable multi_agent", "--disable multi_agent_v2", "--disable hooks",
-                        "--disable memories", "--disable skill_mcp_dependency_install", '-c web_search="disabled"',
-                        "-c project_doc_max_bytes=0", '-c approval_policy="never"']
+NO_FILE_ACCESS_FLAGS = ["--sandbox read-only", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+                        "--strict-config", "-c tools.experimental_request_user_input.enabled=false",
+                        "--disable shell_tool", "--disable unified_exec", "--disable view_image", "--disable apps", "--disable plugins",
+                        "--disable remote_plugin", "--disable browser_use", "--disable browser_use_external", "--disable in_app_browser",
+                        "--disable computer_use", "--disable image_generation", "--disable multi_agent", "--disable multi_agent_v2",
+                        "--disable sleep_tool", "--disable goals", "--disable tool_suggest", "--disable skill_search",
+                        "--disable skill_mcp_dependency_install", "--disable hooks", "--disable memories",
+                        "--disable workspace_dependencies", '-c web_search="disabled"', "-c project_doc_max_bytes=0",
+                        '-c approval_policy="never"']
 
 
 def completion(text, finish="stop", model="gpt-5.6-sol-2026-01-01"):
@@ -225,25 +241,67 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("--search", args)
         self.assertLess(args.index("--strict-config"), args.index("-"), "a setting codex does not know stops it before the prompt is sent")
 
+    def test_codex_gets_a_no_tools_catalog_for_exactly_the_requested_model(self):
+        p = self.run_script(codex="ok")
+        self.assertEqual(json.loads(p.stdout)["backend"], "codex", p.stdout)
+        seen = json.loads((self.codex_dir / "seen.json").read_text(encoding="utf-8"))
+        args = seen["args"]
+        self.assertEqual(args[args.index("-m") + 1], "gpt-5.6-sol")
+        self.assertEqual(sum(1 for a in args if a.startswith("model_catalog_json=")), 1)
+        self.assertEqual(args[args.index([a for a in args if a.startswith("model_catalog_json=")][0]) - 1], "-c")
+        cat = seen["catalog"]
+        self.assertIsNotNone(cat, "the catalog file existed while codex ran")
+        self.assertEqual(len(cat["models"]), 1)
+        m = cat["models"][0]
+        self.assertEqual(m["slug"], "gpt-5.6-sol", "the entry must match -m, or codex would use its own entry and its tools")
+        self.assertEqual(m["tool_mode"], "direct", "not code_mode_only: no `exec` tool")
+        self.assertEqual(m["shell_type"], "disabled")
+        self.assertEqual(m["experimental_supported_tools"], [])
+        self.assertIs(m["supports_search_tool"], False)
+        for absent in ("apply_patch_tool_type", "multi_agent_version", "web_search_tool_type"):
+            self.assertNotIn(absent, m, f"`{absent}` would bring a tool back")
+
     def test_codex_tool_use_discards_the_answer_and_falls_back(self):
         p = self.run_script(codex="tool")
         j = json.loads(p.stdout)
         self.assertEqual(j["backend"], "api", j)
-        self.assertIn("codex used a tool (command_execution)", j["codex_error"])
+        self.assertIn("codex used a tool or printed an unexpected event (command_execution)", j["codex_error"])
         self.assertNotIn("TOOLREAD-SECRET-42", p.stdout + p.stderr, "the answer of a codex that used a tool is never printed")
         self.assertEqual(len(Fake.seen), 1, "the API (which has no tools) answers instead")
 
-    def test_reading_an_mcp_resource_also_trips(self):
-        p = self.run_script(codex="readres")
+    def test_any_mcp_call_trips_now_that_no_tool_is_offered(self):
+        for mode, label in (("readres", "mcp_tool_call:codex/read_mcp_resource"), ("mcplist", "mcp_tool_call:codex/list_mcp_resources")):
+            with self.subTest(mode=mode):
+                Fake.seen = []
+                j = json.loads(self.run_script(codex=mode).stdout)
+                self.assertEqual(j["backend"], "api", j)
+                self.assertIn(label, j["codex_error"])
+
+    def test_a_tool_item_holding_unicode_line_separators_still_trips(self):
+        p = self.run_script(codex="u2028")
         j = json.loads(p.stdout)
         self.assertEqual(j["backend"], "api", j)
-        self.assertIn("codex used a tool (mcp_tool_call:codex/read_mcp_resource)", j["codex_error"])
+        self.assertIn("command_execution", j["codex_error"])
+        self.assertNotIn("unparseable", j["codex_error"], "the line is read whole, not cut at U+2028")
+
+    def test_unicode_line_separators_inside_a_tool_free_item_pass(self):
+        j = json.loads(self.run_script(codex="u2028ok").stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertEqual(j["codex_items"], ["agent_message", "error", "reasoning"])
+
+    def test_an_unknown_event_or_a_bad_line_trips(self):
+        for mode, label in (("newevent", "event:turn.tool_call"), ("garbage", "unparseable")):
+            with self.subTest(mode=mode):
+                Fake.seen = []
+                j = json.loads(self.run_script(codex=mode).stdout)
+                self.assertEqual(j["backend"], "api", j)
+                self.assertIn(label, j["codex_error"])
 
     def test_codex_items_are_reported_and_tool_free_ones_pass(self):
         p = self.run_script(codex="ok")
         j = json.loads(p.stdout)
         self.assertEqual(j["backend"], "codex", j)
-        self.assertEqual(j["codex_items"], ["agent_message", "error", "mcp_tool_call:codex/list_mcp_resources", "reasoning"])
+        self.assertEqual(j["codex_items"], ["agent_message", "error", "reasoning"])
 
     def test_codex_child_env_has_no_api_key(self):
         p = self.run_script(codex="ok", env={"OPENAI_API_KEY": FAKE_KEY, "COPY_OF_KEY": FAKE_KEY})
@@ -309,7 +367,7 @@ class ReviewTests(unittest.TestCase):
         j = json.loads(p.stdout)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(j["backend"], "api")
-        self.assertIn("turn.completed", j["codex_error"])
+        self.assertIn("unparseable", j["codex_error"], "a line that is not JSON trips the tripwire (fail closed)")
         self.assertEqual(len(Fake.seen), 1)
 
     def test_hung_codex_with_a_grandchild_times_out_and_falls_back_within_one_deadline(self):

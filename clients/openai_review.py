@@ -5,8 +5,9 @@ The queue runs it as:  python -I -B clients/openai_review.py -p --system-prompt 
 `result` (the answer text), `is_error`, `total_cost_usd` (null unless prices are configured), `usage` and `modelUsage` (keyed by
 the model the API says answered). Exit code 0 or 1. The key is never printed.
 
-Codex runs with NO tool that can read a file or run a command (CODEX_NO_TOOLS_ARGS, docs/SHADOW_SANDBOX.md, proven by
-scripts/shadow_canary.py); an answer whose event stream shows any tool use is discarded ("codex_items" lists what was seen).
+Codex is offered NO tool at all (codex_command: CODEX_NO_TOOLS_ARGS plus a no-tools model catalog; docs/SHADOW_SANDBOX.md,
+proven by scripts/shadow_canary.py); an answer whose event stream shows any tool item, unknown event or unparseable line is
+discarded ("codex_items" lists what was seen).
 
 Path order: the Codex CLI first (ChatGPT plan, `codex exec ... --json -o <file> -`, prompt on stdin, fresh temp folder); if it is missing
 or fails, the API below answers and the output records "backend": "api" plus "codex_error". A codex answer has "backend": "codex",
@@ -138,13 +139,15 @@ def settings_of(environ):
 MIN_API_SECONDS = 5.0
 
 # THE ONE PLACE codex's tool access is set (audit A6, docs/SHADOW_SANDBOX.md). The reviewed diff is untrusted text, so the model
-# must not be able to read any file: `--sandbox read-only` alone still lets its shell read every file by absolute path (canary
-# 2026-11-19). These flags take away every tool that can read a file or run a command, and `--strict-config` makes codex refuse to
-# start if a later version stops knowing any of them (it errors on an unknown -c key or feature name), so they can never
-# silently stop applying. What remains (codex 0.170.0, `codex debug prompt-input`): the code-mode `exec` (a V8 isolate with no
-# file system or network) whose only nested tools are apply_patch (writes only, refused by the read-only sandbox) and MCP
-# resource readers (no MCP server is configured), plus wait / request_user_input and the multi-agent tools (sub-agents get this
-# same configuration).
+# must be offered NO tool at all. `--sandbox read-only` alone lets its shell read any file by absolute path, and even with every
+# tool feature disabled codex 0.170.0 still offers the code-mode `exec` tool, whose nested `apply_patch` is a file-content oracle
+# (it checks a patch against any file before the sandbox refuses the write), and the multi-agent tools. Those come from the
+# MODEL'S CATALOG ENTRY (tool_mode "code_mode_only", apply_patch_tool_type, multi_agent_version), not from features, so
+# codex_command() also hands codex a catalog entry of our own for the requested model (no_tools_catalog), and
+# `tools.experimental_request_user_input.enabled=false` removes the last one. Result, captured from the request codex sends
+# (local fake Responses server, scripts/shadow_canary.py leg A): `"tools": []` and no `additional_tools` item.
+# `--strict-config` makes codex refuse to start if a later version does not know any key or feature named here, so none of them
+# can silently stop applying. The feature switches below are kept as a second layer.
 CODEX_NO_TOOLS_ARGS = (
     "--sandbox", "read-only",
     "--ephemeral",
@@ -152,9 +155,10 @@ CODEX_NO_TOOLS_ARGS = (
     "--ignore-user-config",  # no user MCP servers (the Node REPL), plugins, notify hooks or project trust; sign-in still works
     "--ignore-rules",  # no execpolicy .rules files
     "--strict-config",
+    "-c", "tools.experimental_request_user_input.enabled=false",
     "--disable", "shell_tool",
     "--disable", "unified_exec",
-    "--disable", "view_image",  # reads image files
+    "--disable", "view_image",
     "--disable", "apps",
     "--disable", "plugins",
     "--disable", "remote_plugin",
@@ -178,34 +182,95 @@ CODEX_NO_TOOLS_ARGS = (
     "-c", 'approval_policy="never"',  # nothing is ever approved
 )
 
-# The --json items a tool-free answer may contain. An MCP call is labelled `mcp_tool_call:<server>/<tool>`; the two allowed ones
-# are codex's built-in resource LISTINGS, which answer `[]` because no MCP server is configured (the model calls them when asked
-# to read a file; canary diagnostic 2026-11-19). Any other item (a command, a file change, read_mcp_resource, any other MCP or
-# sub-agent call, a web search...) means the model reached a tool: the answer is discarded and the call fails (a tripwire for a
-# codex update that brings a tool back).
+# The instructions codex puts first in the request in place of its own agent prompt (which describes a shell and a workspace).
+NO_TOOLS_INSTRUCTIONS = (
+    "You answer one request with text only. You have no tools: you cannot read files, run commands, browse, or start other "
+    "agents. Answer only from the text you are given."
+)
+
+
+def no_tools_catalog(model: str) -> dict:
+    """The model catalog codex is given (model_catalog_json): ONE entry, for exactly the requested model, with no tools:
+    tool_mode "direct" (no code-mode `exec`), shell_type "disabled", and no apply_patch_tool_type, multi_agent_version, web
+    search or experimental tools. The other fields are the ones codex 0.170.0 needs to parse an entry."""
+    return {"models": [{
+        "slug": model,
+        "display_name": model,
+        "tool_mode": "direct",
+        "shell_type": "disabled",
+        "experimental_supported_tools": [],
+        "supports_search_tool": False,
+        "include_skills_usage_instructions": False,
+        "include_plugin_usage_instructions": False,
+        "include_apps_usage_instructions": False,
+        "supported_reasoning_levels": [],
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 0,
+        "support_verbosity": False,
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "base_instructions": NO_TOOLS_INSTRUCTIONS,
+    }]}
+
+
+def codex_command(exe: str, model: str, work: Path, answer: Path) -> list:
+    """The full codex command line, used by the wrapper and the canary alike. Writes the no-tools catalog into `work`."""
+    catalog = Path(work) / "no-tools-catalog.json"
+    catalog.write_text(json.dumps(no_tools_catalog(model)), encoding="utf-8")
+    path = str(catalog)
+    if any(c in path for c in ("'", "\n", "\r")):  # it goes into a TOML literal string
+        raise oc.Fail("the temp folder path cannot be passed to codex (it holds a quote or a line break)")
+    return [exe, "exec", "-m", model, *CODEX_NO_TOOLS_ARGS, "-c", f"model_catalog_json='{path}'", "--json", "-o", str(answer), "-"]
+
+
+# The --json stream of a tool-free answer holds only these event types and these item types. Anything else (a command, a file
+# change, an MCP or sub-agent call, a web search, an unknown event or item, a line that is not one JSON object) trips the call:
+# the answer is discarded and the wrapper falls back. With no tool offered this should never fire; it is there for a codex update
+# that brings a tool back. It cannot be the protection on its own: calls made inside a code-mode `exec` never show up as items.
+CODEX_EVENTS = frozenset({"thread.started", "turn.started", "turn.completed", "turn.failed", "error", "item.started", "item.updated", "item.completed"})
 TOOL_FREE_ITEMS = frozenset({
     "agent_message",
     "reasoning",
     "error",  # codex's own notices, such as "Falling back from WebSockets to HTTPS transport"
-    "mcp_tool_call:codex/list_mcp_resources",
-    "mcp_tool_call:codex/list_mcp_resource_templates",
 })
 
 
-def codex_item_types(stdout: str) -> list:
-    """Every item in codex's --json event stream, as sorted labels: the item type, or `mcp_tool_call:<server>/<tool>`."""
-    seen = set()
-    for line in (stdout or "").splitlines():
+def codex_events(stdout: str) -> list:
+    """The parsed events, one per line. Lines are split on "\\n" ONLY: codex does not escape U+2028, U+2029 or U+0085 inside
+    its JSON, and str.splitlines() would cut a line there. A non-empty line that is not one JSON object becomes
+    {"type": "unparseable"}."""
+    events = []
+    for line in (stdout or "").split("\n"):
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
         try:
             ev = json.loads(line)
         except ValueError:
-            continue
-        if isinstance(ev, dict) and str(ev.get("type", "")).startswith("item.") and isinstance(ev.get("item"), dict):
-            item = ev["item"]
-            kind = str(item.get("type"))
-            if kind == "mcp_tool_call":
-                kind = f"{kind}:{item.get('server')}/{item.get('tool')}"
-            seen.add(kind)
+            ev = None
+        events.append(ev if isinstance(ev, dict) else {"type": "unparseable"})
+    return events
+
+
+def codex_item_types(stdout: str) -> list:
+    """Sorted labels for the event stream: each item's type (an MCP call as `mcp_tool_call:<server>/<tool>`), `event:<type>`
+    for an unknown event, `unparseable` for a bad line, `item:invalid` for an item event without an item object."""
+    seen = set()
+    for ev in codex_events(stdout):
+        kind = str(ev.get("type"))
+        if kind == "unparseable":
+            seen.add("unparseable")
+        elif kind not in CODEX_EVENTS:
+            seen.add(f"event:{kind}")
+        elif kind.startswith("item."):
+            item = ev.get("item")
+            if not isinstance(item, dict):
+                seen.add("item:invalid")
+                continue
+            label = str(item.get("type"))
+            if label == "mcp_tool_call":
+                label = f"{label}:{item.get('server')}/{item.get('tool')}"
+            seen.add(label)
     return sorted(seen)
 
 
@@ -258,25 +323,21 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
     budget = min(timeout * share, deadline - time.monotonic())
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
-        cmd = [exe, "exec", "-m", args.model, *CODEX_NO_TOOLS_ARGS, "--json", "-o", str(answer), "-"]
+        cmd = codex_command(exe, args.model, Path(work), answer)
         child = codex_env(environ, oc.find_main_root(HERE))
         code, stdout, stderr = run_with_deadline(cmd, text_in, work, child, budget)
         items = codex_item_types(stdout)
         tools = [t for t in items if t not in TOOL_FREE_ITEMS]
         if tools:
-            raise oc.Fail(f"codex used a tool ({', '.join(tools)}); its answer is discarded")
+            raise oc.Fail(f"codex used a tool or printed an unexpected event ({', '.join(tools)}); its answer is discarded")
         if code != 0:
             raise oc.Fail(f"codex exited with code {code}: {(stderr or '').strip()[-200:]}")
         text = answer.read_text(encoding="utf-8", errors="replace") if answer.is_file() else ""
     if not text.strip():
         raise oc.Fail("codex answer is empty")
     usage = None
-    for line in (stdout or "").splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
+    for ev in codex_events(stdout):
+        if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
             usage = ev["usage"]
     if not usage:  # never report zero usage as real data
         raise oc.Fail("codex output has no parseable turn.completed event with usage")
