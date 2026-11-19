@@ -24,7 +24,8 @@
 //! another project never lifts the refusal.
 //!
 //! Clean, note and build are one step across processes: the job holds `state/build.lock` (an OS file lock, lock.rs) for
-//! all of its cargo steps. Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
+//! all of its cargo COMPILING (a build, test or check releases it once its test executables are copied out of the build
+//! folder, and runs the tests from those copies: job.rs; a `run` keeps it to the end). Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
 //! own source over the folder before job 2's cargo step runs.
 //!
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
@@ -111,8 +112,8 @@ pub fn write_note(cfg: &Config, package: &str, source: &str) -> Result<(), Strin
 pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_BUSY: u8 = 3;
 
-/// Take `state/build.lock`. A job holds it for ALL of its cargo steps (see the module comment), so it is held for as long
-/// as the job's builds and tests run: seconds to many minutes. A second job waits up to `build_lock_wait_seconds`, then is
+/// Take `state/build.lock`. A job holds it while cargo compiles (see the module comment): a build, test or check releases it
+/// once its test executables are copied and runs the tests from the copies; a `run` holds it until its command ends. A second job waits up to `build_lock_wait_seconds`, then is
 /// refused (exit 3, nothing built, cleaned or recorded) with a message that says how long it waited and who held it.
 pub fn lock(cfg: &Config) -> Result<Lock, (u8, String)> {
     let wait = cfg.build_lock_wait_seconds;

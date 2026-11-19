@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod j;
 use j::{parse, J};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct Out {
@@ -65,19 +66,7 @@ impl Root {
         git(&p, &["init", "-q", "-b", "main"]);
         git(&p, &["add", "."]);
         git(&p, &["commit", "-q", "-m", "first"]);
-        let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-                    ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-                    checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-";
+        let toml = support::config(&[("mcp_call_timeout_seconds", "600")]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
@@ -87,7 +76,7 @@ max_agents = 50
     }
 
     fn run(&self, args: &[&str]) -> Out {
-        let o = Command::new(BIN).args(args).current_dir(&self.dir).stdin(Stdio::null()).output().unwrap();
+        let o = Command::new(bin()).args(args).current_dir(&self.dir).stdin(Stdio::null()).output().unwrap();
         Out { code: o.status.code().unwrap(), stdout: String::from_utf8_lossy(&o.stdout).into_owned(), stderr: String::from_utf8_lossy(&o.stderr).into_owned() }
     }
 
@@ -495,7 +484,7 @@ const ADD_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_WORKTREE_ADD_GATE_FILE";
 #[allow(clippy::zombie_processes)] // the caller waits on (or kills and waits on) the returned child
 fn parked_start(r: &Root, id: &str, tag: &str) -> (std::process::Child, PathBuf) {
     let gate = r.dir.join("scratch").join(format!("gate-{tag}"));
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .args(["task", "start", id, "--owner", "a", "--worktree"])
         .env(ADD_GATE_ENV, &gate)
         .current_dir(&r.dir)
@@ -788,7 +777,7 @@ fn empty_parent_cleanup_never_removes_a_junction() {
 // ---- MCP ---------------------------------------------------------------------------------
 
 fn mcp_call(r: &Root, name: &str, args: &str) -> (bool, String, i64) {
-    let mut child = Command::new(BIN).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = Command::new(bin()).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
@@ -981,7 +970,7 @@ fn a_run_job_that_panics_stays_running_and_blocks_only_its_own_folder() {
     let gate = r.dir.join("scratch/panic.gate");
     fs::write(&gate, "").unwrap();
     let line = "echo changed> a.txt & ping -n 30 127.0.0.1 >nul";
-    let o = Command::new(BIN)
+    let o = Command::new(bin())
         .args(["run", "p", "--task", &a, "--", line])
         .env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate)
         .current_dir(&r.dir)
@@ -1022,7 +1011,7 @@ impl Root {
         let before: Vec<String> = self.job_ids();
         let gate = self.dir.join("scratch/panic.gate");
         fs::write(&gate, "").unwrap();
-        let o = Command::new(BIN)
+        let o = Command::new(bin())
             .args(["run", "p", "--task", task, "--", "echo changed> a.txt & ping -n 30 127.0.0.1 >nul"])
             .env("BROADSWORD_INTERNAL_TEST_PANIC_IN_JOB", &gate)
             .current_dir(&self.dir)

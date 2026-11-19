@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 mod j;
 use j::{parse, J};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
-const FAKE: &str = env!("CARGO_BIN_EXE_fake_claude");
+mod support;
+use support::{bin, fake_claude};
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 const LIB_BASE: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n";
@@ -96,24 +96,12 @@ impl Root {
         }
         git(&p, &["add", "."]);
         git(&p, &["commit", "-q", "-m", "first"]);
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"{projects}\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 60\n\
-             recover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = {timeout_s}\n\
-             reviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2\nreviewer_max_calls_per_entry = 3
-shadow_reviewer = \"{shadow}\"\nshadow_reviewer_model = \"gpt-5.6-sol\"\nshadow_reviewer_timeout_seconds = {shadow_timeout_s}
-max_agents = 50\n"
-        );
+        let toml = support::config(&[("projects_dir", &format!("\"{projects}\"")), ("mcp_call_timeout_seconds", "600"), ("build_lock_wait_seconds", "60"), ("reviewer_timeout_seconds", &timeout_s.to_string()), ("shadow_reviewer", &format!("\"{shadow}\"")), ("shadow_reviewer_timeout_seconds", &shadow_timeout_s.to_string())]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         let fake_out = dir.join("fake-out");
-        let fake = dir.join("scratch/reviewer").join(Path::new(FAKE).file_name().unwrap());
+        let fake = dir.join("scratch/reviewer").join(Path::new(fake_claude()).file_name().unwrap());
         fs::create_dir_all(fake.parent().unwrap()).unwrap();
-        fs::copy(FAKE, &fake).unwrap();
+        fs::copy(fake_claude(), &fake).unwrap();
         Root { dir, fake_out, fake, projects }
     }
 
@@ -126,7 +114,7 @@ max_agents = 50\n"
     }
 
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).current_dir(&self.dir).stdin(Stdio::null()).env("BROADSWORD_REVIEWER_CLI", &self.fake).env("FAKE_CLAUDE_OUT_DIR", &self.fake_out).env("FAKE_CLAUDE_MODEL", "auto");
         for (k, v) in env {
             c.env(k, v);
@@ -845,7 +833,7 @@ fn a_reviewer_cli_outside_the_root_is_a_normal_reviewer_and_one_inside_build_is_
     fs::write(r.dir.join("build/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55
 ").unwrap(); // so cargo will still clean in it
     let in_build = r.dir.join("build").join(r.fake.file_name().unwrap());
-    fs::copy(FAKE, &in_build).unwrap();
+    fs::copy(fake_claude(), &in_build).unwrap();
     let main_before = r.head();
     let o = r.run_env(&["queue", "run"], &[("BROADSWORD_REVIEWER_CLI", in_build.to_str().unwrap())]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
@@ -854,7 +842,7 @@ fn a_reviewer_cli_outside_the_root_is_a_normal_reviewer_and_one_inside_build_is_
     assert_eq!((r.calls(), r.head()), (0, main_before.clone()), "nothing was called or merged");
     // any other folder inside the root is refused too (a relative path included)
     fs::create_dir_all(r.dir.join("tools")).unwrap();
-    fs::copy(FAKE, r.dir.join("tools").join(r.fake.file_name().unwrap())).unwrap();
+    fs::copy(fake_claude(), r.dir.join("tools").join(r.fake.file_name().unwrap())).unwrap();
     let rel = format!("tools/{}", r.fake.file_name().unwrap().to_string_lossy());
     let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", &rel)]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
@@ -862,12 +850,12 @@ fn a_reviewer_cli_outside_the_root_is_a_normal_reviewer_and_one_inside_build_is_
     let _ = fs::remove_file(&in_build); // (a later check may have cleaned it already)
     fs::remove_dir_all(r.dir.join("tools")).unwrap();
     // a path outside the root (the cargo build folder, like the real Claude install is outside) is a normal reviewer: no hook
-    let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", FAKE)]);
+    let o = r.run_env(&["queue", "run", "--entry", &e], &[("BROADSWORD_REVIEWER_CLI", fake_claude())]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert!(!o.stdout.contains("TEST HOOK"), "{}", o.stdout);
-    assert!(o.stdout.contains("reviewer CLI is ") && o.stdout.contains(&FAKE.replace('\\', "/")), "{}", o.stdout);
+    assert!(o.stdout.contains("reviewer CLI is ") && o.stdout.contains(&fake_claude().replace('\\', "/")), "{}", o.stdout);
     assert_eq!(r.field(&e, "test hook"), "false");
-    assert_eq!(r.field(&e, "reviewer CLI"), FAKE.replace('\\', "/"));
+    assert_eq!(r.field(&e, "reviewer CLI"), fake_claude().replace('\\', "/"));
     let review = fs::read_to_string(r.dir.join(r.field(&e, "review file"))).unwrap();
     assert!(review.contains("test_hook: false"), "{review}");
 }
@@ -905,7 +893,7 @@ fn the_fake_with_default_settings_from_outside_the_root_fails_the_family_check()
 ", "task: new file");
     let main_before = r.head();
     let e = r.add(&id, "low", "sonnet");
-    let mut c = r.command(&["queue", "run"], &[("BROADSWORD_REVIEWER_CLI", FAKE)]);
+    let mut c = r.command(&["queue", "run"], &[("BROADSWORD_REVIEWER_CLI", fake_claude())]);
     c.env_remove("FAKE_CLAUDE_MODEL");
     let o = c.output().unwrap();
     let (code, err) = (o.status.code().unwrap(), String::from_utf8_lossy(&o.stderr).into_owned());

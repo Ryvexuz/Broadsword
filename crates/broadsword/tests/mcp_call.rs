@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 mod j;
 use j::{parse, J};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct Root {
@@ -30,21 +31,7 @@ impl Root {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
         fs::create_dir_all(dir.join("projects")).unwrap();
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = {timeout_s}\nmcp_output_max_kb = {out_kb}\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-"
-        );
+        let toml = support::config(&[("mcp_call_timeout_seconds", &timeout_s.to_string()), ("mcp_output_max_kb", &out_kb.to_string())]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
@@ -90,7 +77,7 @@ impl Server {
 
     /// `envs` are added to the server's environment (the test process's own stays).
     fn start_env(root: Root, envs: &[(&str, &str)]) -> Server {
-        let mut child = Command::new(BIN).arg("mcp").envs(envs.iter().copied()).env_remove("OPENAI_API_KEY").current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut child = Command::new(bin()).arg("mcp").envs(envs.iter().copied()).env_remove("OPENAI_API_KEY").current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let stdin = child.stdin.take();
         let out = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -452,7 +439,7 @@ fn the_pause_hook_lets_read_only_mcp_tools_through() {
     let root = Root::new("hook", 600, 1024);
     fs::write(root.dir.join("broadsword.paused"), "time: now\nfree: 0.5 GB\nreason: test\n").unwrap();
     let hook = |tool: &str| {
-        let mut c = Command::new(BIN).args(["hook", "pre-tool"]).current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut c = Command::new(bin()).args(["hook", "pre-tool"]).current_dir(&root.dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         c.stdin.take().unwrap().write_all(format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#).as_bytes()).unwrap();
         c.wait().unwrap().code().unwrap()
     };

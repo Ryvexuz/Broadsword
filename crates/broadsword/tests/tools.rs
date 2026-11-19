@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 struct Root {
     dir: PathBuf,
@@ -17,26 +18,13 @@ impl Root {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
         fs::create_dir_all(dir.join("projects")).unwrap();
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = {floor_gb}\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 2\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-"
-        );
+        let toml = support::config(&[("disk_floor_gb", &floor_gb.to_string()), ("job_disk_reserve_gb", "2")]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN).args(args).current_dir(&self.dir).stdin(Stdio::null()).output().unwrap()
+        Command::new(bin()).args(args).current_dir(&self.dir).stdin(Stdio::null()).output().unwrap()
     }
 }
 
@@ -287,7 +275,7 @@ fn an_mcp_option_like_id_is_refused_and_changes_nothing() {
     let rec = jobs.join("20260101-000002-g-run.rec");
     fs::write(&rec, format!("id = 20260101-000002-g-run\nproject = g\nkind = run\nstatus = running\npid = {dead}\ncheckpoint = refs/broadsword/checkpoints/does-not-exist\n")).unwrap();
     let before = fs::read_to_string(&rec).unwrap();
-    let mut child = Command::new(BIN).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = Command::new(bin()).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     {
         let mut si = child.stdin.take().unwrap();
         let lines = [

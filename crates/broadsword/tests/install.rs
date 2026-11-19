@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 struct Root {
     dir: PathBuf,
@@ -16,21 +17,7 @@ impl Root {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("install-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"{install_dir}\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-"
-        );
+        let toml = support::config(&[("install_dir", &format!("\"{install_dir}\"")), ("mcp_call_timeout_seconds", "600")]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         let r = Root { dir };
         r.set_note(".");
@@ -48,7 +35,7 @@ max_agents = 50
         let p = self.dir.join("build/debug").join(format!("broadsword{}", std::env::consts::EXE_SUFFIX));
         if !p.exists() {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::copy(BIN, &p).unwrap();
+            fs::copy(bin(), &p).unwrap();
         }
         p.to_string_lossy().into_owned()
     }
@@ -92,7 +79,7 @@ fn install_copies_the_running_binary_into_install_dir() {
     let o = r.run(&r.exe(), &["install"]);
     assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
     assert!(stdout(&o).starts_with("installed: "), "{}", stdout(&o));
-    assert_eq!(fs::read(r.target()).unwrap(), fs::read(BIN).unwrap(), "the installed file is a byte-for-byte copy");
+    assert_eq!(fs::read(r.target()).unwrap(), fs::read(bin()).unwrap(), "the installed file is a byte-for-byte copy");
     assert!(r.old_copies().is_empty(), "no temp file left behind: {:?}", r.old_copies());
     // the installed copy works, and installing from it is a no-op
     let o = r.run(r.target().to_str().unwrap(), &["projects"]);
@@ -118,7 +105,7 @@ fn a_running_copy_is_renamed_aside_and_cleaned_up_by_a_later_install() {
 
     let o = r.run(&r.exe(), &["install"]);
     assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
-    assert_eq!(fs::read(r.target()).unwrap(), fs::read(BIN).unwrap(), "the new copy is in place");
+    assert_eq!(fs::read(r.target()).unwrap(), fs::read(bin()).unwrap(), "the new copy is in place");
     if cfg!(windows) {
         let old = r.old_copies();
         assert_eq!(old.len(), 1, "{old:?}");
@@ -150,7 +137,7 @@ fn a_running_copy_is_renamed_aside_and_cleaned_up_by_a_later_install() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(r.old_copies().is_empty(), "old copy not cleaned up: {:?}\n{last}", r.old_copies());
-    assert_eq!(fs::read(r.target()).unwrap(), fs::read(BIN).unwrap());
+    assert_eq!(fs::read(r.target()).unwrap(), fs::read(bin()).unwrap());
 }
 
 #[test]
@@ -220,7 +207,7 @@ fn install_through_mcp_runs_as_a_child_and_installs_the_server_binary() {
 #[test]
 fn install_refuses_a_running_binary_that_is_not_the_main_roots_build_output() {
     let r = Root::new("elsewhere", "build/bin"); // note is `.`
-    let o = r.run(BIN, &["install"]); // BIN lives in the real build folder, not in this root's
+    let o = r.run(bin(), &["install"]); // bin() is not this root's build output (the real build folder, or a job's copy in the real scratch folder)
     assert_eq!(o.status.code(), Some(1));
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("running binary is") && err.contains("vouches only for"), "{err}");
@@ -260,7 +247,7 @@ edition = \"2021\"
         }
         // the repair command builds the package `broadsword` into the build folder, so the test must not run from a copy of the
         // binary in that very folder (a running exe cannot be replaced on Windows)
-        let exe = BIN.to_string(); // note is "." (vouched) before the run
+        let exe = bin().to_string(); // note is "." (vouched) before the run
         let good_path = PathBuf::from(fs::canonicalize(r.dir.join("scratch/Cargo.good")).unwrap().to_string_lossy().trim_start_matches(r"\\?\"));
         let fix = if cfg!(windows) { format!("copy /Y \"{}\" Cargo.toml && cargo build --offline", good_path.display()) } else { format!("cp '{}' Cargo.toml && cargo build --offline", good_path.display()) };
         let o = r.run(&exe, &["run", "broadsword", "--", &fix]);

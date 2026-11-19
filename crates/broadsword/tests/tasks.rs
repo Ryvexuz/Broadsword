@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 mod j;
 use j::{parse, J};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 const GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_TASK_START_GATE_FILE";
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -42,28 +43,13 @@ impl Root {
             fs::create_dir_all(dir.join("projects").join(p)).unwrap();
             fs::write(dir.join("projects").join(p).join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         }
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = {}\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-",
-            wait.unwrap_or(10)
-        );
+        let toml = support::config(&[("mcp_call_timeout_seconds", "600"), ("task_lock_wait_seconds", &wait.unwrap_or(10).to_string())]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).current_dir(&self.dir).stdin(Stdio::null());
         c
     }
@@ -285,7 +271,7 @@ fn worktrees_share_the_main_roots_board() {
     fs::copy(r.dir.join("broadsword.toml"), wt.join("broadsword.toml")).unwrap();
     fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
     let from_wt = |args: &[&str]| {
-        let o = Command::new(BIN).args(args).current_dir(&wt).output().unwrap();
+        let o = Command::new(bin()).args(args).current_dir(&wt).output().unwrap();
         (o.status.code().unwrap(), String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     let (code, id) = from_wt(&["task", "add", "p", "--title", "from worktree", "--claim", "src"]);
@@ -428,7 +414,7 @@ fn sixteen_gated_starts_with_a_garbage_lock_and_a_big_board_never_give_two_runni
 
 /// One `tools/call` over a fresh `broadsword mcp` server. Returns (isError, text, structured exit_code).
 fn mcp_call(r: &Root, name: &str, args: &str) -> (bool, String, i64) {
-    let mut child = Command::new(BIN).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = Command::new(bin()).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
     writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();

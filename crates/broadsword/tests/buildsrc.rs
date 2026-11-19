@@ -13,7 +13,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 const SYNC_GATE: &str = "BROADSWORD_INTERNAL_TEST_BUILD_SYNC_GATE_FILE";
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -74,26 +75,13 @@ impl Root {
         fs::create_dir_all(o.join("src")).unwrap();
         fs::write(o.join("Cargo.toml"), "[package]\nname = \"other\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
         fs::write(o.join("src/lib.rs"), "").unwrap();
-        let toml = format!(
-            "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-             ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-             state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = {build_lock_wait}\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50\n"
-        );
+        let toml = support::config(&[("build_lock_wait_seconds", &build_lock_wait.to_string())]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).current_dir(&self.dir).env_remove(SYNC_GATE).stdin(Stdio::null());
         c
     }
@@ -559,7 +547,7 @@ fn mcp_check_with_task_builds_and_tests_the_worktree() {
     let r = Root::new("mcp", 120);
     let t1 = r.task("a", "MARK-t1");
     r.ok(&["build", "proj"]); // main first, so the call below has to clean
-    let mut child = Command::new(BIN).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = Command::new(bin()).arg("mcp").current_dir(&r.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut out = BufReader::new(child.stdout.take().unwrap());
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"check","arguments":{{"project":"proj","task":"{t1}"}}}}}}"#).unwrap();

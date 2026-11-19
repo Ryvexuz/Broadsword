@@ -3,6 +3,18 @@
 //! Every cargo step runs with `CARGO_TARGET_DIR` pointing at the main root's shared build
 //! folder, is guarded by the disk reserve before it starts, is watched while it runs, and is
 //! tee'd to the terminal and to `scratch/logs/jobs/`.
+//!
+//! THE TEST STEP RUNS FROM COPIES. `state/build.lock` (buildsrc.rs) is held only while cargo compiles: the test step runs
+//! `cargo test --no-run --message-format=json-render-diagnostics` under the lock, reads the test executables (and each package's
+//! bin executables) from cargo's JSON, runs any doc-tests (rustdoc compiles those as it runs them, from the shared folder), copies
+//! the executables to `scratch/test-bins/<job id>/`, and RELEASES the lock. The copies then run one after another, each in its
+//! package root with the environment `cargo test` gives a test (`CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`,
+//! `CARGO_PKG_*`, and for integration tests `CARGO_BIN_EXE_<bin>` pointing at the COPIED bin), so another job may rebuild the
+//! shared folder meanwhile. Results, the summary line and exit codes are those of `cargo test`: the first failing executable
+//! stops the step with cargo's exit code 101. The copies are removed when the step ends; a job killed mid-test leaves them, and
+//! the scratch cleanup removes them by age (each copy's modified time is set to the copy time).
+//! Known limit: a test that reads the compile-time `env!("CARGO_BIN_EXE_<bin>")` still gets the shared folder's path, which
+//! another job may rebuild while it runs; read the run-time variable first (Broadsword's own tests do).
 
 use crate::buildsrc;
 use crate::config::Config;
@@ -222,7 +234,7 @@ type Log = Arc<Mutex<std::fs::File>>;
 
 /// Every line is redacted (every `.env` value becomes `[REDACTED]`) before it reaches the terminal, the job log or the kept
 /// output. Per line: a secret split across two lines is a known limit.
-fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>>>>, secrets: Arc<Secrets>) {
+fn tee(src: impl Read, to_stderr: bool, echo: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>>>>, secrets: Arc<Secrets>) {
     let mut r = std::io::BufReader::new(src);
     let mut buf = Vec::new();
     loop {
@@ -238,14 +250,18 @@ fn tee(src: impl Read, to_stderr: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>
                 buf = red.into_bytes();
             }
         }
-        if to_stderr {
+        if !echo {
+            // machine output (cargo's JSON): kept for the caller only, never echoed or logged
+        } else if to_stderr {
             let _ = std::io::stderr().write_all(&buf);
         } else {
             let _ = std::io::stdout().write_all(&buf);
             let _ = std::io::stdout().flush();
         }
-        if let Ok(mut f) = log.lock() {
-            let _ = f.write_all(&buf);
+        if echo {
+            if let Ok(mut f) = log.lock() {
+                let _ = f.write_all(&buf);
+            }
         }
         if let Some(k) = &keep {
             if let Ok(mut k) = k.lock() {
@@ -266,12 +282,28 @@ fn kill_tree(child: &mut std::process::Child) {
 /// `on_spawn` gets the child's pid as soon as it exists (recorded so recovery can find an orphan).
 pub fn run_child(
     cfg: &Config,
+    cmd: Command,
+    log: &Log,
+    free: &mut dyn FnMut() -> u64,
+    poll: Duration,
+    on_spawn: &mut dyn FnMut(u32),
+    secrets: &Arc<Secrets>,
+) -> Result<StepRun, String> {
+    run_child_opts(cfg, cmd, log, free, poll, on_spawn, secrets, true)
+}
+
+/// `run_child`, with `echo_stdout` false for machine output (cargo's JSON): stdout is then only kept (redacted), never printed
+/// or logged; stderr is printed and logged as always.
+#[allow(clippy::too_many_arguments)]
+fn run_child_opts(
+    cfg: &Config,
     mut cmd: Command,
     log: &Log,
     free: &mut dyn FnMut() -> u64,
     poll: Duration,
     on_spawn: &mut dyn FnMut(u32),
     secrets: &Arc<Secrets>,
+    echo_stdout: bool,
 ) -> Result<StepRun, String> {
     let start = Instant::now();
     let mut child = cmd
@@ -285,11 +317,11 @@ pub fn run_child(
     let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let t_out = {
         let (l, k, sc) = (Arc::clone(log), Arc::clone(&kept), Arc::clone(secrets));
-        std::thread::spawn(move || tee(out, false, l, Some(k), sc))
+        std::thread::spawn(move || tee(out, false, echo_stdout, l, Some(k), sc))
     };
     let t_err = {
         let (l, sc) = (Arc::clone(log), Arc::clone(secrets));
-        std::thread::spawn(move || tee(err, true, l, None, sc))
+        std::thread::spawn(move || tee(err, true, true, l, None, sc))
     };
     let mut next_poll = Instant::now() + poll;
     let outcome = loop {
@@ -340,6 +372,310 @@ fn shell_command(project_dir: &Path, line: &str) -> Command {
     };
     c.current_dir(project_dir);
     c
+}
+
+// ---- the test step: compile under the lock, test from copies ------------------------------
+
+/// The folder (inside scratch) a job's copied test and bin executables live in while its test step runs.
+pub fn test_copies_dir(cfg: &Config, job_id: &str) -> PathBuf {
+    cfg.scratch_dir.join("test-bins").join(job_id)
+}
+
+/// One executable `cargo test --no-run` reported (a `compiler-artifact` message with an `executable`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    /// The package's Cargo.toml.
+    pub manifest: PathBuf,
+    /// The target's first kind: `lib`, `bin`, `test`, `bench`, `example`, ...
+    pub kind: String,
+    /// The target's name (`CARGO_BIN_EXE_<name>` for a bin).
+    pub name: String,
+    pub src_path: String,
+    pub exe: PathBuf,
+}
+
+/// What `cargo test --no-run` built: the test executables in the order `cargo test` runs them, every package's bin
+/// executables (for `CARGO_BIN_EXE_*`), and whether a library has doc-tests to run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Artifacts {
+    pub tests: Vec<Artifact>,
+    pub bins: Vec<Artifact>,
+    pub doctests: bool,
+}
+
+/// The order `cargo test` runs a package's test executables in: the library's unit tests, the bins', then integration tests,
+/// benches and examples, each by name.
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro" => 0,
+        "bin" => 1,
+        "test" => 2,
+        "bench" => 3,
+        _ => 4,
+    }
+}
+
+/// Read cargo's `--message-format=json*` stdout. Lines that are not JSON objects are skipped (cargo prints none there).
+pub fn parse_artifacts(stdout: &str) -> Result<Artifacts, String> {
+    use crate::json::J;
+    let mut a = Artifacts::default();
+    for line in stdout.lines().map(str::trim).filter(|l| l.starts_with('{')) {
+        let j = crate::json::parse(line).map_err(|e| format!("cannot read cargo's JSON output: {e}: {line}"))?;
+        if j.get("reason").and_then(J::str) != Some("compiler-artifact") {
+            continue;
+        }
+        let target = j.get("target").ok_or("a compiler-artifact message has no `target`")?;
+        let kinds: Vec<&str> = match target.get("kind") {
+            Some(J::Arr(v)) => v.iter().filter_map(J::str).collect(),
+            _ => Vec::new(),
+        };
+        let kind = kinds.first().copied().unwrap_or("").to_string();
+        let test = matches!(j.get("profile").and_then(|p| p.get("test")), Some(J::Bool(true)));
+        if !test && kinds.iter().any(|k| kind_rank(k) == 0) && matches!(target.get("doctest"), Some(J::Bool(true))) {
+            a.doctests = true;
+        }
+        let Some(exe) = j.get("executable").and_then(J::str) else { continue };
+        let art = Artifact {
+            manifest: PathBuf::from(j.get("manifest_path").and_then(J::str).ok_or("a compiler-artifact message has no `manifest_path`")?),
+            kind: kind.clone(),
+            name: target.get("name").and_then(J::str).unwrap_or("").to_string(),
+            src_path: target.get("src_path").and_then(J::str).unwrap_or("").to_string(),
+            exe: PathBuf::from(exe),
+        };
+        let list = if test { &mut a.tests } else if kind == "bin" { &mut a.bins } else { continue };
+        if !list.contains(&art) {
+            list.push(art);
+        }
+    }
+    a.tests.sort_by(|x, y| (&x.manifest, kind_rank(&x.kind), &x.name).cmp(&(&y.manifest, kind_rank(&y.kind), &y.name)));
+    Ok(a)
+}
+
+/// The run-time variables `cargo test` gives a test of each package (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`),
+/// keyed by the package's Cargo.toml, from `cargo metadata --no-deps` in `dir`.
+fn package_envs(dir: &Path) -> Result<Vec<(PathBuf, Vec<(String, String)>)>, String> {
+    use crate::json::J;
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let out = c
+        .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot start cargo metadata in {}: {e}", dir.display()))?;
+    if !out.status.success() {
+        return Err(format!("cargo metadata failed in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let j = crate::json::parse(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let Some(J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output has no `packages` list".into()) };
+    let text = |p: &J, k: &str| p.get(k).and_then(J::str).unwrap_or("").to_string();
+    let mut v = Vec::new();
+    for p in pkgs {
+        let manifest = PathBuf::from(text(p, "manifest_path"));
+        let version = text(p, "version");
+        let (core, pre) = match version.split_once('+').map(|(c, _)| c).unwrap_or(&version).split_once('-') {
+            Some((c, pre)) => (c.to_string(), pre.to_string()),
+            None => (version.split_once('+').map(|(c, _)| c).unwrap_or(&version).to_string(), String::new()),
+        };
+        let mut parts = core.split('.');
+        let authors = match p.get("authors") {
+            Some(J::Arr(a)) => a.iter().filter_map(J::str).collect::<Vec<_>>().join(":"),
+            _ => String::new(),
+        };
+        let mut env = vec![
+            ("CARGO_MANIFEST_DIR".to_string(), manifest.parent().map(|d| d.display().to_string()).unwrap_or_default()),
+            ("CARGO_MANIFEST_PATH".to_string(), manifest.display().to_string()),
+            ("CARGO_PKG_NAME".to_string(), text(p, "name")),
+            ("CARGO_PKG_VERSION".to_string(), version.clone()),
+            ("CARGO_PKG_VERSION_MAJOR".to_string(), parts.next().unwrap_or("").to_string()),
+            ("CARGO_PKG_VERSION_MINOR".to_string(), parts.next().unwrap_or("").to_string()),
+            ("CARGO_PKG_VERSION_PATCH".to_string(), parts.next().unwrap_or("").to_string()),
+            ("CARGO_PKG_VERSION_PRE".to_string(), pre),
+            ("CARGO_PKG_AUTHORS".to_string(), authors),
+        ];
+        for (var, key) in [("CARGO_PKG_DESCRIPTION", "description"), ("CARGO_PKG_HOMEPAGE", "homepage"), ("CARGO_PKG_REPOSITORY", "repository"), ("CARGO_PKG_LICENSE", "license"), ("CARGO_PKG_LICENSE_FILE", "license_file"), ("CARGO_PKG_RUST_VERSION", "rust_version"), ("CARGO_PKG_README", "readme")] {
+            env.push((var.to_string(), text(p, key)));
+        }
+        v.push((manifest, env));
+    }
+    Ok(v)
+}
+
+/// Does `a` name the same file as `b`? (cargo's paths and metadata's paths come from the same cargo, but compare loosely.)
+fn same_path(a: &Path, b: &Path) -> bool {
+    let n = |p: &Path| {
+        let t = p.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/");
+        if cfg!(windows) { t.to_lowercase() } else { t }
+    };
+    n(a) == n(b)
+}
+
+/// Copy `exe` (and a Windows `.pdb` beside it, for readable backtraces) into `dir`, with the copy's modified time set to now so
+/// the scratch cleanup (by age) never removes a copy a running job still needs.
+fn copy_exe(exe: &Path, dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let to = dir.join(exe.file_name().ok_or_else(|| format!("cargo named an executable with no file name: {}", exe.display()))?);
+    std::fs::copy(exe, &to).map_err(|e| format!("cannot copy the test executable {} to {}: {e}", exe.display(), to.display()))?;
+    let _ = std::fs::File::options().write(true).open(&to).and_then(|f| f.set_modified(SystemTime::now()));
+    let pdb = exe.with_extension("pdb");
+    if cfg!(windows) && pdb.is_file() {
+        if let Some(n) = pdb.file_name() {
+            let _ = std::fs::copy(&pdb, dir.join(n));
+        }
+    }
+    Ok(to)
+}
+
+/// What `cargo test` passes to rerun one executable (`--lib`, `--bin x`, `--test x`, ...), for the failure line.
+fn rerun_arg(a: &Artifact) -> String {
+    match kind_rank(&a.kind) {
+        0 => "--lib".into(),
+        _ => format!("--{} {}", a.kind, a.name),
+    }
+}
+
+/// One copied test executable, ready to run.
+struct Copied {
+    art: Artifact,
+    copy: PathBuf,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+/// The test step's context: everything `run_child` needs, borrowed from the job.
+struct TestStep<'a> {
+    cfg: &'a Config,
+    job_id: &'a str,
+    project_dir: &'a Path,
+    log: &'a Log,
+    free: &'a mut dyn FnMut() -> u64,
+    poll: Duration,
+    on_spawn: &'a mut dyn FnMut(u32),
+    secrets: &'a Arc<Secrets>,
+}
+
+impl TestStep<'_> {
+    fn note(&self, line: &str) {
+        eprintln!("{line}");
+        if let Ok(mut f) = self.log.lock() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// The test step (see the module comment). `cmd` is the prepared `cargo test --offline` (scrubbed environment, shared build
+    /// folder); `hold` is the job's build lock, released here once the executables are copied. Returns one `StepRun` that reads
+    /// like the old single `cargo test`: the kept stdout of every executable, cargo's exit code, the whole step's time.
+    fn run(&mut self, mut cmd: Command, hold: &mut Option<BuildHold>) -> Result<StepRun, String> {
+        let start = Instant::now();
+        let done = |outcome: Outcome, stdout: String| StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() };
+        // 1. compile (under the lock)
+        cmd.args(["--no-run", "--message-format=json-render-diagnostics"]);
+        let compiled = run_child_opts(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets, false)?;
+        match compiled.outcome {
+            Outcome::Exited(Some(0)) => {}
+            o => return Ok(done(o, String::new())),
+        }
+        let arts = parse_artifacts(&compiled.stdout)?;
+        let envs = package_envs(self.project_dir)?;
+        let mut kept = String::new();
+        // 2. doc-tests: rustdoc builds them from the shared folder's libraries as it runs them, so they stay under the lock
+        if arts.doctests {
+            let mut doc = cargo_command(self.project_dir, "test");
+            doc.arg("--doc");
+            scrub::apply(&mut doc, self.cfg);
+            doc.env("CARGO_TARGET_DIR", &self.cfg.build_dir);
+            let r = run_child(self.cfg, doc, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
+            kept.push_str(&r.stdout);
+            match r.outcome {
+                Outcome::Exited(Some(0)) => {}
+                o => return Ok(done(o, kept)),
+            }
+        }
+        // 3. copy, then release the lock
+        let dir = test_copies_dir(self.cfg, self.job_id);
+        let copied = self.copy_all(&arts, &envs, &dir);
+        let copied = match copied {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
+        if let Some(h) = hold.take() {
+            let held = h.taken.elapsed().as_secs_f64();
+            drop(h);
+            let line = format!("build lock: released after {held:.1} s (compiling only); {} test executable(s) copied to {}", copied.len(), dir.display());
+            println!("{line}");
+            if let Ok(mut f) = self.log.lock() {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        // 4. run the copies, in cargo's order; the first failure stops the step with cargo's exit code
+        let result = self.run_copies(&copied, &mut kept);
+        let _ = std::fs::remove_dir_all(&dir);
+        let outcome = result?;
+        Ok(done(outcome, kept))
+    }
+
+    fn copy_all(&self, arts: &Artifacts, envs: &[(PathBuf, Vec<(String, String)>)], dir: &Path) -> Result<Vec<Copied>, String> {
+        // each package's bins in their own folder: two packages may both have a bin with one name
+        let mut bins: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+        for b in &arts.bins {
+            let i = envs.iter().position(|(m, _)| same_path(m, &b.manifest)).unwrap_or(envs.len());
+            let copy = copy_exe(&b.exe, &dir.join(format!("bins-{i}")))?;
+            bins.push((b.manifest.clone(), b.name.clone(), copy));
+        }
+        let mut out = Vec::new();
+        for t in &arts.tests {
+            let copy = copy_exe(&t.exe, dir)?;
+            let mut env = envs.iter().find(|(m, _)| same_path(m, &t.manifest)).map(|(_, e)| e.clone()).unwrap_or_default();
+            if matches!(t.kind.as_str(), "test" | "bench") {
+                // cargo sets CARGO_BIN_EXE_* for integration tests and benches only
+                for (m, name, copy) in &bins {
+                    if same_path(m, &t.manifest) {
+                        env.push((format!("CARGO_BIN_EXE_{name}"), copy.display().to_string()));
+                    }
+                }
+            }
+            let cwd = t.manifest.parent().map(Path::to_path_buf).unwrap_or_else(|| self.project_dir.to_path_buf());
+            out.push(Copied { art: t.clone(), copy, cwd, env });
+        }
+        Ok(out)
+    }
+
+    fn command_for(&self, c: &Copied) -> Command {
+        let mut cmd = Command::new(&c.copy);
+        cmd.current_dir(&c.cwd);
+        scrub::apply(&mut cmd, self.cfg);
+        // what cargo would give the test, and nothing an outer cargo left for ANOTHER package
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy();
+            if ["CARGO_BIN_EXE_", "CARGO_PKG_", "CARGO_MANIFEST_", "CARGO_CRATE_", "CARGO_PRIMARY_PACKAGE", "CARGO_TARGET_TMPDIR"].iter().any(|p| k.starts_with(p)) {
+                cmd.env_remove(k.as_ref());
+            }
+        }
+        cmd.env("CARGO_TARGET_DIR", &self.cfg.build_dir);
+        cmd.env("CARGO", std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        cmd.envs(c.env.iter().map(|(k, v)| (k, v)));
+        cmd
+    }
+
+    fn run_copies(&mut self, copied: &[Copied], kept: &mut String) -> Result<Outcome, String> {
+        for c in copied {
+            self.note(&format!("     Running {} ({})", c.art.src_path, c.copy.display()));
+            let cmd = self.command_for(c);
+            let r = run_child(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
+            kept.push_str(&r.stdout);
+            match r.outcome {
+                Outcome::Exited(Some(0)) => {}
+                Outcome::DiskDropped(f) => return Ok(Outcome::DiskDropped(f)),
+                Outcome::Exited(code) => {
+                    self.note(&format!("error: test failed, to rerun pass `{}` ({}, {})", rerun_arg(&c.art), exit_text(code), c.art.src_path));
+                    return Ok(Outcome::Exited(Some(101)));
+                }
+            }
+        }
+        Ok(Outcome::Exited(Some(0)))
+    }
 }
 
 // ---- commands ---------------------------------------------------------------------------
@@ -484,10 +820,13 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "(no message)".into())
 }
 
-/// The build lock, held until the job function returns. (A `run` also leaves the note `run:<folder>` for each package: see
+/// The build lock, held until the job function returns, or until the test step has copied its executables (see the module
+/// comment). (A `run` also leaves the note `run:<folder>` for each package: see
 /// `buildsrc::prepare_for_run`; it is written before the command, so a crash cannot leave a note that vouches for it.)
 struct BuildHold {
     _lock: crate::lock::Lock,
+    /// When the lock was taken (the job prints how long it held it when the test step releases it early).
+    taken: Instant,
 }
 
 /// What a finished job tells its caller besides the exit code (the merge queue reads it; the command line ignores it).
@@ -672,11 +1011,12 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         if build_hold.is_none() {
             // The first step this job EXECUTES (whatever step a resumed job starts at: `skip(first_step)` above), so the
             // lock and the prepare below are never skipped. Clean, record and build are one step across processes: take
-            // the build lock now and keep it until this job ends (every cargo step below, tests included, runs the
-            // binaries the shared folder holds). `run` runs a shell command that may call cargo itself, so it takes the
+            // the build lock now and keep it while cargo compiles: until this job ends, except that the test step releases it
+            // once it has copied its test executables out of the shared folder (`TestStep`). `run` runs a shell command that may call cargo itself, so it takes the
             // lock too and prepares the same way (a `cargo test` inside it must test THIS folder's code, not the binary
             // another checkout left), then marks the notes of the folder's packages as `run:<folder>` (before the command, so a
             // crash cannot leave a note that vouches for what the command builds).
+            let asked = Instant::now();
             let lock = match buildsrc::lock(cfg) {
                 Ok(l) => l,
                 Err((code, msg)) => {
@@ -684,7 +1024,10 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                     return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, code);
                 }
             };
-            build_hold = Some(BuildHold { _lock: lock });
+            let waited = asked.elapsed().as_secs_f64();
+            println!("build lock: taken after waiting {waited:.1} s");
+            rec.set("build_lock_wait_secs", format!("{waited:.1}"));
+            build_hold = Some(BuildHold { _lock: lock, taken: Instant::now() });
             let outcome = if kind == "run" {
                 buildsrc::prepare_for_run(cfg, &project_dir, &source)
             } else {
@@ -733,7 +1076,13 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                 panic!("test hook: panic in job after its child started");
             }
         };
-        let run = match run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets) {
+        let ran = if *step == "test" && kind != "run" {
+            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, log: &log, free: &mut *free_src, poll, on_spawn: &mut on_spawn, secrets: &secrets };
+            t.run(cmd, &mut build_hold)
+        } else {
+            run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets)
+        };
+        let run = match ran {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("broadsword: {e}");
@@ -887,6 +1236,36 @@ mod tests {
 
     fn run(code: i32, out: &str) -> StepRun {
         StepRun { outcome: Outcome::Exited(Some(code)), stdout: out.into(), secs: 1.0 }
+    }
+
+    #[test]
+    fn parse_artifacts_finds_test_and_bin_executables_in_cargos_run_order() {
+        let line = |kind: &str, name: &str, test: bool, exe: Option<&str>, doctest: bool| {
+            let exe = exe.map(|e| format!("\"{e}\"")).unwrap_or_else(|| "null".into());
+            format!("{{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/p/Cargo.toml\",\"target\":{{\"kind\":[\"{kind}\"],\"name\":\"{name}\",\"src_path\":\"/p/src/{name}.rs\",\"doctest\":{doctest},\"test\":true}},\"profile\":{{\"test\":{test}}},\"executable\":{exe},\"fresh\":true}}")
+        };
+        let out = [
+            line("test", "zeta", true, Some("/b/deps/zeta-1"), false),
+            "{\"reason\":\"build-script-executed\"}".to_string(),
+            line("bin", "tool", false, Some("/b/tool"), false),
+            line("test", "alpha", true, Some("/b/deps/alpha-1"), false),
+            line("lib", "p", false, None, true),
+            line("bin", "tool", true, Some("/b/deps/tool-2"), false),
+            line("lib", "p", true, Some("/b/deps/p-3"), true),
+            "{\"reason\":\"build-finished\",\"success\":true}".to_string(),
+        ]
+        .join("\n");
+        let a = parse_artifacts(&out).unwrap();
+        let order: Vec<(&str, &str)> = a.tests.iter().map(|t| (t.kind.as_str(), t.name.as_str())).collect();
+        assert_eq!(order, [("lib", "p"), ("bin", "tool"), ("test", "alpha"), ("test", "zeta")]);
+        assert_eq!(a.bins.len(), 1);
+        assert_eq!(a.bins[0].exe, PathBuf::from("/b/tool"));
+        assert!(a.doctests, "a lib with doctest = true");
+        assert_eq!(rerun_arg(&a.tests[0]), "--lib");
+        assert_eq!(rerun_arg(&a.tests[2]), "--test alpha");
+        let none = parse_artifacts(&line("lib", "p", true, Some("/b/deps/p-3"), false)).unwrap();
+        assert!(!none.doctests && none.bins.is_empty());
+        assert!(parse_artifacts("{\"reason\":\"compiler-artifact\"").is_err(), "broken JSON is an error, not an empty list");
     }
 
     #[test]

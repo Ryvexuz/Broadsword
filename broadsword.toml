@@ -43,7 +43,7 @@ task_lock_wait_seconds = 10     # a task command waits at most this long for the
 worktrees_dir = "worktrees"     # inside root; not inside scratch, build or state (a worktree holds unmerged work). Git-ignored. After moving the project run `broadsword worktree repair`
 
 # Shared build folder (build|test|check --task): state/build-sources/<package> notes which checkout last built each package into build_dir; state/build.lock makes "clean the package, record the source, build" one step across processes
-build_lock_wait_seconds = 900   # a build/test/check job holds the build lock for all its cargo steps (minutes); a second job waits at most this long, then is refused with exit 3 "build folder busy" having built and cleaned nothing. Sized to outlast one long `check`
+build_lock_wait_seconds = 900   # a build/test/check job holds the build lock while cargo compiles (the test step releases it once its test executables are copied to scratch, and runs the tests from the copies); a `run` holds it to its end; a second job waits at most this long, then is refused with exit 3 "build folder busy" having built and cleaned nothing. Sized to outlast one long `check`
 
 # Reviewer step and merge queue (broadsword queue ...): entries live in state_dir/queue
 reviewer_backend = "claude"        # which backend reviews a queued branch. Only "claude" exists (Claude Code CLI, headless); an "openai" one can be added later

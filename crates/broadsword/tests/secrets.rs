@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 // The product's own process-identity code, so the test cleanup applies the very same exact-match rule.
 #[allow(dead_code)]
@@ -59,19 +60,7 @@ impl Root {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
         fs::create_dir_all(dir.join("projects")).unwrap();
-        let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\n\
-                    disk_check_every_seconds = 60\nlog_max_mb = 50\nram_warn_percent = 100\ncpu_warn_percent = 90\n\
-                    alert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 1800\nmcp_output_max_kb = 1024\ncheckpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-";
+        let toml = support::config(&[]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir, children: Vec::new() }
     }
@@ -95,7 +84,7 @@ max_agents = 50
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).current_dir(&self.dir).stdin(Stdio::null());
         c
     }

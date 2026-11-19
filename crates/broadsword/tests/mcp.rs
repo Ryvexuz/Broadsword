@@ -3,7 +3,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 /// A throwaway Broadsword root under the repo's scratch folder (never the real root), removed on drop.
 struct Root(std::path::PathBuf);
@@ -15,19 +16,7 @@ impl Root {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("mcp-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("scratch")).unwrap();
-        let toml = "root = \".\"\ndisk_floor_gb = 1\ncleanup_every_hours = 1\nscratch_max_age_hours = 24\ndisk_check_every_seconds = 60\nlog_max_mb = 50\n\
-                    ram_warn_percent = 100\ncpu_warn_percent = 90\nalert_command = \"\"\nscratch_dir = \"scratch\"\nbuild_dir = \"build\"\nprojects_dir = \"projects\"\n\
-                    state_dir = \"state\"\ninstall_dir = \"build/bin\"\nmcp_call_timeout_seconds = 600\nmcp_output_max_kb = 1024\n\
-                    checkpoint_ignored_max_mb = 50\nmax_resumes = 3\njob_disk_reserve_gb = 0\njob_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-";
+        let toml = support::config(&[("mcp_call_timeout_seconds", "600")]);
         std::fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root(dir)
     }
@@ -41,7 +30,7 @@ impl Drop for Root {
 
 fn spawn() -> (Child, Root) {
     let root = Root::new();
-    let child = Command::new(BIN).arg("mcp").current_dir(&root.0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let child = Command::new(bin()).arg("mcp").current_dir(&root.0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     (child, root)
 }
 
@@ -113,7 +102,7 @@ fn ping_returns_an_empty_object() {
 #[test]
 fn tools_list_has_every_tool_with_the_same_schemas_as_tools_json() {
     let cli_root = Root::new();
-    let cli = Command::new(BIN).args(["tools", "--json"]).current_dir(&cli_root.0).output().unwrap();
+    let cli = Command::new(bin()).args(["tools", "--json"]).current_dir(&cli_root.0).output().unwrap();
     assert!(cli.status.success());
     let J::Arr(cli_tools) = parse(&String::from_utf8(cli.stdout).unwrap()).unwrap() else { panic!("tools --json is an array") };
     let (out, code) = session(&[INIT, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);

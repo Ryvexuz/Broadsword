@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 /// A throwaway project folder with its own broadsword.toml. Removed on drop.
 struct Project {
@@ -21,37 +22,7 @@ impl Project {
         let dir = scratch_root.join(format!("cli-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
-        let toml = format!(
-            "root = \".\"\n\
-             disk_floor_gb = {disk_floor_gb}\n\
-             cleanup_every_hours = 1\n\
-             scratch_max_age_hours = 24\n\
-             disk_check_every_seconds = 60\n\
-             log_max_mb = 50\n\
-             ram_warn_percent = 100\n\
-             cpu_warn_percent = 90\n\
-             alert_command = \"\"\n\
-             scratch_dir = \"scratch\"\n\
-             build_dir = \"build\"\n\
-             projects_dir = \"projects\"\n\
-             state_dir = \"state\"\n\
-             install_dir = \"build/bin\"\n\
-             mcp_call_timeout_seconds = 1800\n\
-             mcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\n\
-             max_resumes = 3\n\
-             job_disk_reserve_gb = 2\n\
-             job_disk_poll_seconds = 5\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-"
-        );
+        let toml = support::config(&[("disk_floor_gb", &disk_floor_gb.to_string()), ("job_disk_reserve_gb", "2"), ("job_disk_poll_seconds", "5")]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Project { dir }
     }
@@ -70,7 +41,7 @@ max_agents = 50
 
     /// Run the binary with the project as the working directory, feeding `stdin`.
     fn run(&self, args: &[&str], stdin: &str) -> Output {
-        let mut child = Command::new(BIN)
+        let mut child = Command::new(bin())
             .args(args)
             .current_dir(&self.dir)
             .stdin(Stdio::piped())
@@ -364,7 +335,7 @@ fn hook_in_linked_worktree_honours_main_root_pause() {
     assert!(!wt.join("broadsword.paused").exists());
 
     let run_in_wt = |stdin: &str| {
-        let mut child = Command::new(BIN)
+        let mut child = Command::new(bin())
             .args(["hook", "pre-tool"])
             .current_dir(&wt)
             .stdin(Stdio::piped())

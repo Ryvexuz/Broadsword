@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_broadsword");
+mod support;
+use support::bin;
 
 struct Root {
     dir: PathBuf,
@@ -21,37 +22,7 @@ impl Root {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
         fs::create_dir_all(dir.join("projects")).unwrap();
-        let toml = format!(
-            "root = \".\"\n\
-             disk_floor_gb = {floor_gb}\n\
-             cleanup_every_hours = 1\n\
-             scratch_max_age_hours = 24\n\
-             disk_check_every_seconds = 60\n\
-             log_max_mb = 50\n\
-             ram_warn_percent = 100\n\
-             cpu_warn_percent = 90\n\
-             alert_command = \"\"\n\
-             scratch_dir = \"scratch\"\n\
-             build_dir = \"build\"\n\
-             projects_dir = \"projects\"\n\
-             state_dir = \"state\"\n\
-             install_dir = \"build/bin\"\n\
-             mcp_call_timeout_seconds = 1800\n\
-             mcp_output_max_kb = 1024\n\
-             checkpoint_ignored_max_mb = 50\n\
-             max_resumes = 3\n\
-             job_disk_reserve_gb = {reserve_gb}\n\
-             job_disk_poll_seconds = 1\ntask_lock_wait_seconds = 10\nworktrees_dir = \"worktrees\"\nbuild_lock_wait_seconds = 10\nrecover_lock_wait_seconds = 5
-sweep_older_than_days = 7
-redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
-reviewer_max_calls_per_entry = 3
-shadow_reviewer = \"off\"
-shadow_reviewer_model = \"gpt-5.6-sol\"
-shadow_reviewer_timeout_seconds = 5
-max_agents = 50
-"
-        );
+        let toml = support::config(&[("disk_floor_gb", &floor_gb.to_string()), ("job_disk_reserve_gb", &reserve_gb.to_string())]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
         Root { dir }
     }
@@ -78,7 +49,7 @@ max_agents = 50
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).current_dir(&self.dir).env_remove(HOOK).stdin(Stdio::null());
         c
     }
@@ -455,4 +426,157 @@ fn job_output_that_prints_a_dotenv_value_is_redacted_in_the_log_and_on_the_termi
     assert!(!so.contains("zzsecretvalue123"), "{so}");
     let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
     assert!(log.contains("[REDACTED]") && !log.contains("zzsecretvalue123"), "{log}");
+}
+
+// ---- the test step runs from copies; the build lock covers compiling only ---------------------------------------------
+
+/// A crate `name` with a bin (prints `hi`), a lib with `lib_rs`, and the integration tests in `tests` (file name, source).
+fn bin_project(r: &Root, name: &str, version: &str, lib_rs: &str, tests: &[(&str, &str)]) -> PathBuf {
+    let p = r.dir.join("projects").join(name);
+    fs::create_dir_all(p.join("src")).unwrap();
+    fs::create_dir_all(p.join("tests")).unwrap();
+    fs::write(p.join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\ndescription = \"a probe\"\nauthors = [\"A\", \"B\"]\n\n[workspace]\n")).unwrap();
+    fs::write(p.join("src/main.rs"), "fn main() { println!(\"hi\"); }\n#[cfg(test)] mod t { #[test] fn in_bin() {} }\n").unwrap();
+    fs::write(p.join("src/lib.rs"), lib_rs).unwrap();
+    for (f, src) in tests {
+        fs::write(p.join("tests").join(f), src).unwrap();
+    }
+    p
+}
+
+const ENV_PROBE: &str = r#"
+use std::path::Path;
+#[test]
+fn runs_from_a_copy_with_cargos_environment() {
+    let exe = std::env::current_exe().unwrap();
+    let bin = std::env::var("CARGO_BIN_EXE_envp").expect("CARGO_BIN_EXE_envp is set at run time");
+    for p in [exe.to_string_lossy().replace('\\', "/"), bin.replace('\\', "/")] {
+        assert!(p.contains("/scratch/test-bins/"), "not a job copy: {p}");
+    }
+    assert!(Path::new(&bin).is_file(), "{bin}");
+    let out = std::process::Command::new(&bin).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    assert_eq!(Path::new(&dir).canonicalize().unwrap(), std::env::current_dir().unwrap().canonicalize().unwrap(), "runs in the package root");
+    assert!(std::env::var("CARGO_MANIFEST_PATH").unwrap().ends_with("Cargo.toml"));
+    assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), "envp");
+    assert_eq!(std::env::var("CARGO_PKG_VERSION").unwrap(), "1.2.3-beta.1");
+    assert_eq!(std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(), "1");
+    assert_eq!(std::env::var("CARGO_PKG_VERSION_MINOR").unwrap(), "2");
+    assert_eq!(std::env::var("CARGO_PKG_VERSION_PATCH").unwrap(), "3");
+    assert_eq!(std::env::var("CARGO_PKG_VERSION_PRE").unwrap(), "beta.1");
+    assert_eq!(std::env::var("CARGO_PKG_AUTHORS").unwrap(), "A:B");
+    assert_eq!(std::env::var("CARGO_PKG_DESCRIPTION").unwrap(), "a probe");
+    assert!(std::env::var("CARGO").is_ok());
+    // the same values cargo compiled in
+    assert_eq!(std::env::var("CARGO_PKG_VERSION").unwrap(), env!("CARGO_PKG_VERSION"));
+}
+"#;
+
+#[test]
+fn the_test_step_runs_copied_executables_with_cargos_run_time_environment() {
+    let r = Root::new("copies", 1, 0);
+    bin_project(&r, "envp", "1.2.3-beta.1", "/// ```\n/// assert_eq!(envp::two(), 2);\n/// ```\npub fn two() -> i32 { 2 }\n#[cfg(test)] mod t { #[test] fn in_lib() {} }\n", &[("env.rs", ENV_PROBE)]);
+    let out = r.run(&["check", "envp"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stdout: {so}\nstderr: {se}");
+    // lib unit test, bin unit test, the integration test and the doc-test
+    assert!(so.contains("test: ok — 4 passed, 0 failed"), "{so}");
+    assert!(so.contains("build lock: released after") && so.contains("(compiling only); 3 test executable(s) copied to"), "{so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("Running tests/env.rs") || log.contains("Running tests\\env.rs") || log.contains("env.rs ("), "{log}");
+    assert!(!log.contains("\"reason\":\"compiler-artifact\""), "cargo's JSON stays out of the log: {log}");
+    assert!(!so.contains("\"reason\":"), "cargo's JSON stays off the terminal");
+    // the copies are gone once the step ends
+    let left: Vec<_> = fs::read_dir(r.dir.join("scratch/test-bins")).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "copies left behind: {left:?}");
+}
+
+/// Sum the `test result:` lines of `text`: (passed, failed, ignored).
+fn counts(text: &str) -> (u64, u64, u64) {
+    let mut c = (0, 0, 0);
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("test result:") else { continue };
+        for part in rest.split([';', '.']) {
+            let w: Vec<&str> = part.split_whitespace().collect();
+            if let [n, label, ..] = w[..] {
+                let n: u64 = n.parse().unwrap_or(0);
+                match label {
+                    "passed" => c.0 += n,
+                    "failed" => c.1 += n,
+                    "ignored" => c.2 += n,
+                    _ => {}
+                }
+            }
+        }
+    }
+    c
+}
+
+/// `cargo test --offline` run the old way, straight in `dir`, into its own target folder: (counts, exit code).
+fn plain_cargo_test(r: &Root, dir: &Path) -> ((u64, u64, u64), Option<i32>) {
+    let o = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["test", "--offline"])
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", r.dir.join("build-plain"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (counts(&text(&o.stdout)), o.status.code())
+}
+
+#[test]
+fn test_results_match_plain_cargo_test() {
+    let r = Root::new("same", 1, 0);
+    // passing, with ignored tests and a doc-test: every executable runs, so the totals must be equal
+    let p = bin_project(&r, "okp", "0.1.0", "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n#[cfg(test)] mod t { #[test] fn a() {} #[test] #[ignore] fn skip() {} }\n", &[("a.rs", "#[test] fn x() {}\n#[test] fn y() {}\n"), ("b.rs", "#[test] fn z() {}\n")]);
+    let ((pass, fail, ign), code) = plain_cargo_test(&r, &p);
+    assert_eq!(code, Some(0));
+    let out = r.run(&["test", "okp"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(so.contains(&format!("test: ok — {pass} passed, {fail} failed, {ign} ignored")), "plain cargo: {pass}/{fail}/{ign}; broadsword: {so}");
+    // failing: cargo stops at the first failing executable, and so does the job (no doc-test here: cargo runs those last)
+    let q = bin_project(&r, "badp", "0.1.0", "#[cfg(test)] mod t { #[test] fn a() {} }\n", &[("a.rs", "#[test] fn x() {}\n#[test] fn boom() { panic!(\"no\") }\n"), ("b.rs", "#[test] fn z() {}\n")]);
+    let ((pass, fail, _), code) = plain_cargo_test(&r, &q);
+    assert_eq!(code, Some(101));
+    let out = r.run(&["test", "badp"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{so}{se}");
+    assert!(so.contains(&format!("test: FAILED (exit 101) — {pass} passed, {fail} failed")), "plain cargo: {pass}/{fail}; broadsword: {so}");
+    assert!(se.contains("error: test failed, to rerun pass `--test a`"), "{se}");
+}
+
+#[test]
+fn a_build_in_the_same_root_does_not_wait_while_another_jobs_tests_run() {
+    let r = Root::new("lockfree", 1, 0);
+    // job A's only test waits (at most 90 s) for a gate file, after saying it started
+    let gate = r.dir.join("scratch/gate.flag");
+    let started = r.dir.join("scratch/started.flag");
+    let wait_test = format!(
+        "#[test]\nfn waits() {{\n    std::fs::write({started:?}, \"\").unwrap();\n    let t = std::time::Instant::now();\n    while !std::path::Path::new({gate:?}).exists() {{\n        assert!(t.elapsed().as_secs() < 90, \"gate never opened\");\n        std::thread::sleep(std::time::Duration::from_millis(50));\n    }}\n}}\n"
+    );
+    r.project("slow", &wait_test, None);
+    r.project("other", TWO_TESTS, None);
+    let mut a = r.cmd(&["test", "slow"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let t = Instant::now();
+    while !started.exists() {
+        assert!(t.elapsed() < Duration::from_secs(120), "job A never reached its tests");
+        if let Ok(Some(st)) = a.try_wait() {
+            panic!("job A ended early: {st}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A is inside its tests now. B compiles into the same shared build folder (same lock) without waiting for A.
+    let t0 = Instant::now();
+    let b = r.run(&["build", "other"]);
+    let b_secs = t0.elapsed().as_secs_f64();
+    fs::write(&gate, "").unwrap();
+    let a_out = a.wait_with_output().unwrap();
+    let (bo, be) = (text(&b.stdout), text(&b.stderr));
+    assert_eq!(b.status.code(), Some(0), "job B: {bo}{be}");
+    let waited: f64 = bo.lines().find_map(|l| l.strip_prefix("build lock: taken after waiting ")).and_then(|w| w.trim_end_matches(" s").parse().ok()).expect("B prints its lock wait");
+    assert!(waited < 5.0, "B waited {waited} s for the lock while A ran its tests (B took {b_secs:.1} s)");
+    assert_eq!(a_out.status.code(), Some(0), "job A: {}{}", text(&a_out.stdout), text(&a_out.stderr));
+    assert!(text(&a_out.stdout).contains("test: ok — 1 passed, 0 failed"), "{}", text(&a_out.stdout));
 }
