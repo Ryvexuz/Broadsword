@@ -27,6 +27,7 @@ delete. Exit codes: 0 all repos ok, 1 some repo behind, 2 usage or config error.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -76,13 +77,14 @@ def fmt_age(seconds):
 
 
 def ref_age(repo, full_ref, now):
-    """Age of a local ref (when it was last updated), or None."""
-    common = git(repo, "rev-parse", "--git-common-dir").stdout.strip()
-    common = os.path.normpath(os.path.join(repo, common))
-    for p in (os.path.join(common, *full_ref.split("/")), os.path.join(common, "packed-refs")):
-        if os.path.exists(p):
-            return now - os.path.getmtime(p)
-    return None
+    """Age of a local ref from its own reflog (time of its last update), or None when it has none.
+    File mtimes are not used: git rewrites packed-refs whenever any ref is packed or deleted."""
+    r = git(repo, "reflog", "show", "-1", "--date=unix", "--format=%gd", full_ref, check=False)
+    m = re.search(r"@\{(\d+)\}$", r.stdout.strip())   # %gd is "<ref>@{<time of the reflog entry>}"
+    if r.returncode != 0 or not m:
+        return None
+    out = m.group(1)
+    return now - int(out)
 
 
 def check_repo(root, entry, now):
@@ -142,7 +144,7 @@ def line_for(res):
     if res["tags"]:
         parts[-1] += " (%s)" % ", ".join(res["tags"])
     parts.append("oldest unpushed %s" % (fmt_age(res["oldest_age"]) if res["oldest_age"] is not None else "-"))
-    parts.append("%s updated %s ago" % (res["ref"], fmt_age(res["ref_age"]) if res["ref_age"] is not None else "?"))
+    parts.append(("%s updated %s ago" % (res["ref"], fmt_age(res["ref_age"]))) if res["ref_age"] is not None else ("%s age unknown" % res["ref"]))
     return "%s: %s - %s" % (res["name"], "BEHIND" if res["behind"] else "ok", ", ".join(parts))
 
 
@@ -177,7 +179,8 @@ def do_push(root, entry, url, refspecs):
             src = spec.split(":")[0]
             sha = git(repo, "rev-parse", src).stdout.strip()
             if src.startswith("refs/heads/"):
-                git(repo, "update-ref", "refs/backup-pushed-branch/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
+                git(repo, "update-ref", "--create-reflog",
+                    "refs/backup-pushed-branch/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
                 if git(tracking, "cat-file", "-e", sha + "^{commit}", check=False).returncode == 0:
                     git(tracking, "update-ref", "refs/remotes/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
             else:

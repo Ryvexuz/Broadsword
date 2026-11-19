@@ -13,7 +13,7 @@ Output is one line per repo, then `backup: ok` (exit 0) or `backup: N repos behi
 Exit 2 means a usage or config error (bad map, `--push` without `--yes`).
 
 Each line shows: commits ahead of the remote branch, tags not on the remote, the age of the oldest
-unpushed commit, and how long ago the local remote-tracking ref was last updated (stale tracking
+unpushed commit, and how long ago the local remote-tracking ref was last updated (taken from that ref's own reflog; `age unknown` if it has none; file times are never used because git rewrites `packed-refs` whenever any ref is packed or deleted) (stale tracking
 means the "ahead" count may be out of date; refresh it by hand with `git fetch`, which is network
 and is NOT done by the script).
 

@@ -117,6 +117,27 @@ class Status(Base):
         self.assertIn("origin/main updated", out)
         self.assertTrue(out.rstrip().endswith("backup: 1 repos behind"), out)
 
+    def test_ref_age_comes_from_reflog_not_packed_refs(self):
+        old = "%d +0000" % (time.time() - 5 * 86400)
+        sha = g(self.root, "rev-parse", "origin/main")
+        g(self.root, "update-ref", "-d", "refs/remotes/origin/main")   # drops the ref and its reflog
+        os.environ["GIT_COMMITTER_DATE"] = old
+        try:
+            g(self.root, "update-ref", "--create-reflog", "-m", "old fetch", "refs/remotes/origin/main", sha)
+        finally:
+            os.environ.pop("GIT_COMMITTER_DATE", None)
+        g(self.root, "branch", "gone")
+        g(self.root, "pack-refs", "--all")
+        g(self.root, "branch", "-D", "gone")   # rewrites packed-refs now
+        code, out = self.run_cli()
+        self.assertIn("origin/main updated 5d ago", out)
+
+    def test_no_reflog_says_age_unknown(self):
+        g(self.root, "reflog", "expire", "--expire=all", "--all")
+        os.remove(self.root / ".git" / "logs" / "refs" / "remotes" / "origin" / "main")
+        code, out = self.run_cli()
+        self.assertIn("origin/main age unknown", out)
+
     def test_missing_tag(self):
         commit(self.root, "b.txt")
         g(self.root, "push", "-q", "origin", "main")
