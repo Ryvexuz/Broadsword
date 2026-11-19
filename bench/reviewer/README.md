@@ -1,7 +1,7 @@
 # Reviewer benchmark
 
 Five known-bug cases (`cases.json`), each scored on whether a model flags the real bug as BLOCKING.
-Claude half: `run.py` (headless Claude Code). OpenAI half: `run_openai.py` (Chat Completions). Both use the same
+Claude half: `run.py` (headless Claude Code). OpenAI half: `run_openai.py` (Chat Completions, or the Responses API for the models `../models.json` marks `responses`). Codex half: `run_codex.py` (ChatGPT plan). Both use the same
 system prompt (`run.py`'s `SYSTEM`) and the same user prompt, so results compare directly. Results from both go through `score.py`.
 
 Results so far: `evidence/reviewer-benchmark-claude.md`.
@@ -27,6 +27,16 @@ From `bench/reviewer/`, with `<model>` the name Lazlo gives. Output goes in the 
 - `model_used` in each result is the response's `model` field; check it matches the model asked for.
 - Copy results worth keeping into `evidence/`; scratch can be wiped.
 
+## Model table: `bench/models.json`
+
+`run_openai.py` reads it. Per model: `api` (`chat` or `responses`; gpt-5-pro, gpt-5.2/5.4/5.5-pro and gpt-5.3-codex refuse Chat Completions), `max_output_tokens` (a larger `--max-tokens` is lowered to it, with a note; gpt-4o and gpt-4o-mini stop at 16384) and `service_tiers` (`--service-tier` must be one of them; `default` sends none). **A model not in the file is an error, not a default**: add a row first. Rows with a `note` are assumptions, not measurements. Results record `backend` (`openai-chat` / `openai-responses`) and `max_tokens_sent`. Responses runs send `instructions` (the system prompt), `input` and `max_output_tokens`, and `reasoning.effort` unless the effort is `default`.
+
+## Codex half: `run_codex.py`
+
+    python -I -B run_codex.py ../../scratch/bench-codex <model> default [case-id ...]
+
+Same arguments and result files as `run_openai.py`, with `backend: "codex"` and `cost_usd: null`. Uses ChatGPT plan quota: ask Lazlo first. Only effort `default` is accepted, and the API-only flags (`--base-url`, `--max-tokens`, `--retries`, `--backoff`, `--price-*`, `--service-tier`, `--root`) are refused if given. **Security:** the diff is untrusted and codex reads any file it has a tool for, so the runner calls `clients/openai_review.py`'s `review_codex()` and never builds codex flags itself: no tool is offered (one-entry model catalog, `docs/SHADOW_SANDBOX.md`), the child environment drops the API key and every `.env` value, and a tool item in the event stream makes the answer an error. There is no API fallback.
+
 ## Score and compare
 
     python -I -B score.py ../../scratch/bench-openai
@@ -37,6 +47,8 @@ Token counts: OpenAI `prompt_tokens` / `completion_tokens` are written as `input
 
 ## Tests (no network, fake key)
 
-    env -u OPENAI_API_KEY python -I -B -m unittest discover -s . -p test_run_openai.py -v
+    env -u OPENAI_API_KEY python -I -B -m unittest discover -s . -p "test_run_*.py" -v
+
+(`test_run_codex.py` uses a fake codex on a temporary PATH; neither file makes a real call.)
 
 (`python -I` leaves the current folder off the import path, so plain `-m unittest test_run_openai` cannot find the module.)

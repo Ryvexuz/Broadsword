@@ -9,7 +9,7 @@ writes the files score.py reads: <case>__<model>__<effort>.json and <case>__<mod
 It never runs without a model name on the command line, and every run costs real money: ask Lazlo first.
 The API key comes from OPENAI_API_KEY or the root .env (via clients/openai_mcp.py) and is never printed or written.
 """
-import argparse, importlib.util, json, os, pathlib, re, sys, time, urllib.parse
+import argparse, importlib.util, json, os, pathlib, re, socket, sys, time, urllib.error, urllib.parse, urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
@@ -27,18 +27,129 @@ run_mod = _load("bench_reviewer_run", HERE / "run.py")
 oc = _load("openai_mcp", HERE.parent.parent / "clients" / "openai_mcp.py")
 
 
+MODELS_FILE = HERE.parent / "models.json"  # bench/models.json: per-model API kind, token cap and tiers
+MODEL_KEYS = {"api", "max_output_tokens", "service_tiers", "note"}
+API_KINDS = ("chat", "responses")
+TIERS = ("default", "flex", "fast")
+
+
+def load_models(path=None):
+    """bench/models.json as {model: spec}. Every field is required and checked; nothing is defaulted."""
+    path = pathlib.Path(path or MODELS_FILE)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        models = data["models"]
+        assert isinstance(models, dict)
+    except (OSError, ValueError, KeyError, AssertionError, TypeError) as e:
+        sys.exit(f"cannot read the model table {path}: {type(e).__name__}")
+    for name, spec in models.items():
+        ok = (isinstance(spec, dict) and {"api", "max_output_tokens", "service_tiers"} <= set(spec) and set(spec) <= MODEL_KEYS
+              and spec["api"] in API_KINDS and isinstance(spec["max_output_tokens"], int) and not isinstance(spec["max_output_tokens"], bool)
+              and spec["max_output_tokens"] > 0 and isinstance(spec["service_tiers"], list) and spec["service_tiers"]
+              and all(t in TIERS for t in spec["service_tiers"]))
+        if not ok:
+            sys.exit(f"{path}: the entry for {name!r} is invalid (needs api in {API_KINDS}, max_output_tokens > 0, service_tiers from {TIERS})")
+    return models
+
+
+def model_spec(models, model):
+    if model not in models:
+        sys.exit(f"model {model!r} is not in models.json; add it there (api kind, max_output_tokens, service_tiers). Known: {', '.join(sorted(models))}")
+    return models[model]
+
+
 def user_prompt(case, diff):
     # Identical to run.py's prompt.
     return f"{case['brief']}\n\nDIFF:\n```diff\n{diff}\n```\n\nReview it now, in the required format."
 
 
-def build_payload(model, effort, prompt, max_tokens):
-    payload = {"model": model,
-               "messages": [{"role": "system", "content": run_mod.SYSTEM}, {"role": "user", "content": prompt}],
-               "max_completion_tokens": max_tokens}
-    if effort != "default":
-        payload["reasoning_effort"] = effort
+def build_payload(model, effort, prompt, max_tokens, api="chat", tier="default"):
+    if api == "responses":
+        payload = {"model": model, "instructions": run_mod.SYSTEM, "input": prompt, "max_output_tokens": max_tokens}
+        if effort != "default":
+            payload["reasoning"] = {"effort": effort}
+    else:
+        payload = {"model": model,
+                   "messages": [{"role": "system", "content": run_mod.SYSTEM}, {"role": "user", "content": prompt}],
+                   "max_completion_tokens": max_tokens}
+        if effort != "default":
+            payload["reasoning_effort"] = effort
+    if tier != "default":
+        payload["service_tier"] = tier
     return payload
+
+
+def responses_call(base_url, key, payload, timeout, backoff, retries):
+    """POST {base}/responses (the Responses API). Same error handling as openai_mcp.chat_completion: 429/5xx retried, redirects
+    refused, messages redacted. Raises oc.Fail."""
+    url = base_url.rstrip("/") + "/responses"
+    data = json.dumps(payload).encode("utf-8")
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, method="POST", headers={
+            "Content-Type": "application/json", "Authorization": "Bearer " + key, "User-Agent": oc.CLIENT_NAME})
+        try:
+            with oc._OPENER.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except (OSError, ValueError):
+                body = b""
+            st = e.code
+            if st == 429 or st >= 500:
+                if attempt < retries:
+                    wait = oc.retry_delay(e.headers, attempt, backoff)
+                    oc.err(f"HTTP {st} from the API; retrying in {wait:g} s ({attempt + 1}/{retries})")
+                    time.sleep(wait)
+                    continue
+                raise oc.Fail(f"HTTP {st}: still failing after {retries} retries. API message: {oc.api_message(body)}")
+            if 300 <= st < 400:
+                raise oc.Fail(f"HTTP {st}: the API answered with a redirect, which is not followed. Check --base-url.")
+            if st == 401:
+                raise oc.Fail("HTTP 401: the API rejected the key. Check OPENAI_API_KEY (or the line in .env).")
+            raise oc.Fail(f"HTTP {st}: the API refused the request. API message: {oc.api_message(body)}")
+        except (TimeoutError, socket.timeout):
+            raise oc.Fail(f"the API did not answer within {timeout:g} s (--timeout)")
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, (TimeoutError, socket.timeout)):
+                raise oc.Fail(f"the API did not answer within {timeout:g} s (--timeout)")
+            raise oc.Fail(f"cannot reach {oc.redact(url)}: {oc.redact(e.reason)}")
+        except OSError as e:
+            raise oc.Fail(f"network error talking to the API: {oc.redact(e)}")
+        try:
+            result = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            raise oc.Fail("the API returned something that is not valid JSON")
+        if not isinstance(result, dict) or not isinstance(result.get("output"), list):
+            raise oc.Fail("the API response has no `output` list; it is not a Responses API response")
+        return result
+    raise oc.Fail("unreachable")
+
+
+def parse_responses(raw):
+    """(text, error) from a Responses API body: the output_text parts of every message item, joined."""
+    status = raw.get("status")
+    usage = json.dumps(raw.get("usage") or {}, sort_keys=True)
+    parts, refusal = [], None
+    for item in raw["output"]:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for c in item.get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                parts.append(c["text"])
+            elif isinstance(c, dict) and c.get("type") == "refusal":
+                refusal = c.get("refusal")
+    text = "".join(parts)
+    if status != "completed":
+        det = raw.get("incomplete_details")
+        why = det.get("reason") if isinstance(det, dict) else None
+        e = f"incomplete answer: status={status!r}, reason={why!r}, usage={usage}"
+        if why == "max_output_tokens":
+            e += " (the reasoning probably used up max_output_tokens; raise --max-tokens)"
+        return "", e
+    if not text.strip():
+        return "", (f"the model refused: {refusal}" if refusal else f"empty answer: status='completed', usage={usage}")
+    return text, None
 
 
 def normalize_usage(u):
@@ -46,8 +157,8 @@ def normalize_usage(u):
     if not isinstance(u, dict):
         return None
     u = dict(u)
-    u["input_tokens"] = u.get("prompt_tokens") or 0
-    u["output_tokens"] = u.get("completion_tokens") or 0
+    u["input_tokens"] = u.get("input_tokens") or u.get("prompt_tokens") or 0
+    u["output_tokens"] = u.get("output_tokens") or u.get("completion_tokens") or 0
     return u
 
 
@@ -82,7 +193,9 @@ def parser():
     p.add_argument("--root", help="folder holding .env (default: the main checkout of this repo)")
     p.add_argument("--timeout", type=float, default=600.0, help="seconds to wait per request (default: %(default)s)")
     p.add_argument("--max-tokens", type=int, default=16000,
-                   help="max_completion_tokens per request, reasoning included (default: %(default)s)")
+                   help="max output tokens per request, reasoning included; lowered to the model's max_output_tokens in models.json (default: %(default)s)")
+    p.add_argument("--service-tier", default="default", choices=TIERS,
+                   help="service tier; must be one the model accepts in models.json (default: %(default)s = none sent)")
     p.add_argument("--retries", type=int, default=2, help="retries on 429 and 5xx (default: %(default)s)")
     p.add_argument("--backoff", type=float, default=2.0, help="base retry wait in seconds, doubling (default: %(default)s)")
     p.add_argument("--price-in", type=float, help="USD per 1M input tokens; with --price-out, enables cost_usd (default: none)")
@@ -112,6 +225,12 @@ def main(argv=None):
         sys.exit("--base-url must be an http(s) URL")
     if u.scheme == "http" and u.hostname not in ("127.0.0.1", "localhost", "::1"):
         sys.exit("refusing to send the API key over plain http to a non-local host")
+    spec = model_spec(load_models(), args.model)
+    if args.service_tier not in spec["service_tiers"]:
+        sys.exit(f"model {args.model} does not accept service tier {args.service_tier!r} (models.json lists: {', '.join(spec['service_tiers'])})")
+    max_tokens = min(args.max_tokens, spec["max_output_tokens"])
+    if max_tokens < args.max_tokens:
+        print(f"note: --max-tokens {args.max_tokens} lowered to {max_tokens}, the cap for {args.model} in models.json", file=sys.stderr)
     cases = json.loads((HERE / "cases.json").read_text(encoding="utf-8"))
     known = {c["id"] for c in cases}
     unknown = [c for c in args.cases if c not in known]
@@ -124,20 +243,27 @@ def main(argv=None):
         sys.exit(f"error: {e}")
     if args.price_in is None:
         print("note: no --price-in/--price-out given, so cost_usd is null (prices are never guessed)", file=sys.stderr)
-    out = pathlib.Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
     want = set(args.cases)
+    todo = [c for c in cases if not want or c["id"] in want]
+    diffs = {}
+    for c in todo:  # every input is checked before the first paid call
+        try:
+            diffs[c["id"]] = (HERE / c["diff"]).read_text(encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"case {c['id']}: cannot read its diff {c['diff']} ({type(e).__name__}); run make_cases.sh first")
+    out = pathlib.Path(args.out_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
     failures = 0
-    for c in cases:
-        if want and c["id"] not in want:
-            continue
-        diff = (HERE / c["diff"]).read_text(encoding="utf-8")
-        payload = build_payload(args.model, args.effort, user_prompt(c, diff), args.max_tokens)
+    for c in todo:
+        payload = build_payload(args.model, args.effort, user_prompt(c, diffs[c["id"]]), max_tokens, spec["api"], args.service_tier)
         tag = f"{c['id']}__{safe(args.model)}__{safe(args.effort)}"
         t0 = time.time()
         raw, error = None, None
         try:
-            raw = oc.chat_completion(args.base_url, key, payload, args.timeout, args.backoff, args.retries)
+            if spec["api"] == "responses":
+                raw = responses_call(args.base_url, key, payload, args.timeout, args.backoff, args.retries)
+            else:
+                raw = oc.chat_completion(args.base_url, key, payload, args.timeout, args.backoff, args.retries)
         except oc.Fail as e:
             error = str(e)
         except Exception as e:
@@ -145,7 +271,9 @@ def main(argv=None):
         dt = time.time() - t0
         usage = normalize_usage((raw or {}).get("usage"))
         text = ""
-        if raw is not None:
+        if raw is not None and spec["api"] == "responses":
+            text, error = parse_responses(raw)
+        elif raw is not None:
             try:
                 choice = raw["choices"][0]
                 msg = choice["message"]
@@ -170,6 +298,7 @@ def main(argv=None):
         rec = {"case": c["id"], "model": args.model, "effort": args.effort, "wall_s": round(dt, 1),
                "exit": 1 if rec_error else 0, "cost_usd": cost_usd(usage, args.price_in, args.price_out),
                "usage": usage, "result": text, "is_error": rec_error,
+               "backend": "openai-" + spec["api"], "max_tokens_sent": max_tokens,
                "model_used": [raw["model"]] if raw and isinstance(raw.get("model"), str) else []}
         if error:
             rec["error"] = oc.redact(error)

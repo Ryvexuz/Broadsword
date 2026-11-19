@@ -27,7 +27,7 @@ class Fake:
     """Fake server: `script` is a list of (status, body-dict) answered in order; the last one repeats."""
 
     def __init__(self, script):
-        self.script, self.requests, self.auth = list(script), [], []
+        self.script, self.requests, self.auth, self.paths = list(script), [], [], []
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -35,6 +35,7 @@ class Fake:
                 n = int(self.headers.get("Content-Length", 0))
                 outer.requests.append(json.loads(self.rfile.read(n)))
                 outer.auth.append(self.headers.get("Authorization"))
+                outer.paths.append(self.path)
                 status, body = outer.script.pop(0) if len(outer.script) > 1 else outer.script[0]
                 data = json.dumps(body).encode()
                 self.send_response(status)
@@ -74,12 +75,17 @@ class RunOpenAI(unittest.TestCase):
         (self.tmp / "root").mkdir()
         self.out = self.tmp / "out"
         self.old_here, ro.HERE = ro.HERE, self.here
+        self.models = {"models": {"gpt-fake": {"api": "chat", "max_output_tokens": 20000, "service_tiers": ["default", "fast"]},
+                                  "gpt-resp": {"api": "responses", "max_output_tokens": 50000, "service_tiers": ["default"]}}}
+        (self.tmp / "models.json").write_text(json.dumps(self.models), encoding="utf-8")
+        self.old_models, ro.MODELS_FILE = ro.MODELS_FILE, self.tmp / "models.json"
         self.old_key = os.environ.pop("OPENAI_API_KEY", None)
         os.environ["OPENAI_API_KEY"] = FAKE_KEY
         ro.oc._SECRETS.clear()
 
     def tearDown(self):
         ro.HERE = self.old_here
+        ro.MODELS_FILE = self.old_models
         os.environ.pop("OPENAI_API_KEY", None)
         if self.old_key is not None:
             os.environ["OPENAI_API_KEY"] = self.old_key
@@ -236,6 +242,105 @@ class RunOpenAI(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 ro.main([str(self.out), "m", "high", "--base-url", f.url, "--root", str(self.tmp / "root")])
         self.assertEqual(f.requests, [])
+
+    # ---- models.json, Responses API, caps, tiers ----
+
+    def resp_body(self, text=REVIEW, status="completed", reason=None, model="gpt-resp-2026"):
+        body = {"model": model, "status": status,
+                "output": [{"type": "reasoning", "summary": []},
+                           {"type": "message", "content": [{"type": "output_text", "text": text}]}] if text is not None else [],
+                "usage": {"input_tokens": 900, "output_tokens": 300}}
+        if reason:
+            body["incomplete_details"] = {"reason": reason}
+        return body
+
+    def test_responses_model_uses_responses_endpoint_and_shape(self):
+        f = Fake([(200, self.resp_body())])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f, "gpt-resp", "high")
+        self.assertEqual(code, 0)
+        self.assertEqual(f.paths, ["/v1/responses"])
+        req = f.requests[0]
+        self.assertEqual(req["instructions"], ro.run_mod.SYSTEM)
+        self.assertIn("DIFF:", req["input"])
+        self.assertEqual(req["reasoning"], {"effort": "high"})
+        self.assertEqual(req["max_output_tokens"], 16000)
+        self.assertNotIn("messages", req)
+        r = self.record("gpt-resp")
+        self.assertEqual((r["exit"], r["is_error"], r["result"], r["backend"]), (0, False, REVIEW, "openai-responses"))
+        self.assertEqual((r["usage"]["input_tokens"], r["usage"]["output_tokens"]), (900, 300))
+        self.assertEqual(r["model_used"], ["gpt-resp-2026"])
+
+    def test_responses_incomplete_is_an_error(self):
+        f = Fake([(200, self.resp_body(text=None, status="incomplete", reason="max_output_tokens"))])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f, "gpt-resp", "default")
+        self.assertEqual(code, 1)
+        r = self.record("gpt-resp", "default")
+        self.assertTrue(r["is_error"])
+        self.assertIn("max_output_tokens", r["error"])
+        self.assertNotIn("reasoning", f.requests[0])
+
+    def test_responses_chat_shaped_body_is_an_error(self):
+        f = Fake([(200, ok_body())])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f, "gpt-resp", "default")
+        self.assertEqual(code, 1)
+
+    def test_max_tokens_lowered_to_model_cap(self):
+        f = Fake([(200, ok_body())])
+        self.addCleanup(f.close)
+        code, _, se = self.run_it(f, "gpt-fake", "high", "--max-tokens", "32000")
+        self.assertEqual(code, 0)
+        self.assertEqual(f.requests[0]["max_completion_tokens"], 20000)
+        self.assertEqual(self.record()["max_tokens_sent"], 20000)
+        self.assertIn("lowered to 20000", se)
+
+    def test_model_not_in_table_is_refused_before_any_call(self):
+        f = Fake([(200, ok_body())])
+        self.addCleanup(f.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                ro.main([str(self.out), "gpt-nope", "high", "--base-url", f.url, "--root", str(self.tmp / "root")])
+        self.assertIn("not in models.json", str(cm.exception))
+        self.assertEqual(f.requests, [])
+
+    def test_invalid_table_entry_is_refused(self):
+        (self.tmp / "models.json").write_text(json.dumps({"models": {"gpt-fake": {"api": "chat"}}}), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                ro.main([str(self.out), "gpt-fake", "high", "--root", str(self.tmp / "root")])
+        self.assertIn("invalid", str(cm.exception))
+
+    def test_service_tier_sent_only_when_model_accepts_it(self):
+        f = Fake([(200, ok_body())])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f, "gpt-fake", "high", "--service-tier", "fast")
+        self.assertEqual(code, 0)
+        self.assertEqual(f.requests[0]["service_tier"], "fast")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_it(f, "gpt-fake", "high", "--service-tier", "flex")
+        self.assertIn("does not accept", str(cm.exception))
+        self.assertEqual(len(f.requests), 1)
+
+    def test_missing_diff_refused_before_first_call(self):
+        (self.here / "cases" / "c1.diff").unlink()
+        f = Fake([(200, ok_body())])
+        self.addCleanup(f.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_it(f)
+        self.assertIn("cannot read its diff", str(cm.exception))
+        self.assertEqual(f.requests, [])
+        self.assertFalse(self.out.exists())
+
+    def test_real_models_json_is_valid_and_has_the_known_rows(self):
+        m = ro.load_models(REAL_HERE.parent / "models.json")
+        for name in ("gpt-5-pro", "gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro", "gpt-5.3-codex"):
+            self.assertEqual(m[name]["api"], "responses")
+        self.assertEqual(m["gpt-4o"]["max_output_tokens"], 16384)
+        self.assertEqual(m["gpt-4o-mini"]["max_output_tokens"], 16384)
 
     def test_help_makes_no_network_call(self):
         p = subprocess.run([sys.executable, "-I", "-B", str(REAL_HERE / "run_openai.py"), "--help"],
