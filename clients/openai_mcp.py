@@ -617,6 +617,9 @@ def run_agent(args, key: str, server: McpServer, offered: list[dict], run: Run, 
         calls = message.get("tool_calls") or []
         if not calls:
             run.final = message.get("content") or ""
+            reason = response["choices"][0].get("finish_reason")
+            if reason is not None and reason != "stop":
+                raise Fail(f"the model's answer is incomplete: finish_reason is `{reason}`, not `stop` (the partial text is kept in the final answer and the log)")
             return
         if message.get("content"):
             out(f"[model] {message['content']}")

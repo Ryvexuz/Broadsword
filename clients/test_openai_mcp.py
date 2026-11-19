@@ -193,6 +193,24 @@ class EndToEnd(RootCase):
         self.assertEqual([m["role"] for m in fake.requests[0]["json"]["messages"]], ["system", "user"])
         self.assertTrue(self.mcp_log().rstrip().endswith("stopped"), "the server must have been closed and have said so")
 
+    def test_truncated_or_filtered_answer_is_an_error_but_stop_and_missing_are_fine(self):
+        for reason in ("length", "content_filter"):
+            partial = final("half an ans")
+            partial["body"]["choices"][0]["finish_reason"] = reason
+            with FakeOpenAI([partial]) as fake:
+                r = self.cli(fake.url)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn(reason, r.stderr)
+            self.assertIn("half an ans", r.stdout)
+        missing = final("whole answer")
+        del missing["body"]["choices"][0]["finish_reason"]
+        with FakeOpenAI([missing]) as fake:
+            r = self.cli(fake.url)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with FakeOpenAI([final("fine")]) as fake:
+            r = self.cli(fake.url)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_model_and_tools_offered(self):
         with FakeOpenAI([final("hi")]) as fake:
             r = self.cli(fake.url, "--model", "gpt-test-1")
