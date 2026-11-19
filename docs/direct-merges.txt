@@ -6,7 +6,7 @@
 # A commit whose approval is not on record is NOT listed here: it stays UNACCOUNTED until Lazlo approves it.
 # Records-only commits (only *.md at the root, evidence/, docs/) need no entry.
 
-# 2026-11-19, two commits the orchestrator made directly. cfadd9e: its own commit message says "Lazlo's decision". eafe80a: its commit message does not say who approved it; the approval (Lazlo chose "Fable review" in the session) is in state/staging/direct-merges/nb06-eafe80a.md, which is outside Git, and a LAB_LOG.md entry for it is still to be committed.
+# 2026-11-19, two commits the orchestrator made directly. cfadd9e: its own commit message says "Lazlo's decision". eafe80a: its commit message does not say who approved it; the approval (Lazlo chose "Fable review" in the session) is recorded in evidence/direct-merges/nb06-eafe80a.md (committed in 4d49571).
 broadsword | cfadd9e4ddc2 | Lazlo (per the commit message) | broadsword.toml shadow_reviewer = off, a safety stop for audit finding A6 | commit message of cfadd9e
 broadsword | eafe80abf17f | Lazlo ("Fable review" choice, per the orchestrator's record) | nb-06 scripts/baseline.py merged on one Fable 5.2 review (PASS on 8b77662) after four haiku queue FAILs with new non-regression points | evidence/direct-merges/nb06-eafe80a.md (committed in 4d49571)
 
