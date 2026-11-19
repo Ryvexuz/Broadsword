@@ -45,4 +45,5 @@ The first line names the version. This parser reads version 1 only and refuses a
 
 ## Line endings in a Windows checkout
 
-The format is strict about `\n`. Git on Windows with `core.autocrlf=true` checks text files out with CRLF, which `parse` refuses by name. The tests normalise `\r\n` before parsing; a program that reads a scenario from a checkout needs either the same step or a `.gitattributes` line `*.bsn text eol=lf`.
+The format is strict about `
+`. Git on Windows with `core.autocrlf=true` would check text files out with CRLF, which `parse` refuses by name. The repo now enforces LF: `.gitattributes` has `*.bsn text eol=lf` and `*.input text eol=lf`, and the tests read scenario files exactly as checked out (`scenario_files_have_no_carriage_returns` fails on a CRLF copy).

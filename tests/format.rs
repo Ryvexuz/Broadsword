@@ -6,11 +6,27 @@ use crash_sim::format::{parse, write, Body, BodyBeam, Group, Material, Node, Par
 use crash_sim::vec3::Vec3;
 use crash_sim::{Config, Sim, BEAM_DAMPING, BEAM_STIFFNESS, NODE_MASS};
 
-/// A scenario file. Git on Windows may check text files out with CRLF line endings; the
-/// format itself is strict about `\n`, so the test normalises what the checkout did.
+/// A scenario file, exactly as checked out (`.gitattributes` forces LF for `*.bsn`).
 fn scenario(name: &str) -> String {
     let path = format!("{}/scenarios/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}")).replace("\r\n", "\n")
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// The files must be LF on disk: `.gitattributes` has to keep Windows checkouts from
+/// turning them into CRLF, which the strict parser refuses.
+#[test]
+fn scenario_files_have_no_carriage_returns() {
+    let dir = format!("{}/scenarios", env!("CARGO_MANIFEST_DIR"));
+    let mut seen = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().map_or(false, |x| x == "bsn") {
+            let bytes = std::fs::read(&p).unwrap();
+            assert!(!bytes.contains(&b'\r'), "{} contains a carriage return", p.display());
+            seen += 1;
+        }
+    }
+    assert!(seen >= 2, "found {seen} .bsn files");
 }
 
 // ---------------------------------------------------------------------------------------
