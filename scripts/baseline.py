@@ -15,7 +15,9 @@ Sources (read-only), all in the main checkout:
   state/jobs/*.rec           job kind, start and end
   state/agent-runs.tsv       subagent runs the orchestrator logs (role, model, task, tokens, seconds)
   git                        main's commit, Revert commits on main inside the window
-Helpers are imported by path from scripts/dev_metrics.py and scripts/review_costs.py, so the numbers agree with them.
+Helpers (fields, num, steps, covered, header) are imported by path from scripts/dev_metrics.py and scripts/review_costs.py.
+dev_metrics has no function for coder use or coder tokens (its `util` is computed inside its printing function), so
+those are baseline's own, with the same formula (seconds / window).
 
 Window membership: a task counts if it merged (ended) inside [since, until); a queue entry, review or job counts if it
 was created or started inside the window; a task's running time counts where it overlaps the window.
@@ -32,11 +34,13 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import re
 import statistics
 import subprocess
 import time
+import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 SCHEMA = 1
@@ -50,7 +54,7 @@ METRICS = {
     "lead_median_s": ("throughput", "down", "s", "median task start -> merged"),
     "lead_p90_s": ("throughput", "down", "s", "p90 task start -> merged"),
     "idle_share": ("pipeline", "down", "share", "share of the window with no task running (dev_metrics 'idle')"),
-    "coder_use": ("pipeline", "up", "share", "coder seconds / window, as dev_metrics 'util'; over 100% = coders in parallel"),
+    "coder_use": ("pipeline", "up", "share", "coder seconds of runs overlapping the window / window (dev_metrics' util formula); over 100% = parallel"),
     "review_rounds_per_merged": ("quality", "down", "rounds", "reviews per merged task, failed ones included"),
     "first_pass_fail_rate": ("quality", "down", "share", "merged tasks whose first review was FAIL"),
     "reverted_or_reopened": ("quality", "down", "count", "Revert commits on main + tasks merged more than once"),
@@ -58,8 +62,8 @@ METRICS = {
     "direct_merges": ("quality", None, "count", "tasks merged outside the queue (approved direct merges)"),
     "review_usd_per_merged": ("cost", "down", "USD", "all review cost in the window (retries included) / merged"),
     "review_tokens_per_merged": ("cost", "down", "tokens", "all review tokens in the window / merged"),
-    "coder_tokens_per_merged": ("cost", "down", "tokens", "coder tokens from agent-runs.tsv / merged"),
-    "coder_runs_recorded": ("cost", None, "runs", "coder runs found in agent-runs.tsv for the window"),
+    "coder_tokens_per_merged": ("cost", "down", "tokens", "coder tokens of tasks that ended in the window / merged"),
+    "coder_runs_recorded": ("cost", None, "runs", "coder runs of tasks that ended in the window"),
     "entry_median_s": ("queue", "down", "s", "median queue entry created -> ended (merge time per attempt)"),
     "check_median_s": ("queue", "down", "s", "median `check` step per entry"),
     "review_median_s": ("queue", "down", "s", "median `review` step per entry"),
@@ -248,22 +252,43 @@ def measure(root, since, until):
     win_reviews = [r for r in reviews if inside(review_time(r)[0])]
     usd = 0.0
     rtok = 0
+    no_cost = no_tokens = 0
     per_model = {}
     for r in win_reviews:
-        try:
-            c = float(r.get("cost_usd") or 0)
-        except ValueError:
-            raise InputError(f"{qdir / r['_file']}: cost_usd {r.get('cost_usd')!r} is not a number") from None
-        tok = (dm.num(r.get("input tokens")) or 0) + (dm.num(r.get("output tokens")) or 0)
-        usd += c
+        # A review with no cost or token field is not counted as zero: it is counted apart and reported.
+        c = None
+        if r.get("cost_usd", "").strip():
+            try:
+                c = float(r["cost_usd"])
+            except ValueError:
+                raise InputError(f"{qdir / r['_file']}: cost_usd {r.get('cost_usd')!r} is not a number") from None
+        else:
+            no_cost += 1
+        tin, tout = dm.num(r.get("input tokens")), dm.num(r.get("output tokens"))
+        if tin is None or tout is None:
+            no_tokens += 1
+        tok = (tin or 0) + (tout or 0)
+        usd += c or 0.0
         rtok += tok
         m = per_model.setdefault(f"reviewer:{r.get('model', '?')}", {"runs": 0, "usd": 0.0, "tokens": 0, "seconds": 0})
         m["runs"] += 1
-        m["usd"] += c
+        m["usd"] += c or 0.0
         m["tokens"] += tok
+    if no_cost:
+        notes.append(f"{no_cost} of {len(win_reviews)} reviews have no cost recorded: review USD is a lower bound")
+    if no_tokens:
+        notes.append(f"{no_tokens} of {len(win_reviews)} reviews have no token counts recorded: review tokens are a lower bound")
 
-    # Coder runs: a row counts if its task's running time overlaps the window; a row with no known task, by its date.
+    # Coder runs. Two rules, one per use:
+    #  - coder_use and per_model (activity in the window): a row counts if its task's running time overlaps the window,
+    #    or, with no known task, by its date. dev_metrics has no function for this (its `util` is computed inside the
+    #    printing function `models()`, selected by date only), so this is its formula, seconds / window, with
+    #    baseline's own row selection.
+    #  - coder_tokens_per_merged (cost): only rows of tasks that ENDED inside the window (finished work, merged or
+    #    abandoned, as rejected review attempts are counted too). Tasks still running at `until` and rows with no known
+    #    task are left out and counted in the notes, so unfinished work never inflates the cost.
     task_span = {t.get("id"): (dm.num(t.get("started")), dm.num(t.get("ended")) or until) for t in tasks}
+    task_ended = {t.get("id"): dm.num(t.get("ended")) for t in tasks}
     first_day, last_day = time.strftime("%Y-%m-%d", time.gmtime(since)), time.strftime("%Y-%m-%d", time.gmtime(until - 1))
     try:
         lines = runs_file.read_text(encoding="utf-8").splitlines()
@@ -273,7 +298,7 @@ def measure(root, since, until):
     for col in ("date_utc", "role", "model", "task", "tokens", "seconds"):
         if col not in head:
             raise InputError(f"{runs_file}: header has no `{col}` column (found {head})")
-    coder_secs = coder_tok = coder_runs = 0
+    coder_secs = coder_tok = coder_runs = unfinished_runs = 0
     for line in lines[1:]:
         if not line.strip():
             continue
@@ -286,14 +311,21 @@ def measure(root, since, until):
         if not hit:
             continue
         secs, tok = dm.num(v.get("seconds")) or 0, dm.num(v.get("tokens")) or 0
+        finished = inside(task_ended.get(v.get("task")))
+        if v.get("role") == "coder" and not finished:
+            unfinished_runs += 1
         m = per_model.setdefault(f"{v.get('role', '?')}:{v.get('model', '?')}", {"runs": 0, "usd": 0.0, "tokens": 0, "seconds": 0})
         m["runs"] += 1
         m["tokens"] += tok
         m["seconds"] += secs
         if v.get("role") == "coder":
-            coder_runs += 1
             coder_secs += secs
-            coder_tok += tok
+            if finished:
+                coder_runs += 1
+                coder_tok += tok
+    if unfinished_runs:
+        notes.append(f"{unfinished_runs} coder run(s) in the window belong to tasks not finished in it (or of no known task): "
+                     "counted in coder_use, left out of coder tokens")
     for r in win_reviews:
         secs = dm.steps(entry_by_id[r["entry"]]).get("review") if r.get("entry") in entry_by_id else None
         per_model[f"reviewer:{r.get('model', '?')}"]["seconds"] += secs or 0
@@ -342,9 +374,10 @@ def measure(root, since, until):
         "build_lock_wait_s": None,
     }
     if not coder_runs:
-        notes.append("no coder runs in state/agent-runs.tsv for this window: coder tokens not known")
+        notes.append("no coder runs of tasks that ended in this window in state/agent-runs.tsv: coder tokens not known")
     samples = {"merged_tasks": n, "queue_entries": len(win_entries), "reviews": len(win_reviews),
-               "test_jobs": len(test_jobs), "coder_runs": coder_runs}
+               "test_jobs": len(test_jobs), "coder_runs": coder_runs,
+               "reviews_without_cost": no_cost, "reviews_without_tokens": no_tokens}
     return values, samples, per_model, main_sha, notes
 
 
@@ -366,6 +399,30 @@ def baselines_dir(root):
     return root / "state" / "baselines"
 
 
+def validate_baseline(data, path):
+    """Every key compare and list read must be there with the right type, else bad input naming the file."""
+    def bad(why):
+        raise InputError(f"{path}: not a valid schema-{SCHEMA} baseline ({why})")
+    if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+        bad("schema")
+    for key, typ in (("name", str), ("main_commit", str), ("broadsword_toml_sha256", str), ("window", dict),
+                     ("metrics", dict), ("samples", dict), ("per_model", dict), ("notes", list)):
+        if not isinstance(data.get(key), typ):
+            bad(f"`{key}` missing or not a {typ.__name__}")
+    for key in ("since", "until"):
+        if not isinstance(data["window"].get(key), str):
+            bad(f"`window.{key}` missing")
+    mt = data["samples"].get("merged_tasks")
+    if isinstance(mt, bool) or not isinstance(mt, int):
+        bad("`samples.merged_tasks` missing or not a whole number")
+    for k, v in data["metrics"].items():
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            bad(f"metric `{k}` is not a number or null")
+    for k, v in data["per_model"].items():
+        if not isinstance(v, dict) or not all(isinstance(v.get(f), (int, float)) for f in ("runs", "usd", "tokens")):
+            bad(f"per_model `{k}` is malformed")
+
+
 def load_baseline(root, name):
     if not NAME_RE.match(name):
         raise InputError(f"baseline name {name!r}: use letters, digits, '.', '_' and '-' only")
@@ -376,8 +433,7 @@ def load_baseline(root, name):
         raise InputError(f"{path}: no such baseline (record it with: baseline.py record {name} --since ...)") from None
     except (OSError, UnicodeError, ValueError) as e:
         raise InputError(f"{path}: unreadable ({e})") from None
-    if not isinstance(data, dict) or data.get("schema") != SCHEMA or not isinstance(data.get("metrics"), dict):
-        raise InputError(f"{path}: not a schema-{SCHEMA} baseline")
+    validate_baseline(data, path)
     return data
 
 
@@ -405,9 +461,22 @@ def cmd_record(args):
         "metrics": values, "samples": samples, "per_model": per_model, "notes": notes,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(out)
+    # Never-overwrite must be atomic: write a uniquely named temp file, then os.link it to the final name. link fails if
+    # the name exists, so of two concurrent records exactly one wins and the loser exits 1 with the winner untouched.
+    tmp = out.with_name(f".{out.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            os.link(tmp, out)
+        except FileExistsError:
+            raise InputError(f"{out}: already exists; a baseline is evidence and is never overwritten, pick a new name") from None
+        except OSError as e:
+            raise InputError(f"{out}: cannot create ({e})") from None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     print(f"baseline {args.name}: {data['window']['since']} to {data['window']['until']} ({data['window']['hours']} h)")
     print(f"main {main_sha[:10]}, broadsword.toml sha256 {toml_hash[:12]}")
     for k, (group, _, unit, desc) in METRICS.items():

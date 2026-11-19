@@ -1,6 +1,6 @@
 # Baselines: before/after evidence for process changes
 
-Project rule: every process change needs before/after evidence (throughput, quality, cost). If the evidence does not show an improvement, switch back. `scripts/baseline.py` gathers the numbers. `scripts/ledger_check.py` makes the `RETRO.md` improvement ledger follow the rule.
+Project rule: every process change needs before/after evidence (throughput, quality, cost). If the evidence does not show an improvement, switch back. `scripts/baseline.py` gathers the numbers. A later ledger check that reads these files is planned; it is not built yet, and nothing enforces the ledger rule today.
 
 ## Commands
 
@@ -11,7 +11,8 @@ python -I scripts/baseline.py list
 ```
 
 - `record` measures one window and writes `state/baselines/<name>.json`. That folder is outside Git, under `state/`. The file also stores main's commit and the `broadsword.toml` SHA-256, so a baseline says what it measured.
-- `record` never overwrites. A "before" is evidence, so pick a new name instead.
+- `record` never overwrites, even when two records race for one name (the file is created with an atomic link; the loser exits 1). A "before" is evidence, so pick a new name instead.
+- A baseline file is checked in full when read. A missing key or wrong type is bad input (exit 1) and names the file.
 - Times need a zone, for example `2026-11-18T09:00:00Z`. A bare time is refused, because it would be read in the wrong zone.
 - `compare` prints each metric's before, after, change and verdict, then an overall verdict.
 - `--min-samples` and `--noise` are required, because the code has no defaults (the settings rule).
@@ -27,22 +28,24 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 | throughput | `merged_per_hour` | higher | merged / window hours |
 | throughput | `lead_median_s`, `lead_p90_s` | lower | task `started` to `ended` (merge) |
 | pipeline | `idle_share` | lower | `dev_metrics.covered()` over task running spans |
-| pipeline | `coder_use` | higher | coder-role seconds in `state/agent-runs.tsv` / window. Over 100% means coders ran in parallel |
+| pipeline | `coder_use` | higher | coder-role seconds of runs overlapping the window, from `state/agent-runs.tsv`, / window. Over 100% means coders ran in parallel. `dev_metrics.py` has no function for this (its `util` is computed inside its printing function), so baseline computes it with the same formula (seconds / window) but its own row selection; the two need not match |
 | quality | `review_rounds_per_merged` | lower | `.review` files of merged tasks, failed rounds included |
 | quality | `first_pass_fail_rate` | lower | merged tasks whose first review was FAIL |
 | quality | `reverted_or_reopened` | lower | `Revert...` commits on main in the window, plus tasks merged more than once |
 | quality | `main_check_failed` | lower | entries with status `merged_check_failed` |
 | quality | `direct_merges` | context only | tasks merged outside the queue |
 | cost | `review_usd_per_merged`, `review_tokens_per_merged` | lower | every review in the window, retries and rejected attempts included, / merged |
-| cost | `coder_tokens_per_merged` | lower | coder rows in `agent-runs.tsv` / merged |
+| cost | `coder_tokens_per_merged` | lower | coder rows in `agent-runs.tsv` of tasks that ended inside the window / merged |
 | queue | `entry_median_s` | lower | entry created to ended (one attempt's merge time) |
 | queue | `check_median_s`, `review_median_s`, `recheck_median_s` | lower | `dev_metrics.steps()`: `check`, `review`, `main_check` |
 | queue | `test_job_median_s` | lower | `state/jobs/*.rec` of kind `check` or `test` |
 | queue | `build_lock_wait_s` | lower | not recorded by Broadsword yet, so always `-` |
 
 - **Per model:** runs, tokens, USD and seconds per `role:model`, for example `reviewer:opus` or `coder:sonnet`. These are shown as context, with no verdict.
-- **Coder runs:** a row counts when its task's running time overlaps the window. A row with no known task counts by its date.
-- **Shared helpers:** `fields`, `num`, `steps` and `covered` come from `scripts/dev_metrics.py`, and the review header parser comes from `scripts/review_costs.py`. Both are imported by path, so the numbers match those reports.
+- **Coder runs for use and per model:** a row counts when its task's running time overlaps the window. A row with no known task counts by its date.
+- **Coder tokens (cost):** only rows of tasks that ended inside the window count, so work still running at the window end never inflates the cost. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
+- **Reviews with no cost recorded:** a review whose `cost_usd` (or token fields) is missing is not counted as zero. `record` counts them (`samples.reviews_without_cost`, `reviews_without_tokens`) and prints "N of M reviews have no cost recorded"; the USD and token figures are then lower bounds. A `cost_usd` that is present but not a number is bad input naming the file.
+- **Shared helpers:** `fields`, `num`, `steps` and `covered` (idle share) come from `scripts/dev_metrics.py`, and the review header parser comes from `scripts/review_costs.py`. Both are imported by path, not copied. Coder use and coder tokens are not in dev_metrics as functions, so they are baseline's own (see above).
 
 ## Verdicts
 
@@ -60,18 +63,13 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
    `baseline.py record pre-<change> --since <8 h before> --until <now>`.
 2. Add or update the ledger row. In Status, write `before: pre-<change> after: pending YYYY-MM-DD`. Optionally add `metrics: a,b`.
 3. Once enough tasks have merged with the change, record `post-<change>` and replace `pending YYYY-MM-DD` with `post-<change>`.
-4. `ledger_check.py` compares the two. If the result is WORSE, the row fails until its Status says `reverted` or `fixed`.
+4. Compare by hand: `baseline.py compare pre-<change> post-<change> --min-samples <n> --noise <percent>`. If the result is WORSE, the row's Status says `reverted` or `fixed`. (A later `ledger_check.py` is planned to do this check; it is not built yet.)
 
-```
-python -I scripts/ledger_check.py --since <YYYY-MM-DD> --max-pending-days <n> --min-samples <n> --noise <percent>
-```
-
-Rows whose Since cell starts with `planned` are skipped. A row's "added" date is the date of the oldest commit that has its `| Since | Change |` text. A row that is not committed yet counts as added today.
+A row's Since cell starting with `planned` means the change is not in force yet.
 
 ## Starting settings (a suggestion, not a default)
 
 - `--min-samples 5`: a 4-hour window on 2026-11-18 had 13 to 14 merges.
 - `--noise 10`.
-- `--max-pending-days 7`.
 
 Check these against real before/after pairs at the next retro. Change them there with evidence, like any other process setting.

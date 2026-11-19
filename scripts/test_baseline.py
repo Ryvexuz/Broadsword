@@ -148,6 +148,53 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("never overwritten", res.stderr)
 
+    def test_review_without_cost_is_counted_apart_not_as_zero(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, cost="0.20")
+        self.r.merged_task(T0 + 900, T0 + 2700, cost="0.40")
+        rev = sorted((self.r.root / "state" / "queue").glob("*.review"))[1]
+        rev.write_text("".join(l for l in rev.read_text(encoding="utf-8").splitlines(True) if not l.startswith("cost_usd")), encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["samples"]["reviews_without_cost"], 1)
+        self.assertIn("1 of 2 reviews have no cost recorded", " ".join(data["notes"]))
+        self.assertIn("1 of 2 reviews have no cost recorded", res.stdout)
+
+    def test_unfinished_coder_work_is_left_out_of_coder_tokens(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens=1000)
+        self.r.write("state/tasks/t-open.task", {"id": "t-open", "project": "broadsword", "status": "running",
+                                                 "created": T0 + 900, "started": T0 + 900, "title": "still running"})
+        with open(self.r.root / "state" / "agent-runs.tsv", "a", encoding="utf-8") as f:
+            f.write("2026-11-18\tcoder\tsonnet\tt-open\t999000\t60\tdone\tx\n")
+        self.assertEqual(self.record().returncode, 0)
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["metrics"]["coder_tokens_per_merged"], 1000)
+        self.assertEqual(data["metrics"]["coder_runs_recorded"], 1)
+
+    def test_record_never_overwrites_even_when_another_record_wins_the_race(self):
+        """The other record lands after our existence check, while we measure: ours must fail, theirs must survive."""
+        out = self.r.root / "state" / "baselines" / "race.json"
+        calls = []
+
+        def fake_measure(root, since, until):
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("WINNER", encoding="utf-8")
+            calls.append(1)
+            return {k: None for k in bl.METRICS}, {"merged_tasks": 0}, {}, "0" * 40, []
+
+        saved = bl.measure, bl.main_root
+        bl.measure, bl.main_root = fake_measure, (lambda: self.r.root)
+        try:
+            args = bl.parser().parse_args(["record", "race", "--since", "2026-11-18T09:00:00Z", "--until", "2026-11-18T11:00:00Z"])
+            with self.assertRaises(bl.InputError) as cm:
+                bl.cmd_record(args)
+        finally:
+            bl.measure, bl.main_root = saved
+        self.assertEqual(calls, [1])
+        self.assertIn("never overwritten", str(cm.exception))
+        self.assertEqual(out.read_text(encoding="utf-8"), "WINNER")
+        self.assertEqual([p.name for p in out.parent.iterdir()], ["race.json"])
+
     def test_missing_agent_runs_is_an_error_naming_the_file(self):
         (self.r.root / "state" / "agent-runs.tsv").unlink()
         res = self.record()
@@ -244,6 +291,25 @@ class CompareCliTests(unittest.TestCase):
         res = self.r.run("compare", "before", "ghost", "--min-samples", "5", "--noise", "10")
         self.assertEqual(res.returncode, 1)
         self.assertIn("ghost.json", res.stderr)
+
+    def test_malformed_baseline_exits_1_naming_the_file_never_a_traceback(self):
+        self.r.put_baseline("before", 20, 3.0)
+        self.r.put_baseline("after", 20, 2.1)
+        path = self.r.root / "state" / "baselines" / "after.json"
+        good = json.loads(path.read_text(encoding="utf-8"))
+        broken = {"no samples": lambda d: d.pop("samples"), "no window": lambda d: d.pop("window"),
+                  "samples without merged_tasks": lambda d: d["samples"].clear(),
+                  "text metric": lambda d: d["metrics"].update(merged_per_hour="fast"),
+                  "no per_model": lambda d: d.pop("per_model")}
+        for label, damage in broken.items():
+            d = json.loads(json.dumps(good))
+            damage(d)
+            path.write_text(json.dumps(d), encoding="utf-8")
+            for cmd in (("compare", "before", "after", "--min-samples", "5", "--noise", "10"), ("list",)):
+                res = self.r.run(*cmd)
+                self.assertEqual(res.returncode, 1, f"{label} {cmd}: {res.stderr}")
+                self.assertIn("after.json", res.stderr, label)
+                self.assertNotIn("Traceback", res.stderr, label)
 
     def test_flags_are_required(self):
         res = self.r.run("compare", "a", "b", "--min-samples", "5")
