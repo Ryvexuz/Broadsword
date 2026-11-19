@@ -187,6 +187,27 @@ def strict_num(text, where):
         raise InputError(f"{where}: {str(text).strip()[:40]!r} is not a whole number") from None
 
 
+def finite(value, where):
+    """The one number gate: a float that is finite, else an input error naming `where`. float() alone accepts 'nan' and 'inf'."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise InputError(f"{where}: {str(value).strip()[:40]!r} is not a number") from None
+    if not math.isfinite(v):
+        raise InputError(f"{where}: {str(value).strip()[:40]!r} is not a finite number")
+    return v
+
+
+def check_finite(values, per_model):
+    """Final gate before a baseline is written: no metric or per-model figure may be NaN or infinite."""
+    for k, v in values.items():
+        if v is not None:
+            finite(v, f"metric {k}")
+    for name, m in per_model.items():
+        for f in ("runs", "usd", "tokens", "seconds"):
+            finite(m[f], f"per_model {name} {f}")
+
+
 def measure(root, since, until):
     """Every metric for [since, until), plus samples, per-model rows and notes. Raises InputError on a bad source."""
     dm = load_script("dev_metrics")
@@ -259,16 +280,19 @@ def measure(root, since, until):
             spans.append((s, dm.num(t.get("ended")) or until))
     busy = dm.covered(spans, since, until)
 
-    # Quality: reviews of the merged tasks, first one by entry creation and attempt.
+    # Quality: reviews of the merged tasks. Every review of a merged task counts as a round. The first pass is the review
+    # whose queue entry was created first (attempt number breaks ties); a review with no entry or no created time cannot be
+    # placed in time, so it is left out of the first-pass and cost figures and counted in a note.
     merged_ids = {t["id"] for t in merged}
     rounds = 0
     first_fail = 0
     reviewed = 0
     no_time = 0
     for tid in merged_ids:
-        rs = sorted((r for r in reviews if r.get("task") == tid), key=lambda r: (review_time(r)[0] or 0, review_time(r)[1]))
-        rounds += len(rs)
-        no_time += sum(1 for r in rs if review_time(r)[0] is None)
+        all_rs = [r for r in reviews if r.get("task") == tid]
+        rounds += len(all_rs)
+        rs = sorted((r for r in all_rs if review_time(r)[0] is not None), key=lambda r: (review_time(r)[0], review_time(r)[1]))
+        no_time += len(all_rs) - len(rs)
         if rs:
             reviewed += 1
             first_fail += rs[0].get("verdict", "").startswith("FAIL")
@@ -286,7 +310,7 @@ def measure(root, since, until):
     win_reviews = [r for r in reviews if inside(review_time(r)[0])]
     if no_time:
         notes.append(f"{no_time} review(s) of merged tasks have no queue entry or no created time: counted in "
-                     "review_rounds_per_merged, left out of review cost and tokens")
+                     "review_rounds_per_merged, left out of first_pass_fail_rate and review cost and tokens")
     usd = 0.0
     rtok = 0
     no_cost = no_tokens = 0
@@ -295,10 +319,7 @@ def measure(root, since, until):
         # A review with no cost or token field is not counted as zero: it is counted apart and reported.
         c = None
         if r.get("cost_usd", "").strip():
-            try:
-                c = float(r["cost_usd"])
-            except ValueError:
-                raise InputError(f"{qdir / r['_file']}: cost_usd {r.get('cost_usd')!r} is not a number") from None
+            c = finite(r["cost_usd"], f"{qdir / r['_file']}: cost_usd")
         else:
             no_cost += 1
         tin = strict_num(r.get("input tokens"), f"{qdir / r['_file']}: input tokens")
@@ -339,19 +360,23 @@ def measure(root, since, until):
         if col not in head:
             raise InputError(f"{runs_file}: header has no `{col}` column (found {head})")
     coder_secs = coder_tok = coder_runs = unfinished_runs = coder_tok_unmerged = 0
-    no_tok_runs = no_sec_runs = 0
+    no_tok_runs = no_sec_runs = no_span_runs = 0
     for lineno, line in enumerate(lines[1:], 2):
         if not line.strip():
             continue
         v = dict(zip(head, line.split("\t")))
         span = task_span.get(v.get("task"))
-        if span and span[0]:
+        known = bool(span and span[0])
+        if known:
             hit = span[0] < until and span[1] > since
             overlap = min(span[1], until) - max(span[0], since)
         else:
             hit = first_day <= v.get("date_utc", "") <= last_day
             overlap = window
-        if not hit:
+        finished = inside(task_ended.get(v.get("task")))
+        # Cost to completion counts every run of a task that ended in the window, whatever the run's date; activity
+        # (coder use, per model) counts only runs that are in the window by task span or, with no span, by date.
+        if not hit and not finished:
             continue
         secs = strict_num(v.get("seconds"), f"{runs_file} line {lineno}: seconds")
         tok = strict_num(v.get("tokens"), f"{runs_file} line {lineno}: tokens")
@@ -360,23 +385,28 @@ def measure(root, since, until):
             no_sec_runs += secs is None
         secs, tok = secs or 0, tok or 0
         secs = min(secs, overlap)
-        finished = inside(task_ended.get(v.get("task")))
-        if v.get("role") == "coder" and not finished:
-            unfinished_runs += 1
-        m = per_model.setdefault(f"{v.get('role', '?')}:{v.get('model', '?')}", {"runs": 0, "usd": 0.0, "tokens": 0, "seconds": 0})
-        m["runs"] += 1
-        m["tokens"] += tok
-        m["seconds"] += secs
-        if v.get("role") == "coder":
-            coder_secs += secs
-            if finished:
-                coder_runs += 1
-                coder_tok += tok
-                if v.get("task") not in merged_ids:
-                    coder_tok_unmerged += tok
+        coder = v.get("role") == "coder"
+        if hit:
+            if coder and not finished:
+                unfinished_runs += 1
+            if coder and not known:
+                no_span_runs += 1
+            m = per_model.setdefault(f"{v.get('role', '?')}:{v.get('model', '?')}", {"runs": 0, "usd": 0.0, "tokens": 0, "seconds": 0})
+            m["runs"] += 1
+            m["tokens"] += tok
+            m["seconds"] += secs
+            if coder:
+                coder_secs += secs
+        if coder and finished:
+            coder_runs += 1
+            coder_tok += tok
+            if v.get("task") not in merged_ids:
+                coder_tok_unmerged += tok
     if unfinished_runs:
         notes.append(f"{unfinished_runs} coder run(s) in the window belong to tasks not finished in it (or of no known task): "
                      "counted in coder_use_upper_bound, left out of coder tokens")
+    if no_span_runs:
+        notes.append(f"{no_span_runs} runs have no task span: counted in full, capped at the window (coder_use_upper_bound)")
     if no_tok_runs:
         notes.append(f"{no_tok_runs} coder runs have no token count: coder tokens are a lower bound")
     if no_sec_runs:
@@ -519,6 +549,7 @@ def cmd_record(args):
     except OSError as e:
         raise InputError(f"{toml}: unreadable ({e})") from None
     values, samples, per_model, main_sha, notes = measure(root, since, until)
+    check_finite(values, per_model)
     data = {
         "schema": SCHEMA, "name": args.name, "recorded_at": iso(int(time.time())),
         "window": {"since": iso(since), "until": iso(until), "hours": round((until - since) / 3600, 3)},

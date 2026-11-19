@@ -248,6 +248,55 @@ class RecordTests(unittest.TestCase):
         self.assertIn("did not merge", bl.METRICS["coder_tokens_unmerged"][3])
         self.assertIn("done, failed or abandoned", bl.METRICS["coder_tokens_per_merged"][3])
 
+    def test_non_finite_review_cost_is_an_input_error_naming_the_file(self):
+        self.r.merged_task(T0 + 600, T0 + 1800)
+        rev = next((self.r.root / "state" / "queue").glob("*.review"))
+        for bad in ("nan", "inf", "-Infinity"):
+            rev.write_text(rev.read_text(encoding="utf-8").replace("cost_usd: 0.10", f"cost_usd: {bad}").replace("cost_usd: nan", f"cost_usd: {bad}"), encoding="utf-8")
+            res = self.record(f"nan-{bad.strip('-').lower()}")
+            self.assertEqual(res.returncode, 1, f"{bad}: {res.stdout} {res.stderr}")
+            self.assertIn(rev.name, res.stderr)
+            self.assertIn("finite", res.stderr)
+        self.assertFalse(list((self.r.root / "state" / "baselines").glob("*.json")) if (self.r.root / "state" / "baselines").is_dir() else [])
+
+    def test_check_finite_refuses_any_non_finite_metric_or_per_model_figure(self):
+        bl.check_finite({"a": 1.0, "b": None}, {"x": {"runs": 1, "usd": 0.1, "tokens": 2, "seconds": 3}})
+        for values, pm in (({"a": float("nan")}, {}), ({"a": float("inf")}, {}),
+                           ({}, {"x": {"runs": 1, "usd": float("inf"), "tokens": 2, "seconds": 3}})):
+            with self.assertRaises(bl.InputError):
+                bl.check_finite(values, pm)
+
+    def test_orphan_later_fail_does_not_decide_the_first_pass(self):
+        self.r.merged_task(T0 + 600, T0 + 1800)  # one PASS on its first (only) entry
+        (self.r.root / "state" / "queue" / "q-x-orphan.review").write_text(
+            "\n".join(["entry: q-x-orphan", "attempt: 1", "task: t-x-1", "test_hook: false", "model: opus", "cost_usd: 0.1",
+                       "input tokens: 1", "output tokens: 1", "verdict: FAIL (answer followed the format: yes)", ""]),
+            encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        m = self.metrics()
+        self.assertEqual(m["first_pass_fail_rate"], 0.0)
+        self.assertAlmostEqual(m["review_rounds_per_merged"], 2.0)
+        self.assertIn("left out of first_pass_fail_rate", res.stdout)
+
+    def test_runs_of_a_finished_task_count_whatever_their_date_even_with_no_start_time(self):
+        self.r.write("state/tasks/t-nostart.task", {"id": "t-nostart", "project": "broadsword", "status": "done", "created": T0,
+                                                    "ended": T0 + 600, "note": "merged directly", "title": "no start"})
+        with open(self.r.root / "state" / "agent-runs.tsv", "a", encoding="utf-8") as f:
+            f.write("2026-11-10\tcoder\tsonnet\tt-nostart\t7000\t60\tdone\tx\n")  # dated well before the window
+        self.assertEqual(self.record().returncode, 0)
+        m = self.metrics()
+        self.assertEqual(m["coder_tokens_per_merged"], 7000)
+        self.assertEqual(m["coder_runs_recorded"], 1)
+        self.assertEqual(m["coder_use_upper_bound"], 0)  # not in the window by date: no use counted
+
+    def test_coder_runs_with_no_task_span_are_counted_and_named_in_a_note(self):
+        self.runs(("t-unknown", 10, 99999))
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertAlmostEqual(self.metrics()["coder_use_upper_bound"], 1.0)  # capped at the whole window
+        self.assertIn("1 runs have no task span: counted in full, capped at the window", res.stdout)
+
     def test_missing_main_branch_falls_back_to_head_with_a_note(self):
         git(self.r.root, "checkout", "-q", "-b", "other")
         git(self.r.root, "branch", "-q", "-D", "main")

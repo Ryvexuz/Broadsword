@@ -29,8 +29,8 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 | throughput | `lead_median_s`, `lead_p90_s` | lower | task `started` to `ended` (merge) |
 | pipeline | `idle_share` | lower | `dev_metrics.covered()` over task running spans |
 | pipeline | `coder_use_upper_bound` | context only | UPPER BOUND of coder use, from `state/agent-runs.tsv`. Runs have only a date and a duration, no start time, so a run overlapping a window edge cannot be clipped exactly. Each run's seconds are capped at its task's overlap with the window (the task's own started/ended), summed, / window. The true figure is at most this. Over 100% means coders ran in parallel. `dev_metrics.py` has no function for this, so baseline computes it itself |
-| quality | `review_rounds_per_merged` | lower | `.review` files of merged tasks, failed rounds included |
-| quality | `first_pass_fail_rate` | lower | merged tasks whose first review was FAIL |
+| quality | `review_rounds_per_merged` | lower | every `.review` file of a merged task (the task's `task:` header), failed rounds included, whether or not its queue entry is known; a test-hook review is not counted |
+| quality | `first_pass_fail_rate` | lower | merged tasks whose first review was FAIL; the first review is the one whose queue entry was created first (attempt number breaks ties); a review with no queue entry or no created time cannot be ordered and never decides it |
 | quality | `reverted_or_reopened` | lower | `Revert...` commits on main in the window, plus tasks merged more than once |
 | quality | `main_check_failed` | lower | entries with status `merged_check_failed` |
 | quality | `direct_merges` | context only | tasks merged outside the queue |
@@ -43,8 +43,8 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 | queue | `build_lock_wait_s` | lower | not recorded by Broadsword yet, so always `-` |
 
 - **Per model:** runs, tokens, USD and seconds per `role:model`, for example `reviewer:opus` or `coder:sonnet`. These are shown as context, with no verdict.
-- **Coder runs for use and per model:** a row counts when its task's running time overlaps the window; its seconds are capped at the task's overlap with the window (an upper bound, see above). A row with no known task counts by its date, capped at the window length.
-- **Coder tokens (cost):** only rows of tasks that ended inside the window count, so work still running at the window end never inflates the cost. Abandoned or failed work that ended in the window stays in on purpose (cost to completion includes waste); `coder_tokens_unmerged` says how much of the total that is. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
+- **Coder runs for use and per model:** a row counts when its task's running time overlaps the window; its seconds are capped at the task's overlap with the window (an upper bound, see above). A row whose task has no known start time counts by its date, capped at the window length, and `record` prints "N runs have no task span: counted in full, capped at the window", since these can inflate `coder_use_upper_bound`.
+- **Coder tokens (cost):** every run of a task that ended inside the window counts, whatever the run's date, and no other run does, so work still running at the window end never inflates the cost. Abandoned or failed work that ended in the window stays in on purpose (cost to completion includes waste); `coder_tokens_unmerged` says how much of the total that is. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
 - **Reviews with no cost recorded:** a review whose `cost_usd` (or token fields) is missing is not counted as zero. `record` counts them (`samples.reviews_without_cost`, `reviews_without_tokens`) and prints "N of M reviews have no cost recorded"; the USD and token figures are then lower bounds. A `cost_usd` that is present but not a number is bad input naming the file.
 - **Shared helpers:** `fields`, `num`, `steps` and `covered` (idle share) come from `scripts/dev_metrics.py`, and the review header parser comes from `scripts/review_costs.py`. Both are imported by path, not copied. Coder use and coder tokens are not in dev_metrics as functions, so they are baseline's own (see above).
 
@@ -53,7 +53,8 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 - **NOISE:** the change is within `--noise` percent, or the metric is not recorded on both sides.
 - **NOISE, context only:** a context-only metric (no good direction) is always NOISE with the reason "context only, no direction" and is left out of the overall verdict.
 - **Bad numbers:** a present but malformed number in `state/agent-runs.tsv` (named with its line) or in a review's token fields, or a NaN/Infinity in a baseline file, is an input error (exit 1), never a silent zero. An empty cell stays "unknown" and is counted in a note (for example "N coder runs have no token count").
-- **Reviews with no entry time:** a review of a merged task whose queue entry is missing or has no created time is counted in `review_rounds_per_merged` but left out of review cost; `record` prints a note with the count.
+- **Reviews with no entry time:** a review of a merged task whose queue entry is missing or has no created time is counted in `review_rounds_per_merged` but left out of the first-pass rate and of review cost; `record` prints a note with the count.
+- **Non-finite numbers:** `nan` and `inf` in a review's `cost_usd` are input errors naming the file, and `record` refuses to write any metric that is not finite.
 - **NOISE, too few samples:** either side has fewer than `--min-samples` merged tasks. This is never BETTER, and the reason is printed.
 - **BETTER or WORSE:** otherwise, by each metric's direction.
 - **Overall:** WORSE if any compared metric is WORSE. This is the ledger's watch-for-harm rule. Otherwise it is BETTER if any metric is BETTER, and NOISE if none is.
@@ -67,7 +68,7 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
    `baseline.py record pre-<change> --since <8 h before> --until <now>`.
 2. Add or update the ledger row. In Status, write `before: pre-<change> after: pending YYYY-MM-DD`. Optionally add `metrics: a,b`.
 3. Once enough tasks have merged with the change, record `post-<change>` and replace `pending YYYY-MM-DD` with `post-<change>`.
-4. Compare by hand: `baseline.py compare pre-<change> post-<change> --min-samples <n> --noise <percent>`. If the result is WORSE, the row's Status says `reverted` or `fixed`. (A later `ledger_check.py` is planned to do this check; it is not built yet.)
+4. Compare by hand: `baseline.py compare pre-<change> post-<change> --min-samples <n> --noise <percent>`. The change stays only if the overall verdict is BETTER. NOISE and WORSE both mean switch back (the row's Status says `reverted` or `fixed`), or extend the trial, record `post-<change>` again under a new name and compare again. (A later `ledger_check.py` is planned to do this check; it is not built yet.)
 
 A row's Since cell starting with `planned` means the change is not in force yet.
 
