@@ -1,5 +1,26 @@
 # Progress
 
+## PAUSE HANDOFF 2 (2026-11-19, about 23:45 UTC, restart to try Claude Code's experimental code mode: read this first)
+
+Paused by Lazlo's choice via the coordinator (option 1: try code mode in the desktop app). Before restarting, Lazlo sets the user env var himself (this session's `setx` was refused by its permission check): `setx CLAUDE_CODE_EXPERIMENTAL_CODE_MODE 1`; undo: `reg delete HKCU\Environment /v CLAUDE_CODE_EXPERIMENTAL_CODE_MODE /f`.
+
+State at pause: queue idle (the last running entry finished; 10 queued entries cancelled), no coder or ahead agent running, inbox poll deleted, queue driver exited. max_agents = 14. The RAM/CPU sampler (scratch/scale/sys-14-resume.csv) dies with the session.
+
+**First check after restart:** is code mode active in the new session (env var visible to claude.exe; the session reports code mode)? Log the answer in state/pc-progress.md. Then the code-mode trial step 2 (before/after on a few comparable coder tasks: tokens, wall time, context size, review pass rate, bugs; keep only if better).
+
+**Resume in this order:**
+1. Log `RESUMED <UTC>` in state/pc-progress.md; read state/pc-inbox.md.
+2. Re-add the queue entries in order from state/staging/records/pause-requeue-2026-11-19-b.tsv (entry, task, risk, coder) with `queue add <task> --risk <risk> --coder <coder> --brief scratch/briefs/<task>.md`. If scratch/briefs was wiped, copy from state/staging/records/pause-briefs-b/ (those copies carry the appended review verdicts for nb-21 and tp3). The last row (new) is nb-33 plastic beams t-20261119-171333-32 (af05500, 150 passed), never queued yet. Then start ONE driver: scratch/queue-driver.ps1 (sets BROADSWORD_REVIEWER_CLI itself).
+3. Restart the 5-minute inbox poll and the sampler (scratch/scale/sampler.ps1 -Out scratch/scale/sys-14-resume2.csv).
+4. Ahead-work paused (resume oldest first): t-20261119-232113 at state/staging/t-20261119-232113/pc-ahead (canary part done; openai_review.py gate + $20/day cap written, untested; tests to write are in its NOTES.md) and t-20261119-232113-2 at state/staging/t-20261119-232113-2/on-32797d3 (config/toml done, queue.rs half, uncompiled; add tests/support/mod.rs to its claims).
+5. t-20261119-215207 (crash-sim stdout write) is ready once nb-33 frees src/main.rs.
+
+**Decisions since the last handoff (all in state/pc-progress.md):** full GPT reviews use gpt-6.1-sol, not astra (Lazlo); GPT reviews may use up to $20/day of overflow credits (Lazlo), enforced by t-20261119-232113 part 2 once merged; gpt-6.1-sol second-gate trial boarded (t-20261119-232113-2), ships off, on after the credit reset; scrub follow-up t-20261119-233612 boarded; shadow canary re-run 23:20Z PASS on codex-cli 0.170.0.
+**Merged this session:** t-20261119-215214 (bcbe897), nb-32 t-20261119-171333-30 (f37e17a), n20-03 t-20261119-223123-3 (60d2300), n20-01 t-20261119-223123 was REJECTED at 23:41Z by haiku (q-20261119-231529-4: STAGE6-M4-M5.md 4.6 check diffs only four scenario files; read the .review/.shadow.review and give it a fix round to its Opus coder, or rule 34 if refuted).
+**Camry reference:** another session downloaded reference/camry-2013/ccsa/2012-toyota-camry-detailed-v5a.zip (58.5 MB, complete) and was fetching 2015-toyota-camry-bm-v1.zip (.part); check whether the .part finished or was cut by the restart.
+
+---
+
 ## PAUSE HANDOFF (2026-11-19, about 23:02 UTC, Lazlo's restart: read this first)
 
 Paused by the inbox item 2026-11-19T22:56Z. State at pause: queue idle (0 queued, 0 running), no broadsword/cargo/rustc process, no build or recover lock held, no coder or ahead agent running, the inbox loop deleted, the queue driver and the RAM/CPU sampler stopped. max_agents = 14 (step 2 of the slot climb; not stepped to 18: about 7 merges/h vs 8.44/h at 10, see state/pc-progress.md).
