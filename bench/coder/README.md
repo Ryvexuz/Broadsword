@@ -132,3 +132,7 @@ When the graded batch cannot run (busy lock, refused job, no result file), `run.
 ```
 python -I -B bench/coder/run.py regrade <out-dir>
 ```
+
+## Retries and cost to pass (`--attempts`)
+
+`python -I -B run.py <out> <provider> <model> <effort> --attempts 3 [tasks]` asks each task up to 3 times (1 to 3; default 1 = the one-shot run, same JSON as before). A task that does not fully pass is asked again with its spec plus the names of the failing hidden tests (names only: no compiler text, no assertion output, no earlier solution; "did not compile" or "no single code block" when there are no names). Each round is graded as one Broadsword batch. The result JSON then also holds `attempts_made`, `pass_at` (first attempt that fully passed, null = no pass), `cost_usd_total`, `cost_unknown_attempts`, `wall_s_total` and an `attempts` list; the other fields describe the last attempt. The name is `--attempts` because `--retries` already means HTTP retries of the openai provider. `score.py` then adds a second table ranked by cost to pass (tasks without a pass first-sorted last, then cost): `pass@1`, `passed`, per task "tries $cost" or "no pass $cost", and "no pass at cost X" in the last column. Not done yet: `--review <model>` (one review of each passing solution).
