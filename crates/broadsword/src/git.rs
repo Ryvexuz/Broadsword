@@ -49,21 +49,100 @@ impl Opts {
     }
 }
 
-/// THE one rule for what a secret file is (Lazlo's set, 2026-11-19): a file whose NAME (last path part, at any depth) is
-/// exactly `.env` or `.envrc` (direnv), or `.env.`, `.env-` or `.env_` followed by a name (`.env.local`, `.env-prod`,
-/// `.env_staging`). Both `/` and a backslash separate folders. Letters compare case-insensitively (ASCII) on every
+/// The secret NAMES (Lazlo's set, 2026-11-19): exactly `.env` or `.envrc` (direnv), or `.env.`, `.env-` or `.env_`
+/// followed by a name (`.env.local`, `.env-prod`, `.env_staging`). Letters compare case-insensitively (ASCII) on every
 /// platform (Windows file names are, and a `.ENV` is a secret wherever it is), after trailing dots and spaces are dropped
-/// (Windows drops them, so `.env ` and `.env.` are the file `.env`).
-/// Other files that merely start with `.env` (`.envoy.yaml`, `.environment`) are NOT secrets: they are checkpointed and
-/// rolled back like any other file. A FOLDER named `.env` (a Python venv) does not make its files secret.
+/// (Windows drops them, so `.env ` and `.env.` are the file `.env`). A name is cut at every `:` and each piece is judged,
+/// so an NTFS stream (`.env:s`, `.env::$DATA`) and a drive-relative `C:.env` are secrets.
+/// Other names that merely start with `.env` (`.envoy.yaml`, `.environment`) are NOT secret.
+fn is_secret_name(name: &str) -> bool {
+    name.split(':').any(|piece| {
+        let n = piece.trim_end_matches([' ', '.']).to_ascii_lowercase();
+        n == ".env" || n == ".envrc" || [".env.", ".env-", ".env_"].iter().any(|p| n.len() > p.len() && n.starts_with(p))
+    })
+}
+
+/// Shaped like an NTFS 8.3 short name: `<1-6 chars>~<digits>[.<1-3 chars>]` (`ENV~1`, `ENV~1.LOC`, `ENVOY~1.YAM`),
+/// after trailing dots and spaces are dropped.
+fn looks_like_short_name(name: &str) -> bool {
+    let name = name.trim_end_matches([' ', '.']); // Windows drops these: `ENV~1.` is `ENV~1`
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s, Some(e)),
+        None => (name, None),
+    };
+    if ext.is_some_and(|e| e.is_empty() || e.chars().count() > 3) {
+        return false;
+    }
+    match stem.rsplit_once('~') {
+        Some((pre, num)) => (1..=6).contains(&pre.chars().count()) && !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// The long (real) name of the last part of `p` as the file system has it, if `p` exists. On Windows this is
+/// `GetLongPathNameW`, which turns an 8.3 alias (`ENV~1`) into the name it stands for (`.env`) and does not follow links.
+#[cfg(windows)]
+fn long_name(p: &Path) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
+    }
+    let wide: Vec<u16> = p.as_os_str().encode_wide().map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c }).chain(Some(0)).collect();
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `wide` is NUL-terminated and `buf` holds `buf.len()` u16s; the call writes at most that many.
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return None; // missing, or cannot be resolved
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf.resize(n + 1, 0); // too small: `n` is the size needed
+    }
+    let long = OsString::from_wide(&buf).to_string_lossy().into_owned();
+    long.rsplit(['/', '\\']).next().map(str::to_string)
+}
+
+#[cfg(not(windows))]
+fn long_name(p: &Path) -> Option<String> {
+    std::fs::symlink_metadata(p).ok().and(p.file_name()).map(|n| n.to_string_lossy().into_owned())
+}
+
+/// THE one rule for what a secret file is: `path` (relative to `base`; `/` and a backslash separate folders) is a secret
+/// when the last part's name is a secret name (`is_secret_name`), OR, when it exists on disk, the long name the file system
+/// has for it is one (so `ENV~1`, the 8.3 alias of `.env`, is a secret), OR it is shaped like an 8.3 alias
+/// (`looks_like_short_name`) and its long name cannot be found (strict: a missing alias may stand for a secret).
+/// A FOLDER named `.env` (a Python venv) does not make its files secret.
 ///
 /// Every place that captures, restores, deletes or lists files calls this function: checkpoint capture (`capture`), the
-/// stored index trees (`secret_free_tree`), rollback (`changes`, `Guard`) and the queue's `--brief` reader (`queue.rs`,
-/// through the older name `is_secret_file`, which is this same function).
+/// stored index trees (`secret_free_tree`, and the index entries rollback keeps), rollback (`changes`, `Guard`) and,
+/// through `is_secret_path`, the queue's `--brief` reader (`queue.rs`, as `is_secret_file`).
+pub fn is_secret_in(base: &Path, path: &str) -> bool {
+    let (parent, name) = match path.rfind(['/', '\\']) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    };
+    if is_secret_name(name) {
+        return true;
+    }
+    let file = name.split(':').next().unwrap_or("");
+    if file.is_empty() {
+        return false;
+    }
+    let on_disk = if parent.is_empty() { base.join(file) } else { base.join(parent).join(file) };
+    match long_name(&on_disk) {
+        Some(long) => is_secret_name(&long),
+        None => name.split(':').any(looks_like_short_name),
+    }
+}
+
+/// `is_secret_in` for a path relative to the current folder (or absolute).
 pub fn is_secret_path(path: &str) -> bool {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or("").trim_end_matches([' ', '.']);
-    let name = name.to_ascii_lowercase();
-    name == ".env" || name == ".envrc" || [".env.", ".env-", ".env_"].iter().any(|p| name.len() > p.len() && name.starts_with(p))
+    is_secret_in(Path::new(""), path)
 }
 
 /// The older name of `is_secret_path` (the same function, not a second rule), kept so callers outside this module compile.
@@ -218,12 +297,13 @@ fn entries(out: &[u8]) -> Vec<(&[u8], String)> {
 fn secret_free_tree(dir: &Path, state: &Path, tag: &str, tree: &str, extra: &[Vec<u8>]) -> Result<(String, Vec<String>), String> {
     let out = git(dir, &["ls-tree", "-r", "-z", "--full-tree", tree], None, None)?;
     let all = entries(&out);
-    let dropped: Vec<String> = all.iter().filter(|(_, p)| is_secret_path(p)).map(|(_, p)| p.clone()).collect();
+    let secret: Vec<bool> = all.iter().map(|(_, p)| is_secret_in(dir, p)).collect();
+    let dropped: Vec<String> = all.iter().zip(&secret).filter(|(_, s)| **s).map(|((_, p), _)| p.clone()).collect();
     if dropped.is_empty() && extra.is_empty() {
         return Ok((tree.to_string(), dropped));
     }
     let mut input = Vec::new();
-    for raw in all.iter().filter(|(_, p)| !is_secret_path(p)).map(|(r, _)| *r).chain(extra.iter().map(Vec::as_slice)) {
+    for raw in all.iter().zip(&secret).filter(|(_, s)| !**s).map(|((r, _), _)| *r).chain(extra.iter().map(Vec::as_slice)) {
         input.extend_from_slice(raw); // `ls-tree` lines are a format `--index-info` reads as they are
         input.push(0);
     }
@@ -269,7 +349,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
     // Secret files are dropped here, before any blob is written: nothing below ever sees their bytes.
     let mut secret_skipped: Vec<String> = Vec::new();
     files.retain(|p| {
-        let secret = is_secret_path(p);
+        let secret = is_secret_in(dir, p);
         if secret {
             secret_skipped.push(p.clone());
         }
@@ -284,7 +364,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
         if excluded(&p, opts) || !is_regular(dir, &p) {
             continue;
         }
-        if is_secret_path(&p) {
+        if is_secret_in(dir, &p) {
             if !secret_skipped.contains(&p) {
                 secret_skipped.push(p);
             }
@@ -363,7 +443,8 @@ pub struct Rollback {
 
 fn safe_rel(p: &str) -> Result<PathBuf, String> {
     let path = Path::new(p);
-    if path.components().all(|c| matches!(c, Component::Normal(_))) {
+    // A `:` would name an NTFS stream or a drive (`.env:s`, `C:x`): never a plain file inside the project.
+    if path.components().all(|c| matches!(c, Component::Normal(n) if !n.to_string_lossy().contains(':'))) {
         Ok(path.to_path_buf())
     } else {
         Err(format!("refusing unsafe path from git: {p}"))
@@ -389,7 +470,7 @@ fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
         if f.len() < 5 {
             return Err(format!("unexpected diff-tree line: {meta}"));
         }
-        if is_secret_path(path) {
+        if is_secret_in(dir, path) {
             continue; // a checkpoint made before this rule may hold one: it is never restored or deleted
         }
         v.push(Change { status: f[4].chars().next().unwrap_or('M'), mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
@@ -446,7 +527,7 @@ impl Guard<'_> {
 
     /// Write the blob of `c` to its path. Ok(true) = written, Ok(false) = skipped.
     fn write(&mut self, c: &Change) -> Result<bool, String> {
-        if is_secret_path(&c.path) {
+        if is_secret_in(self.dir, &c.path) {
             return Ok(false); // never written; not even listed as skipped: a secret file does not exist for rollback
         }
         if !self.may_change(&c.path)? {
@@ -470,7 +551,7 @@ impl Guard<'_> {
 
     /// Delete a file the job added (its bytes are in the snapshot), then the folders that leaves empty.
     fn remove(&mut self, rel: &str) -> Result<bool, String> {
-        if is_secret_path(rel) {
+        if is_secret_in(self.dir, rel) {
             return Ok(false); // never deleted
         }
         let full = self.dir.join(safe_rel(rel)?);
@@ -616,7 +697,7 @@ pub fn rollback(
                 (None, None) => git_text(dir, &["mktree"], None)?, // no commit yet: the empty tree
             };
             let now = git(dir, &["ls-files", "-s", "-z"], None, None)?;
-            let keep: Vec<Vec<u8>> = entries(&now).into_iter().filter(|(_, p)| is_secret_path(p)).map(|(raw, _)| raw.to_vec()).collect();
+            let keep: Vec<Vec<u8>> = entries(&now).into_iter().filter(|(_, p)| is_secret_in(dir, p)).map(|(raw, _)| raw.to_vec()).collect();
             let (restore, _) = secret_free_tree(dir, state, &format!("{id}-rst-idx"), &base, &keep)?;
             git_text(dir, &["read-tree", &restore], None)?;
         }
@@ -1015,6 +1096,25 @@ mod tests {
             assert!(!is_secret_path(no), "{no}");
         }
         assert!(is_secret_file(".env-prod") && !is_secret_file(".envoy.yaml"), "the older name is the same function");
+        // NTFS streams and drive-relative names: every `:` piece is judged
+        for yes in [".env:s", ".env::$DATA", ".ENV.local:x:$DATA", "C:.env", "sub/.envrc:s", "a.txt:.env"] {
+            assert!(is_secret_path(yes), "{yes}");
+        }
+        assert!(!is_secret_path("tracked-nowhere.txt:s"));
+        // 8.3-alias shapes that do not exist here: strict, they may stand for a secret
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-folder-for-the-rule-test");
+        for yes in ["ENV~1", "ENV~1.LOC", "ENVOY~1.YAM", "sub/ABCDEF~12", "env~1:s", "ENV~1. "] {
+            assert!(is_secret_in(&missing, yes), "{yes}");
+        }
+        for no in ["ENV~", "~1", "ABCDEFG~1", "ENV~1.LOCA", "ENV~X", "notes~old.txt"] {
+            assert!(!looks_like_short_name(no), "{no}");
+            assert!(!is_secret_in(&missing, no), "{no}");
+        }
+        // a path with a `:` is never written or deleted by rollback
+        for bad in [".env:s", "sub/a:b", "C:x"] {
+            assert!(safe_rel(bad).is_err(), "{bad}");
+        }
+        assert!(safe_rel("sub/ok.txt").is_ok());
     }
 
     /// Paths in a tree, recursively.

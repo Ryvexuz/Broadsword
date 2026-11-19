@@ -232,3 +232,118 @@ fn staged_env_is_never_in_an_index_ref_and_lookalike_names_roll_back() {
     }
     r.children.clear();
 }
+
+/// The 8.3 short name the file system gave the existing file `p`, or None when it has none (8.3 names are disabled on the
+/// volume, or the long name already is 8.3).
+#[cfg(windows)]
+fn short_name(p: &Path) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+    }
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` holds 1024 u16s; the call writes at most that many.
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    assert!(n > 0 && n < buf.len(), "GetShortPathNameW failed for {}", p.display());
+    buf.truncate(n);
+    let short = OsString::from_wide(&buf).to_string_lossy().into_owned();
+    let name = short.rsplit(['/', '\\']).next().unwrap().to_string();
+    let long = p.file_name().unwrap().to_string_lossy().into_owned();
+    (!name.eq_ignore_ascii_case(&long)).then_some(name)
+}
+
+/// Say loudly that a test did not run its checks. Written straight to stderr, which the test harness does not capture, so
+/// the line shows in the job log of every run.
+fn say_skipped(test: &str, why: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {why}");
+}
+
+/// Review finding (NTFS 8.3 aliases): `ENV~1` is another name for `.env` and `ENV~1.LOC` for `.env.local`. Staged under
+/// those names, the secret bytes must still never reach a `refs/broadsword/*` ref, and rollback must not write through the
+/// alias into `.env`. `ENVOY~1.YAM`, the alias of the ordinary `.envoy.yaml`, stays an ordinary file.
+#[cfg(windows)]
+#[test]
+fn an_8dot3_alias_of_a_secret_file_is_a_secret() {
+    let mut r = Root::new("alias");
+    let p = r.project();
+    fs::write(p.join(".env"), "API_KEY=sk-fake-alias-env-original\n").unwrap();
+    fs::write(p.join(".env.local"), "API_KEY=sk-fake-alias-local\n").unwrap();
+    fs::write(p.join(".envoy.yaml"), "envoy: original\n").unwrap();
+    let (Some(s_env), Some(s_local), Some(s_envoy)) = (short_name(&p.join(".env")), short_name(&p.join(".env.local")), short_name(&p.join(".envoy.yaml"))) else {
+        say_skipped("an_8dot3_alias_of_a_secret_file_is_a_secret", &format!("the volume holding {} gives files no 8.3 short names (fsutil 8dot3name), so there is no alias to test", p.display()));
+        return;
+    };
+    println!("aliases: .env = {s_env}, .env.local = {s_local}, .envoy.yaml = {s_envoy}");
+    git(&p, &["update-index", "--add", &s_env, &s_local, &s_envoy]);
+    let blobs: Vec<String> = [".env", ".env.local"].iter().map(|f| git(&p, &["hash-object", "--no-filters", f])).collect();
+    let line = "echo API_KEY=sk-fake-alias-env-job> .env & echo changed> tracked.txt & ping -n 30 127.0.0.1 >nul";
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have changed .env", 90, || {
+        let recs = r.records();
+        recs.len() == 1 && !Root::field(&recs[0], "child_pid").is_empty() && fs::read_to_string(p.join(".env")).is_ok_and(|s| s.contains("env-job"))
+    });
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    for s in [&s_env, &s_local] {
+        assert!(Root::field(&rec, "secret_skipped").split('|').any(|f| f == s.as_str()), "{s} is listed as a secret: {rec}");
+    }
+    let (ckpt, index_ref) = (format!("refs/broadsword/checkpoints/{id}"), format!("refs/broadsword/index/{id}"));
+    for rf in [&ckpt, &index_ref] {
+        let paths = tree_paths(&p, rf);
+        assert!(!paths.iter().any(|f| f == &s_env || f == &s_local), "no alias of a secret in {rf}: {paths:?}");
+        assert!(paths.iter().any(|f| f == &s_envoy), "the alias of an ordinary file is kept in {rf}: {paths:?}");
+    }
+    kill_hard(bs_pid);
+    let out = r.run(&["recover", &id]);
+    let so = text(&out.stdout);
+    println!("{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap(), "original\n", "ordinary files roll back");
+    let env_now = fs::read_to_string(p.join(".env")).unwrap();
+    assert!(env_now.starts_with("API_KEY=sk-fake-alias-env-job"), "rollback never writes into .env through its alias: {env_now:?}");
+    assert_eq!(fs::read_to_string(p.join(".env.local")).unwrap(), "API_KEY=sk-fake-alias-local\n");
+    for rf in [format!("refs/broadsword/interrupted/{id}/1"), format!("refs/broadsword/interrupted-index/{id}/1")] {
+        let paths = tree_paths(&p, &rf);
+        assert!(!paths.iter().any(|f| f == &s_env || f == &s_local), "no alias of a secret in {rf}: {paths:?}");
+    }
+    let job_blob = git(&p, &["hash-object", "--no-filters", ".env"]);
+    for h in blobs.iter().chain([&job_blob]) {
+        assert_unreachable_from_broadsword_refs(&p, h);
+    }
+    r.children.clear();
+}
+
+/// Review finding (NTFS streams): `.env:s` is a stream of `.env`. Staged under that name (Git allows it with
+/// core.protectNTFS off), its bytes must never reach a `refs/broadsword/*` ref.
+#[cfg(windows)]
+#[test]
+fn a_stream_of_a_secret_file_is_a_secret() {
+    let r = Root::new("stream");
+    let p = r.project();
+    git(&p, &["config", "core.protectNTFS", "false"]);
+    fs::write(p.join(".env"), "API_KEY=sk-fake-plain\n").unwrap();
+    if fs::write(p.join(".env:s"), "API_KEY=sk-fake-in-a-stream\n").is_err() {
+        say_skipped("a_stream_of_a_secret_file_is_a_secret", &format!("the volume holding {} has no NTFS streams", p.display()));
+        return;
+    }
+    assert_eq!(fs::read_to_string(p.join(".env:s")).unwrap(), "API_KEY=sk-fake-in-a-stream\n", "a real stream, not a file");
+    let blob = git(&p, &["hash-object", "--no-filters", ".env:s"]);
+    let staged = git(&p, &["hash-object", "-w", "--no-filters", ".env:s"]);
+    assert_eq!(staged, blob);
+    git(&p, &["update-index", "--add", "--cacheinfo", &format!("100644,{blob},.env:s")]);
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    assert!(Root::field(&rec, "secret_skipped").split('|').any(|f| f == ".env:s"), "{rec}");
+    for rf in [format!("refs/broadsword/checkpoints/{id}"), format!("refs/broadsword/index/{id}")] {
+        let paths = tree_paths(&p, &rf);
+        assert!(!paths.iter().any(|f| f.contains(':')), "no stream in {rf}: {paths:?}");
+    }
+    assert_unreachable_from_broadsword_refs(&p, &blob);
+}
