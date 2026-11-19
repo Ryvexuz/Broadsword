@@ -206,8 +206,28 @@ def main():
     return 0
 
 
-def models(entries, since, lo, hi, window):
-    """Per model and role: runs, active seconds, tokens, cost, and active share of the window."""
+def read_runs(since=None):
+    """Rows of state/agent-runs.tsv as dicts (header names as keys), from `since` (YYYYMMDD) on. [] if there is no file.
+    An empty field is an empty string: unknown, never 0 (use num())."""
+    log = ROOT / "state" / "agent-runs.tsv"
+    if not log.is_file():
+        return []
+    lines = log.read_text(encoding="utf-8").splitlines()
+    head = lines[0].split("	") if lines else []
+    out = []
+    for line in lines[1:]:
+        v = dict(zip(head, line.split("	")))
+        if since and v.get("date_utc", "").replace("-", "") < since:
+            continue
+        out.append(v)
+    return out
+
+
+def model_rows(entries, since, lo, hi):
+    """Per (model, role): [runs, active seconds, tokens, cost $]. Reusable: `active seconds / window` is the utilisation
+    (coder use is the rows whose role is "coder"). Reviews come from the queue entries created in [lo, hi]; every
+    subagent run in state/agent-runs.tsv from `since` on counts. An unknown token count or duration adds 0 here (the
+    printed table has always done so); use read_runs() and num() to tell unknown from zero."""
     rows = {}
 
     def add(model, role, secs, tokens, cost):
@@ -232,20 +252,19 @@ def models(entries, since, lo, hi, window):
             cost = 0.0
         if e.get("verdict") or secs:  # a review that ran but never reached a verdict (timeout, stale) still used the model
             add(e.get("reviewer_model"), "reviewer", secs, tokens, cost)
-    log = ROOT / "state" / "agent-runs.tsv"
-    if log.is_file():
-        lines = log.read_text(encoding="utf-8").splitlines()
-        head = lines[0].split("\t") if lines else []
-        for line in lines[1:]:
-            v = dict(zip(head, line.split("\t")))
-            if since and v.get("date_utc", "").replace("-", "") < since:
-                continue
-            add(v.get("model", "?"), v.get("role", "?"), num(v.get("seconds")), num(v.get("tokens")), 0.0)
+    for v in read_runs(since):
+        add(v.get("model", "?"), v.get("role", "?"), num(v.get("seconds")), num(v.get("tokens")), 0.0)
+    return rows
+
+
+def models(entries, since, lo, hi, window):
+    """Prints model_rows(): per model and role, runs, active seconds, tokens, cost, and active share of the window."""
+    rows = model_rows(entries, since, lo, hi)
     print()
     print(f"{'model':<8} {'role':<12} {'runs':>4} {'active':>8} {'tokens':>10} {'cost $':>8} {'util':>6}")
     for (model, role), (n, secs, tokens, cost) in sorted(rows.items()):
         print(f"{model:<8} {role:<12} {n:>4} {dur(secs):>8} {tokens:>10} {cost:>8.4f} {secs / window:>6.1%}")
-    if not log.is_file():
+    if not (ROOT / "state" / "agent-runs.tsv").is_file():
         print("(no state/agent-runs.tsv: subagent runs are not logged yet)")
 
 
