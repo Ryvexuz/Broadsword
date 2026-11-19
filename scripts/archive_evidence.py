@@ -257,7 +257,16 @@ def find_sources(root: Path, cfg: dict) -> tuple[list[tuple[str, Path]], list[st
 
 def read_manifest(path: Path) -> set[tuple[str, str]]:
     seen = set()
-    if path.exists() or path.is_symlink():  # a directory or a dangling link is NOT "absent": it is a named error below
+    try:
+        # lstat, not exists(): exists() may raise PermissionError (older Python) or silently report False (newer Python) when the
+        # archive folder cannot be traversed; either way that must be the named error, never "absent" and never a traceback
+        os.lstat(path)
+        present = True
+    except FileNotFoundError:
+        present = False
+    except OSError as e:
+        raise Fail(f"cannot read the manifest {path} ({type(e).__name__}); fix or move it, nothing was archived", 1)
+    if present:  # a directory or a dangling link is NOT "absent": it is a named error below
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:

@@ -261,6 +261,35 @@ class Hardening(Base):
         self.assertEqual(self.archived(), [])
 
 
+class ManifestStatDenied(Base):
+    def test_permission_error_from_the_existence_check_is_a_named_error(self):
+        """An archive folder without traversal permission makes stat() raise PermissionError: that is the named error, not a traceback."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        self.queue("q-1.entry", "x")
+        mod = load(SCRIPT)
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def deny(real):
+            def f(path, *a, **kw):
+                if str(path).endswith("manifest.tsv"):
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real(path, *a, **kw)
+            return f
+
+        for extra in ([], ["--dry-run"]):
+            err = io.StringIO()
+            with mock.patch("os.stat", deny(real_stat)), mock.patch("os.lstat", deny(real_lstat)), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = mod.main(["--root", str(self.root), "--date", "2026-11-19", *extra])
+            self.assertEqual(code, 1, err.getvalue())
+            self.assertIn("cannot read the manifest", err.getvalue())
+            self.assertIn("PermissionError", err.getvalue())
+        self.assertEqual(self.archived(), [])
+
+
 class Secrets(Base):
     def test_env_files_are_never_copied(self):
         self.queue(".env", f"OPENAI_API_KEY={FAKE_KEY}\n")
