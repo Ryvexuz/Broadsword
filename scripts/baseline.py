@@ -177,6 +177,16 @@ def ratio(a, b):
     return a / b if b else None
 
 
+def strict_num(text, where):
+    """A whole number from a record cell. Empty or absent is None (unknown); present but malformed is an input error naming `where`."""
+    if text is None or not str(text).strip():
+        return None
+    try:
+        return int(str(text).strip())
+    except ValueError:
+        raise InputError(f"{where}: {str(text).strip()[:40]!r} is not a whole number") from None
+
+
 def measure(root, since, until):
     """Every metric for [since, until), plus samples, per-model rows and notes. Raises InputError on a bad source."""
     dm = load_script("dev_metrics")
@@ -216,7 +226,8 @@ def measure(root, since, until):
 
     def review_time(h):
         e = entry_by_id.get(h.get("entry"))
-        return (dm.num(e.get("created")) if e else None), dm.num(h.get("attempt")) or 1
+        where = f"{qdir / h['_file']}: attempt"
+        return (dm.num(e.get("created")) if e else None), strict_num(h.get("attempt"), where) or 1
 
     by_task = {}
     for e in entries:
@@ -253,9 +264,11 @@ def measure(root, since, until):
     rounds = 0
     first_fail = 0
     reviewed = 0
+    no_time = 0
     for tid in merged_ids:
         rs = sorted((r for r in reviews if r.get("task") == tid), key=lambda r: (review_time(r)[0] or 0, review_time(r)[1]))
         rounds += len(rs)
+        no_time += sum(1 for r in rs if review_time(r)[0] is None)
         if rs:
             reviewed += 1
             first_fail += rs[0].get("verdict", "").startswith("FAIL")
@@ -271,6 +284,9 @@ def measure(root, since, until):
 
     # Cost: all reviews whose entry was created in the window (retries and rejected attempts included).
     win_reviews = [r for r in reviews if inside(review_time(r)[0])]
+    if no_time:
+        notes.append(f"{no_time} review(s) of merged tasks have no queue entry or no created time: counted in "
+                     "review_rounds_per_merged, left out of review cost and tokens")
     usd = 0.0
     rtok = 0
     no_cost = no_tokens = 0
@@ -285,7 +301,8 @@ def measure(root, since, until):
                 raise InputError(f"{qdir / r['_file']}: cost_usd {r.get('cost_usd')!r} is not a number") from None
         else:
             no_cost += 1
-        tin, tout = dm.num(r.get("input tokens")), dm.num(r.get("output tokens"))
+        tin = strict_num(r.get("input tokens"), f"{qdir / r['_file']}: input tokens")
+        tout = strict_num(r.get("output tokens"), f"{qdir / r['_file']}: output tokens")
         if tin is None or tout is None:
             no_tokens += 1
         tok = (tin or 0) + (tout or 0)
@@ -322,7 +339,8 @@ def measure(root, since, until):
         if col not in head:
             raise InputError(f"{runs_file}: header has no `{col}` column (found {head})")
     coder_secs = coder_tok = coder_runs = unfinished_runs = coder_tok_unmerged = 0
-    for line in lines[1:]:
+    no_tok_runs = no_sec_runs = 0
+    for lineno, line in enumerate(lines[1:], 2):
         if not line.strip():
             continue
         v = dict(zip(head, line.split("\t")))
@@ -335,7 +353,12 @@ def measure(root, since, until):
             overlap = window
         if not hit:
             continue
-        secs, tok = dm.num(v.get("seconds")) or 0, dm.num(v.get("tokens")) or 0
+        secs = strict_num(v.get("seconds"), f"{runs_file} line {lineno}: seconds")
+        tok = strict_num(v.get("tokens"), f"{runs_file} line {lineno}: tokens")
+        if v.get("role") == "coder":
+            no_tok_runs += tok is None
+            no_sec_runs += secs is None
+        secs, tok = secs or 0, tok or 0
         secs = min(secs, overlap)
         finished = inside(task_ended.get(v.get("task")))
         if v.get("role") == "coder" and not finished:
@@ -354,6 +377,10 @@ def measure(root, since, until):
     if unfinished_runs:
         notes.append(f"{unfinished_runs} coder run(s) in the window belong to tasks not finished in it (or of no known task): "
                      "counted in coder_use_upper_bound, left out of coder tokens")
+    if no_tok_runs:
+        notes.append(f"{no_tok_runs} coder runs have no token count: coder tokens are a lower bound")
+    if no_sec_runs:
+        notes.append(f"{no_sec_runs} coder runs have no seconds: coder use is a lower bound")
     for r in win_reviews:
         secs = dm.steps(entry_by_id[r["entry"]]).get("review") if r.get("entry") in entry_by_id else None
         per_model[f"reviewer:{r.get('model', '?')}"]["seconds"] += secs or 0
@@ -450,9 +477,15 @@ def validate_baseline(data, path):
     for k, v in data["metrics"].items():
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
             bad(f"metric `{k}` is not a number or null")
+        if isinstance(v, float) and not math.isfinite(v):
+            bad(f"metric `{k}` is not a finite number")
     for k, v in data["per_model"].items():
         if not isinstance(v, dict) or not all(isinstance(v.get(f), (int, float)) for f in ("runs", "usd", "tokens")):
             bad(f"per_model `{k}` is malformed")
+
+
+def _no_constant(text):
+    raise ValueError(f"{text} is not a finite number")
 
 
 def load_baseline(root, name):
@@ -460,7 +493,7 @@ def load_baseline(root, name):
         raise InputError(f"baseline name {name!r}: use letters, digits, '.', '_' and '-' only")
     path = baselines_dir(root) / f"{name}.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"), parse_constant=_no_constant)
     except FileNotFoundError:
         raise InputError(f"{path}: no such baseline (record it with: baseline.py record {name} --since ...)") from None
     except (OSError, UnicodeError, ValueError) as e:
@@ -540,7 +573,7 @@ def compare(before, after, min_samples, noise, metrics=None):
             if b == 0 and a < 0:
                 change = -math.inf
         if direction is None:
-            verdict, reason = "info", "context only"
+            verdict, reason = "NOISE", "context only, no direction"
         elif b is None or a is None:
             verdict, reason = "NOISE", "not recorded on both sides"
         elif few:
@@ -551,7 +584,7 @@ def compare(before, after, min_samples, noise, metrics=None):
             good = (change > 0) == (direction == "up")
             verdict, reason = ("BETTER" if good else "WORSE"), ""
         rows.append((m, b, a, change, verdict, reason, unit))
-    verdicts = [r[4] for r in rows]
+    verdicts = [r[4] for r in rows if METRICS[r[0]][1] is not None]
     overall = "WORSE" if "WORSE" in verdicts else "BETTER" if "BETTER" in verdicts else "NOISE"
     return rows, overall
 

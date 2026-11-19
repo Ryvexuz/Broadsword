@@ -160,6 +160,44 @@ class RecordTests(unittest.TestCase):
         self.assertIn("1 of 2 reviews have no cost recorded", " ".join(data["notes"]))
         self.assertIn("1 of 2 reviews have no cost recorded", res.stdout)
 
+    def test_malformed_coder_run_number_is_an_input_error_naming_file_and_line(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens=1000)
+        for col, bad in (("tokens", "1,234"), ("seconds", "abc")):
+            runs = self.r.root / "state" / "agent-runs.tsv"
+            good = runs.read_text(encoding="utf-8")
+            cells = good.splitlines()[1].split("\t")
+            cells[4 if col == "tokens" else 5] = bad
+            runs.write_text(good + "\t".join(cells) + "\n", encoding="utf-8")
+            res = self.record(f"bad-{col}")
+            runs.write_text(good, encoding="utf-8")
+            self.assertEqual(res.returncode, 1, f"{col}: {res.stdout} {res.stderr}")
+            self.assertIn("agent-runs.tsv line 3", res.stderr)
+            self.assertIn(bad, res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+
+    def test_empty_coder_token_cell_is_counted_in_a_note_not_a_silent_zero(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens="")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("1 coder runs have no token count", res.stdout)
+
+    def test_malformed_review_token_count_is_an_input_error(self):
+        self.r.merged_task(T0 + 600, T0 + 1800)
+        rev = next((self.r.root / "state" / "queue").glob("*.review"))
+        rev.write_text(rev.read_text(encoding="utf-8").replace("input tokens: 1000", "input tokens: 1,000"), encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn(rev.name, res.stderr)
+
+    def test_review_without_entry_time_is_counted_in_a_note(self):
+        self.r.merged_task(T0 + 600, T0 + 1800)
+        (self.r.root / "state" / "queue" / "q-x-orphan.review").write_text(
+            "entry: q-x-orphan\nattempt: 1\ntask: t-x-1\ntest_hook: false\nmodel: opus\ncost_usd: 0.1\n"
+            "input tokens: 1\noutput tokens: 1\nverdict: FAIL (answer followed the format: yes)\n", encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("1 review(s) of merged tasks have no queue entry or no created time", res.stdout)
+
     def test_unfinished_coder_work_is_left_out_of_coder_tokens(self):
         self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens=1000)
         self.r.write("state/tasks/t-open.task", {"id": "t-open", "project": "broadsword", "status": "running",
@@ -319,6 +357,18 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(bl.compare(b, a, 5, 10)[1], "WORSE")
         self.assertEqual(bl.compare(b, a, 5, 10, metrics=["lead_median_s"])[1], "BETTER")
 
+    def test_context_only_metric_is_noise_and_stays_out_of_the_overall_verdict(self):
+        rows, overall = bl.compare(self.base(20, 3.0, direct_merges=1), self.base(20, 3.0, direct_merges=9), 5, 10)
+        row = next(r for r in rows if r[0] == "direct_merges")
+        self.assertEqual(row[4], "NOISE")
+        self.assertEqual(row[5], "context only, no direction")
+        self.assertEqual(overall, "NOISE")
+        self.assertTrue(all(r[4] in ("BETTER", "WORSE", "NOISE") for r in rows))
+
+    def test_below_min_samples_every_metric_is_noise(self):
+        rows, _ = bl.compare(self.base(2, 1.0, lead_median_s=9, direct_merges=1), self.base(2, 9.0, lead_median_s=1, direct_merges=5), 5, 10)
+        self.assertEqual({r[4] for r in rows}, {"NOISE"})
+
     def test_unknown_metric_is_bad_input(self):
         with self.assertRaises(bl.InputError):
             bl.compare(self.base(20, 3.0), self.base(20, 3.0), 5, 10, metrics=["nope"])
@@ -364,6 +414,19 @@ class CompareCliTests(unittest.TestCase):
                 self.assertEqual(res.returncode, 1, f"{label} {cmd}: {res.stderr}")
                 self.assertIn("after.json", res.stderr, label)
                 self.assertNotIn("Traceback", res.stderr, label)
+
+    def test_non_finite_metric_is_bad_input_exit_1_naming_the_file(self):
+        self.r.put_baseline("before", 20, 3.0)
+        self.r.put_baseline("after", 20, 2.1)
+        path = self.r.root / "state" / "baselines" / "after.json"
+        for token in ("NaN", "Infinity", "-Infinity"):
+            path.write_text(path.read_text(encoding="utf-8").replace('"merged_per_hour": 2.1', f'"merged_per_hour": {token}'), encoding="utf-8")
+            self.assertIn(token, path.read_text(encoding="utf-8"))
+            res = self.r.run("compare", "before", "after", "--min-samples", "5", "--noise", "10")
+            self.assertEqual(res.returncode, 1, f"{token}: {res.stdout}")
+            self.assertIn("after.json", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.r.put_baseline("after", 20, 2.1)
 
     def test_baseline_missing_a_metric_is_bad_input_but_a_later_metric_may_be_absent(self):
         self.r.put_baseline("before", 20, 3.0)

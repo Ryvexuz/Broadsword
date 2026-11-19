@@ -51,6 +51,9 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 ## Verdicts
 
 - **NOISE:** the change is within `--noise` percent, or the metric is not recorded on both sides.
+- **NOISE, context only:** a context-only metric (no good direction) is always NOISE with the reason "context only, no direction" and is left out of the overall verdict.
+- **Bad numbers:** a present but malformed number in `state/agent-runs.tsv` (named with its line) or in a review's token fields, or a NaN/Infinity in a baseline file, is an input error (exit 1), never a silent zero. An empty cell stays "unknown" and is counted in a note (for example "N coder runs have no token count").
+- **Reviews with no entry time:** a review of a merged task whose queue entry is missing or has no created time is counted in `review_rounds_per_merged` but left out of review cost; `record` prints a note with the count.
 - **NOISE, too few samples:** either side has fewer than `--min-samples` merged tasks. This is never BETTER, and the reason is printed.
 - **BETTER or WORSE:** otherwise, by each metric's direction.
 - **Overall:** WORSE if any compared metric is WORSE. This is the ledger's watch-for-harm rule. Otherwise it is BETTER if any metric is BETTER, and NOISE if none is.
