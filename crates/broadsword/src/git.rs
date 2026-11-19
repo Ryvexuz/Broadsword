@@ -49,8 +49,9 @@ impl Opts {
     }
 }
 
-/// The secret NAMES (Lazlo's set, 2026-11-19): exactly `.env` or `.envrc` (direnv), or `.env.`, `.env-` or `.env_`
-/// followed by a name (`.env.local`, `.env-prod`, `.env_staging`). Letters compare case-insensitively (ASCII) on every
+/// The secret NAMES (Lazlo's set, 2026-11-19): exactly `.env` or `.envrc` (direnv), `.env.` followed by a name
+/// (`.env.local`), or anything starting with `.env-` or `.env_`, the bare `.env-` and `.env_` included (`.env-prod`,
+/// `.env_staging`). Letters compare case-insensitively (ASCII) on every
 /// platform (Windows file names are, and a `.ENV` is a secret wherever it is), after trailing dots and spaces are dropped
 /// (Windows drops them, so `.env ` and `.env.` are the file `.env`). A name is cut at every `:` and each piece is judged,
 /// so an NTFS stream (`.env:s`, `.env::$DATA`) and a drive-relative `C:.env` are secrets.
@@ -58,7 +59,8 @@ impl Opts {
 fn is_secret_name(name: &str) -> bool {
     name.split(':').any(|piece| {
         let n = piece.trim_end_matches([' ', '.']).to_ascii_lowercase();
-        n == ".env" || n == ".envrc" || [".env.", ".env-", ".env_"].iter().any(|p| n.len() > p.len() && n.starts_with(p))
+        // (a bare `.env.` is already `.env` here: the trailing dot was dropped)
+        n == ".env" || n == ".envrc" || (n.len() > ".env.".len() && n.starts_with(".env.")) || n.starts_with(".env-") || n.starts_with(".env_")
     })
 }
 
@@ -141,10 +143,33 @@ fn long_name(p: &Path) -> Option<String> {
 /// (fail closed), OR it is shaped like an 8.3 alias (`looks_like_short_name`) and does not exist (strict: a missing alias
 /// may stand for a secret). A FOLDER named `.env` (a Python venv) does not make its files secret.
 ///
-/// Every place that captures, restores, deletes or lists files calls this function: checkpoint capture (`capture`), the
-/// stored index trees (`secret_free_tree`, and the index entries rollback keeps), rollback (`changes`, `Guard`) and,
-/// through `is_secret_path`, the queue's `--brief` reader (`queue.rs`, as `is_secret_file`).
+/// Every place that captures, deletes or lists files calls this function: checkpoint capture (`capture`), the stored index
+/// trees (`secret_free_tree`, and the index entries rollback keeps), rollback's deletes (`changes`, `Guard::remove`) and,
+/// through `is_secret_path`, the queue's `--brief` reader (`queue.rs`, as `is_secret_file`). Rollback's RESTORES use
+/// `is_secret_to_restore`: the same rule except the missing-alias clause.
 pub fn is_secret_in(base: &Path, path: &str) -> bool {
+    secret_check(base, path, Missing::Strict)
+}
+
+/// The rule for a path rollback would WRITE from a checkpoint tree: exactly `is_secret_in`, except that a path that does
+/// not exist now is not a secret just because its name is shaped like an 8.3 alias. Such a path passed `is_secret_in` when
+/// the checkpoint captured it (it existed then and resolved to an ordinary long name), so an ordinary `report~1.txt` the
+/// job deleted is restored. The name rule and the long-name rule for a file that exists now still apply in full: rollback
+/// never writes through a name that resolves to a secret, and never writes a secret name.
+fn is_secret_to_restore(base: &Path, path: &str) -> bool {
+    secret_check(base, path, Missing::Captured)
+}
+
+/// How `secret_check` judges a path that is missing and cannot be resolved.
+#[derive(Clone, Copy, PartialEq)]
+enum Missing {
+    /// Secret if shaped like an 8.3 alias (it may stand for a secret).
+    Strict,
+    /// Not a secret: the path comes from a checkpoint tree, which only holds paths that passed `Strict` when captured.
+    Captured,
+}
+
+fn secret_check(base: &Path, path: &str, missing: Missing) -> bool {
     let (parent, name) = match path.rfind(['/', '\\']) {
         Some(i) => (&path[..i], &path[i + 1..]),
         None => ("", path),
@@ -159,8 +184,9 @@ pub fn is_secret_in(base: &Path, path: &str) -> bool {
     let on_disk = if parent.is_empty() { base.join(file) } else { base.join(parent).join(file) };
     match long_name(&on_disk) {
         Some(long) => is_secret_name(&long),
-        // Cannot resolve: a file that exists is a secret (its real name is unknown), a missing one only if alias-shaped.
-        None => std::fs::symlink_metadata(&on_disk).is_ok() || name.split(':').any(looks_like_short_name),
+        // Cannot resolve: a file that exists is a secret (its real name is unknown); a missing one only if alias-shaped
+        // and judged strictly.
+        None => std::fs::symlink_metadata(&on_disk).is_ok() || (missing == Missing::Strict && name.split(':').any(looks_like_short_name)),
     }
 }
 
@@ -463,6 +489,9 @@ pub struct Rollback {
     pub not_restored: Vec<String>,
     /// Ignored files the checkpoint itself skipped (over the cap) that are missing or changed now.
     pub not_protected: Vec<String>,
+    /// Paths rollback would have restored or deleted but left exactly as they are because they are (or now name) a
+    /// secret file. Never silent: `rollback` prints each one.
+    pub secret_skipped: Vec<String>,
 }
 
 fn safe_rel(p: &str) -> Result<PathBuf, String> {
@@ -484,7 +513,9 @@ struct Change {
     path: String,
 }
 
-fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
+/// A path that is (or now names) a secret is left out and added to `secret_skipped`: a delete (`D`: the path exists now)
+/// is judged by `is_secret_in`, a restore from the checkpoint tree by `is_secret_to_restore`.
+fn changes(dir: &Path, from: &str, to: &str, secret_skipped: &mut Vec<String>) -> Result<Vec<Change>, String> {
     let out = git(dir, &["diff-tree", "-r", "--no-renames", "--raw", "-z", from, to], None, None)?;
     let out = String::from_utf8_lossy(&out).into_owned();
     let mut toks = out.split('\0').filter(|t| !t.is_empty());
@@ -494,10 +525,16 @@ fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
         if f.len() < 5 {
             return Err(format!("unexpected diff-tree line: {meta}"));
         }
-        if is_secret_in(dir, path) {
-            continue; // a checkpoint made before this rule may hold one: it is never restored or deleted
+        let status = f[4].chars().next().unwrap_or('M');
+        let secret = if status == 'D' { is_secret_in(dir, path) } else { is_secret_to_restore(dir, path) };
+        if secret {
+            // never restored or deleted (a checkpoint made before this rule may hold one, or the name now resolves to one)
+            if !secret_skipped.iter().any(|s| s == path) {
+                secret_skipped.push(path.to_string());
+            }
+            continue;
         }
-        v.push(Change { status: f[4].chars().next().unwrap_or('M'), mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
+        v.push(Change { status, mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
     }
     Ok(v)
 }
@@ -526,6 +563,8 @@ struct Guard<'a> {
     dir: &'a Path,
     snapshot: HashMap<String, String>,
     skipped: Vec<String>,
+    /// Paths left alone because they are (or now name) a secret file.
+    secret_skipped: Vec<String>,
 }
 
 impl Guard<'_> {
@@ -543,6 +582,12 @@ impl Guard<'_> {
         }
     }
 
+    fn secret_skip(&mut self, rel: &str) {
+        if !self.secret_skipped.iter().any(|s| s == rel) {
+            self.secret_skipped.push(rel.to_string());
+        }
+    }
+
     fn skip(&mut self, rel: &str) {
         if !self.skipped.iter().any(|s| s == rel) {
             self.skipped.push(rel.to_string());
@@ -551,8 +596,9 @@ impl Guard<'_> {
 
     /// Write the blob of `c` to its path. Ok(true) = written, Ok(false) = skipped.
     fn write(&mut self, c: &Change) -> Result<bool, String> {
-        if is_secret_in(self.dir, &c.path) {
-            return Ok(false); // never written; not even listed as skipped: a secret file does not exist for rollback
+        if is_secret_to_restore(self.dir, &c.path) {
+            self.secret_skip(&c.path); // never written
+            return Ok(false);
         }
         if !self.may_change(&c.path)? {
             self.skip(&c.path);
@@ -576,7 +622,8 @@ impl Guard<'_> {
     /// Delete a file the job added (its bytes are in the snapshot), then the folders that leaves empty.
     fn remove(&mut self, rel: &str) -> Result<bool, String> {
         if is_secret_in(self.dir, rel) {
-            return Ok(false); // never deleted
+            self.secret_skip(rel); // never deleted
+            return Ok(false);
         }
         let full = self.dir.join(safe_rel(rel)?);
         if full.symlink_metadata().is_err() {
@@ -659,7 +706,8 @@ pub fn rollback(
 
     let apply = || -> Result<Rollback, String> {
     let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
-    let main = changes(dir, &cap.tree, &ckpt_tree)?;
+    let mut secret_skipped = Vec::new();
+    let main = changes(dir, &cap.tree, &ckpt_tree, &mut secret_skipped)?;
     let ignored = match (checkpoint_ignored_ref, &cap.ignored_tree) {
         (Some(r), now) => {
             let ckpt_ign = git_text(dir, &["rev-parse", "--verify", &format!("{r}^{{tree}}")], None)?;
@@ -667,7 +715,7 @@ pub fn rollback(
                 Some(t) => t.clone(),
                 None => git_text(dir, &["mktree"], None)?, // empty tree: everything in the checkpoint is "missing"
             };
-            changes(dir, &now, &ckpt_ign)?
+            changes(dir, &now, &ckpt_ign, &mut secret_skipped)?
         }
         (None, _) => Vec::new(),
     };
@@ -680,7 +728,7 @@ pub fn rollback(
     if let Some(t) = &cap.ignored_tree {
         snapshot.extend(tree_blobs(dir, t)?);
     }
-    let mut guard = Guard { dir, snapshot, skipped: Vec::new() };
+    let mut guard = Guard { dir, snapshot, skipped: Vec::new(), secret_skipped };
     let (mut removed, mut restored, mut ignored_restored) = (0, 0, 0);
     for c in main.iter().filter(|c| c.status == 'D') {
         removed += usize::from(guard.remove(&c.path)?);
@@ -736,11 +784,17 @@ pub fn rollback(
         ignored_restored,
         not_restored,
         not_protected,
+        secret_skipped: std::mem::take(&mut guard.secret_skipped),
     })
     };
-    apply().map_err(|e| {
+    let rb = apply().map_err(|e| {
         format!("{e}. The work as it was before this attempt is saved in {interrupted_ref}; steps before the failure may already have been applied")
-    })
+    })?;
+    // No silent skip: every path left alone as a secret is named (names only, never content) in the recover output.
+    for p in &rb.secret_skipped {
+        println!("  secret file left exactly as it is (a rollback never restores, overwrites or deletes one): {p}");
+    }
+    Ok(rb)
 }
 
 #[cfg(test)]
@@ -1022,7 +1076,7 @@ mod tests {
         let mut snapshot = HashMap::new();
         snapshot.insert("captured.txt".to_string(), blob(b"as snapshotted"));
         snapshot.insert("changed.txt".to_string(), blob(b"as it was at snapshot time"));
-        let mut g = Guard { dir: &d, snapshot, skipped: Vec::new() };
+        let mut g = Guard { dir: &d, snapshot, skipped: Vec::new(), secret_skipped: Vec::new() };
         // refuses an existing path that is not in the snapshot
         assert!(!g.write(&change("uncaptured.txt", &target)).unwrap());
         assert!(!g.remove("uncaptured.txt").unwrap());
@@ -1110,12 +1164,13 @@ mod tests {
         for yes in [
             ".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".ENV.Local", ".env.", ".env ", "a/.env.x.y",
             ".envrc", "sub/.ENVRC", ".envrc. ", ".env-prod", ".ENV-Staging", "a\\.env_local", ".env_x",
+            ".env-", ".env_", ".ENV-", "x/.env_. ",
         ] {
             assert!(is_secret_path(yes), "{yes}");
         }
         for no in [
             "env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", "", ".envoy.yaml", ".environment", ".ENVIRONMENT", ".env/key.txt", ".env.d/x",
-            "x.env.local", ".env-", ".env_", ".envrc2", "envrc", ".env-/x",
+            "x.env.local", ".envrc2", "envrc", ".env-/x",
         ] {
             assert!(!is_secret_path(no), "{no}");
         }
@@ -1139,6 +1194,14 @@ mod tests {
             assert!(safe_rel(bad).is_err(), "{bad}");
         }
         assert!(safe_rel("sub/ok.txt").is_ok());
+        // restoring from a checkpoint: a missing alias-shaped name was captured as ordinary, so it is restored; the name
+        // rule still holds
+        for p in ["report~1.txt", "sub/draft~2.doc", "ENV~1"] {
+            assert!(is_secret_in(&missing, p) && !is_secret_to_restore(&missing, p), "{p}");
+        }
+        for p in [".env", "sub/.env.local", ".envrc:s"] {
+            assert!(is_secret_to_restore(&missing, p), "{p}");
+        }
     }
 
     /// Past MAX_PATH the long name is still resolved (the `\\?\` form), so an ordinary deep file is NOT made a secret by the
@@ -1329,6 +1392,7 @@ mod tests {
         let r = rollback(&d, &state, "old", "refs/broadsword/checkpoints/old", Some("refs/broadsword/checkpoints-ignored/old"), &[], c.index_tree.as_deref(), &opts()).unwrap();
         assert!(!d.join(".env").exists());
         assert!(r.not_restored.is_empty());
+        assert_eq!(r.secret_skipped, [".env"], "the skip is reported, never silent");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }

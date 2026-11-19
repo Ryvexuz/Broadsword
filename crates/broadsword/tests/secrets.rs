@@ -400,3 +400,97 @@ fn a_short_name_of_a_secret_in_a_folder_past_max_path_is_a_secret() {
         assert_unreachable_from_broadsword_refs(&p, h);
     }
 }
+
+/// Re-review finding (regression): ORDINARY committed files whose names only look like 8.3 aliases (`report~1.txt`,
+/// `draft~2.doc`) and that a killed job deleted must come back with `recover`. They passed the rule when the checkpoint
+/// captured them, so a missing one is restored. A real alias of a secret (`ENV~1` for `.env`) is still never restored.
+#[cfg(windows)]
+#[test]
+fn ordinary_files_with_alias_shaped_names_are_restored_by_recover() {
+    let mut r = Root::new("tilde");
+    let p = r.project();
+    fs::write(p.join("report~1.txt"), "report bytes\r\nline 2\n").unwrap();
+    fs::write(p.join("draft~2.doc"), b"\x00draft\xff bytes").unwrap();
+    git(&p, &["add", "report~1.txt", "draft~2.doc"]);
+    git(&p, &["commit", "-q", "-m", "files with tilde names"]);
+    fs::write(p.join(".env"), "API_KEY=sk-fake-tilde-original\n").unwrap();
+    let env_blob = git(&p, &["hash-object", "--no-filters", ".env"]);
+    let alias = short_name(&p.join(".env"));
+    match &alias {
+        Some(a) => git(&p, &["update-index", "--add", a]),
+        None => {
+            say_skipped("ordinary_files_with_alias_shaped_names_are_restored_by_recover (secret-alias part)", "the volume gives no 8.3 short names");
+            String::new()
+        }
+    };
+    let line = "del report~1.txt & del draft~2.doc & echo API_KEY=sk-fake-tilde-job> .env & ping -n 30 127.0.0.1 >nul";
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have deleted both files and changed .env", 90, || {
+        let recs = r.records();
+        recs.len() == 1
+            && !Root::field(&recs[0], "child_pid").is_empty()
+            && !p.join("report~1.txt").exists()
+            && !p.join("draft~2.doc").exists()
+            && fs::read_to_string(p.join(".env")).is_ok_and(|s| s.contains("tilde-job"))
+    });
+    let id = Root::field(&r.only_record(), "id");
+    kill_hard(bs_pid);
+    let out = r.run(&["recover", &id]);
+    let so = text(&out.stdout);
+    println!("{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(so.contains("restored 2 file(s)"), "{so}");
+    assert_eq!(fs::read(p.join("report~1.txt")).unwrap(), b"report bytes\r\nline 2\n", "restored byte for byte");
+    assert_eq!(fs::read(p.join("draft~2.doc")).unwrap(), b"\x00draft\xff bytes", "restored byte for byte");
+    let env_now = fs::read_to_string(p.join(".env")).unwrap();
+    assert!(env_now.starts_with("API_KEY=sk-fake-tilde-job"), "the secret is never restored, through its alias or otherwise: {env_now:?}");
+    let job_blob = git(&p, &["hash-object", "--no-filters", ".env"]);
+    for h in [&env_blob, &job_blob] {
+        assert_unreachable_from_broadsword_refs(&p, h);
+    }
+    if let Some(a) = &alias {
+        for rf in [format!("refs/broadsword/checkpoints/{id}"), format!("refs/broadsword/interrupted/{id}/1")] {
+            assert!(!tree_paths(&p, &rf).contains(a), "{a} is not in {rf}");
+        }
+    }
+    r.children.clear();
+}
+
+/// No silent skip: a checkpointed file that, at rollback time, names a secret (here `notes.txt` became the short name of a
+/// new `.env.swap` the job made) is left alone AND listed in the `recover` output.
+#[cfg(windows)]
+#[test]
+fn a_path_rollback_skips_as_secret_is_listed_in_the_recover_output() {
+    const TEST: &str = "a_path_rollback_skips_as_secret_is_listed_in_the_recover_output";
+    let mut r = Root::new("listed");
+    let p = r.project();
+    fs::write(p.join("notes.txt"), "ordinary notes\n").unwrap();
+    git(&p, &["add", "notes.txt"]);
+    git(&p, &["commit", "-q", "-m", "notes"]);
+    let line = "del notes.txt & echo API_KEY=sk-fake-swap> .env.swap & fsutil file setshortname .env.swap NOTES.TXT & ping -n 30 127.0.0.1 >nul";
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have made .env.swap", 90, || {
+        let recs = r.records();
+        recs.len() == 1 && !Root::field(&recs[0], "child_pid").is_empty() && p.join(".env.swap").exists()
+    });
+    // fsutil runs right after: wait (bounded) until it has really named the secret NOTES.TXT, or say why not
+    let renamed = || short_name(&p.join(".env.swap")).is_some_and(|s| s.eq_ignore_ascii_case("NOTES.TXT"));
+    let end = Instant::now() + Duration::from_secs(20);
+    while !renamed() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !renamed() {
+        kill_hard(bs_pid);
+        say_skipped(TEST, "`fsutil file setshortname` is not permitted here (it needs admin rights and 8.3 names on the volume)");
+        return;
+    }
+    let id = Root::field(&r.only_record(), "id");
+    kill_hard(bs_pid);
+    let out = r.run(&["recover", &id]);
+    let so = text(&out.stdout);
+    println!("{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert!(fs::read_to_string(p.join(".env.swap")).unwrap().starts_with("API_KEY=sk-fake-swap"), "never written through notes.txt");
+    assert!(so.lines().any(|l| l.contains("secret file left exactly as it is") && l.contains("notes.txt")), "the skip is listed: {so}");
+    r.children.clear();
+}
