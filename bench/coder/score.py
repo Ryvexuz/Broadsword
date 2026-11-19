@@ -18,7 +18,8 @@ and time columns are the sums over all attempts, and a second table ranks the mo
   passed    tasks fully passed within the attempts / tasks
   tries     the tries a task needed ("1", "2", ...) or "no pass"; a cell is "<tries> $<cost of all its attempts>"
   cost-to-pass  cost of all attempts of the tasks that passed; "no pass at cost X" for the tasks that never passed
-  Rows are sorted by tasks without a pass (fewest first), then by total cost. A cost that is n/a for some attempt is
+  Rows are sorted by tasks without a pass (fewest first), then models whose cost is known before models with any
+  unknown or plan-allowance cost (their sum is only a lower bound), then by total cost. A cost that is n/a for some attempt is
   shown with "+": the sum of the known ones (never a 0).
 """
 import json, pathlib, sys
@@ -71,7 +72,8 @@ def attempts_table(groups, tasks):
         if nopass:
             tail += f"; no pass at cost {usd(npc, npu)} ({nopass})"
         total = sum(pc) + sum(npc)
-        rows.append(((nopass, total), [f"{prov}:{model}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
+        unknown = bool(pu or npu)  # an unknown or plan-allowance cost is never $0: such models rank after the known ones
+        rows.append(((nopass, unknown, total), [f"{prov}:{model}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
     if not rows:
         return None
     head = ["model", "effort", "pass@1", "passed"] + [t.split("-")[0] + "-" + t.split("-", 1)[1][:8] for t in tasks] + ["cost-to-pass"]
@@ -113,9 +115,9 @@ def main():
                 continue
             cells.append(f"{r['passed']}/{r['total']}")
             passed += r["passed"]; total += r["total"]
-        costs = [task_cost(r)[0] for r in by_task.values()]
-        known = [c for c in costs if c is not None]
-        missing = len(costs) - len(known)
+        tcs = [task_cost(r) for r in by_task.values()]
+        known = [c for c, _ in tcs if c is not None]
+        missing = sum(1 for c, u in tcs if c is None or u)  # tasks with any attempt of unknown cost
         if not known:
             cost = "n/a"
         elif missing:
@@ -135,7 +137,8 @@ def main():
     table = attempts_table(groups, tasks)
     if table:
         print()
-        print("cost to pass (all attempts; ranked by tasks without a pass, then cost):")
+        print("cost to pass (all attempts; ranked by tasks without a pass, then known-cost models before models with an "
+              "unknown or plan cost, then cost; a + is a lower bound):")
         printable(table)
 
 

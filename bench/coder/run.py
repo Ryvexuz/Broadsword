@@ -127,6 +127,9 @@ def regrade(out):
             rec["attempts"][-1].update(compiles=h["compiles"], passed=h["passed"], total=h["total"],
                                        harness_wall_s=h["wall_s"], first_error=h["first_error"], graded=True,
                                        failed_tests=h.get("failed_tests", []))
+            # the attempts list changed, so the summary is worked out again from it (a regraded solution may now pass)
+            rec["pass_at"] = next((i + 1 for i, a in enumerate(rec["attempts"]) if fully_passed(dict(a))), None)
+            rec.pop("stopped_early", None)
         f.write_text(json.dumps(rec, indent=1), encoding="utf-8")
         print(f"{f.stem}: compiles={rec['compiles']} passed={rec['passed']}/{rec['total']}", flush=True)
 
@@ -207,14 +210,17 @@ def main():
         state[t.name]["prompt"] = state[t.name]["base"]
     for rnd in range(1, attempts + 1):
         to_grade = []
+        asked = []  # (state, this round's record, the prompt this round sent): nothing is read back from an earlier round
         for st in state.values():
             if st["stop"]:
                 continue
+            st["rec"] = None
+            sent = st["prompt"]
             t = st["dir"]
             tag = f"{t.name}__{provider}__{model}__{effort}"
             atag = tag if rnd == 1 else f"{tag}__a{rnd}"
             t0 = time.time()
-            res = PROVIDERS[provider](st["prompt"], model, effort)
+            res = PROVIDERS[provider](sent, model, effort)
             dt = time.time() - t0
             code, problem = extract_code(res["answer"])
             call_failed = bool(res.get("is_error") and not res["answer"])
@@ -236,6 +242,7 @@ def main():
             elif stale.exists():
                 stale.unlink()  # the latest attempt has no code; an older solution must not be taken for it
             st["rec"] = rec
+            asked.append((st, rec, sent))
             print(f"{atag}: model call {rec['wall_s']}s cost={rec['cost_usd']} call_failed={rec['call_failed']} format_failure={rec['format_failure']}", flush=True)
         # one Broadsword job grades every extracted solution of this round
         if to_grade:
@@ -252,15 +259,20 @@ def main():
                 for (rec, _, _), h in zip(to_grade, results):
                     rec.update(compiles=h["compiles"], passed=h["passed"], total=h["total"], harness_wall_s=h["wall_s"],
                                first_error=h["first_error"], graded=True, _failed=h.get("failed_tests", []))
-        for st in state.values():
-            rec = st["rec"]
-            if st["stop"] or rec is None or len(st["log"]) >= rnd:
-                continue
+        for st, rec, sent in asked:
             entry = {k: v for k, v in rec.items() if k not in ("provider", "model", "effort", "task", "_failed")}
+            entry["prompt"] = sent
             entry["failed_tests"] = rec.get("_failed", [])
             st["log"].append(entry)
-            if fully_passed(rec) or rec["graded"] is False:
-                st["stop"] = True  # passed, or cannot be judged (ungraded): no point asking again
+            if fully_passed(rec):
+                st["stop"] = True
+            elif rec["graded"] is False:
+                # cannot be judged, so there is no failing-test feedback to give: stop, and say so in the result
+                st["stop"] = True
+                if attempts == 1:
+                    continue  # a one-shot result keeps its old format (graded=false says it all)
+                rec["stopped_early"] = f"grading failed in attempt {rnd}; no further attempt was asked (run.py regrade grades the saved solution)"
+                print(f"{st['dir'].name}: {rec['stopped_early']}", file=sys.stderr, flush=True)
             else:
                 st["prompt"] = retry_prompt(st["base"], rec)
     for st in state.values():

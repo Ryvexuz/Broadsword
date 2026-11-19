@@ -120,6 +120,12 @@ class Completion(unittest.TestCase):
         self.assertEqual(rows["t1"]["first_adjudicated"], ["real"])  # only the FIRST review's findings
         self.assertEqual(rows["t2"]["first_verdict"], "PASS")
 
+    def test_adjudication_matches_entry_ids_case_insensitively_and_trimmed(self):
+        entries = [entry("Q-0001", "t1", "FAIL", blocking="a:1 - x")]
+        verdicts = [{"entry": " q-0001 ", "verdict": "real"}]
+        rows = self.costs([task("t1")], entries, [], verdicts)
+        self.assertEqual(rows["t1"]["first_adjudicated"], ["real"])
+
 
 if __name__ == "__main__":
     unittest.main()

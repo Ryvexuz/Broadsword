@@ -24,6 +24,22 @@ print(json.dumps({"result": answer, "is_error": False, "total_cost_usd": 0.25,
                   "usage": {"input_tokens": 10, "output_tokens": 20}, "modelUsage": {"fake-model": {}}}))
 '''
 
+# a CLI whose answer depends on how many times it was called: call 1 bad code, call 2 __SECOND__, call 3 good code
+SCRIPTED_CLI = '''import json, pathlib, sys
+prompt = sys.stdin.read()
+log = pathlib.Path(__file__).with_name("prompts.log")
+with open(log, "a", encoding="utf-8") as f:
+    f.write(json.dumps(prompt) + chr(10))
+n = len(log.read_text(encoding="utf-8").splitlines())
+code = lambda body: "```rust" + chr(10) + body + chr(10) + "```"
+if n == 2:
+    out = {"result": __SECOND__, "is_error": True}
+else:
+    out = {"result": code("pub fn good() {}" if n == 3 else "pub fn bad() {}"), "is_error": False}
+out.update(total_cost_usd=0.25, usage={"input_tokens": 10, "output_tokens": 20}, modelUsage={"fake-model": {}})
+print(json.dumps(out))
+'''
+
 
 def load(name):
     spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
@@ -100,6 +116,84 @@ class Attempts(unittest.TestCase):
             self.assertIn("$0.500; no pass at cost $0.750 (1)", text)
             self.assertIn("no pass $0.750", text)
 
+    def scripted(self, second, argv_extra=("01-duration",), grade=fake_grade):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        cli = tmp / "fake_cli.py"
+        cli.write_text(SCRIPTED_CLI.replace("__SECOND__", second), encoding="utf-8")
+        os.environ["BENCH_CLAUDE"] = str(cli)
+        os.environ["BENCH_CWD"] = str(tmp / "cwd")
+        run = load("run")
+        run.H.grade_batch = grade
+        out = tmp / "out"
+        self.run_main(run, ["run.py", str(out), "claude", "fake-model", "default", "--attempts", "3", *argv_extra])
+        prompts = [json.loads(x) for x in (tmp / "prompts.log").read_text(encoding="utf-8").splitlines()]
+        rec = json.loads((out / "01-duration__claude__fake-model__default.json").read_text(encoding="utf-8"))
+        return run, out, prompts, rec
+
+    def test_each_attempt_records_its_own_prompt_and_result_after_a_failed_call(self):
+        # call 2 fails with NO answer; call 3 must be asked the base prompt again, and each entry holds its own prompt
+        run, out, prompts, rec = self.scripted('""')
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual([a["prompt"] for a in rec["attempts"]], prompts)
+        self.assertTrue(rec["attempts"][1]["call_failed"])
+        self.assertEqual(rec["attempts"][1]["passed"], 0)
+        self.assertEqual((rec["attempts"][2]["passed"], rec["pass_at"]), (3, 3))  # call 3 answers good code
+        self.assertEqual(rec["passed"], rec["attempts"][2]["passed"])
+        self.assertEqual(rec["first_error"], rec["attempts"][2]["first_error"])
+
+    def test_failed_call_with_an_answer_but_no_code_is_its_own_attempt(self):
+        run, out, prompts, rec = self.scripted('"no code here"')
+        a = rec["attempts"]
+        self.assertEqual([x["prompt"] for x in a], prompts)
+        self.assertTrue(a[1]["format_failure"])
+        self.assertFalse(a[1]["compiles"])
+        self.assertEqual(a[1]["passed"], 0)
+        self.assertIn("exactly one fenced rust code block", prompts[2])  # fed back from attempt 2, not attempt 1
+
+    def ungraded_run(self):
+        def refuse(items):
+            raise SystemExit("job refused")
+        return self.scripted('""', grade=refuse)
+
+    def test_a_round_whose_grading_failed_is_recorded_ungraded_and_says_it_stopped(self):
+        old = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            run, out, prompts, rec = self.ungraded_run()
+        finally:
+            sys.stderr = old
+        self.assertEqual(len(prompts), 1)
+        self.assertIs(rec["graded"], False)
+        self.assertIs(rec["attempts"][0]["graded"], False)
+        self.assertIsNone(rec["pass_at"])
+        self.assertEqual(rec["attempts_made"], 1)
+        self.assertIn("grading failed in attempt 1", rec["stopped_early"])
+
+    def test_regrade_of_an_ungraded_multi_attempt_solution_recomputes_pass_at(self):
+        old = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            run, out, prompts, rec = self.ungraded_run()
+        finally:
+            sys.stderr = old
+        # the saved .rs is "bad" (call 1); make it a solution the fake grader passes, then regrade
+        rs = out / "01-duration__claude__fake-model__default.rs"
+        rs.write_text("pub fn good() {}", encoding="utf-8")
+        run.H.grade_batch = fake_grade
+        with contextlib.redirect_stdout(io.StringIO()):
+            run.regrade(out)
+        rec = json.loads((out / "01-duration__claude__fake-model__default.json").read_text(encoding="utf-8"))
+        self.assertEqual(rec["pass_at"], 1)
+        self.assertNotIn("stopped_early", rec)
+        score = load("score")
+        sys.argv = ["score.py", str(out)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            score.main()
+        self.assertIn("1/1", buf.getvalue().split("cost to pass")[1])  # passed 1/1 in the cost-to-pass table
+        self.assertNotIn("no pass", buf.getvalue().split("cost to pass")[1].split(chr(10), 1)[1])
+
     def test_one_attempt_keeps_the_one_shot_format(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -138,6 +232,33 @@ class Attempts(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 score.main()
             self.assertIn("2 $0.100+", buf.getvalue())
+
+    def score_text(self, recs):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            for i, r in enumerate(recs):
+                base = {"provider": "claude", "effort": "default", "task": "01-duration", "wall_s": 1.0, "wall_s_total": 2.0,
+                        "compiles": True, "passed": 3, "total": 3, "format_failure": False, "call_failed": False,
+                        "graded": True, "max_attempts": 3, "attempts_made": 1, "pass_at": 1}
+                base.update(r)
+                (out / f"01-duration__claude__{base['model']}__default.json").write_text(json.dumps(base), encoding="utf-8")
+            score = load("score")
+            sys.argv = ["score.py", str(out)]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                score.main()
+            return buf.getvalue()
+
+    def test_unknown_cost_models_rank_after_known_ones(self):
+        text = self.score_text([{"model": "aaa-plan", "cost_usd": None, "cost_usd_total": None, "cost_unknown_attempts": 1},
+                                {"model": "zzz-paid", "cost_usd": 0.5, "cost_usd_total": 0.5, "cost_unknown_attempts": 0}])
+        table = text.split("cost to pass")[1]
+        self.assertLess(table.index("claude:zzz-paid"), table.index("claude:aaa-plan"))
+        self.assertIn("unknown or plan", table.split(chr(10))[0])  # the header says how unknown costs rank
+
+    def test_a_task_with_an_unknown_attempt_cost_shows_the_lower_bound_in_the_main_table(self):
+        text = self.score_text([{"model": "m", "cost_usd": 0.1, "cost_usd_total": 0.1, "cost_unknown_attempts": 1}])
+        self.assertIn("$0.100+ (1 n/a)", text.split("cost to pass")[0])
 
 
 if __name__ == "__main__":

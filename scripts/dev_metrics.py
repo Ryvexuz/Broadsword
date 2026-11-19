@@ -322,7 +322,8 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
             if e.get("shadow_model"):  # Codex on the plan allowance: tokens only, never $0
                 add(openai, e.get("shadow_tokens"))
         first = next((e for e in es if e.get("verdict")), None)
-        adj = [v for v in verdicts if first and v.get("entry") == first.get("id")]
+        fid = str(first.get("id", "")).strip().lower() if first else None
+        adj = [v for v in verdicts if first and str(v.get("entry", "")).strip().lower() == fid]  # case and spaces never hide an adjudication
         out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "coder_runs": len(coder_rs),
                     "wall": (ended - (started or created)) if ended and (started or created) else None,
                     "claude": claude, "openai": openai, "usd": usd,
