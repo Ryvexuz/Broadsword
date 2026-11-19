@@ -13,7 +13,7 @@ Map file (JSON, required, nothing is hard-coded here):
     ]}
   path, tracking_path: relative to --root. tracking_path is the repo that holds the
   remote-tracking ref <remote>/<remote_branch> (and the URL of <remote>); it defaults to path.
-  All keys except tracking_path are required.
+  All keys except tracking_path are required (tracking_path may be absent or null).
 
 Status never touches the network: it only reads local refs with `git rev-list`.
 Tags: a tag counts as not on the remote when its commit is not reachable from the
@@ -22,7 +22,8 @@ written by --push). A tag on an already-pushed commit that was never pushed itse
 NOT detected without network access (see docs/BACKUPS.md).
 
 --push needs --yes as well. Plain pushes only: never --force, never a '+' refspec, never a
-delete. Exit codes: 0 all repos ok, 1 some repo behind, 2 usage or config error.
+delete (enforced by check_plain_push, a real check that also holds under python -O). A mapped
+branch with no tracking ref yet is published as a new remote branch by --push --yes. Exit codes: 0 all repos ok, 1 some repo behind, 2 usage or config error.
 """
 import argparse
 import json
@@ -40,11 +41,39 @@ class ConfigError(Exception):
     pass
 
 
+class PushRefused(RuntimeError):
+    pass
+
+
+_USERINFO = re.compile(r"(://)[^/\s@]*@")
+_PLAIN_SPEC = re.compile(r"^refs/(heads|tags)/[^:+\s-][^:\s]*:refs/(heads|tags)/[^:+\s-][^:\s]*$")
+_FORBIDDEN_FLAGS = ("--force", "-f", "--delete", "-d", "--mirror", "--prune", "--all")
+
+
+def scrub(text):
+    """Remove URL credentials (https://user:token@host -> https://host) from anything printed."""
+    return _USERINFO.sub(r"\1", str(text))
+
+
+def check_plain_push(cmd):
+    """The one guard that keeps pushes plain. A real check, not an assert (python -O removes those)."""
+    i = cmd.index("push")
+    rest = cmd[i + 1:]
+    if len(rest) < 2 or rest[0].startswith("-"):
+        raise PushRefused("refusing push command without a plain url and refspecs")
+    for a in rest[1:]:
+        if a.startswith("-") or a in _FORBIDDEN_FLAGS:
+            raise PushRefused("refusing push flag %r" % a)
+        if not _PLAIN_SPEC.match(a):
+            raise PushRefused("refusing non-plain refspec %r" % a)
+    return cmd
+
+
 def git(repo, *args, check=True):
     r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
                        timeout=GIT_TIMEOUT)
     if check and r.returncode != 0:
-        raise RuntimeError("git %s failed in %s: %s" % (" ".join(args), repo, r.stderr.strip()))
+        raise RuntimeError(scrub("git %s failed in %s: %s" % (" ".join(args), repo, r.stderr.strip())))
     return r
 
 
@@ -63,7 +92,11 @@ def load_map(path):
         for k in REQUIRED:
             if not isinstance(r.get(k), str) or not r[k]:
                 raise ConfigError("map entry %r is missing required key %r" % (r.get("name"), k))
-        r.setdefault("tracking_path", r["path"])
+        tp = r.get("tracking_path")
+        if tp is None:   # absent or null both mean: same repo as path
+            r["tracking_path"] = r["path"]
+        elif not isinstance(tp, str) or not tp:
+            raise ConfigError("map entry %r: tracking_path must be a non-empty string or null" % r["name"])
     return repos
 
 
@@ -93,7 +126,8 @@ def check_repo(root, entry, now):
     tracking = os.path.join(root, entry["tracking_path"])
     ref = "%s/%s" % (entry["remote"], entry["remote_branch"])
     res = {"name": entry["name"], "ref": ref, "behind": True, "ahead": None, "tags": [],
-            "oldest_age": None, "ref_age": None, "error": None, "remote_sha": None}
+            "oldest_age": None, "ref_age": None, "error": None, "remote_sha": None,
+            "recorded": False, "first_time": False, "tags_unverified": False}
     sha = git(tracking, "rev-parse", "--verify", "--quiet",
               "refs/remotes/%s^{commit}" % ref, check=False).stdout.strip()
     if sha and git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0:
@@ -106,8 +140,13 @@ def check_repo(root, entry, now):
     if rec and (not sha or git(repo, "merge-base", "--is-ancestor", sha, rec, check=False).returncode == 0):
         sha, res["error"] = rec, None
         age_from = (repo, rec_ref)
+        res["recorded"] = True
     if not sha:
-        res["error"] = res["error"] or "no local tracking ref %s" % ref
+        if not res["error"]:
+            res["error"] = "no local tracking ref %s" % ref
+            # never published from here: --push --yes may create the remote branch
+            res["first_time"] = git(repo, "rev-parse", "--verify", "--quiet",
+                                    "refs/heads/%s^{commit}" % entry["branch"], check=False).returncode == 0
         return res
     res["remote_sha"] = sha
     local = git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/%s^{commit}" % entry["branch"],
@@ -130,6 +169,7 @@ def check_repo(root, entry, now):
             continue
         target = git(repo, "rev-parse", "%s^{commit}" % name, check=False).stdout.strip()
         if target and git(repo, "merge-base", "--is-ancestor", target, sha, check=False).returncode == 0:
+            res["tags_unverified"] = True   # reachable, but nothing proves the tag itself was pushed
             continue
         res["tags"].append(name)
     res["tags"].sort()
@@ -139,12 +179,16 @@ def check_repo(root, entry, now):
 
 def line_for(res):
     if res["error"]:
-        return "%s: BEHIND (cannot verify: %s)" % (res["name"], res["error"])
+        return "%s: BEHIND (cannot verify: %s)" % (res["name"], scrub(res["error"]))
     parts = ["ahead %d" % res["ahead"], "tags not on remote %d" % len(res["tags"])]
     if res["tags"]:
         parts[-1] += " (%s)" % ", ".join(res["tags"])
     parts.append("oldest unpushed %s" % (fmt_age(res["oldest_age"]) if res["oldest_age"] is not None else "-"))
-    parts.append(("%s updated %s ago" % (res["ref"], fmt_age(res["ref_age"]))) if res["ref_age"] is not None else ("%s age unknown" % res["ref"]))
+    verb = "pushed (recorded)" if res.get("recorded") else "updated"
+    if res["ref_age"] is not None:
+        parts.append("%s %s %s ago" % (res["ref"], verb, fmt_age(res["ref_age"])))
+    else:
+        parts.append("%s %s" % (res["ref"], "pushed (recorded), age unknown" if res.get("recorded") else "age unknown"))
     return "%s: %s - %s" % (res["name"], "BEHIND" if res["behind"] else "ok", ", ".join(parts))
 
 
@@ -153,26 +197,28 @@ def push_plan(root, entry, res):
     tracking = os.path.join(root, entry["tracking_path"])
     url = git(tracking, "remote", "get-url", entry["remote"]).stdout.strip()
     refspecs = []
-    if res["ahead"]:
+    if res["first_time"] or res["ahead"]:
         refspecs.append("refs/heads/%s:refs/heads/%s" % (entry["branch"], entry["remote_branch"]))
     for t in res["tags"]:
         refspecs.append("refs/tags/%s:refs/tags/%s" % (t, t))
-    for spec in refspecs:   # one place that keeps pushes plain
-        if spec.startswith(("+", ":")) or spec.split(":")[0] == "":
-            raise RuntimeError("refusing non-plain refspec %r" % spec)
     return url, refspecs
 
 
-def do_push(root, entry, url, refspecs):
+def push_cmd(root, entry, url, refspecs):
+    """The full push command; refused unless plain (see check_plain_push)."""
+    repo = os.path.join(root, entry["path"])
+    return check_plain_push(["git", "-C", repo, "push", url, *refspecs])
+
+
+def do_push(root, entry, cmd, refspecs):
     """Plain push. Returns True on success; any failure (git error, timeout) is reported, not raised."""
     repo = os.path.join(root, entry["path"])
     tracking = os.path.join(root, entry["tracking_path"])
-    cmd = ["git", "-C", repo, "push", url, *refspecs]
-    assert "--force" not in cmd and "-f" not in cmd and "--delete" not in cmd
     try:
+        check_plain_push(cmd)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
-            print("%s: push FAILED: %s" % (entry["name"], r.stderr.strip()))
+            print("%s: push FAILED: %s" % (entry["name"], scrub(r.stderr.strip())))
             return False
         # Record what is now on the remote, as git itself would for a named remote.
         for spec in refspecs:
@@ -186,7 +232,7 @@ def do_push(root, entry, url, refspecs):
             else:
                 git(repo, "update-ref", "refs/backup-pushed/%s/%s" % (entry["remote"], src[len("refs/tags/"):]), sha)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
-        print("%s: push FAILED: %s" % (entry["name"], e))
+        print("%s: push FAILED: %s" % (entry["name"], scrub(e)))
         return False
     return True
 
@@ -214,22 +260,22 @@ def main(argv=None):
         results.append((entry, res))
         print(line_for(res))
     if args.push:
-        todo = [(e, r) for e, r in results if not r["error"] and r["behind"]]
+        todo = [(e, r) for e, r in results if (not r["error"] and r["behind"]) or r.get("first_time")]
         plans = []
         try:
             for e, r in todo:
                 url, specs = push_plan(args.root, e, r)
-                plans.append((e, url, specs))
+                plans.append((e, url, specs, push_cmd(args.root, e, url, specs)))
         except (RuntimeError, OSError) as e:
-            print("backup: cannot plan push: %s" % e)
+            print("backup: cannot plan push: %s" % scrub(e))
             return 2
-        for e, url, specs in plans:
-            print("will push %s to %s: %s" % (e["name"], url, " ".join(specs)))
+        for e, url, specs, _cmd in plans:
+            print("will push %s to %s: %s" % (e["name"], scrub(url), " ".join(specs)))
         if not args.yes:
             print("backup: --push publishes your work; nothing pushed. Add --yes to confirm.")
             return 2
-        for e, url, specs in plans:
-            do_push(args.root, e, url, specs)
+        for e, url, specs, cmd in plans:
+            do_push(args.root, e, cmd, specs)
         now = time.time()
         results = []
         for entry in repos:
@@ -244,7 +290,8 @@ def main(argv=None):
         print("backup: --yes only has a meaning together with --push")
         return 2
     behind = sum(1 for _, r in results if r["behind"])
-    print("backup: ok" if behind == 0 else "backup: %d repos behind" % behind)
+    note = " (tags: offline check only)" if any(r.get("tags_unverified") for _, r in results) else ""
+    print(("backup: ok" if behind == 0 else "backup: %d repos behind" % behind) + note)
     return 0 if behind == 0 else 1
 
 

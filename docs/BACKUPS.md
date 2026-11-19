@@ -45,7 +45,21 @@ Plain pushes only: never `--force`, never a `+` refspec, never a delete; a rejec
 and left alone. Branch and unpushed tags are pushed as explicit refspecs. After a successful push the
 script records what it pushed in the pushed repo itself (`refs/backup-pushed-branch/<remote>/<branch>` and `refs/backup-pushed/<remote>/<tag>`), because a nested repo's commits are not in the root repo that holds the tracking ref. It also updates the tracking ref when that repo has the commit.
 
+A mapped branch with no tracking ref yet (never published) is reported "cannot verify"; `--push --yes`
+publishes it as a new remote branch with a plain push (branch only; tags follow on the next push). If the
+remote branch already exists and differs, the plain push is rejected and reported, never forced.
+
+The no-force/no-delete rule is one real check (`check_plain_push`, not an `assert`), so it also holds
+under `python -O`; a push command that fails it is refused at planning time (exit 2). Remote URLs and
+git error text are printed with any `user:token@` part removed.
+
 ## Known limits
+
+- After `--push` the line reads `origin/<branch> pushed (recorded)`: that comes from the script's own
+  record of its push, not from the remote. A remote that someone rewound by hand is not seen offline.
+- When any tag is only counted as pushed because its commit is reachable from the tracking ref, the
+  summary line says `(tags: offline check only)`: `backup: ok` is then not proof that tags are remote.
+- `tracking_path` may be absent or `null` (both mean the repo's own `path`); any other non-string is exit 2.
 
 - Tags: without network access a tag counts as pushed if its commit is reachable from the tracking ref
   or `--push` recorded it. A tag created on an already-pushed commit and never pushed is not detected.

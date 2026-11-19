@@ -145,6 +145,7 @@ class Status(Base):
         g(self.root, "tag", "v1")
         code, out = self.run_cli()
         self.assertEqual(code, 0, out)  # tag on an already-pushed commit: documented limitation
+        self.assertTrue(out.rstrip().endswith("backup: ok (tags: offline check only)"), out)
         commit(self.root, "c.txt")
         g(self.root, "tag", "v2")
         code, out = self.run_cli()
@@ -163,6 +164,33 @@ class Status(Base):
         code, out = self.run_cli()
         self.assertEqual(code, 2)
         self.assertIn("remote_branch", out)
+
+    def test_null_tracking_path_is_same_as_absent(self):
+        self.write_map([{"name": "root", "path": ".", "branch": "main", "remote": "origin",
+                         "remote_branch": "main", "tracking_path": None}])
+        code, out = self.run_cli()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Traceback", out)
+
+    def test_bad_tracking_path_type_exit_2(self):
+        self.write_map([{"name": "root", "path": ".", "branch": "main", "remote": "origin",
+                         "remote_branch": "main", "tracking_path": 5}])
+        code, out = self.run_cli()
+        self.assertEqual(code, 2, out)
+        self.assertIn("tracking_path", out)
+
+    def test_url_credentials_never_printed(self):
+        commit(self.root, "b.txt")
+        g(self.root, "remote", "set-url", "origin", "https://user:FAKETOKEN123@example.invalid/r.git")
+        code, out = self.run_cli("--push")   # no --yes: prints the plan only, no network
+        self.assertEqual(code, 2, out)
+        self.assertIn("will push", out)
+        self.assertIn("https://example.invalid/r.git", out)
+        self.assertNotIn("FAKETOKEN123", out)
+        self.assertNotIn("user:", out)
+        self.assertEqual(bs.scrub("fatal: unable to access 'https://u:tok@h.example/x.git/'"),
+                         "fatal: unable to access 'https://h.example/x.git/'")
+        self.assertEqual(bs.scrub("git@github.com:me/r.git"), "git@github.com:me/r.git")
 
     def test_read_only_by_default(self):
         commit(self.root, "b.txt")
@@ -208,6 +236,8 @@ class Push(Base):
         self.assertEqual(g(self.bare, "rev-parse", "sub-main"), g(sub, "rev-parse", "main"))
         code, out = self.run_cli()   # a fresh, separate status run agrees
         self.assertEqual(code, 0, out)
+        self.assertIn("origin/sub-main pushed (recorded)", out)
+        self.assertNotIn("origin/sub-main updated", out)
         commit(sub, "t.txt")
         code, out = self.run_cli()
         self.assertEqual(code, 1, out)
@@ -241,6 +271,65 @@ class Push(Base):
         self.assertTrue(out.rstrip().endswith("backup: ok"), out)
         self.assertIn("refs/tags/v1", self.remote_refs())
         self.assertEqual(g(self.bare, "rev-parse", "main"), g(self.root, "rev-parse", "main"))
+
+    def test_first_time_branch_push(self):
+        self.write_map([{"name": "root", "path": ".", "branch": "main",
+                         "remote": "origin", "remote_branch": "brand-new"}])
+        code, out = self.run_cli()
+        self.assertEqual(code, 1, out)
+        self.assertIn("cannot verify", out)
+        code, out = self.run_cli("--push")
+        self.assertEqual(code, 2, out)
+        self.assertIn("will push root", out)
+        self.assertNotIn("refs/heads/brand-new", self.remote_refs())
+        code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(g(self.bare, "rev-parse", "brand-new"), g(self.root, "rev-parse", "main"))
+        code, out = self.run_cli()
+        self.assertEqual(code, 0, out)
+
+    def test_first_time_push_skipped_when_local_branch_missing(self):
+        self.write_map([{"name": "root", "path": ".", "branch": "nobranch",
+                         "remote": "origin", "remote_branch": "brand-new"}])
+        code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("refs/heads/brand-new", self.remote_refs())
+
+    def test_guard_refuses_force_exit_2(self):
+        commit(self.root, "b.txt")
+        orig = bs.push_plan
+        bs.push_plan = lambda root, entry, res: ("origin", ["+refs/heads/main:refs/heads/main"])
+        try:
+            code, out = self.run_cli("--push", "--yes")
+        finally:
+            bs.push_plan = orig
+        self.assertEqual(code, 2, out)
+        self.assertIn("cannot plan push", out)
+        self.assertEqual(g(self.bare, "rev-parse", "main"), g(self.root, "rev-parse", "main~1"))
+
+    def test_guard_survives_python_O(self):
+        code = """
+import importlib.util, sys
+s = importlib.util.spec_from_file_location('m', sys.argv[1])
+m = importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+spec = 'refs/heads/a:refs/heads/a'
+bad = [['git', 'push', 'u', spec, '--force'], ['git', 'push', 'u', '-f', spec],
+       ['git', 'push', 'u', '--delete', 'x'], ['git', 'push', 'u', ':refs/heads/a'],
+       ['git', 'push', 'u', '+' + spec]]
+n = 0
+for c in bad:
+    try:
+        m.check_plain_push(c)
+    except m.PushRefused:
+        n += 1
+m.check_plain_push(['git', 'push', 'u', spec, 'refs/tags/v1+b:refs/tags/v1+b'])
+print('refused', n, 'debug', __debug__)
+"""
+        r = subprocess.run([sys.executable, "-O", "-I", "-B", "-c", code, str(SCRIPT)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "refused 5 debug False")
 
     def test_push_never_forces_or_deletes(self):
         # remote main has a commit the local branch lacks: a plain push must be rejected, not forced
