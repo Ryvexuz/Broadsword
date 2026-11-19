@@ -24,7 +24,6 @@ import argparse
 import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -61,17 +60,42 @@ def error_result(message: str) -> dict:
 
 
 def find_codex(environ):
-    """The codex executable: on PATH (the environment given), else the npm global folder under APPDATA. None if absent."""
-    found = shutil.which("codex", path=environ.get("PATH"))
-    if found:
-        return found
+    """The codex executable: found by walking the PATH entries of the environment given (absolute entries only; "." , empty and
+    relative entries are skipped, so the current folder is never searched, which shutil.which may do on Windows), then the npm
+    global folder under APPDATA (absolute only). None if absent."""
+    names = ("codex.cmd", "codex.exe", "codex.bat", "codex") if os.name == "nt" else ("codex",)
+    folders = []
+    for raw in (environ.get("PATH") or "").split(os.pathsep):
+        entry = raw.strip().strip('"')
+        if entry and Path(entry).is_absolute():
+            folders.append(Path(entry))
     appdata = environ.get("APPDATA")
-    if appdata:
-        for name in ("codex.cmd", "codex.exe", "codex"):
-            cand = Path(appdata) / "npm" / name
+    if appdata and Path(appdata).is_absolute():
+        folders.append(Path(appdata) / "npm")
+    for folder in folders:
+        for name in names:
+            cand = folder / name
             if cand.is_file():
                 return str(cand)
     return None
+
+
+def codex_env(environ, root: Path) -> dict:
+    """The ONE place the codex child's environment is built. Codex signs in with ChatGPT, so it never needs the API key: drop
+    OPENAI_API_KEY by name, and every variable whose VALUE equals a value in `<root>/.env` or the API key's own value (the same
+    secret under another name). Empty values are not secrets and are kept. The API fallback uses the key in this process only.
+    Raises oc.Fail if the .env cannot be read, so the child is never started with an unchecked environment."""
+    secrets = set()
+    env_file = root / ".env"
+    if env_file.is_file():
+        try:
+            secrets.update(v for v in oc.parse_env_text(env_file.read_text(encoding="utf-8", errors="replace")).values() if v)
+        except OSError as e:
+            raise oc.Fail(f"cannot read the .env to scrub the codex environment: {type(e).__name__}")
+    key = (environ.get("OPENAI_API_KEY") or "").strip()
+    if key:
+        secrets.add(key)
+    return {k: v for k, v in environ.items() if k.upper() != "OPENAI_API_KEY" and v.strip() not in secrets}
 
 
 def timeout_of(environ) -> float:
@@ -140,7 +164,8 @@ def review_codex(args, prompt: str, environ, deadline: float) -> dict:
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
         cmd = [exe, "exec", "-m", args.model, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", str(answer), "-"]
-        code, stdout, stderr = run_with_deadline(cmd, text_in, work, environ, budget)
+        child = codex_env(environ, oc.find_main_root(HERE))
+        code, stdout, stderr = run_with_deadline(cmd, text_in, work, child, budget)
         if code != 0:
             raise oc.Fail(f"codex exited with code {code}: {(stderr or '').strip()[-200:]}")
         text = answer.read_text(encoding="utf-8", errors="replace") if answer.is_file() else ""

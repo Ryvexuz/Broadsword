@@ -49,7 +49,7 @@ d = os.path.dirname(os.path.abspath(__file__))
 mode = open(os.path.join(d, "mode"), encoding="utf-8").read().strip()
 args = sys.argv[1:]
 stdin = sys.stdin.read()
-json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd()}, open(os.path.join(d, "seen.json"), "w", encoding="utf-8"))
+json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd(), "env": dict(os.environ)}, open(os.path.join(d, "seen.json"), "w", encoding="utf-8"))
 sys.stderr.write("unrelated MCP connection error\n")
 if mode == "fail":
     sys.exit(1)
@@ -102,7 +102,7 @@ class ReviewTests(unittest.TestCase):
         (d / "mode").write_text(mode, encoding="utf-8")
         return d
 
-    def run_script(self, prompt="the prompt", env=None, base=None, codex=None):
+    def run_script(self, prompt="the prompt", env=None, base=None, codex=None, cwd=None):
         """codex=None: no codex anywhere (PATH is an empty folder, APPDATA an empty folder). codex=<mode>: a fake codex first on PATH."""
         e = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY" and not k.startswith("OPENAI_")}
         e["OPENAI_API_KEY"] = FAKE_KEY
@@ -116,7 +116,7 @@ class ReviewTests(unittest.TestCase):
             self.codex_dir = self.make_codex_dir(codex)
             e["PATH"] = str(self.codex_dir)
         e.update(env or {})
-        p = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), *ARGS], input=prompt, capture_output=True, text=True, env=e, timeout=60)
+        p = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), *ARGS], input=prompt, capture_output=True, text=True, env=e, timeout=60, cwd=cwd)
         return p
 
     def test_success_prints_the_claude_cli_json(self):
@@ -186,6 +186,45 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(cwd.exists(), "the temp working folder is deleted afterwards")
         self.assertTrue(str(cwd).startswith(str(Path(tempfile.gettempdir()).resolve())), "under the system temp folder")
         self.assertNotIn(FAKE_KEY, p.stdout + p.stderr)
+
+    def test_codex_child_env_has_no_api_key(self):
+        p = self.run_script(codex="ok", env={"OPENAI_API_KEY": FAKE_KEY, "COPY_OF_KEY": FAKE_KEY})
+        self.assertEqual(json.loads(p.stdout)["backend"], "codex", p.stdout)
+        seen = json.loads((self.codex_dir / "seen.json").read_text(encoding="utf-8"))
+        self.assertNotIn("OPENAI_API_KEY", {k.upper() for k in seen["env"]})
+        self.assertNotIn("COPY_OF_KEY", seen["env"], "the same secret under another name is dropped too")
+        self.assertNotIn(FAKE_KEY, json.dumps(seen["env"]))
+        self.assertTrue(seen["env"].get("PATH"), "ordinary variables survive")
+
+    def test_codex_env_drops_the_key_and_every_dotenv_value(self):
+        root = Path(tempfile.mkdtemp(prefix="fakeroot-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / ".env").write_text('OPENAI_API_KEY=sk-from-file\nOTHER_THING="hello-secret-value"\nEMPTY=\n', encoding="utf-8")
+        environ = {"OPENAI_API_KEY": "sk-env-key", "openai_api_key": "x", "RENAMED": "hello-secret-value", "COPY": "sk-env-key",
+                   "FILECOPY": "sk-from-file", "PATH": "p", "APPDATA": "a", "BLANK": ""}
+        sys.path.insert(0, str(HERE))
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("openai_review_under_test", SCRIPT)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+        finally:
+            sys.path.remove(str(HERE))
+        out = m.codex_env(environ, root)
+        self.assertEqual(out, {"PATH": "p", "APPDATA": "a", "BLANK": ""})
+
+    def test_a_codex_in_the_current_folder_is_not_picked_up(self):
+        cur = Path(tempfile.mkdtemp(prefix="curdir-"))
+        self.addCleanup(shutil.rmtree, cur, True)
+        for name in ("codex.cmd", "codex.exe", "codex"):
+            (cur / name).write_text("echo PWNED\n", encoding="utf-8")
+        # PATH holds "." , an empty entry and a relative one; none may be searched
+        p = self.run_script(env={"PATH": os.pathsep.join([".", "", "sub", str(cur / "nope")])}, cwd=str(cur))
+        j = json.loads(p.stdout)
+        self.assertEqual(j["backend"], "api", j)
+        self.assertIn("not found", j["codex_error"])
+        self.assertEqual(len(Fake.seen), 1)
+        self.assertFalse((cur / "seen.json").exists())
 
     def test_codex_missing_falls_back_to_the_api(self):
         p = self.run_script()
