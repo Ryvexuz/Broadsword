@@ -2,6 +2,27 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-19 — PC session: Stage 4 v1 close, shadow sandbox, secret files, scale-up test
+
+- **Stage:** 4 v1 closed and tagged; Stage 6 milestone 1 started (crash sim).
+- **Models:** Opus 5.5 orchestrator. Coders: Sonnet 5.5 (most tasks), Opus 5.5 high (Stage 6 done checks, shadow sandbox, secret files, ADR). Queue gates: Haiku (low risk), Opus (high risk). Sonnet 5.5 high as a hand-run security reviewer for Opus-written security code. Fable 5.2: the nb-06 decisive review (Lazlo's choice), the Stage 4 audit and one security review (now rare-only by Lazlo's rule). gpt-6.2-astra: two audit sweeps through Codex. gpt-5.6-sol then gpt-6.1-sol: shadow reviewer. Haiku: shadow-finding verdicts, a benchmark run.
+- **Throughput:** 20 merges in the 17:00-21:30 UTC window measured by scripts/baseline.py (4.45/h), first-pass FAIL 45%, no reverts, no failed checks on main.
+- **What went wrong and what fixed it:**
+  - The Codex shadow reviewer could read any file by absolute path (canary). Shadow off (Lazlo), then Codex with no tools offered, proven by a canary with an offline leg; an independent review found an apply_patch read oracle in the first fix.
+  - My safety-stop commit broke a test on main: I ran `status`, not the full suite. Fixed through the queue; carry item to enforce a full check before any direct commit.
+  - `prove.py` inside `broadsword run` deadlocked all builds for 15 minutes (nested build lock); cleared by the lock-wait timeout.
+  - Board claim edits silently failed: the shell turned `\n` separators into newlines in a heredoc; redone from a script file.
+  - The secret-file rule went through six security rounds (8.3 aliases, paths past 260 characters, a rollback regression, escaped records).
+  - Haiku failed low-risk Python tooling repeatedly on new or refuted points; rule 34 stopped each loop with one stronger review.
+- **Git commands beyond a plain commit:**
+  - `git merge --ff-only <sha>` (nb-06, nb-19, the records allow-list): moves main to an already-reviewed commit without a merge commit, with the queue idle.
+  - `git tag -a stage-4-v1-done -m ...` (main and render): an annotated, dated marker on the verified stage commit.
+  - `git fetch origin main` then `git merge --no-ff origin/main`: brought the project thread's two records commits from GitHub without rewriting the 42 local commits the queue records point to.
+  - `git push origin main <tag>` and `git -C projects/<p> push <url> <branch>:refs/heads/<name>` (Lazlo's explicit OK): off-drive backup; render's tag pushed as `render/stage-4-v1-done` to avoid a name clash.
+  - `git rebase main` in task worktrees before direct merges: replays the task's commits on the current main.
+- **Rough cost and time:** about 4.5 hours of pipeline. Queue reviews about $0.41 per merged task. Fable about 1.4M tokens; astra about 944k tokens on the ChatGPT plan; five Opus judges for the audit.
+- **One lesson about AI development:** a sandbox flag is a claim, not a control. "read-only" still read every file, and the first fix still left a tool that leaked file contents by guessing. Only a canary that attacks the real setup, checked by a reviewer who did not write it, showed what the model could actually reach.
+
 ## 2026-11-18 — Session end: throughput test, Codex-first wrapper, ready to move
 
 - **Stage:** 4 (v1 built, audit pending).
