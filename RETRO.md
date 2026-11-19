@@ -55,6 +55,7 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 32. **Check the model you asked for is the model that answered.** An old model id can silently run as a newer one. [S4]
 33. **Scripts that other tools run from another folder need absolute paths, and should check their inputs exist before the first paid call.** [S4]
 34. **When a cheap reviewer keeps failing low-risk tooling with new, non-regression points, verify them against the code, and stop the loop.** The cost is the re-check time, not the review fee. [S4]
+35. **Judge a scale-up on throughput and failures.** Lock wait and test time are costs inside throughput, not a separate veto: record them as warnings, and step back only if merges per hour stop rising, failures rise, or memory runs out (RAM over 90%, swap growing). [S4 close]
 
 ---
 
@@ -100,7 +101,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 close | Fable only as a rare one-off (Lazlo, 2026-11-19): never a default coder, reviewer or judge | Weekly Claude allowance lasts | Fable tokens per stage (about 1.4M on 2026-11-19, about 990k of it avoidable) | A security or decisive review done by a weaker model that misses a real bug | open |
 | S4 close | Rule 34 applied: a cheap reviewer's second FAIL with new, non-regression points on low-risk tooling goes to one decisive strong review | Fewer fix rounds on low-risk tooling | Rounds per merged task for haiku-tier entries | Real bugs slipping because the loop stopped early | open |
 | S4 close | Shadow reviewer through Codex with no tools offered (one-entry model catalog), proven by `scripts/shadow_canary.py` | No secret can be read by the shadow; shadow answers fast | Canary exit code after every codex update; shadow seconds per entry (144 s timeouts before, 3-21 s after) | A codex update re-adding a tool (the canary must be re-run; not yet enforced) | open |
-| S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h, build-lock wait p90, test-job median | Lock waits and test time rising | hindered: lock-wait p90 26 -> 88 s, test median 82 -> 100 s; reverted to 6; retry after tp3 |
+| S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h; failed/retried jobs; RAM and swap (lock wait and test time as warnings, Lazlo 2026-11-19 21:32Z) | Failures or memory, not lock wait | re-judged under Lazlo's new rule: 2.82 -> 8.44 merged/h, 0 failures, RAM peak 14.8%, no swap = helped; lock-wait p90 26 -> 88 s and test median 82 -> 100 s recorded as warnings. The first verdict (hindered, reverted to 6) used the old rule that made lock wait a veto. Now 14, stepping +4 |
 
 ## Retros, newest first
 
@@ -147,7 +148,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 2. A direct commit to main runs the full check first (a wrapper or hook), so no direct commit can break main again.
 3. Add to `templates/coder-prompt.md`: never wrap a script that itself calls broadsword inside `broadsword run`.
 4. SPEC_CHECKLIST: a done check that names a window or a visible result needs an on-screen capture saved in evidence.
-5. Retry max_agents 10 after tp3 (build lock covers compiling only), with the same baselines.
+5. Scale-up (Lazlo, 21:32Z and 21:40Z): max_agents straight to 14, then +4 per step (18, 22, ...), judged on merges per hour, failures and RAM/swap against the 10-slot window (8.44/h); lock wait and test time are warnings only (portable lesson 35). tp3 (build lock covers compiling only) still cuts the lock wait.
 6. File the 8 SERIOUS audit findings as tasks (`evidence/stage-4-v1-audit-verdicts.md` section 6); Lazlo decides on the two unapproved direct commits (f4123a1, render 4184930).
 
 ---
