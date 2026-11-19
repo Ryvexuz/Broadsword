@@ -1,0 +1,3 @@
+# Settings for bench/instruct. Every key is required; the scripts never fall back to a default.
+
+model_timeout_seconds = 600   # run.py kills one model call that runs longer than this; the case is then an ERROR, not a FAIL
