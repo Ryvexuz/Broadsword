@@ -49,12 +49,13 @@ impl Opts {
     }
 }
 
-/// THE one rule for what a secret file is: a file whose NAME (last path part, at any depth) is exactly `.env`, or
-/// `.env.` followed by a name (`.env.local`, `.env.production`). Both `/` and a backslash separate folders. Letters
-/// compare case-insensitively on every platform (Windows file names are, and a `.ENV` is a secret wherever it is), and
-/// trailing dots and spaces are ignored (Windows drops them, so `.env ` and `.env.` are the file `.env`).
-/// Ordinary files that merely start with `.env` (`.envoy.yaml`, `.environment`, `.envrc`) are NOT secrets: they are
-/// checkpointed and rolled back like any other file. A FOLDER named `.env` (a Python venv) does not make its files secret.
+/// THE one rule for what a secret file is (Lazlo's set, 2026-11-19): a file whose NAME (last path part, at any depth) is
+/// exactly `.env` or `.envrc` (direnv), or `.env.`, `.env-` or `.env_` followed by a name (`.env.local`, `.env-prod`,
+/// `.env_staging`). Both `/` and a backslash separate folders. Letters compare case-insensitively (ASCII) on every
+/// platform (Windows file names are, and a `.ENV` is a secret wherever it is), after trailing dots and spaces are dropped
+/// (Windows drops them, so `.env ` and `.env.` are the file `.env`).
+/// Other files that merely start with `.env` (`.envoy.yaml`, `.environment`) are NOT secrets: they are checkpointed and
+/// rolled back like any other file. A FOLDER named `.env` (a Python venv) does not make its files secret.
 ///
 /// Every place that captures, restores, deletes or lists files calls this function: checkpoint capture (`capture`), the
 /// stored index trees (`secret_free_tree`), rollback (`changes`, `Guard`) and the queue's `--brief` reader (`queue.rs`,
@@ -62,7 +63,7 @@ impl Opts {
 pub fn is_secret_path(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or("").trim_end_matches([' ', '.']);
     let name = name.to_ascii_lowercase();
-    name == ".env" || (name.len() > ".env.".len() && name.starts_with(".env."))
+    name == ".env" || name == ".envrc" || [".env.", ".env-", ".env_"].iter().any(|p| name.len() > p.len() && name.starts_with(p))
 }
 
 /// The older name of `is_secret_path` (the same function, not a second rule), kept so callers outside this module compile.
@@ -1001,13 +1002,19 @@ mod tests {
 
     #[test]
     fn the_secret_file_rule() {
-        for yes in [".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".ENV.Local", ".env.", ".env ", "a/.env.x.y"] {
+        for yes in [
+            ".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".ENV.Local", ".env.", ".env ", "a/.env.x.y",
+            ".envrc", "sub/.ENVRC", ".envrc. ", ".env-prod", ".ENV-Staging", "a\\.env_local", ".env_x",
+        ] {
             assert!(is_secret_path(yes), "{yes}");
         }
-        for no in ["env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", "", ".envrc", ".envoy.yaml", ".environment", ".env/key.txt", ".env.d/x", ".env-prod", "x.env.local"] {
+        for no in [
+            "env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", "", ".envoy.yaml", ".environment", ".ENVIRONMENT", ".env/key.txt", ".env.d/x",
+            "x.env.local", ".env-", ".env_", ".envrc2", "envrc", ".env-/x",
+        ] {
             assert!(!is_secret_path(no), "{no}");
         }
-        assert!(is_secret_file(".env.local") && !is_secret_file(".envoy.yaml"), "the older name is the same function");
+        assert!(is_secret_file(".env-prod") && !is_secret_file(".envoy.yaml"), "the older name is the same function");
     }
 
     /// Paths in a tree, recursively.

@@ -1,4 +1,5 @@
-//! Secret files through the real binary: which names are secrets (`git::is_secret_path`: exactly `.env` and `.env.<name>`),
+//! Secret files through the real binary: which names are secrets (`git::is_secret_path`: `.env`, `.envrc`, `.env.<name>`,
+//! `.env-<name>`, `.env_<name>`),
 //! and that a secret someone staged never becomes reachable from a `refs/broadsword/*` index ref. Each test makes a
 //! throwaway Broadsword root under the repo's `scratch/` folder with a throwaway Git repo as its project; the secret files
 //! are fake. Everything is deleted afterwards. Never touches the real repo, its `.env` or the crash sim.
@@ -79,14 +80,14 @@ max_agents = 50
         self.dir.join("projects/p")
     }
 
-    /// Project `p`: a tiny lib, `tracked.txt` = original, one commit. `.env` and `.env.<name>` are ignored, the look-alikes are not.
+    /// Project `p`: a tiny lib, `tracked.txt` = original, one commit. The secret names are ignored, the look-alikes are not.
     fn project(&self) -> PathBuf {
         let p = self.project_dir();
         fs::create_dir_all(p.join("src")).unwrap();
         fs::write(p.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
         fs::write(p.join("src/lib.rs"), "").unwrap();
         fs::write(p.join("tracked.txt"), "original\n").unwrap();
-        fs::write(p.join(".gitignore"), ".env\n.env.*\n*.log\n").unwrap();
+        fs::write(p.join(".gitignore"), ".env\n.envrc\n.env.*\n.env-*\n.env_*\n*.log\n").unwrap();
         for a in [&["init", "-q"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["config", "core.autocrlf", "false"], &["add", "-A"], &["commit", "-q", "-m", "init"]] {
             git(&p, a);
         }
@@ -167,8 +168,9 @@ fn assert_unreachable_from_broadsword_refs(p: &Path, hash: &str) {
     assert!(!objs.lines().any(|l| l.starts_with(hash)), "blob {hash} of a secret file is reachable from a broadsword ref");
 }
 
-/// The done check: a staged `.env` is absent from `refs/broadsword/index/<id>`, a secret the killed job staged is absent
-/// from the saved interrupted index, and `.envoy.yaml` / `.environment` (ordinary files) are checkpointed and restored.
+/// The done check: a staged `.env` and `.envrc` are absent from `refs/broadsword/index/<id>`, a secret the killed job staged
+/// (`.env-prod`) is absent from the saved interrupted index, a secret the job changed (`.envrc`) keeps the job's bytes, and
+/// `.envoy.yaml` / `.environment` (ordinary files) are checkpointed and restored.
 #[test]
 fn staged_env_is_never_in_an_index_ref_and_lookalike_names_roll_back() {
     let mut r = Root::new("idx");
@@ -176,33 +178,37 @@ fn staged_env_is_never_in_an_index_ref_and_lookalike_names_roll_back() {
     fs::write(p.join(".env"), "API_KEY=sk-fake-staged-before-the-job\n").unwrap();
     git(&p, &["add", "-f", ".env"]);
     let env_blob = git(&p, &["rev-parse", ":.env"]);
+    fs::write(p.join(".envrc"), "export API_KEY=sk-fake-direnv-before-the-job\n").unwrap();
+    git(&p, &["add", "-f", ".envrc"]);
+    let envrc_blob = git(&p, &["rev-parse", ":.envrc"]);
     fs::write(p.join(".envoy.yaml"), "envoy: original\n").unwrap();
     fs::write(p.join(".environment"), "ENVIRONMENT=original\n").unwrap();
     let line = if cfg!(windows) {
-        "echo envoy: job> .envoy.yaml & del .environment & echo API_KEY=sk-fake-staged-by-the-job> .env.prod & git add -f .env.prod & ping -n 30 127.0.0.1 >nul"
+        "echo envoy: job> .envoy.yaml & del .environment & echo DIRENV=job> .envrc & echo API_KEY=sk-fake-staged-by-the-job> .env-prod & git add -f .env-prod & ping -n 30 127.0.0.1 >nul"
     } else {
-        "echo 'envoy: job' > .envoy.yaml; rm .environment; echo API_KEY=sk-fake-staged-by-the-job > .env.prod; git add -f .env.prod; sleep 30"
+        "echo 'envoy: job' > .envoy.yaml; rm .environment; echo DIRENV=job > .envrc; echo API_KEY=sk-fake-staged-by-the-job > .env-prod; git add -f .env-prod; sleep 30"
     };
     let bs_pid = r.spawn(&["run", "p", "--", line]);
-    wait_until("the job to have changed the look-alikes and staged .env.prod", 90, || {
+    wait_until("the job to have changed the look-alikes and .envrc and staged .env-prod", 90, || {
         let recs = r.records();
         recs.len() == 1
             && !Root::field(&recs[0], "child_pid").is_empty()
             && !p.join(".environment").exists()
             && fs::read_to_string(p.join(".envoy.yaml")).is_ok_and(|s| s.contains("job"))
-            && git_out(&p, &["ls-files", "--", ".env.prod"]).stdout.starts_with(b".env.prod")
+            && fs::read_to_string(p.join(".envrc")).is_ok_and(|s| s.contains("DIRENV=job"))
+            && git_out(&p, &["ls-files", "--", ".env-prod"]).stdout.starts_with(b".env-prod")
     });
     let rec = r.only_record();
     let id = Root::field(&rec, "id");
-    assert_eq!(Root::field(&rec, "secret_skipped"), ".env", "{rec}");
+    assert_eq!(Root::field(&rec, "secret_skipped"), ".env|.envrc", "{rec}");
     let index_ref = format!("refs/broadsword/index/{id}");
     let in_index = tree_paths(&p, &index_ref);
-    assert!(!in_index.iter().any(|f| f == ".env"), "the staged .env is not in {index_ref}: {in_index:?}");
+    assert!(!in_index.iter().any(|f| f == ".env" || f == ".envrc"), "the staged .env and .envrc are not in {index_ref}: {in_index:?}");
     assert!(in_index.iter().any(|f| f == "tracked.txt"), "{in_index:?}");
     let ckpt = format!("refs/broadsword/checkpoints/{id}");
     assert_eq!(git(&p, &["show", &format!("{ckpt}:.envoy.yaml")]), "envoy: original", ".envoy.yaml is checkpointed");
     assert_eq!(git(&p, &["show", &format!("{ckpt}:.environment")]), "ENVIRONMENT=original", ".environment is checkpointed");
-    let prod_blob = git(&p, &["rev-parse", ":.env.prod"]);
+    let prod_blob = git(&p, &["rev-parse", ":.env-prod"]);
 
     kill_hard(bs_pid);
     let out = r.run(&["recover", &id]);
@@ -211,15 +217,18 @@ fn staged_env_is_never_in_an_index_ref_and_lookalike_names_roll_back() {
     assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
     assert_eq!(fs::read(p.join(".envoy.yaml")).unwrap(), b"envoy: original\n", ".envoy.yaml is restored byte for byte");
     assert_eq!(fs::read(p.join(".environment")).unwrap(), b"ENVIRONMENT=original\n", ".environment is restored");
-    assert!(fs::read_to_string(p.join(".env.prod")).unwrap().contains("staged-by-the-job"), "secret files are never touched");
+    assert!(fs::read_to_string(p.join(".env-prod")).unwrap().contains("staged-by-the-job"), "secret files are never touched");
+    assert!(fs::read_to_string(p.join(".envrc")).unwrap().contains("DIRENV=job"), ".envrc is a secret: never restored");
     let int_index = format!("refs/broadsword/interrupted-index/{id}/1");
     let in_int = tree_paths(&p, &int_index);
-    assert!(!in_int.iter().any(|f| f == ".env" || f == ".env.prod"), "no secret in {int_index}: {in_int:?}");
-    for h in [&env_blob, &prod_blob] {
+    assert!(!in_int.iter().any(|f| f == ".env" || f == ".envrc" || f == ".env-prod"), "no secret in {int_index}: {in_int:?}");
+    for h in [&env_blob, &envrc_blob, &prod_blob] {
         assert_unreachable_from_broadsword_refs(&p, h);
     }
     assert_eq!(Root::field(&r.only_record(), "status"), "rolled_back");
     // (the job's own command line is in the record, so only the content of the file staged before the job is checked)
-    assert!(!so.contains("staged-before-the-job") && !rec.contains("staged-before-the-job"), "no secret content in output or record");
+    for s in ["staged-before-the-job", "direnv-before-the-job"] {
+        assert!(!so.contains(s) && !rec.contains(s), "no secret content in output or record");
+    }
     r.children.clear();
 }
