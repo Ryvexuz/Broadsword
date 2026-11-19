@@ -2,27 +2,23 @@
 # scripts/main_provenance.py reads this file. One entry per line, five fields separated by `|`, all required:
 #   repo | commit hash (7 to 40 hex chars) | approved by | reason | source (where the approval is recorded)
 # `repo` is the project name: broadsword, crash-sim or render. Lines starting with # and blank lines are ignored.
-# Never add a commit here to silence the script. An entry needs a named approver and a source a reader can check;
-# where the records do not show an approver, the line says so instead of inventing one.
+# The approver must name a person or quote the rule that approved it; the script refuses placeholders such as "NOT RECORDED", "?", "TBD", "unknown", "none" (exit 2).
+# A commit whose approval is not on record is NOT listed here: it stays UNACCOUNTED until Lazlo approves it.
 # Records-only commits (only *.md at the root, evidence/, docs/) need no entry.
 
-# 2026-11-19: approved by Lazlo in the session that made them (the orchestrator's report to Lazlo; the record for eafe80a is state/staging/direct-merges/nb06-eafe80a.md, not in Git).
-broadsword | cfadd9e4ddc2 | Lazlo | broadsword.toml shadow_reviewer = off, a safety stop | commit message "safety stop, Lazlo's decision"; 2026-11-19 session
-broadsword | eafe80abf17f | Lazlo | nb-06 scripts/baseline.py merged on one Fable 5.2 review (PASS on 8b77662) after four haiku queue FAILs with new non-regression points | state/staging/direct-merges/nb06-eafe80a.md (Lazlo's choice "Fable review")
+# 2026-11-19, two commits the orchestrator made directly. cfadd9e: its own commit message says "Lazlo's decision". eafe80a: its commit message does not say who approved it; the approval (Lazlo chose "Fable review" in the session) is in state/staging/direct-merges/nb06-eafe80a.md, which is outside Git, and a LAB_LOG.md entry for it is still to be committed.
+broadsword | cfadd9e4ddc2 | Lazlo (per the commit message) | broadsword.toml shadow_reviewer = off, a safety stop for audit finding A6 | commit message of cfadd9e
+broadsword | eafe80abf17f | Lazlo ("Fable review" choice, per the orchestrator's record) | nb-06 scripts/baseline.py merged on one Fable 5.2 review (PASS on 8b77662) after four haiku queue FAILs with new non-regression points | state/staging/direct-merges/nb06-eafe80a.md (outside Git; LAB_LOG.md entry to follow)
 
 # 2026-11-18: scripts/dev_metrics.py, five commits merged with `git merge --ff-only` after refuted Haiku FAILs, on Lazlo's rule "If you're confident it's wrong just take the file". The audit finding A4 lists them; the last Haiku FAIL was on b9ae9e5 (q-20261118-074036). The author was the orchestrator.
-broadsword | e188dd40831d | Lazlo (rule: take the file when a cheap review is shown wrong) | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74
-broadsword | 79a06561c01a | Lazlo (rule: take the file when a cheap review is shown wrong) | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74
-broadsword | 880f7da15cb6 | Lazlo (rule: take the file when a cheap review is shown wrong) | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74
-broadsword | baaf804a99c2 | Lazlo (rule: take the file when a cheap review is shown wrong) | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74
-broadsword | b9ae9e5913a9 | Lazlo (rule: take the file when a cheap review is shown wrong) | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74
+broadsword | e188dd40831d | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
+broadsword | 79a06561c01a | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
+broadsword | 880f7da15cb6 | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
+broadsword | baaf804a99c2 | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
+broadsword | b9ae9e5913a9 | general rule, not a per-commit approval: Lazlo's "If you're confident it's wrong just take the file" | dev_metrics.py merged directly after refuted Haiku FAILs | LAB_LOG.md:37, PROGRESS.md:121, RETRO.md:74 (Git-tracked records)
 
 # 2026-11-18: bench/reviewer/run_openai.py, task t-20261118-075453, two commits merged directly after Haiku FAILs (round 1 real and fixed, round 3 refuted). Audit finding A4: the commit on main is the one the reviewer last FAILED (q-20261118-081559, ec7a479).
-broadsword | f3bdd38c3c8e | Lazlo ("outside the queue, per Lazlo") | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
-broadsword | ec7a4796d371 | Lazlo ("outside the queue, per Lazlo") | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
+broadsword | f3bdd38c3c8e | Lazlo ("outside the queue, per Lazlo", per IDEAS.md:41) | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
+broadsword | ec7a4796d371 | Lazlo ("outside the queue, per Lazlo", per IDEAS.md:41) | OpenAI runner merged directly after Haiku FAILs | IDEAS.md:41, LAB_LOG.md:37
 
-# 2026-11-18: max_agents 4 -> 6 in broadsword.toml (audit finding A4). The records show the change and its ledger row but NOT an approver.
-broadsword | f4123a1a350d | NOT RECORDED (orchestrator's own change; no approval found in the records) | max_agents 4 -> 6 for the work-ahead backlog, committed directly | RETRO.md:92 (ledger row), commit message
 
-# 2026-11-18: render repo, .gitattributes `*.ppm binary` so the queue's diff of golden images stays small (audit finding A4). Approver not recorded.
-render | 41849306f4d6 | NOT RECORDED (orchestrator; the commit message says "outside the queue") | .gitattributes stopgap: the queue diffs in the main checkout, which reads .gitattributes from there | LAB_LOG.md:39, RETRO.md:135

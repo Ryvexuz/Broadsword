@@ -217,6 +217,16 @@ class Rules(Scratch):
         self.assertIn("UNACCOUNTED broadsword " + c[:12], out)
         self.assertIn("WARNING allow-list line 1", out)  # that hash is not a commit in proj
 
+    def test_allow_listed_hash_on_another_branch_warns(self):
+        git(self.root, "checkout", "-q", "-b", "side", "base")
+        off = commit(self.root, {"src/side.rs": "s\n"}, "side branch only")
+        git(self.root, "checkout", "-q", "main")
+        self.write_allow(f"broadsword | {off[:12]} | Lazlo | testing | src\n")
+        code, out, _ = self.run_script()
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARNING allow-list line 1", out)
+        self.assertIn("is not a commit on broadsword main", out)
+
     def test_read_only_nothing_in_the_repo_changes(self):
         self.four()
         def snap():
@@ -264,6 +274,34 @@ class BadInput(Scratch):
     def test_allow_list_bad_hash(self):
         self.write_allow("broadsword | xyz | Lazlo | why | src\n")
         self.assert_2(expect="not a hex commit hash")
+
+    def test_placeholder_approvers_are_refused_naming_the_line(self):
+        for who in ("NOT RECORDED", "not recorded (orchestrator; nothing found)", "?", "TBD", "Unknown", "none", "None.", "n/a", "-", "unapproved"):
+            with self.subTest(who=who):
+                self.write_allow(f"# comment\nbroadsword | abcdef1 | {who} | why | src\n")
+                code, out, err = self.run_script()
+                self.assertEqual(code, 2, who + out + err)
+                self.assertIn("direct-merges.txt:2", err)
+                self.assertIn("placeholder", err)
+
+    def test_real_approvers_are_accepted(self):
+        c = commit(self.root, {"src/z.rs": "z\n"}, "approved")
+        for who in ("Lazlo", "Nonesuch Person", "Unknownson", "general rule: Lazlo's \"take the file\""):
+            with self.subTest(who=who):
+                self.write_allow(f"broadsword | {c[:12]} | {who} | why | src\n")
+                code, out, err = self.run_script()
+                self.assertEqual(code, 0, out + err)
+
+    def test_git_failure_message_keeps_gits_stderr(self):
+        commit(self.root, {"src/t.rs": "t" + chr(10)}, "tree about to go missing")
+        tree = git(self.root, "rev-parse", "HEAD^{tree}")
+        obj = os.path.join(self.root, ".git", "objects", tree[:2], tree[2:])
+        os.chmod(obj, 0o700)
+        os.remove(obj)  # `git show` of that commit now fails with its own explanation
+        code, out, err = self.run_script()
+        self.assertEqual(code, 2, out + err)
+        self.assertRegex(err, r"failed in .*\(exit \d+\): \S")
+        self.assertIn(tree[:6], err)  # git's own stderr names the missing object
 
     def test_allow_list_unknown_repo(self):
         self.write_allow("nosuch | abcdef1 | Lazlo | why | src\n")

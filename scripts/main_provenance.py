@@ -26,6 +26,8 @@ import tomllib
 
 MERGED_STATUSES = ("merged", "merged_check_failed")
 HEX_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# An approver field that only says nobody approved it. The one place this is enforced is parse_allow.
+PLACEHOLDER_RE = re.compile(r"^[\s\"'(\[]*(not\s+recorded|not\s+known|unknown|unapproved|tbd|todo|none|n/?a|\?+|-+)(?![A-Za-z0-9])", re.I)
 ROOT_PROJECT = "broadsword"
 
 
@@ -33,18 +35,23 @@ class BadInput(Exception):
     pass
 
 
-def git(repo, *args):
-    """Run one read-only git command in `repo`; return (exit code, stdout)."""
+def git_full(repo, *args):
+    """Run one read-only git command in `repo`; return (exit code, stdout, stderr)."""
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
     p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
                        errors="replace", env=env)
-    return p.returncode, p.stdout
+    return p.returncode, p.stdout, p.stderr
+
+
+def git(repo, *args):
+    code, out, _ = git_full(repo, *args)
+    return code, out
 
 
 def git_ok(repo, *args):
-    code, out = git(repo, *args)
+    code, out, err = git_full(repo, *args)
     if code != 0:
-        raise BadInput(f"git {' '.join(args)} failed in {repo} (exit {code})")
+        raise BadInput(f"git {' '.join(args)} failed in {repo} (exit {code}): {err.strip()[:300]}")
     return out
 
 
@@ -122,6 +129,8 @@ def parse_allow(path):
         if len(parts) != 5 or not all(parts):
             raise BadInput(f"{path}:{n}: need `repo | hash | approved by | reason | source`, all five non-empty")
         repo, h, who, why, src = parts
+        if PLACEHOLDER_RE.match(who):
+            raise BadInput(f"{path}:{n}: approver {who!r} is a placeholder; name who approved it, or leave the commit out (it stays UNACCOUNTED until someone approves it)")
         if not HEX_RE.match(h):
             raise BadInput(f"{path}:{n}: `{h}` is not a hex commit hash of 7 to 40 characters")
         allowed.append({"repo": repo, "hash": h, "who": who, "why": why, "source": src, "line": n})
@@ -220,7 +229,8 @@ def audit_repo(name, repo, since, entries, allowed):
         else:
             res["unaccounted"].append((sha, subject, files))
     for a in mine:
-        if resolve(repo, a["hash"]) is None:
+        full = resolve(repo, a["hash"])
+        if full is None or not is_ancestor(repo, full, tip):
             res["stale_allow"].append(a)
     return res
 
@@ -261,7 +271,7 @@ def run(argv, out=sys.stdout):
         for sha, subj, files in r["records"]:
             p(f"RECORDS {r['name']} {sha[:12]} {subj[:90]}")
         for a in r["stale_allow"]:
-            p(f"WARNING allow-list line {a['line']}: {a['hash']} is not a commit in {r['name']}")
+            p(f"WARNING allow-list line {a['line']}: {a['hash']} is not a commit on {r['name']} {r['branch']}")
         for sha, subj, files in r["unaccounted"]:
             bad += 1
             p(f"UNACCOUNTED {r['name']} {sha[:12]} {subj} | files: {', '.join(files) if files else '(none)'}")
