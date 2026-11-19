@@ -24,9 +24,20 @@ Window (first task created -> last task ended):
               `running` by a crash counts until it is recovered, and such jobs are listed in the warnings
 Models (same window, by date for agent runs):
   runs, active time, tokens and review cost per model and role; utilisation = active time / window
+Cost to completion (per coder model, over the tasks in range): everything a task used until it was done, summed over
+  every coder or fix run (state/agent-runs.tsv), every gating review and every shadow review of its queue entries.
+  rounds = queue entries of the task; wall = task started -> ended. Median and worst over DONE tasks only. Tasks that are
+  not done are counted as open (open or running) or not merged (abandoned) and never enter a median. An empty token field
+  is unknown, never 0: a task whose sum has an unknown part is a lower bound (counted), a task with no known number
+  is left out of that median. Claude coder tokens are not priced (no $ recorded) and Codex (shadow) tokens are plan
+  allowance, shown as tokens, never as $0. Also per coder: first-pass PASS rate under the gating reviewer, BLOCKING lines
+  per first review split by the adjudicated verdict in state/shadow-verdicts.tsv, and fix rounds (rounds - 1).
+Reusable by other scripts: model_rows() (per model and role: runs, seconds, tokens, $; coder use = role "coder" seconds
+  / window), read_runs(), task_costs().
 """
 import calendar
 import pathlib
+import statistics
 import subprocess
 import sys
 import time
@@ -200,6 +211,7 @@ def main():
     print(f"idle        {1 - busy / window:5.1%}  no task running (pipeline empty)")
     print(f"jobs        {job_time / window:5.1%}  at least one Broadsword job running")
     models(entries, since, lo, hi, window)
+    completion(tasks, entries, read_runs(None))
     print("not recorded: build-lock wait inside a job; the orchestrator's own tokens (see the app's usage card)")
     for w in WARNINGS:
         print(f"warning: {w}")
@@ -255,6 +267,130 @@ def model_rows(entries, since, lo, hi):
     for v in read_runs(since):
         add(v.get("model", "?"), v.get("role", "?"), num(v.get("seconds")), num(v.get("tokens")), 0.0)
     return rows
+
+
+def is_openai(model):
+    return str(model or "").lower().startswith(("gpt", "o1", "o3", "o4", "codex"))
+
+
+def blocking_lines(entry):
+    """BLOCKING lines of a queue entry (the field holds them joined by a literal backslash-n)."""
+    return [x for x in entry.get("blocking", "").split("\\n") if x.strip()]
+
+
+def task_costs(tasks, entries_by_task, runs, verdicts):
+    """One dict per task: coder model, state (done / open / not merged), rounds, wall seconds, tokens (Claude, OpenAI),
+    review $, and the first review. Token fields are [known sum, unknown parts] pairs, never a silent 0."""
+    runs_by_task = {}
+    for v in runs:
+        if v.get("role") in ("coder", "fix", "fixer"):
+            runs_by_task.setdefault(v.get("task"), []).append(v)
+    out = []
+    for t in tasks:
+        tid = t.get("id")
+        es = sorted((e for e in entries_by_task.get(tid, []) if e.get("test_hook") != "true"), key=lambda e: num(e.get("created")) or 0)
+        rs = runs_by_task.get(tid, [])
+        coder_rs = [v for v in rs if v.get("role") == "coder"]
+        model = (coder_rs[0].get("model") if coder_rs else None) or (es[0].get("coder") if es and es[0].get("coder") else "?")
+        status = t.get("status")
+        state = "done" if status == "done" else "open" if status in ("open", "running") else "not merged"
+        started, ended, created = num(t.get("started")), num(t.get("ended")), num(t.get("created"))
+        claude, openai = [0, 0], [0, 0]  # [known sum, unknown parts]
+
+        def add(bucket, v):
+            n = num(v)
+            if n is None:
+                bucket[1] += 1
+            else:
+                bucket[0] += n
+
+        for v in rs:
+            add(openai if is_openai(v.get("model")) else claude, v.get("tokens"))
+        usd = 0.0
+        for e in es:
+            if e.get("reviewer_model") and (e.get("verdict") or e.get("review_calls")):
+                bucket = openai if is_openai(e.get("reviewer_model")) else claude
+                rt = [num(e.get("tokens_in")), num(e.get("tokens_out"))]
+                if None in rt:
+                    bucket[1] += 1
+                else:
+                    bucket[0] += sum(rt)
+                try:
+                    usd += float(e["cost_usd"])
+                except (KeyError, ValueError):
+                    pass  # a missing review cost adds nothing; the table says only gating $ is shown
+            if e.get("shadow_model"):  # Codex on the plan allowance: tokens only, never $0
+                add(openai, e.get("shadow_tokens"))
+        first = next((e for e in es if e.get("verdict")), None)
+        adj = [v for v in verdicts if first and v.get("entry") == first.get("id")]
+        out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "coder_runs": len(coder_rs),
+                    "wall": (ended - (started or created)) if ended and (started or created) else None,
+                    "claude": claude, "openai": openai, "usd": usd,
+                    "first_verdict": first.get("verdict") if first else None,
+                    "first_lines": len(blocking_lines(first)) if first else 0,
+                    "first_adjudicated": [v.get("verdict") for v in adj]})
+    return out
+
+
+def read_verdicts():
+    f = ROOT / "state" / "shadow-verdicts.tsv"
+    if not f.is_file():
+        return []
+    lines = f.read_text(encoding="utf-8").splitlines()
+    head = lines[0].split("\t") if lines else []
+    return [dict(zip(head, ln.split("\t"))) for ln in lines[1:]]
+
+
+def stats(values):
+    """(median, worst) of known numbers, (None, None) if none."""
+    return (statistics.median(values), max(values)) if values else (None, None)
+
+
+def completion(tasks, entries, runs):
+    by_task = {}
+    for e in entries:
+        by_task.setdefault(e.get("task"), []).append(e)
+    rows = task_costs(tasks, by_task, runs, read_verdicts())
+    print()
+    print("cost to completion per coder model (done tasks only; median / worst)")
+    by_model = {}
+    for r in rows:
+        by_model.setdefault(r["model"], []).append(r)
+
+    def fmt(v, f=lambda x: f"{x:.0f}"):
+        return "-" if v is None else f(v)
+
+    g = lambda x: f"{x:g}"
+    for model, rs in sorted(by_model.items()):
+        done = [r for r in rs if r["state"] == "done"]
+        print(f"{model}: {len(done)} done, {sum(1 for r in rs if r['state'] == 'open')} open, "
+              f"{sum(1 for r in rs if r['state'] == 'not merged')} not merged")
+        if not done:
+            continue
+        m, w = stats([r["rounds"] for r in done if r["rounds"]])
+        print(f"  rounds to merge     {fmt(m, g)} / {fmt(w)}  (done tasks with no queue entry, left out: {sum(1 for r in done if not r['rounds'])})")
+        m, w = stats([r["wall"] for r in done if r["wall"] is not None])
+        print(f"  wall time to merge  {fmt(m, dur)} / {fmt(w, dur)}")
+        for key, label in (("claude", "Claude tokens"), ("openai", "OpenAI tokens (plan)")):
+            known = [r[key][0] for r in done if r[key][0]]
+            lower = sum(1 for r in done if r[key][1] and r[key][0])
+            nothing = sum(1 for r in done if r[key][1] and not r[key][0])
+            m, w = stats(known)
+            print(f"  {label:<20}  {fmt(m)} / {fmt(w)}  (lower bounds, part unknown: {lower}; no number, left out: {nothing})")
+        print(f"  coder runs recorded for {sum(1 for r in done if r['coder_runs'])} of {len(done)} done tasks (the rest: no coder tokens in the sums above)")
+        m, w = stats([r["usd"] for r in done])
+        print(f"  review $            {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (gating reviews only; coder $ and Codex shadow are not priced: plan, not $0)")
+        firsts = [r for r in done if r["first_verdict"]]
+        passed = sum(1 for r in firsts if r["first_verdict"].startswith("PASS"))
+        print(f"  first-pass PASS     {passed}/{len(firsts)}" + (f" = {passed / len(firsts):.0%}" if firsts else ""))
+        lines = sum(r["first_lines"] for r in firsts)
+        split = {}
+        for r in firsts:
+            for v in r["first_adjudicated"]:
+                split[v] = split.get(v, 0) + 1
+        print(f"  BLOCKING, 1st review  {lines} in {len(firsts)} reviews; adjudicated {dict(sorted(split.items())) or 'none'}, not adjudicated {max(lines - sum(split.values()), 0)}")
+        m, w = stats([r["rounds"] - 1 for r in done if r["rounds"]])
+        print(f"  fix rounds          {fmt(m, g)} / {fmt(w)}")
 
 
 def models(entries, since, lo, hi, window):
