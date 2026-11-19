@@ -20,6 +20,23 @@ OPENAI_PRICE_OUTPUT_PER_MTOK (USD per million tokens; both needed for a cost), O
 inside the queue's shadow limit) and OPENAI_REVIEW_CODEX_SHARE (0 < share <= 1, the part of it codex may use; the API fallback gets the
 rest). Invalid values are an error naming the variable. Until the queue passes them, absent ones use 240 and 0.6 and the result's "notes"
 (and "codex_error" on a fallback) say so.
+
+Two gates sit in review(), the ONE function every GPT call goes through (shadow, second gate, full reviews, bench re-scores):
+
+1. Daily spend cap (Lazlo 2026-11-19: GPT reviews may draw on the OpenAI overflow credits, at most $20 a day). Every call that gets
+   past the gates is appended as one row to <state_dir>/gpt-spend/<UTC date>.tsv (utc, caller, model, input_tokens, output_tokens,
+   est_usd, plan_or_credits) under an OS lock. Before a call, if today's est_usd sum is >= the cap, no model is called: the result
+   is is_error with codex_error "daily_cap_reached: <sum> of <cap>" (callers record SKIPPED), and CAP-REACHED-<date>.txt is written
+   once. THE ESTIMATE IS CONSERVATIVE: tokens x list price from bench/models.json, and calls the ChatGPT plan answered are counted
+   at list price too, so the sum can only over-state what the credits were charged. A model with no listed price counts at the
+   highest listed price (never 0). Calls running at the same moment can overshoot the cap by what they cost: the check is made
+   before a call, not held across it. Cap 0 means no GPT call at all. `caller` comes from OPENAI_REVIEW_CALLER ("unlabelled" if absent).
+2. Codex canary (Lazlo 2026-11-19: re-run the shadow canary after any Codex update). Before any codex process other than
+   `codex --version` is started, the current version is compared with <checkout>/<state_dir>/canary/last-pass.json (written by
+   scripts/shadow_canary.py on a full PASS). Missing, unreadable or different: scripts/shadow_canary.py --offline-only runs as a child
+   (no model call) with the codex child environment. It must exit 0 AND leave a last-pass.json naming this version, else no codex is
+   started and the result is is_error with codex_error "canary_failed: <reason>". `codex --version` failing, or no codex found, is "codex_unavailable".
+   Neither falls back to the API: the queue records the shadow as ERROR and goes on.
 """
 
 import sys
@@ -27,12 +44,14 @@ import sys
 sys.dont_write_bytecode = True  # never write .pyc files into the repo
 
 import argparse
+import datetime
 import importlib.util
 import json
 import os
 import subprocess
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -318,13 +337,15 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
     """Answer through the Codex CLI (the ChatGPT plan). Raises oc.Fail with a short reason when it cannot."""
     exe = find_codex(environ)
     if exe is None:
-        raise oc.Fail("codex executable not found")
+        raise Refused("codex_unavailable: codex executable not found")
     text_in = (f"=== SYSTEM INSTRUCTIONS ===\n{args.system_prompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n" if args.system_prompt else "") + prompt
+    root = oc.find_main_root(HERE)
+    child = codex_env(environ, root)
+    canary_gate(root, exe, child, deadline)  # raises Refused BEFORE any codex process other than `codex --version` starts
     budget = min(timeout * share, deadline - time.monotonic())
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
         cmd = codex_command(exe, args.model, Path(work), answer)
-        child = codex_env(environ, oc.find_main_root(HERE))
         code, stdout, stderr = run_with_deadline(cmd, text_in, work, child, budget)
         items = codex_item_types(stdout)
         tools = [t for t in items if t not in TOOL_FREE_ITEMS]
@@ -355,14 +376,260 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
     }
 
 
+# ---- gate 1: the daily GPT spend cap ----------------------------------------------------------------------------------------
+
+# TEMPORARY: Lazlo's cap of $20 a day (2026-11-19), in this ONE named place until broadsword.toml has the key `gpt_daily_cap_usd`
+# (follow-up once the toml is free to edit). If the toml already has that key it wins over this constant. 0 = no GPT calls.
+GPT_DAILY_CAP_USD = 20.0
+# USD per million tokens, used only when bench/models.json lists NO price for any model (it holds none today). Deliberately high.
+UNPRICED_USD_PER_MTOK = {"input": 30.0, "output": 120.0}
+LEDGER_COLUMNS = ("utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits")
+LEDGER_LOCK_WAIT = 10.0  # seconds to wait for the ledger's OS lock
+
+
+class Refused(Exception):
+    """A gate that stops the call before any model is reached. Never falls back to the API; review() returns it as an error result."""
+
+    def __init__(self, backend_error: str):
+        super().__init__(backend_error)
+        self.backend_error = backend_error
+
+
+def config_of(root: Path) -> dict:
+    try:
+        return tomllib.loads((root / oc.CONFIG_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise oc.Fail(f"cannot read {oc.CONFIG_FILE}: {type(e).__name__}")
+
+
+def state_dir_of(root: Path) -> str:
+    v = config_of(root).get("state_dir")
+    if not isinstance(v, str) or not v:
+        raise oc.Fail(f"{oc.CONFIG_FILE} has no `state_dir`")
+    return v
+
+
+def daily_cap(root: Path) -> float:
+    cfg = config_of(root)
+    if "gpt_daily_cap_usd" not in cfg:
+        return GPT_DAILY_CAP_USD
+    v = cfg["gpt_daily_cap_usd"]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (v == v and 0 <= v < float("inf")):
+        raise oc.Fail(f"{oc.CONFIG_FILE} `gpt_daily_cap_usd` must be a number >= 0")
+    return float(v)
+
+
+def model_prices(root: Path, model: str) -> tuple:
+    """(input, output) USD per million tokens. The model's own `price_usd_per_mtok` ({"input": x, "output": y}) in bench/models.json;
+    a model without one counts at the HIGHEST input and output price listed for any model, and with no price listed anywhere at
+    UNPRICED_USD_PER_MTOK. Never 0, so an unpriced model cannot be used to dodge the cap."""
+    listed = {}
+    try:
+        models = json.loads((root / "bench" / "models.json").read_text(encoding="utf-8")).get("models") or {}
+        for name, entry in models.items():
+            p = entry.get("price_usd_per_mtok") if isinstance(entry, dict) else None
+            if isinstance(p, dict):
+                i, o = p.get("input"), p.get("output")
+                if all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in (i, o)):
+                    listed[name] = (float(i), float(o))
+    except (OSError, ValueError, AttributeError):
+        pass
+    if model in listed:
+        return listed[model]
+    if listed:
+        return max(p[0] for p in listed.values()), max(p[1] for p in listed.values())
+    return UNPRICED_USD_PER_MTOK["input"], UNPRICED_USD_PER_MTOK["output"]
+
+
+class ledger_lock:
+    """An OS lock on a file (released when the process dies, so a crash never leaves it stuck)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "a+b")
+        end = time.monotonic() + LEDGER_LOCK_WAIT
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= end:
+                    self.f.close()
+                    raise oc.Fail("the GPT spend ledger is locked by another process")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self.f.close()
+
+
+def utc_today() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def spend_dir(root: Path) -> Path:
+    return root / state_dir_of(root) / "gpt-spend"
+
+
+def spent_today(ledger: Path) -> float:
+    """Sum of est_usd in today's ledger. A row that cannot be read is an error (fail closed), never skipped."""
+    if not ledger.is_file():
+        return 0.0
+    total = 0.0
+    for n, line in enumerate(ledger.read_text(encoding="utf-8").split("\n"), 1):
+        if not line.strip() or line.startswith("utc\t"):
+            continue
+        cols = line.split("\t")
+        try:
+            total += float(cols[5])
+        except (IndexError, ValueError):
+            raise oc.Fail(f"the GPT spend ledger {ledger.name} has an unreadable row (line {n})")
+    return total
+
+
+def cap_gate(root: Path) -> None:
+    """Raises Refused when today's estimated spend has reached the cap; writes CAP-REACHED-<date>.txt once."""
+    cap = daily_cap(root)
+    day = utc_today()
+    folder = spend_dir(root)
+    with ledger_lock(folder / f"{day}.lock"):
+        total = spent_today(folder / f"{day}.tsv")
+    if total < cap:
+        return
+    note = folder / f"CAP-REACHED-{day}.txt"
+    try:
+        with open(note, "x", encoding="utf-8") as f:
+            f.write(f"GPT daily cap reached on {day} (UTC): estimated {total:.4f} USD of {cap:g} USD. No GPT call is made until the next UTC day "
+                    f"or until gpt_daily_cap_usd is raised. Orchestrator: tell Lazlo.\n")
+    except FileExistsError:
+        pass
+    except OSError:
+        pass  # the refusal below still holds
+    raise Refused(f"daily_cap_reached: {total:.4f} of {cap:g}")
+
+
+def record_spend(root: Path, environ, model: str, result: dict, backend: str) -> None:
+    """Append one ledger row for a call that got past the gates. Tokens come from the result (0 when the call failed)."""
+    tin = tout = 0
+    mu = result.get("modelUsage") if isinstance(result.get("modelUsage"), dict) else {}
+    for v in mu.values():
+        if isinstance(v, dict):
+            tin, tout = int(v.get("inputTokens") or 0), int(v.get("outputTokens") or 0)
+    pin, pout = model_prices(root, model)
+    est = (tin * pin + tout * pout) / 1e6
+    caller = (environ.get("OPENAI_REVIEW_CALLER") or "unlabelled").replace("\t", " ").replace("\n", " ")
+    label = ("codex-plan" if backend == "codex" else "api-credits") + ("" if not result.get("is_error") else "-failed")
+    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), caller, model, str(tin), str(tout), f"{est:.6f}", label])
+    folder = spend_dir(root)
+    day = utc_today()
+    with ledger_lock(folder / f"{day}.lock"):
+        ledger = folder / f"{day}.tsv"
+        new = not ledger.is_file() or ledger.stat().st_size == 0
+        with open(ledger, "a", encoding="utf-8", newline="\n") as f:
+            if new:
+                f.write("\t".join(LEDGER_COLUMNS) + "\n")
+            f.write(row + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+# ---- gate 2: the canary must have passed for this codex version -------------------------------------------------------------
+
+
+def canary_state_file(root: Path) -> Path:
+    return HERE.parent / state_dir_of(root) / "canary" / "last-pass.json"
+
+
+def read_last_pass(path: Path):
+    """The codex_version recorded by the last canary PASS, or None if the file is missing, unreadable or malformed."""
+    try:
+        v = json.loads(path.read_text(encoding="utf-8")).get("codex_version")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, str) and v else None
+
+
+def codex_version(exe: str, child: dict, budget: float) -> str:
+    try:
+        with tempfile.TemporaryDirectory(prefix="bsw-codexv-") as work:
+            code, out, _ = run_with_deadline([exe, "--version"], "", work, child, budget)
+    except oc.Fail as e:
+        raise Refused(f"codex_unavailable: {e}")
+    version = (out or "").strip()
+    if code != 0 or not version:
+        raise Refused(f"codex_unavailable: codex --version exited {code}" + ("" if version else " with no output"))
+    return version
+
+
+def canary_gate(root: Path, exe: str, child: dict, deadline: float) -> None:
+    """Raises Refused unless the canary has passed for the installed codex version (running it offline when it has not)."""
+    version = codex_version(exe, child, min(20.0, max(deadline - time.monotonic(), 0.1)))
+    state = canary_state_file(root)
+    if read_last_pass(state) == version:
+        return
+    script = HERE.parent / "scripts" / "shadow_canary.py"
+    if not script.is_file():
+        raise Refused("canary_failed: scripts/shadow_canary.py not found")
+    try:
+        with tempfile.TemporaryDirectory(prefix="bsw-canary-") as work:
+            code, out, err = run_with_deadline([sys.executable, "-I", "-B", str(script), "--offline-only"], "", work, child, deadline - time.monotonic())
+    except oc.Fail as e:
+        raise Refused(f"canary_failed: {oc.redact(str(e))}"[:300])
+    if code != 0:
+        lines = [x.strip() for x in (out or "").split("\n") if x.strip()] or [x.strip() for x in (err or "").split("\n") if x.strip()]
+        raise Refused(f"canary_failed: {oc.redact(lines[0] if lines else 'no output')} (exit {code})"[:300])
+    if read_last_pass(state) != version:
+        raise Refused("canary_failed: the canary exited 0 but did not record a pass for this codex version")
+
+
 def review(args, prompt: str, environ) -> dict:
     timeout, share, notes = settings_of(environ)
     deadline = time.monotonic() + timeout
+    root = oc.find_main_root(HERE)
+    try:
+        cap_gate(root)
+    except Refused as e:
+        return refused_result(e)
+    try:
+        result = answer_call(args, prompt, environ, timeout, share, notes, deadline)
+    except Refused as e:
+        return refused_result(e)
+    try:
+        record_spend(root, environ, args.model, result, result.get("backend", "api"))
+    except Exception as e:  # the call is made; say the ledger missed it rather than lose the answer
+        result.setdefault("notes", []).append(f"spend ledger NOT written: {oc.redact(type(e).__name__)}")
+    return result
+
+
+def refused_result(e: Refused) -> dict:
+    result = error_result(e.backend_error)
+    result["backend"] = "codex"
+    result["codex_error"] = oc.redact(e.backend_error)[:400]
+    return result
+
+
+def answer_call(args, prompt: str, environ, timeout: float, share: float, notes: list, deadline: float) -> dict:
     try:
         result = review_codex(args, prompt, environ, deadline, timeout, share)
         if notes:
             result["notes"] = notes
         return result
+    except Refused:
+        raise
     except Exception as e:  # any codex failure falls back, and is recorded
         codex_error = oc.redact(f"{type(e).__name__}: {e}" if not isinstance(e, oc.Fail) else str(e))[:400]
     try:

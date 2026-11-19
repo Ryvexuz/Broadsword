@@ -46,8 +46,15 @@ class Fake(BaseHTTPRequestHandler):
 FAKE_CODEX_PY = r'''
 import json, os, sys
 d = os.path.dirname(os.path.abspath(__file__))
-mode = open(os.path.join(d, "mode"), encoding="utf-8").read().strip()
 args = sys.argv[1:]
+if args == ["--version"]:
+    v = open(os.path.join(d, "version"), encoding="utf-8").read().strip()
+    if v == "FAIL":
+        sys.exit(3)
+    print(v)
+    sys.exit(0)
+open(os.path.join(d, "started"), "w").write("codex was started")  # the marker: a refusal must leave it absent
+mode = open(os.path.join(d, "mode"), encoding="utf-8").read().strip()
 stdin = sys.stdin.read()
 sys.stdout.reconfigure(encoding="utf-8")  # codex writes UTF-8; raw U+2028 must survive
 catalog = None
@@ -107,6 +114,30 @@ NO_FILE_ACCESS_FLAGS = ["--sandbox read-only", "--ephemeral", "--skip-git-repo-c
                         '-c approval_policy="never"']
 
 
+CODEX_VERSION = "codex-cli 9.9.9-test"
+
+# The stand-in for scripts/shadow_canary.py inside the temp ROOT. It records that it ran (and its arguments), then passes (writing
+# last-pass.json for the version in ROOT/canary_version, like the real one) or fails, as ROOT/canary_mode says.
+FAKE_CANARY_PY = r'''
+import json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(here)
+open(os.path.join(here, "canary-ran"), "w").write(" ".join(sys.argv[1:]))
+if open(os.path.join(root, "canary_mode"), encoding="utf-8").read().strip() == "fail":
+    print("leg A: FAIL, the model was offered a tool")
+    print("a second line")
+    sys.exit(1)
+if open(os.path.join(root, "canary_mode"), encoding="utf-8").read().strip() == "pass-unrecorded":
+    sys.exit(0)  # exit 0 but no last-pass.json: must not count
+os.makedirs(os.path.join(root, "state", "canary"), exist_ok=True)
+json.dump({"codex_version": open(os.path.join(root, "canary_version"), encoding="utf-8").read().strip()},
+          open(os.path.join(root, "state", "canary", "last-pass.json"), "w"))
+print("canary: PASS")
+'''
+
+MODELS_JSON = {"models": {"gpt-5.6-sol": {}}}
+
+
 def completion(text, finish="stop", model="gpt-5.6-sol-2026-01-01"):
     return {"model": model, "choices": [{"finish_reason": finish, "message": {"role": "assistant", "content": text}}], "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
 
@@ -123,26 +154,52 @@ class ReviewTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
+    models_json = MODELS_JSON
+
     def setUp(self):
         Fake.seen = []
         Fake.status = 200
         Fake.reply = completion("VERDICT: PASS\nBLOCKING: none\nMINOR: none")
 
-    def make_codex_dir(self, mode):
+    def make_codex_dir(self, mode, version=CODEX_VERSION):
         """A folder holding a FAKE codex (a script that prints canned JSONL and writes the -o file). Never the real one."""
         d = Path(tempfile.mkdtemp(prefix="fakecodex-"))
         self.addCleanup(shutil.rmtree, d, True)
         (d / "fake_codex.py").write_text(FAKE_CODEX_PY, encoding="utf-8")
         if os.name == "nt":
-            (d / "codex.cmd").write_text(f'@"{sys.executable}" -I -B "%~dp0fake_codex.py" %*\r\n', encoding="utf-8")
+            (d / "codex.cmd").write_text(f'@"{sys.executable}" -I -B "%~dp0fake_codex.py" %*' + "\r\n", encoding="utf-8")
         else:
             (d / "codex").write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -B "$(dirname "$0")/fake_codex.py" "$@"\n', encoding="utf-8")
             (d / "codex").chmod(0o755)
         (d / "mode").write_text(mode, encoding="utf-8")
+        (d / "version").write_text(version, encoding="utf-8")
         return d
 
-    def run_script(self, prompt="the prompt", env=None, base=None, codex=None, cwd=None):
-        """codex=None: no codex anywhere (PATH is an empty folder, APPDATA an empty folder). codex=<mode>: a fake codex first on PATH."""
+    def make_root(self, cap=None, planted="match", canary="pass"):
+        """A temp ROOT holding copies of the wrapper (so the real state/ledger/canary file are never touched) and a fake canary.
+        planted: "match" (last-pass.json names CODEX_VERSION), "stale", "garbage", or None (no file)."""
+        root = Path(tempfile.mkdtemp(prefix="bswroot-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "clients").mkdir()
+        (root / "scripts").mkdir()
+        (root / "bench").mkdir()
+        for name in ("openai_review.py", "openai_mcp.py"):
+            shutil.copy(HERE / name, root / "clients" / name)
+        (root / "scripts" / "shadow_canary.py").write_text(FAKE_CANARY_PY, encoding="utf-8")
+        (root / "bench" / "models.json").write_text(json.dumps(self.models_json), encoding="utf-8")
+        (root / "broadsword.toml").write_text('state_dir = "state"\n' + ("" if cap is None else f"gpt_daily_cap_usd = {cap}\n"), encoding="utf-8")
+        (root / "canary_mode").write_text(canary, encoding="utf-8")
+        (root / "canary_version").write_text(CODEX_VERSION, encoding="utf-8")
+        if planted is not None:
+            (root / "state" / "canary").mkdir(parents=True)
+            body = {"match": json.dumps({"codex_version": CODEX_VERSION}), "stale": json.dumps({"codex_version": "codex-cli 0.0.1-old"}), "garbage": "{not json"}[planted]
+            (root / "state" / "canary" / "last-pass.json").write_text(body, encoding="utf-8")
+        return root
+
+    def run_script(self, prompt="the prompt", env=None, base=None, codex="fail", cwd=None, root=None, cap=None, planted="match", canary="pass",
+                   version=CODEX_VERSION):
+        """The wrapper runs from a temp ROOT copy (self.root). codex=<mode>: a fake codex first on PATH ("fail" by default: it answers
+        --version and then fails, so the API answers). codex=None: no codex anywhere (PATH is an empty folder, APPDATA an empty folder)."""
         e = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY" and not k.startswith("OPENAI_")}
         e["OPENAI_API_KEY"] = FAKE_KEY
         e["OPENAI_BASE_URL"] = base or self.url
@@ -152,10 +209,11 @@ class ReviewTests(unittest.TestCase):
         if codex is None:
             e["PATH"] = str(empty)
         else:
-            self.codex_dir = self.make_codex_dir(codex)
+            self.codex_dir = self.make_codex_dir(codex, version)
             e["PATH"] = str(self.codex_dir)
         e.update(env or {})
-        p = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), *ARGS], input=prompt, capture_output=True, text=True, env=e, timeout=60, cwd=cwd)
+        self.root = root or self.make_root(cap=cap, planted=planted, canary=canary)
+        p = subprocess.run([sys.executable, "-I", "-B", str(self.root / "clients" / "openai_review.py"), *ARGS], input=prompt, capture_output=True, text=True, env=e, timeout=60, cwd=cwd)
         return p
 
     def test_success_prints_the_claude_cli_json(self):
@@ -335,20 +393,199 @@ class ReviewTests(unittest.TestCase):
         for name in ("codex.cmd", "codex.exe", "codex"):
             (cur / name).write_text("echo PWNED\n", encoding="utf-8")
         # PATH holds "." , an empty entry and a relative one; none may be searched
-        p = self.run_script(env={"PATH": os.pathsep.join([".", "", "sub", str(cur / "nope")])}, cwd=str(cur))
+        p = self.run_script(codex=None, env={"PATH": os.pathsep.join([".", "", "sub", str(cur / "nope")])}, cwd=str(cur))
         j = json.loads(p.stdout)
-        self.assertEqual(j["backend"], "api", j)
-        self.assertIn("not found", j["codex_error"])
-        self.assertEqual(len(Fake.seen), 1)
+        self.assertTrue(j["is_error"], j)
+        self.assertTrue(j["codex_error"].startswith("codex_unavailable"), j)
+        self.assertEqual(Fake.seen, [], "no codex found: an error, not an API call")
         self.assertFalse((cur / "seen.json").exists())
 
-    def test_codex_missing_falls_back_to_the_api(self):
-        p = self.run_script()
+    def test_codex_missing_is_codex_unavailable_and_nothing_is_called(self):
+        p = self.run_script(codex=None)
         j = json.loads(p.stdout)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(j["backend"], "api")
-        self.assertIn("not found", j["codex_error"])
-        self.assertEqual(len(Fake.seen), 1)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertTrue(j["is_error"])
+        self.assertEqual(j["backend"], "codex")
+        self.assertTrue(j["codex_error"].startswith("codex_unavailable"), j)
+        self.assertEqual(Fake.seen, [])
+        self.assertFalse((self.root / "scripts" / "canary-ran").exists(), "no codex: no canary run")
+
+    # ---- gate: the canary must have passed for the installed codex version ----
+
+    def test_version_mismatch_runs_the_offline_canary_then_codex(self):
+        for planted in ("stale", None, "garbage"):
+            with self.subTest(planted=planted):
+                p = self.run_script("PROMPT TEXT", codex="ok", planted=planted)
+                j = json.loads(p.stdout)
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertEqual(j["backend"], "codex", j)
+                self.assertFalse(j["is_error"], j)
+                ran = self.root / "scripts" / "canary-ran"
+                self.assertTrue(ran.is_file(), "the canary ran")
+                self.assertEqual(ran.read_text(encoding="utf-8"), "--offline-only", "offline leg only: no model call from the automatic path")
+                started = self.codex_dir / "started"
+                self.assertTrue(started.is_file(), "codex was started after the canary passed")
+                self.assertLessEqual(ran.stat().st_mtime_ns, started.stat().st_mtime_ns, "canary first, then codex")
+                last = json.loads((self.root / "state" / "canary" / "last-pass.json").read_text(encoding="utf-8"))
+                self.assertEqual(last["codex_version"], CODEX_VERSION)
+
+    def test_a_failing_canary_refuses_and_codex_never_starts(self):
+        p = self.run_script(codex="ok", planted="stale", canary="fail")
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertTrue(j["is_error"], j)
+        self.assertEqual(j["backend"], "codex")
+        self.assertTrue(j["codex_error"].startswith("canary_failed"), j)
+        self.assertIn("leg A: FAIL", j["codex_error"], "the first line of the canary's output")
+        self.assertNotIn("second line", j["codex_error"])
+        self.assertTrue((self.root / "scripts" / "canary-ran").is_file(), "the canary did run")
+        self.assertFalse((self.codex_dir / "started").exists(), "the fake codex was never started")
+        self.assertEqual(Fake.seen, [], "and the API fallback was not used either")
+
+    def test_a_canary_that_exits_0_without_recording_a_pass_still_refuses(self):
+        p = self.run_script(codex="ok", planted=None, canary="pass-unrecorded")
+        j = json.loads(p.stdout)
+        self.assertTrue(j["is_error"] and j["codex_error"].startswith("canary_failed"), j)
+        self.assertFalse((self.codex_dir / "started").exists())
+
+    def test_a_missing_canary_script_refuses(self):
+        root = self.make_root(planted="stale")
+        (root / "scripts" / "shadow_canary.py").unlink()
+        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertTrue(j["is_error"] and j["codex_error"].startswith("canary_failed"), j)
+        self.assertFalse((self.codex_dir / "started").exists())
+
+    def test_matching_version_skips_the_canary(self):
+        p = self.run_script(codex="ok", planted="match")
+        j = json.loads(p.stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertFalse((self.root / "scripts" / "canary-ran").exists(), "a recorded pass for this version: no canary run")
+        self.assertTrue((self.codex_dir / "started").is_file())
+
+    def test_codex_version_failing_is_codex_unavailable_with_no_canary(self):
+        p = self.run_script(codex="ok", version="FAIL", planted="stale")
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertTrue(j["is_error"], j)
+        self.assertTrue(j["codex_error"].startswith("codex_unavailable"), j)
+        self.assertFalse((self.root / "scripts" / "canary-ran").exists(), "no canary when codex itself is unavailable")
+        self.assertFalse((self.codex_dir / "started").exists())
+        self.assertEqual(Fake.seen, [])
+
+    # ---- gate: the daily GPT spend cap and its ledger ----
+
+    @staticmethod
+    def today():
+        import datetime
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def plant_ledger(self, root, usd):
+        d = root / "state" / "gpt-spend"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{self.today()}.tsv").write_text("utc\tcaller\tmodel\tinput_tokens\toutput_tokens\test_usd\tplan_or_credits\n"
+                                               f"2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t{usd}\tcodex-plan\n", encoding="utf-8")
+
+    def ledger_lines(self, root):
+        return (root / "state" / "gpt-spend" / f"{self.today()}.tsv").read_text(encoding="utf-8").strip().split("\n")
+
+    def test_cap_reached_refuses_before_any_call_and_writes_the_note_once(self):
+        root = self.make_root()
+        self.plant_ledger(root, 20.0)  # the built-in cap is 20
+        for _ in range(2):
+            j = json.loads(self.run_script(codex="ok", root=root).stdout)
+            self.assertTrue(j["is_error"], j)
+            self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+            self.assertFalse((self.codex_dir / "started").exists(), "no codex process")
+            self.assertEqual(Fake.seen, [], "no API call")
+        self.assertFalse((root / "scripts" / "canary-ran").exists())
+        notes = list((root / "state" / "gpt-spend").glob("CAP-REACHED-*.txt"))
+        self.assertEqual([n.name for n in notes], [f"CAP-REACHED-{self.today()}.txt"])
+        self.assertEqual(len(self.ledger_lines(root)), 2, "a refused call adds no ledger row")
+
+    def test_just_under_the_cap_still_calls(self):
+        root = self.make_root()
+        self.plant_ledger(root, 19.99)
+        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertEqual(j["backend"], "codex", j)
+
+    def test_the_cap_comes_from_the_toml_and_zero_means_no_calls(self):
+        for cap in ("0", "0.0"):
+            with self.subTest(cap=cap):
+                j = json.loads(self.run_script(codex="ok", cap=cap).stdout)
+                self.assertTrue(j["is_error"], j)
+                self.assertEqual(j["codex_error"], "daily_cap_reached: 0.0000 of 0")
+                self.assertFalse((self.codex_dir / "started").exists())
+                self.assertEqual(Fake.seen, [])
+        root = self.make_root(cap="5")
+        self.plant_ledger(root, 5.0)
+        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 5.0000 of 5", "a lower cap in the toml wins over the built-in 20")
+
+    def test_a_bad_cap_in_the_toml_is_an_error_and_no_call(self):
+        p = self.run_script(codex="ok", cap='"lots"')
+        j = json.loads(p.stdout)
+        self.assertTrue(j["is_error"], j)
+        self.assertFalse((self.codex_dir / "started").exists())
+
+    def test_the_ledger_records_each_call(self):
+        root = self.make_root()
+        j = json.loads(self.run_script(codex="ok", root=root, env={"OPENAI_REVIEW_CALLER": "shadow"}).stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        j2 = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertEqual(j2["backend"], "codex")
+        lines = self.ledger_lines(root)
+        self.assertEqual(lines[0].split("\t"), ["utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits"])
+        self.assertEqual(len(lines), 3, "one header and one row per call")
+        first = lines[1].split("\t")
+        self.assertEqual(first[1:5], ["shadow", "gpt-5.6-sol", "50", "7"])
+        self.assertAlmostEqual(float(first[5]), (50 * 30 + 7 * 120) / 1e6, places=6, msg="no price listed anywhere: the built-in high price, never 0")
+        self.assertEqual(first[6], "codex-plan")
+        self.assertEqual(lines[2].split("\t")[1], "unlabelled")
+
+    def test_an_unpriced_model_counts_at_the_highest_listed_price(self):
+        self.addCleanup(setattr, self, "models_json", MODELS_JSON)
+        self.models_json = {"models": {"cheap": {"price_usd_per_mtok": {"input": 1, "output": 2}},
+                                       "dear": {"price_usd_per_mtok": {"input": 5, "output": 10}}, "gpt-5.6-sol": {}}}
+        root = self.make_root()
+        self.run_script(codex="ok", root=root)
+        row = self.ledger_lines(root)[1].split("\t")
+        self.assertAlmostEqual(float(row[5]), (50 * 5 + 7 * 10) / 1e6, places=6)
+        self.models_json = {"models": {"cheap": {"price_usd_per_mtok": {"input": 1, "output": 2}},
+                                       "gpt-5.6-sol": {"price_usd_per_mtok": {"input": 3, "output": 4}}}}
+        root = self.make_root()
+        self.run_script(codex="ok", root=root)
+        row = self.ledger_lines(root)[1].split("\t")
+        self.assertAlmostEqual(float(row[5]), (50 * 3 + 7 * 4) / 1e6, places=6, msg="a listed model counts at its own price")
+
+    def test_an_api_fallback_call_is_recorded_as_credits(self):
+        root = self.make_root()
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)  # codex answers --version, then fails: the API answers
+        self.assertEqual(j["backend"], "api", j)
+        row = self.ledger_lines(root)[1].split("\t")
+        self.assertEqual((row[3], row[4], row[6]), ("100", "20", "api-credits"))
+
+    def test_concurrent_appends_under_the_lock_lose_no_rows(self):
+        root = self.make_root()
+        driver = (
+            "import importlib.util, sys\n"
+            "from pathlib import Path\n"
+            "root = Path(sys.argv[1])\n"
+            "spec = importlib.util.spec_from_file_location('orv', root / 'clients' / 'openai_review.py')\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "for i in range(40):\n"
+            "    m.record_spend(root, {'OPENAI_REVIEW_CALLER': sys.argv[2]}, 'gpt-5.6-sol', {'modelUsage': {'x': {'inputTokens': 1, 'outputTokens': 1}}}, 'codex')\n"
+        )
+        procs = [subprocess.Popen([sys.executable, "-I", "-B", "-c", driver, str(root), name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for name in ("A", "B", "C")]
+        for pr in procs:
+            _, err = pr.communicate(timeout=60)
+            self.assertEqual(pr.returncode, 0, err)
+        lines = self.ledger_lines(root)
+        self.assertEqual(len(lines), 1 + 120, "one header (written once) and every row of the three writers")
+        self.assertEqual(sum(1 for x in lines if x.startswith("utc\t")), 1)
+        for who in "ABC":
+            self.assertEqual(sum(1 for x in lines[1:] if x.split("\t")[1] == who), 40)
+        self.assertTrue(all(len(x.split("\t")) == 7 for x in lines), "no row is torn")
 
     def test_codex_failing_falls_back_and_records_why(self):
         for mode, needle in (("fail", "code 1"), ("empty", "empty")):

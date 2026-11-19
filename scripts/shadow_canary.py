@@ -25,6 +25,11 @@ Exit codes:
      wrapper reported tool use (it then discards the answer, so the canary must assume the worst).
   2  INCONCLUSIVE: codex did not run or did not answer, or the setup failed; nothing was proven.
 
+On a full PASS (exit 0: leg A, and leg B when it ran) it writes <checkout>/<state_dir>/canary/last-pass.json atomically:
+{"codex_version", "utc", "legs", "model"}. Never on a FAIL. clients/openai_review.py compares codex_version with `codex --version`
+before it starts codex and runs `shadow_canary.py --offline-only` itself when they differ (an --offline-only pass is recorded with
+legs ["A"] and model null). If `codex --version` fails the legs cannot be recorded and the exit code is 2.
+
 Differences from the queue, outside what is tested: (1) the queue also drops variables whose VALUE matches a value in the root
 .env; this script never reads any .env, so it scrubs by name only (in leg B the wrapper itself still scrubs codex's environment by
 value, as in the queue). (2) In leg B the API fallback is pointed at a closed local port with a dummy key, so a codex failure can
@@ -43,6 +48,7 @@ sys.dont_write_bytecode = True  # never write .pyc files into the repo
 
 import argparse
 import base64
+import datetime
 import importlib.util
 import json
 import os
@@ -355,6 +361,50 @@ def leg_real(canary_dir: Path, cwd: Path, model: str, timeout: float, system_pro
     return REFUSED
 
 
+def codex_version(timeout: float = 20.0):
+    """The output of `codex --version`, stripped, or None if codex is missing or fails."""
+    exe = rv.find_codex(scrubbed_env())
+    if exe is None:
+        return None
+    try:
+        code, out, _ = run([exe, "--version"], "", CHECKOUT, scrubbed_env(), timeout)
+    except OSError:
+        return None
+    out = (out or "").strip()
+    return out if code == 0 and out else None
+
+
+def write_last_pass(state_dir: str, version: str, legs: list, model) -> Path:
+    """state/canary/last-pass.json of THIS checkout, written atomically (temp file, then replace). Only ever called on a full PASS.
+    openai_review.py reads it before it starts codex and re-runs this canary when the codex version differs."""
+    folder = CHECKOUT / state_dir / "canary"
+    folder.mkdir(parents=True, exist_ok=True)
+    final = folder / "last-pass.json"
+    tmp = folder / f"last-pass.json.{os.getpid()}.tmp"
+    record = {"codex_version": version, "utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "legs": legs, "model": model}
+    try:
+        tmp.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        os.replace(tmp, final)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return final
+
+
+def record_pass(state_dir: str, legs: list, model) -> int:
+    """REFUSED when the pass was recorded; INCONCLUSIVE when it could not be (no codex version): a pass nobody can find is not a pass."""
+    version = codex_version()
+    if version is None:
+        print("INCONCLUSIVE: the legs passed but `codex --version` failed, so no pass was recorded")
+        return INCONCLUSIVE
+    try:
+        path = write_last_pass(state_dir, version, legs, model)
+    except OSError as e:
+        print(f"INCONCLUSIVE: the legs passed but last-pass.json could not be written: {type(e).__name__}")
+        return INCONCLUSIVE
+    print(f"canary: PASS recorded in {path} (codex {version}, legs {''.join(legs)})")
+    return REFUSED
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Shadow-reviewer canary: exit 0 only if codex is offered no tool and cannot read a planted file.")
     ap.add_argument("--model", help="override broadsword.toml shadow_reviewer_model")
@@ -366,6 +416,7 @@ def main(argv=None) -> int:
         scratch = root / required(cfg, "scratch_dir", str)
         model = args.model or required(cfg, "shadow_reviewer_model", str)
         timeout = required(cfg, "shadow_reviewer_timeout_seconds", int)
+        state_dir = required(cfg, "state_dir", str)
         system_prompt = queue_system_prompt(REVIEWER_RS)
     except Exception as e:
         print(f"INCONCLUSIVE: setup failed: {type(e).__name__}: {e}")
@@ -385,8 +436,9 @@ def main(argv=None) -> int:
         return a
     if args.offline_only:
         print("canary: leg B skipped (--offline-only)")
-        return REFUSED
-    return leg_real(canary_dir, cwd, model, timeout, system_prompt)
+        return record_pass(state_dir, ["A"], None)
+    b = leg_real(canary_dir, cwd, model, timeout, system_prompt)
+    return record_pass(state_dir, ["A", "B"], model) if b == REFUSED else b
 
 
 if __name__ == "__main__":
