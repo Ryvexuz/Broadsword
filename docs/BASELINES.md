@@ -35,7 +35,7 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 | quality | `main_check_failed` | lower | entries with status `merged_check_failed` |
 | quality | `direct_merges` | context only | tasks merged outside the queue |
 | cost | `review_usd_per_merged`, `review_tokens_per_merged` | lower | every review in the window, retries and rejected attempts included, / merged |
-| cost | `coder_tokens_per_merged` | lower | coder tokens of all tasks finished in the window (done, failed or abandoned; every run, retries included) / merged tasks |
+| cost | `coder_tokens_per_merged` | lower | coder tokens of all tasks finished in the window (done, failed or abandoned; every run, retries included) / the merged tasks that have a coder run recorded; null if none. A merged task with no coder run is not counted as zero tokens: `samples.merged_with_coder_run` holds the divisor and `record` prints "N of M merged tasks have no coder run recorded". Below `--min-samples` of those covered tasks the metric is NOISE |
 | cost | `coder_tokens_unmerged` | context only | how many of those tokens belong to tasks that did not merge |
 | queue | `entry_median_s` | lower | entry created to ended (one attempt's merge time) |
 | queue | `check_median_s`, `review_median_s`, `recheck_median_s` | lower | `dev_metrics.steps()`: `check`, `review`, `main_check` |
@@ -46,6 +46,8 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 - **Coder runs for use and per model:** a row counts when its task's running time overlaps the window; its seconds are capped at the task's overlap with the window (an upper bound, see above). A row whose task has no known start time counts by its date, capped at the window length, and `record` prints "N runs have no task span: counted in full, capped at the window", since these can inflate `coder_use_upper_bound`.
 - **Coder tokens (cost):** every run of a task that ended inside the window counts, whatever the run's date, and no other run does, so work still running at the window end never inflates the cost. Abandoned or failed work that ended in the window stays in on purpose (cost to completion includes waste); `coder_tokens_unmerged` says how much of the total that is. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
 - **Reviews with no cost recorded:** a review whose `cost_usd` (or token fields) is missing is not counted as zero. `record` counts them (`samples.reviews_without_cost`, `reviews_without_tokens`) and prints "N of M reviews have no cost recorded"; the USD and token figures are then lower bounds. A `cost_usd` that is present but not a number is bad input naming the file.
+- **Shadow reviews:** a `*.shadow.review` file is not a review of record. It is left out of every metric, of `samples.reviews` and of the per-model rows.
+- **Definitions version:** every record has a `definitions` map (metric to version, for example `"coder_tokens_per_merged": "v1"`). The version is bumped whenever a metric's meaning changes. `compare` gives NOISE with the reason "definition differs (before v0, after v1)" for any metric whose version differs between the two sides, and keeps it out of the overall verdict. A record with no map, or no entry for a metric, used the old definition `v0` (all records before 2026-11-19 are v0). To compare across a change of definition, record the "before" window again with the current code, under a new name.
 - **Shared helpers:** `fields`, `num`, `steps` and `covered` (idle share) come from `scripts/dev_metrics.py`, and the review header parser comes from `scripts/review_costs.py`. Both are imported by path, not copied. Coder use and coder tokens are not in dev_metrics as functions, so they are baseline's own (see above).
 
 ## Verdicts
@@ -55,10 +57,15 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 - **Bad numbers:** a present but malformed number in `state/agent-runs.tsv` (named with its line) or in a review's token fields, or a NaN/Infinity in a baseline file, is an input error (exit 1), never a silent zero. An empty cell stays "unknown" and is counted in a note (for example "N coder runs have no token count").
 - **Reviews with no entry time:** a review of a merged task whose queue entry is missing or has no created time is counted in `review_rounds_per_merged` but left out of the first-pass rate and of review cost; `record` prints a note with the count.
 - **Non-finite numbers:** `nan` and `inf` in a review's `cost_usd` are input errors naming the file, and `record` refuses to write any metric that is not finite.
+- **NOISE, before is 0:** a change from 0 has no relative size, so it is NOISE with the reason "before is 0, no relative change"; look at the numbers yourself.
 - **NOISE, too few samples:** either side has fewer than `--min-samples` merged tasks. This is never BETTER, and the reason is printed.
 - **BETTER or WORSE:** otherwise, by each metric's direction.
 - **Overall:** WORSE if any compared metric is WORSE. This is the ledger's watch-for-harm rule. Otherwise it is BETTER if any metric is BETTER, and NOISE if none is.
 - **`--metrics a,b`:** compares only the metrics the change should move, plus the harm you named. Without it, unrelated swings (for example a window with more Rust tasks) turn the overall verdict WORSE.
+
+- **Notes:** `compare` prints each side's stored notes (for example "lower bound") under the table.
+
+**Known limits.** (1) `idle_share` stays 0 while old tasks are still marked `running`, because it follows `dev_metrics`. (2) `state/` and `main` are fixed names here, like in `dev_metrics.py` and `review_costs.py` (a gap shared by all three). (3) The never-overwrite guard uses `os.link`, which a file system without hard links (exFAT) does not support: `record` then exits 1 with "cannot create".
 
 **Compare like with like.** Use windows of similar length and task mix (project, risk tier, reviewer model). A window of crash-sim checks (6 s) against one of Broadsword checks (3 minutes) measures the mix, not the change.
 

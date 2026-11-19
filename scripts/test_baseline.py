@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,17 @@ def load_baseline():
 
 
 bl = load_baseline()
+
+
+def scratch_tmp():
+    """A temp folder under the project's scratch folder (resolved the way baseline.py finds the root), removed by cleanup()."""
+    root = bl.main_root()
+    m = re.search(r'^scratch_dir\s*=\s*"([^"]+)"', (root / "broadsword.toml").read_text(encoding="utf-8"), re.M)
+    if not m:
+        raise RuntimeError("broadsword.toml has no scratch_dir")
+    base = root / m.group(1)
+    base.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=base, prefix="test-baseline-", ignore_cleanup_errors=True)
 
 
 def epoch(text):
@@ -95,13 +107,15 @@ class Root:
         return subprocess.run([sys.executable, "-I", "-B", str(self.root / "scripts" / "baseline.py"), *args],
                               capture_output=True, text=True, timeout=120)
 
-    def put_baseline(self, name, merged, per_hour, **metrics):
+    def put_baseline(self, name, merged, per_hour, definitions=None, notes=(), samples=None, **metrics):
         d = self.root / "state" / "baselines"
         d.mkdir(parents=True, exist_ok=True)
         values = {m: None for m in bl.METRICS}
         values.update(merged_tasks=merged, merged_per_hour=per_hour, **metrics)
         data = {"schema": 1, "name": name, "window": {"since": "a", "until": "b", "hours": 1}, "main_commit": "0" * 40,
-                "broadsword_toml_sha256": "f" * 64, "metrics": values, "samples": {"merged_tasks": merged}, "per_model": {}, "notes": []}
+                "broadsword_toml_sha256": "f" * 64, "metrics": values, "samples": dict({"merged_tasks": merged}, **(samples or {})), "per_model": {}, "notes": list(notes)}
+        if definitions is not None:
+            data["definitions"] = definitions
         (d / f"{name}.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -110,7 +124,7 @@ T0 = epoch("2026-11-18 09:00:00")
 
 class RecordTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._tmp = scratch_tmp()
         self.r = Root(self._tmp.name)
 
     def tearDown(self):
@@ -208,6 +222,43 @@ class RecordTests(unittest.TestCase):
         data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
         self.assertEqual(data["metrics"]["coder_tokens_per_merged"], 1000)
         self.assertEqual(data["metrics"]["coder_runs_recorded"], 1)
+
+    def test_merged_tasks_without_a_coder_run_are_not_counted_as_zero_tokens(self):
+        a = self.r.merged_task(T0 + 600, T0 + 1800)
+        self.r.merged_task(T0 + 700, T0 + 1900)  # merged, no coder run recorded
+        self.runs((a, 40000, 60))
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        m = self.metrics()
+        self.assertEqual(m["coder_tokens_per_merged"], 40000)
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["samples"]["merged_with_coder_run"], 1)
+        self.assertEqual(data["samples"]["merged_tasks"], 2)
+        self.assertIn("1 of 2 merged tasks have no coder run recorded", res.stdout)
+
+    def test_no_merged_task_with_a_coder_run_gives_null_coder_tokens(self):
+        self.r.merged_task(T0 + 600, T0 + 1800)
+        self.assertEqual(self.record().returncode, 0)
+        self.assertIsNone(self.metrics()["coder_tokens_per_merged"])
+
+    def test_record_writes_the_definitions_map(self):
+        self.assertEqual(self.record().returncode, 0)
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(data["definitions"]), set(bl.METRICS))
+        self.assertEqual(data["definitions"]["coder_tokens_per_merged"], "v1")
+
+    def test_shadow_reviews_are_not_counted_anywhere(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, model="opus")
+        rev = next((self.r.root / "state" / "queue").glob("*.review"))
+        shadow = rev.with_name(rev.name[:-len(".review")] + ".shadow.review")
+        shadow.write_text(rev.read_text(encoding="utf-8").replace("model: opus", "model: sol"), encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["samples"]["reviews"], 1)
+        self.assertNotIn("reviewer:sol", data["per_model"])
+        self.assertAlmostEqual(data["metrics"]["review_rounds_per_merged"], 1.0)
+        self.assertAlmostEqual(data["metrics"]["review_usd_per_merged"], 0.10)
 
     def runs(self, *rows):
         with open(self.r.root / "state" / "agent-runs.tsv", "a", encoding="utf-8") as f:
@@ -418,6 +469,44 @@ class CompareTests(unittest.TestCase):
         rows, _ = bl.compare(self.base(2, 1.0, lead_median_s=9, direct_merges=1), self.base(2, 9.0, lead_median_s=1, direct_merges=5), 5, 10)
         self.assertEqual({r[4] for r in rows}, {"NOISE"})
 
+    def test_coder_tokens_below_min_samples_of_covered_tasks_is_noise(self):
+        s = {"merged_with_coder_run": 2}
+        b = self.base(20, 3.0, coder_tokens_per_merged=100)
+        a = self.base(20, 3.0, coder_tokens_per_merged=10)
+        b["samples"], a["samples"] = dict(b["samples"], **s), dict(a["samples"], **s)
+        rows, overall = bl.compare(b, a, 5, 10)
+        row = next(r for r in rows if r[0] == "coder_tokens_per_merged")
+        self.assertEqual(row[4], "NOISE")
+        self.assertIn("with a coder run", row[5])
+        self.assertEqual(overall, "NOISE")
+
+    def test_a_changed_or_missing_definition_is_noise_and_out_of_the_overall_verdict(self):
+        old = self.base(20, 3.0, coder_tokens_per_merged=400000, lead_median_s=1000)
+        new = self.base(20, 3.0, coder_tokens_per_merged=100000, lead_median_s=1000)
+        new["definitions"] = {"coder_tokens_per_merged": "v1"}
+        rows, overall = bl.compare(old, new, 5, 10)
+        row = next(r for r in rows if r[0] == "coder_tokens_per_merged")
+        self.assertEqual(row[4], "NOISE")
+        self.assertEqual(row[5], "definition differs (before v0, after v1)")
+        self.assertEqual(overall, "NOISE")
+        new["definitions"] = {"coder_tokens_per_merged": "v0"}  # same version on both sides: a real verdict again
+        self.assertEqual(self.verdict(bl.compare(old, new, 5, 10)[0], "coder_tokens_per_merged"), "BETTER")
+
+    def test_record_vs_old_record_of_the_same_window_is_noise_for_every_changed_metric(self):
+        old = self.base(20, 3.0, **{m: 100 for m in bl.CHANGED_V1})
+        new = self.base(20, 3.0, **{m: 10 for m in bl.CHANGED_V1})
+        new["definitions"] = dict(bl.DEFINITIONS)
+        rows, overall = bl.compare(old, new, 5, 10)
+        for m in bl.CHANGED_V1:
+            self.assertEqual(self.verdict(rows, m), "NOISE", m)
+        self.assertEqual(overall, "NOISE")
+
+    def test_a_change_from_zero_is_noise_not_worse(self):
+        rows, overall = bl.compare(self.base(20, 3.0, main_check_failed=0), self.base(20, 3.0, main_check_failed=1), 5, 10)
+        row = next(r for r in rows if r[0] == "main_check_failed")
+        self.assertEqual((row[4], row[5]), ("NOISE", "before is 0, no relative change"))
+        self.assertEqual(overall, "NOISE")
+
     def test_unknown_metric_is_bad_input(self):
         with self.assertRaises(bl.InputError):
             bl.compare(self.base(20, 3.0), self.base(20, 3.0), 5, 10, metrics=["nope"])
@@ -425,7 +514,7 @@ class CompareTests(unittest.TestCase):
 
 class CompareCliTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._tmp = scratch_tmp()
         self.r = Root(self._tmp.name)
 
     def tearDown(self):
@@ -494,6 +583,28 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("after.json", res.stderr)
         self.assertIn("lead_median_s", res.stderr)
+
+    def test_cli_prints_both_sides_notes(self):
+        self.r.put_baseline("before", 20, 3.0, notes=["lower bound here"])
+        self.r.put_baseline("after", 20, 3.0, notes=["another note"])
+        res = self.r.run("compare", "before", "after", "--min-samples", "5", "--noise", "10")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("before note: lower bound here", res.stdout)
+        self.assertIn("after note: another note", res.stdout)
+
+    def test_non_finite_per_model_figure_is_bad_input(self):
+        self.r.put_baseline("before", 20, 3.0)
+        self.r.put_baseline("after", 20, 3.0)
+        path = self.r.root / "state" / "baselines" / "after.json"
+        for token in ("NaN", "Infinity", "1e999", '"x"'):
+            d = json.loads(path.read_text(encoding="utf-8"))
+            d["per_model"] = {"m": {"runs": 1, "usd": 0.5, "tokens": 5, "seconds": 1}}
+            text = json.dumps(d).replace('"usd": 0.5', f'"usd": {token}')
+            path.write_text(text, encoding="utf-8")
+            res = self.r.run("compare", "before", "after", "--min-samples", "5", "--noise", "10")
+            self.assertEqual(res.returncode, 1, f"{token}: {res.stdout}")
+            self.assertIn("after.json", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
 
     def test_flags_are_required(self):
         res = self.r.run("compare", "a", "b", "--min-samples", "5")

@@ -47,6 +47,11 @@ SCHEMA = 1
 # Metrics added or renamed after the first schema-1 baselines were recorded. Old baselines (evidence, never rewritten)
 # lack them; validation does not require them and compare shows "-" for them. Every other METRICS key is required.
 LATER_METRICS = ("coder_use_upper_bound", "coder_tokens_unmerged")
+# Per-metric definition versions, written into every record. Bump a metric's version whenever what it measures changes, so
+# `compare` never gives a verdict between two different definitions. A record with no `definitions` map, or no entry for a
+# metric, used the old definition "v0". v1: the fix rounds of t-20261119-170109 (review set without shadow reviews, first
+# pass by entry time, coder tokens by finished task / merged tasks that have a coder run, coder use as an upper bound).
+OLD_DEFINITION = "v0"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 # name -> (group, direction, unit, description). direction: "up" = higher is better, "down" = lower is better,
@@ -65,7 +70,7 @@ METRICS = {
     "direct_merges": ("quality", None, "count", "tasks merged outside the queue (approved direct merges)"),
     "review_usd_per_merged": ("cost", "down", "USD", "all review cost in the window (retries included) / merged"),
     "review_tokens_per_merged": ("cost", "down", "tokens", "all review tokens in the window / merged"),
-    "coder_tokens_per_merged": ("cost", "down", "tokens", "coder tokens of all tasks finished in the window (done, failed or abandoned) / merged tasks"),
+    "coder_tokens_per_merged": ("cost", "down", "tokens", "coder tokens of all tasks finished in the window (done, failed or abandoned) / merged tasks that have a coder run recorded"),
     "coder_tokens_unmerged": ("cost", None, "tokens", "of those coder tokens, how many belong to tasks that did not merge (waste kept in the cost)"),
     "coder_runs_recorded": ("cost", None, "runs", "coder runs of tasks that ended in the window"),
     "entry_median_s": ("queue", "down", "s", "median queue entry created -> ended (merge time per attempt)"),
@@ -75,6 +80,9 @@ METRICS = {
     "test_job_median_s": ("queue", "down", "s", "median check/test job run time (state/jobs, kind check or test)"),
     "build_lock_wait_s": ("queue", "down", "s", "build-lock wait inside jobs: not recorded by Broadsword yet"),
 }
+CHANGED_V1 = ("coder_use_upper_bound", "review_rounds_per_merged", "first_pass_fail_rate", "review_usd_per_merged",
+              "review_tokens_per_merged", "coder_tokens_per_merged", "coder_tokens_unmerged", "coder_runs_recorded")
+DEFINITIONS = {m: ("v1" if m in CHANGED_V1 else OLD_DEFINITION) for m in METRICS}
 
 
 class InputError(Exception):
@@ -231,6 +239,8 @@ def measure(root, since, until):
     # Reviews: every .review file whose entry is not a test hook, keyed by task.
     reviews = []
     for p in sorted(qdir.glob("*.review")):
+        if p.name.endswith(".shadow.review"):
+            continue  # a shadow review is not a review of record: never counted in any metric or sample
         try:
             h = rc.header(p.read_text(encoding="utf-8", errors="replace"))
         except OSError as e:
@@ -360,6 +370,7 @@ def measure(root, since, until):
         if col not in head:
             raise InputError(f"{runs_file}: header has no `{col}` column (found {head})")
     coder_secs = coder_tok = coder_runs = unfinished_runs = coder_tok_unmerged = 0
+    merged_with_run = set()
     no_tok_runs = no_sec_runs = no_span_runs = 0
     for lineno, line in enumerate(lines[1:], 2):
         if not line.strip():
@@ -402,6 +413,8 @@ def measure(root, since, until):
             coder_tok += tok
             if v.get("task") not in merged_ids:
                 coder_tok_unmerged += tok
+            else:
+                merged_with_run.add(v.get("task"))
     if unfinished_runs:
         notes.append(f"{unfinished_runs} coder run(s) in the window belong to tasks not finished in it (or of no known task): "
                      "counted in coder_use_upper_bound, left out of coder tokens")
@@ -449,7 +462,7 @@ def measure(root, since, until):
         "direct_merges": direct,
         "review_usd_per_merged": ratio(usd, n),
         "review_tokens_per_merged": ratio(rtok, n),
-        "coder_tokens_per_merged": ratio(coder_tok, n) if coder_runs else None,
+        "coder_tokens_per_merged": ratio(coder_tok, len(merged_with_run)) if merged_with_run else None,
         "coder_tokens_unmerged": coder_tok_unmerged if coder_runs else None,
         "coder_runs_recorded": coder_runs,
         "entry_median_s": med(durs),
@@ -459,10 +472,13 @@ def measure(root, since, until):
         "test_job_median_s": med(test_jobs),
         "build_lock_wait_s": None,
     }
+    if merged_with_run and len(merged_with_run) < n:
+        notes.append(f"{n - len(merged_with_run)} of {n} merged tasks have no coder run recorded: "
+                     f"coder_tokens_per_merged divides by the {len(merged_with_run)} that have one")
     if not coder_runs:
         notes.append("no coder runs of tasks that ended in this window in state/agent-runs.tsv: coder tokens not known")
     samples = {"merged_tasks": n, "queue_entries": len(win_entries), "reviews": len(win_reviews),
-               "test_jobs": len(test_jobs), "coder_runs": coder_runs,
+               "test_jobs": len(test_jobs), "coder_runs": coder_runs, "merged_with_coder_run": len(merged_with_run),
                "reviews_without_cost": no_cost, "reviews_without_tokens": no_tokens}
     return values, samples, per_model, main_sha, notes
 
@@ -510,8 +526,14 @@ def validate_baseline(data, path):
         if isinstance(v, float) and not math.isfinite(v):
             bad(f"metric `{k}` is not a finite number")
     for k, v in data["per_model"].items():
-        if not isinstance(v, dict) or not all(isinstance(v.get(f), (int, float)) for f in ("runs", "usd", "tokens")):
-            bad(f"per_model `{k}` is malformed")
+        if not isinstance(v, dict) or not all(isinstance(v.get(f), (int, float)) and not isinstance(v.get(f), bool)
+                                              and math.isfinite(v.get(f)) for f in ("runs", "usd", "tokens")):
+            bad(f"per_model `{k}` is malformed or not finite")
+        if "seconds" in v and (isinstance(v["seconds"], bool) or not isinstance(v["seconds"], (int, float)) or not math.isfinite(v["seconds"])):
+            bad(f"per_model `{k}` seconds is not a finite number")
+    if "definitions" in data and (not isinstance(data["definitions"], dict)
+                                  or not all(isinstance(k, str) and isinstance(v, str) for k, v in data["definitions"].items())):
+        bad("`definitions` is not a map of metric to version text")
 
 
 def _no_constant(text):
@@ -554,7 +576,7 @@ def cmd_record(args):
         "schema": SCHEMA, "name": args.name, "recorded_at": iso(int(time.time())),
         "window": {"since": iso(since), "until": iso(until), "hours": round((until - since) / 3600, 3)},
         "main_commit": main_sha, "broadsword_toml_sha256": toml_hash,
-        "metrics": values, "samples": samples, "per_model": per_model, "notes": notes,
+        "definitions": dict(DEFINITIONS), "metrics": values, "samples": samples, "per_model": per_model, "notes": notes,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     # Never-overwrite must be atomic: write a uniquely named temp file, then os.link it to the final name. link fails if
@@ -594,21 +616,33 @@ def compare(before, after, min_samples, noise, metrics=None):
     nb = before["samples"].get("merged_tasks", 0)
     na = after["samples"].get("merged_tasks", 0)
     few = nb < min_samples or na < min_samples
+    # The coder-token average divides by the merged tasks that have a coder run; its sample size is that count.
+    cb = before["samples"].get("merged_with_coder_run", nb)
+    ca = after["samples"].get("merged_with_coder_run", na)
     rows = []
     for m in names:
         _, direction, unit, _ = METRICS[m]
         b, a = before["metrics"].get(m), after["metrics"].get(m)
+        vb = before.get("definitions", {}).get(m, OLD_DEFINITION)
+        va = after.get("definitions", {}).get(m, OLD_DEFINITION)
         change = None
         if b is not None and a is not None:
-            change = 0.0 if a == b else (math.inf if b == 0 else (a - b) / abs(b) * 100)
-            if b == 0 and a < 0:
-                change = -math.inf
-        if direction is None:
+            if a == b:
+                change = 0.0
+            elif b != 0:
+                change = (a - b) / abs(b) * 100
+        if vb != va:
+            verdict, reason = "NOISE", f"definition differs (before {vb}, after {va})"
+        elif direction is None:
             verdict, reason = "NOISE", "context only, no direction"
         elif b is None or a is None:
             verdict, reason = "NOISE", "not recorded on both sides"
         elif few:
             verdict, reason = "NOISE", f"fewer than {min_samples} merged tasks (before {nb}, after {na})"
+        elif m == "coder_tokens_per_merged" and (cb < min_samples or ca < min_samples):
+            verdict, reason = "NOISE", f"fewer than {min_samples} merged tasks with a coder run (before {cb}, after {ca})"
+        elif change is None:
+            verdict, reason = "NOISE", "before is 0, no relative change"
         elif abs(change) <= noise:
             verdict, reason = "NOISE", f"within {noise:g}%"
         else:
@@ -635,6 +669,9 @@ def cmd_compare(args):
     for m, b, a, change, verdict, reason, unit in rows:
         ch = "-" if change is None else ("inf" if math.isinf(change) else f"{change:+.1f}%")
         print(f"{m:<26} {fmt(b, unit):>12} {fmt(a, unit):>12} {ch:>9}  {verdict}{'  (' + reason + ')' if reason else ''}")
+    for label, d in (("before", before), ("after", after)):
+        for nline in d["notes"]:
+            print(f"{label} note: {nline}")
     models = sorted(set(before.get("per_model", {})) | set(after.get("per_model", {})))
     if models:
         print("per model (context only): runs, tokens per run, USD per run, before -> after")
