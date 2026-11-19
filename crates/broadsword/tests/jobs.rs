@@ -545,6 +545,67 @@ fn test_results_match_plain_cargo_test() {
     assert_eq!(out.status.code(), Some(1), "{so}{se}");
     assert!(so.contains(&format!("test: FAILED (exit 101) — {pass} passed, {fail} failed")), "plain cargo: {pass}/{fail}; broadsword: {so}");
     assert!(se.contains("error: test failed, to rerun pass `--test a`"), "{se}");
+    // cargo runs doc-tests LAST and only when every executable passed: a failing unit test hides a failing doc-test (the doc-test's
+    // pass and fail are not counted); with the unit tests passing, the failing doc-test is counted after them
+    let both = "/// ```
+/// assert!(false, \"doc boom\");
+/// ```
+pub fn f() {}
+#[cfg(test)] mod t { #[test] fn ok() {} #[test] fn boom() { panic!(\"unit\") } }
+";
+    let doc_only = "/// ```
+/// assert!(false, \"doc boom\");
+/// ```
+pub fn f() {}
+/// ```
+/// assert!(true);
+/// ```
+pub fn g() {}
+#[cfg(test)] mod t { #[test] fn ok() {} #[test] fn ok2() {} }
+";
+    for (name, lib) in [("unitdoc", both), ("onlydoc", doc_only)] {
+        let d = bin_project(&r, name, "0.1.0", lib, &[("a.rs", "#[test] fn x() {}
+")]);
+        let ((pass, fail, ign), code) = plain_cargo_test(&r, &d);
+        assert_eq!(code, Some(101), "{name}");
+        let out = r.run(&["test", name]);
+        let (so, se) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(1), "{name}: {so}{se}");
+        let want = format!("test: FAILED (exit 101) — {pass} passed, {fail} failed, {ign} ignored");
+        let want_short = format!("test: FAILED (exit 101) — {pass} passed, {fail} failed");
+        assert!(so.contains(&want) || so.contains(&want_short), "{name}: plain cargo {pass}/{fail}/{ign}; broadsword: {so}");
+        if name == "unitdoc" {
+            assert_eq!((pass, fail), (1, 1), "cargo stops at the failing unit test; no doc-test is counted");
+            assert!(!so.contains("doc boom") && !se.contains("Doc-tests"), "no doc-test may run after a failing unit test: {so}{se}");
+        } else {
+            assert_eq!((pass, fail), (5, 1), "lib, bin and integration tests pass, then one doc-test passes and one fails");
+        }
+    }
+}
+
+/// A fake `cargo` (a .cmd file) that logs the environment it was started with, for `cargo metadata` only, then runs the real one.
+#[test]
+fn every_cargo_child_gets_the_scrubbed_environment_including_cargo_metadata() {
+    let r = Root::new("scrubmeta", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    let dump = r.dir.join("scratch/meta-env.txt");
+    let fake = r.dir.join("scratch/fakecargo.cmd");
+    let real = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    fs::write(&fake, format!("@echo off
+if not \"%1\"==\"metadata\" goto run
+echo ---- metadata >> \"{}\"
+set >> \"{}\"
+:run
+\"{real}\" %*
+", dump.display(), dump.display())).unwrap();
+    let out = r.cmd(&["test", "p"]).env("CARGO", &fake).env("PLANTED_API_KEY", "topsecretvalue123").output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    let env = fs::read_to_string(&dump).expect("the fake cargo saw a `metadata` call");
+    // one call lists the packages for the build-source check, one reads the package variables for the copied tests
+    assert!(env.matches("---- metadata").count() >= 2, "{env}");
+    assert!(env.contains("CARGO_TARGET_DIR") || env.to_uppercase().contains("PATH="), "the child still gets its ordinary environment: {env}");
+    assert!(!env.contains("topsecretvalue123") && !env.contains("PLANTED_API_KEY"), "a secret reached a cargo metadata child: {env}");
 }
 
 #[test]

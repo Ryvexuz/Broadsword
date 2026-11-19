@@ -6,15 +6,23 @@
 //!
 //! THE TEST STEP RUNS FROM COPIES. `state/build.lock` (buildsrc.rs) is held only while cargo compiles: the test step runs
 //! `cargo test --no-run --message-format=json-render-diagnostics` under the lock, reads the test executables (and each package's
-//! bin executables) from cargo's JSON, runs any doc-tests (rustdoc compiles those as it runs them, from the shared folder), copies
-//! the executables to `scratch/test-bins/<job id>/`, and RELEASES the lock. The copies then run one after another, each in its
-//! package root with the environment `cargo test` gives a test (`CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`,
-//! `CARGO_PKG_*`, and for integration tests `CARGO_BIN_EXE_<bin>` pointing at the COPIED bin), so another job may rebuild the
-//! shared folder meanwhile. Results, the summary line and exit codes are those of `cargo test`: the first failing executable
-//! stops the step with cargo's exit code 101. The copies are removed when the step ends; a job killed mid-test leaves them, and
-//! the scratch cleanup removes them by age (each copy's modified time is set to the copy time).
-//! Known limit: a test that reads the compile-time `env!("CARGO_BIN_EXE_<bin>")` still gets the shared folder's path, which
-//! another job may rebuild while it runs; read the run-time variable first (Broadsword's own tests do).
+//! bin executables) from cargo's JSON, copies
+//! the executables to `scratch/test-bins/<job id>/`, and RELEASES the lock. The copies then run one after another, in cargo's
+//! order, each in its package root with the environment `cargo test` gives a test (`CARGO`, `CARGO_MANIFEST_DIR`,
+//! `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`, and for integration tests `CARGO_BIN_EXE_<bin>` pointing at the COPIED bin), so another
+//! job may rebuild the shared folder meanwhile. Results, the summary line and exit codes are those of `cargo test`: the first
+//! failing executable stops the step with cargo's exit code 101, and doc-tests run LAST, only if every executable passed.
+//! The copies are removed when the step ends; a job killed mid-test leaves them, and the scratch cleanup removes them by age
+//! (each copy's modified time is set to the copy time).
+//! Every cargo child (including `cargo metadata`) is made by `buildsrc::cargo`, which applies the scrubbed environment.
+//!
+//! Known limits:
+//! - Doc-tests are not copied: rustdoc builds them from the shared folder's library as it runs them. So the step takes the build
+//!   lock AGAIN for them (and re-checks the source note), after the copies; a package with slow doc-tests holds it meanwhile.
+//! - A test that reads the compile-time `env!("CARGO_BIN_EXE_<bin>")` still gets the shared folder's path, which another job
+//!   may rebuild while it runs; read the run-time variable first (Broadsword's own tests do).
+//! - Only executables are copied, not DLLs beside them (cargo puts the `deps` folders on `PATH` on Windows; the copies get no such
+//!   search path), so a test that loads a dylib from the build folder fails or sees another job's files.
 
 use crate::buildsrc;
 use crate::config::Config;
@@ -349,8 +357,8 @@ fn run_child_opts(
 }
 
 /// `cargo <sub> --offline` in `project_dir` (the caller sets the shared build folder).
-fn cargo_command(project_dir: &Path, sub: &str) -> Command {
-    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+fn cargo_command(cfg: &Config, project_dir: &Path, sub: &str) -> Command {
+    let mut c = buildsrc::cargo(cfg); // the one cargo factory: scrubbed environment
     c.arg(sub).arg("--offline").current_dir(project_dir);
     c
 }
@@ -453,19 +461,9 @@ pub fn parse_artifacts(stdout: &str) -> Result<Artifacts, String> {
 
 /// The run-time variables `cargo test` gives a test of each package (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`),
 /// keyed by the package's Cargo.toml, from `cargo metadata --no-deps` in `dir`.
-fn package_envs(dir: &Path) -> Result<Vec<(PathBuf, Vec<(String, String)>)>, String> {
+fn package_envs(cfg: &Config, dir: &Path) -> Result<Vec<(PathBuf, Vec<(String, String)>)>, String> {
     use crate::json::J;
-    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    let out = c
-        .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot start cargo metadata in {}: {e}", dir.display()))?;
-    if !out.status.success() {
-        return Err(format!("cargo metadata failed in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    let j = crate::json::parse(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let j = crate::json::parse(&buildsrc::metadata_json(cfg, dir)?).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
     let Some(J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output has no `packages` list".into()) };
     let text = |p: &J, k: &str| p.get(k).and_then(J::str).unwrap_or("").to_string();
     let mut v = Vec::new();
@@ -546,6 +544,7 @@ struct TestStep<'a> {
     cfg: &'a Config,
     job_id: &'a str,
     project_dir: &'a Path,
+    source: &'a str,
     log: &'a Log,
     free: &'a mut dyn FnMut() -> u64,
     poll: Duration,
@@ -575,22 +574,9 @@ impl TestStep<'_> {
             o => return Ok(done(o, String::new())),
         }
         let arts = parse_artifacts(&compiled.stdout)?;
-        let envs = package_envs(self.project_dir)?;
+        let envs = package_envs(self.cfg, self.project_dir)?;
         let mut kept = String::new();
-        // 2. doc-tests: rustdoc builds them from the shared folder's libraries as it runs them, so they stay under the lock
-        if arts.doctests {
-            let mut doc = cargo_command(self.project_dir, "test");
-            doc.arg("--doc");
-            scrub::apply(&mut doc, self.cfg);
-            doc.env("CARGO_TARGET_DIR", &self.cfg.build_dir);
-            let r = run_child(self.cfg, doc, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
-            kept.push_str(&r.stdout);
-            match r.outcome {
-                Outcome::Exited(Some(0)) => {}
-                o => return Ok(done(o, kept)),
-            }
-        }
-        // 3. copy, then release the lock
+        // 2. copy, then release the lock
         let dir = test_copies_dir(self.cfg, self.job_id);
         let copied = self.copy_all(&arts, &envs, &dir);
         let copied = match copied {
@@ -609,11 +595,38 @@ impl TestStep<'_> {
                 let _ = writeln!(f, "{line}");
             }
         }
-        // 4. run the copies, in cargo's order; the first failure stops the step with cargo's exit code
+        // 3. run the copies, in cargo's order; the first failure stops the step with cargo's exit code (and, as in cargo, no
+        // doc-test runs after a failure)
         let result = self.run_copies(&copied, &mut kept);
         let _ = std::fs::remove_dir_all(&dir);
-        let outcome = result?;
-        Ok(done(outcome, kept))
+        match result? {
+            Outcome::Exited(Some(0)) => {}
+            o => return Ok(done(o, kept)),
+        }
+        // 4. doc-tests, last, as cargo runs them. rustdoc builds them from the shared folder's library as it runs them, so they
+        // need the build lock again, and the source note re-checked (another job may have rebuilt the folder from its own source).
+        if arts.doctests {
+            let (waited, lock) = {
+                let asked = Instant::now();
+                match buildsrc::lock(self.cfg) {
+                    Ok(l) => (asked.elapsed().as_secs_f64(), l),
+                    Err((_, msg)) => return Err(msg),
+                }
+            };
+            self.note(&format!("build lock: taken again for the doc-tests after waiting {waited:.1} s"));
+            for l in buildsrc::prepare(self.cfg, self.project_dir, self.source)?.lines {
+                self.note(&l);
+            }
+            let mut doc = cargo_command(self.cfg, self.project_dir, "test");
+            doc.arg("--doc");
+            doc.env("CARGO_TARGET_DIR", &self.cfg.build_dir);
+            let r = run_child(self.cfg, doc, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets);
+            drop(lock);
+            let r = r?;
+            kept.push_str(&r.stdout);
+            return Ok(done(r.outcome, kept));
+        }
+        Ok(done(Outcome::Exited(Some(0)), kept))
     }
 
     fn copy_all(&self, arts: &Artifacts, envs: &[(PathBuf, Vec<(String, String)>)], dir: &Path) -> Result<Vec<Copied>, String> {
@@ -1058,7 +1071,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         }
         let mut cmd = match (&spec.command, *step) {
             (Some(line), "run") => shell_command(&project_dir, line),
-            _ => cargo_command(&project_dir, step),
+            _ => cargo_command(cfg, &project_dir, step),
         };
         // The one place every job's child gets the shared build folder: cargo steps, and any `cargo ...` inside `run`
         // (a worktree's .cargo/config.toml with a relative target-dir would otherwise build inside the worktree).
@@ -1077,7 +1090,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             }
         };
         let ran = if *step == "test" && kind != "run" {
-            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, log: &log, free: &mut *free_src, poll, on_spawn: &mut on_spawn, secrets: &secrets };
+            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_spawn: &mut on_spawn, secrets: &secrets };
             t.run(cmd, &mut build_hold)
         } else {
             run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets)

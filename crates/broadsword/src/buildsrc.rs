@@ -148,13 +148,17 @@ pub fn parse_packages(metadata: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn cargo() -> Command {
-    Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+/// THE one place this module (and job.rs's test step) starts a cargo child, so every such child gets the scrubbed environment
+/// (`scrub::apply`: no secret-named variable, nothing holding a `.env` value) before the caller adds its own variables.
+pub fn cargo(cfg: &Config) -> Command {
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    crate::scrub::apply(&mut c, cfg);
+    c
 }
 
-/// `cargo metadata --no-deps --format-version 1 --offline` in `dir`: the package names of the folder about to be built.
-pub fn packages_of(dir: &Path) -> Result<Vec<String>, String> {
-    let out = cargo()
+/// The stdout of `cargo metadata --no-deps --format-version 1 --offline` in `dir`, run with the scrubbed environment.
+pub fn metadata_json(cfg: &Config, dir: &Path) -> Result<String, String> {
+    let out = cargo(cfg)
         .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -163,7 +167,12 @@ pub fn packages_of(dir: &Path) -> Result<Vec<String>, String> {
     if !out.status.success() {
         return Err(format!("cargo metadata failed in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
     }
-    parse_packages(&String::from_utf8_lossy(&out.stdout))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The package names of the folder about to be built (from `metadata_json`).
+pub fn packages_of(cfg: &Config, dir: &Path) -> Result<Vec<String>, String> {
+    parse_packages(&metadata_json(cfg, dir)?)
 }
 
 // ---- cleaning ---------------------------------------------------------------------------
@@ -201,7 +210,7 @@ pub fn clean_command(cfg: &Config, dir: &Path, package: &str) -> Result<Command,
     if dir.starts_with(b) {
         return Err(format!("refusing to clean: the source folder {} is inside the build folder {}", dir.display(), b.display()));
     }
-    let mut c = cargo();
+    let mut c = cargo(cfg);
     c.arg("clean").arg("-p").arg(package).arg("--offline").arg("--target-dir").arg(b).current_dir(dir).env("CARGO_TARGET_DIR", b).stdin(Stdio::null());
     Ok(c)
 }
@@ -227,7 +236,7 @@ pub struct Prepared {
 /// needs no clean; it is rewritten to plain `source`, because the cargo step that follows rebuilds what is out of date and
 /// vouches for it. The caller holds the build lock. Err = nothing may be built (the message says why and what to do).
 pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, String> {
-    prepare_packages(cfg, dir, source, packages_of(dir)?, false)
+    prepare_packages(cfg, dir, source, packages_of(cfg, dir)?, false)
 }
 
 /// The preparation a `run` job makes before its command (the command may be `cargo test`, which would otherwise test the
@@ -238,7 +247,7 @@ pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, Strin
 /// Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped. A `cargo clean`
 /// that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
 pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
-    match packages_of(dir) {
+    match packages_of(cfg, dir) {
         Ok(packages) => Ok(prepare_packages(cfg, dir, source, packages, true)?.lines),
         Err(e) => {
             // The packages cannot be listed (a broken Cargo.toml the command may be there to repair), but whatever the command

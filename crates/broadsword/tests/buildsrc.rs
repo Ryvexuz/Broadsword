@@ -63,7 +63,7 @@ impl Root {
             // cargo runs a test with the package root of the checkout being tested as its working directory, so reading
             // src/lib.rs at run time compares the binary with THIS checkout's source even if the test executable itself
             // is a stale one built from another checkout
-            "#[test]\nfn the_binary_is_this_checkouts_binary() {\n    let o = std::process::Command::new(env!(\"CARGO_BIN_EXE_markprobe\")).output().unwrap();\n    let printed = String::from_utf8_lossy(&o.stdout).into_owned();\n    let source = std::fs::read_to_string(\"src/lib.rs\").unwrap();\n    assert!(source.contains(&format!(\"\\\"{printed}\\\"\")), \"binary prints {printed}, this checkout says {source}\");\n}\n",
+            "#[test]\nfn the_binary_is_this_checkouts_binary() {\n    let o = std::process::Command::new(std::env::var(\"CARGO_BIN_EXE_markprobe\").unwrap_or_else(|_| env!(\"CARGO_BIN_EXE_markprobe\").to_string())).output().unwrap();\n    let printed = String::from_utf8_lossy(&o.stdout).into_owned();\n    let source = std::fs::read_to_string(\"src/lib.rs\").unwrap();\n    assert!(source.contains(&format!(\"\\\"{printed}\\\"\")), \"binary prints {printed}, this checkout says {source}\");\n}\n",
         )
         .unwrap();
         set_marker(&p, "MARK-main");
@@ -574,10 +574,13 @@ fn mcp_check_with_task_builds_and_tests_the_worktree() {
 
 /// Job 1 (task t1, whose package note names t2, so it must clean) pauses at the sync gate: it has DECIDED to clean and
 /// has not yet cleaned or built. Job 2 (task t2, whose note matches, so it needs no clean) starts meanwhile. With the
-/// lock, job 2 cannot even read the note until job 1 is finished; then it sees t1's note, cleans and builds its own code.
+/// lock, job 2 cannot even read the note until job 1 has finished COMPILING (a test job releases the lock once its test
+/// executables are copied out, and runs them from the copies); then it sees t1's note, cleans and builds its own code.
 /// Without it, job 2 decides "no clean" off the stale note, job 1 cleans and builds t1 into the folder, and job 2's
 /// cargo reports `Finished` on its own still-fresh build and leaves t1's binary in place: its tests (which run the
-/// binary) fail. Each job's tests assert that the binary is its own checkout's.
+/// binary) fail. Each job's tests assert that the binary is its own checkout's (they read the run-time
+/// `CARGO_BIN_EXE_markprobe`, which is the job's COPY). The shared folder's binary after the jobs is no longer asserted: once
+/// job 1 has copied its executables job 2 may clean and rebuild, and job 1's doc-tests take the lock again.
 #[test]
 fn two_checkouts_building_at_once_each_get_their_own_binary() {
     let r = Root::new("race", 120);
@@ -593,15 +596,12 @@ fn two_checkouts_building_at_once_each_get_their_own_binary() {
     // has ended. Either way the test goes on after this wait; only the outcome below tells the two apart.
     let reached = wait_for(&e2, "TEST HOOK ACTIVE", 6);
     eprintln!("job 2 reached the sync gate while job 1 held it: {reached}");
+    // open both gates: job 1's doc-tests need the lock again after its copies run, and job 2 holds it at its own gate
     fs::write(&g1, "go").unwrap();
-    assert_eq!(finish(j1, 300), 0, "job 1 (t1) failed:\n{}", fs::read_to_string(&e1).unwrap_or_default());
-    assert_eq!(r.probe(), "MARK-t1", "job 1's binary is its own");
     fs::write(&g2, "go").unwrap();
+    assert_eq!(finish(j1, 300), 0, "job 1 (t1) failed:\n{}", fs::read_to_string(&e1).unwrap_or_default());
     assert_eq!(finish(j2, 300), 0, "job 2 (t2) got a binary that is not its own:\n{}", fs::read_to_string(&e2).unwrap_or_default());
-    // the last job to run was t2's, so the folder holds t2's binary (a stale one would still print MARK-t1) and the note agrees
-    assert_eq!(r.probe(), "MARK-t2", "job 2's binary is its own");
     assert!(!reached, "with the lock job 2 must not get past reading the note while job 1 holds it");
-    assert_eq!(r.note().as_deref(), Some(format!("worktrees/proj/{t2}").as_str()));
 }
 
 #[test]
