@@ -56,6 +56,7 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 33. **Scripts that other tools run from another folder need absolute paths, and should check their inputs exist before the first paid call.** [S4]
 34. **When a cheap reviewer keeps failing low-risk tooling with new, non-regression points, verify them against the code, and stop the loop.** The cost is the re-check time, not the review fee. [S4]
 35. **Judge a scale-up on throughput and failures.** Lock wait and test time are costs inside throughput, not a separate veto: record them as warnings, and step back only if merges per hour stop rising, failures rise, or memory runs out (RAM over 90%, swap growing). [S4 close]
+36. **A free slot is filled before any other work.** At the start of every step, list the board and start a coder on every ready task (dependencies merged, claims free) until running = max_agents; hand reviews, audits and records go to background agents so starts never wait. On 2026-11-19 the session averaged 3.2 running tasks of 6 to 10 slots: empty slots, not the slot limit, were the main loss. [S4 close]
 
 ---
 
@@ -101,6 +102,7 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 close | Fable only as a rare one-off (Lazlo, 2026-11-19): never a default coder, reviewer or judge | Weekly Claude allowance lasts | Fable tokens per stage (about 1.4M on 2026-11-19, about 990k of it avoidable) | A security or decisive review done by a weaker model that misses a real bug | open |
 | S4 close | Rule 34 applied: a cheap reviewer's second FAIL with new, non-regression points on low-risk tooling goes to one decisive strong review | Fewer fix rounds on low-risk tooling | Rounds per merged task for haiku-tier entries | Real bugs slipping because the loop stopped early | open |
 | S4 close | Shadow reviewer through Codex with no tools offered (one-entry model catalog), proven by `scripts/shadow_canary.py` | No secret can be read by the shadow; shadow answers fast | Canary exit code after every codex update; shadow seconds per entry (144 s timeouts before, 3-21 s after) | A codex update re-adding a tool (the canary must be re-run; not yet enforced) | open |
+| S4 close | Fill free slots first (Lazlo, 2026-11-19 21:50Z); inbox read at least every 10 minutes | Merged/h | Average running tasks and merged/h from task times vs state/throughput/throughput-review-2026-11-19.md | Coders started on tasks whose dependencies are not really merged; claim collisions | open |
 | S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h; failed/retried jobs; RAM and swap (lock wait and test time as warnings, Lazlo 2026-11-19 21:32Z) | Failures or memory, not lock wait | re-judged under Lazlo's new rule: 2.82 -> 8.44 merged/h, 0 failures, RAM peak 14.8%, no swap = helped; lock-wait p90 26 -> 88 s and test median 82 -> 100 s recorded as warnings. The first verdict (hindered, reverted to 6) used the old rule that made lock wait a veto. Now 14, stepping +4 |
 
 ## Retros, newest first
