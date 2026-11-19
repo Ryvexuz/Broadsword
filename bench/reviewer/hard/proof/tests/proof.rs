@@ -51,7 +51,7 @@ fn bug01_max_attempts_upper_bound_is_inclusive() {
 fn bug02_duplicate_put_race_has_one_winner() {
     let store = Arc::new(Store::open(&config("b02")).unwrap());
     let threads = 8;
-    let rounds = 300;
+    let rounds = 2000;
     let barrier = Arc::new(Barrier::new(threads));
     let handles: Vec<_> = (0..threads)
         .map(|t| {

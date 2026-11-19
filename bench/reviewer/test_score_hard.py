@@ -1,7 +1,7 @@
 """Tests for score_hard.py, with hand-written review texts. Run from bench/reviewer/:
-  python -I -B -m unittest test_score_hard
+  python -B -m unittest test_score_hard
 """
-import json, pathlib, re, tempfile, unittest
+import json, pathlib, re, shutil, subprocess, tempfile, unittest
 
 import score_hard
 
@@ -111,8 +111,23 @@ class ScoreHard(unittest.TestCase):
         src = (HERE / "run.py").read_text(encoding="utf-8")
         self.assertEqual(set(re.findall(r"\bc\[['\"](\w+)['\"]\]", src)), {"id", "diff", "brief"})
 
+    def built_diff(self):
+        """Builds the diff with hard/make_diff.sh into a temp file (cases/ is git-ignored, so a fresh checkout has no
+        hard1.diff). If a cases/hard1.diff exists it must be byte-identical to the fresh one."""
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "bash is needed to run hard/make_diff.sh")
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d) / "hard1.diff"
+            r = subprocess.run([bash, str(HERE / "hard" / "make_diff.sh"), str(out)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            fresh = out.read_bytes()
+        existing = HERE / CASE["diff"]
+        if existing.exists():
+            self.assertEqual(existing.read_bytes(), fresh, "cases/hard1.diff is stale: rerun hard/make_diff.sh")
+        return fresh.decode("utf-8")
+
     def test_brief_and_diff_do_not_hint(self):
-        diff = (HERE / CASE["diff"]).read_text(encoding="utf-8")
+        diff = self.built_diff()
         words = r"\b(bugs?|buggy|planted|decoys?|fixme|todo|xxx|hack|vulnerab\w*|insecure|broken)\b"
         self.assertIsNone(re.search(words, diff, re.I))
         self.assertIsNone(re.search(words, CASE["brief"], re.I))
