@@ -58,6 +58,9 @@ if mode == "hang":
     # a grandchild that inherits the output pipes and outlives the timeout, like node behind codex.cmd
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(25)"], stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
     time.sleep(60)
+if mode == "slow":
+    import time
+    time.sleep(6)
 out = args[args.index("-o") + 1]
 open(out, "w", encoding="utf-8").write("" if mode == "empty" else "VERDICT: FAIL\nBLOCKING: add is wrong\nMINOR: none")
 if mode == "garbage":
@@ -285,6 +288,61 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(j["is_error"] and "401" in j["result"])
         self.assertEqual(j["backend"], "api")
         self.assertIn("code 1", j["codex_error"])
+
+    def test_codex_timeout_then_api_error_names_both(self):
+        Fake.status = 429
+        Fake.reply = {"error": {"message": "You have no credits remaining"}}
+        p = self.run_script(codex="hang", env={"OPENAI_REVIEW_TIMEOUT": "12", "OPENAI_REVIEW_CODEX_SHARE": "0.3"})  # codex gets 3.6 s
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertTrue(j["is_error"])
+        self.assertTrue(j["result"].startswith("codex: "), j["result"])
+        self.assertIn("timed out", j["result"])
+        self.assertIn("; api: ", j["result"])
+        self.assertIn("429", j["result"])
+        self.assertIn("timed out", j["codex_error"])
+        self.assertEqual(j["backend"], "api")
+        self.assertEqual(len(Fake.seen), 1)
+
+    def test_invalid_codex_share_is_an_error_naming_it(self):
+        for bad in ("0", "1.5", "x", "-1", "nan", ""):
+            with self.subTest(share=bad):
+                Fake.seen = []
+                p = self.run_script(env={"OPENAI_REVIEW_TIMEOUT": "30", "OPENAI_REVIEW_CODEX_SHARE": bad})
+                j = json.loads(p.stdout)
+                self.assertEqual(p.returncode, 1)
+                self.assertTrue(j["is_error"] and "OPENAI_REVIEW_CODEX_SHARE" in j["result"], j)
+                self.assertEqual(Fake.seen, [], "no call is made on a bad setting")
+
+    def test_invalid_timeout_is_an_error_naming_it(self):
+        for bad in ("0", "-5", "x", "inf", ""):
+            with self.subTest(timeout=bad):
+                Fake.seen = []
+                p = self.run_script(env={"OPENAI_REVIEW_TIMEOUT": bad, "OPENAI_REVIEW_CODEX_SHARE": "0.5"})
+                j = json.loads(p.stdout)
+                self.assertEqual(p.returncode, 1)
+                self.assertTrue(j["is_error"] and "OPENAI_REVIEW_TIMEOUT" in j["result"], j)
+                self.assertEqual(Fake.seen, [])
+
+    def test_share_of_one_gives_codex_the_whole_deadline(self):
+        # the fake codex answers after 6 s: with share 1.0 and 8 s it fits; with 0.5 (4 s) it would time out
+        p = self.run_script(codex="slow", env={"OPENAI_REVIEW_TIMEOUT": "8", "OPENAI_REVIEW_CODEX_SHARE": "1.0"})
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertEqual(Fake.seen, [])
+        self.assertNotIn("notes", j, "both settings were given, so no legacy-default note")
+
+    def test_absent_settings_use_the_legacy_values_and_say_so(self):
+        p = self.run_script()  # no codex: fallback; neither variable set
+        j = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        notes = " ".join(j["notes"])
+        self.assertIn("OPENAI_REVIEW_TIMEOUT", notes)
+        self.assertIn("OPENAI_REVIEW_CODEX_SHARE", notes)
+        self.assertIn("OPENAI_REVIEW_TIMEOUT", j["codex_error"])
+        p = self.run_script(codex="ok")
+        self.assertIn("OPENAI_REVIEW_CODEX_SHARE", " ".join(json.loads(p.stdout)["notes"]))
 
     def test_unreachable_server_is_an_error(self):
         p = self.run_script(base="http://127.0.0.1:1/v1")

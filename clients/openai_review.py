@@ -13,7 +13,9 @@ the queue's scrub drops only secret-named variables, so they survive.
 The key comes from the OPENAI_API_KEY environment variable, else the main root's `.env` (the loader in openai_mcp.py).
 Optional environment: OPENAI_BASE_URL (tests point it at a local fake server), OPENAI_PRICE_INPUT_PER_MTOK and
 OPENAI_PRICE_OUTPUT_PER_MTOK (USD per million tokens; both needed for a cost), OPENAI_REVIEW_TIMEOUT (seconds, ONE deadline for the whole call,
-default 240, inside the queue's 300 s shadow limit; codex gets at most 60% of it, the API fallback the rest).
+inside the queue's shadow limit) and OPENAI_REVIEW_CODEX_SHARE (0 < share <= 1, the part of it codex may use; the API fallback gets the
+rest). Invalid values are an error naming the variable. Until the queue passes them, absent ones use 240 and 0.6 and the result's "notes"
+(and "codex_error" on a fallback) say so.
 """
 
 import sys
@@ -98,18 +100,37 @@ def codex_env(environ, root: Path) -> dict:
     return {k: v for k, v in environ.items() if k.upper() != "OPENAI_API_KEY" and v.strip() not in secrets}
 
 
-def timeout_of(environ) -> float:
-    """The ONE deadline for the whole call (codex plus the API fallback). The default sits inside the queue's
-    shadow_reviewer_timeout_seconds (300 in broadsword.toml): the queue passes no timeout to this wrapper, it only kills it at that
-    limit, so the wrapper must finish and print its JSON before then."""
-    try:
-        return float(environ.get("OPENAI_REVIEW_TIMEOUT", "240"))
-    except ValueError:
-        return 240.0
+# TEMPORARY (task t-20261119-175203): until the queue passes OPENAI_REVIEW_TIMEOUT and OPENAI_REVIEW_CODEX_SHARE, an ABSENT variable
+# falls back to these and the result says so. A PRESENT but invalid value is always an error. Remove once the queue passes both.
+LEGACY_TIMEOUT = 240.0
+LEGACY_CODEX_SHARE = 0.6
 
 
-# Codex may use at most this share of the overall deadline, so a hung codex still leaves the API fallback real time to answer.
-CODEX_SHARE = 0.6
+def settings_of(environ):
+    """(overall deadline seconds, codex share of it, notes). OPENAI_REVIEW_TIMEOUT is the ONE deadline for the whole call (codex plus
+    the API fallback); the queue only kills this wrapper at shadow_reviewer_timeout_seconds, so the value it passes must leave room to
+    print the JSON. OPENAI_REVIEW_CODEX_SHARE (0 < share <= 1) is the part of it codex may use. A present but invalid value raises
+    oc.Fail naming the variable; an absent one uses the legacy value and adds a note naming the variable."""
+    notes = []
+
+    def number(name, legacy, ok, rule):
+        raw = environ.get(name)
+        if raw is None:
+            notes.append(f"{name} not set: using the legacy {legacy:g}")
+            return legacy
+        try:
+            v = float(raw)
+        except ValueError:
+            raise oc.Fail(f"{name} is invalid ({raw!r}): {rule}")
+        if not (v == v and ok(v)):
+            raise oc.Fail(f"{name} is invalid ({raw!r}): {rule}")
+        return v
+
+    timeout = number("OPENAI_REVIEW_TIMEOUT", LEGACY_TIMEOUT, lambda v: 0 < v < float("inf"), "must be a number of seconds > 0")
+    share = number("OPENAI_REVIEW_CODEX_SHARE", LEGACY_CODEX_SHARE, lambda v: 0 < v <= 1, "must be a number with 0 < share <= 1")
+    return timeout, share, notes
+
+
 # The API fallback needs at least this many seconds; with less it fails with a clear error instead of starting a doomed call.
 MIN_API_SECONDS = 5.0
 
@@ -154,13 +175,13 @@ def run_with_deadline(cmd, text_in: str, work: str, environ, budget: float):
     return p.returncode, out, err
 
 
-def review_codex(args, prompt: str, environ, deadline: float) -> dict:
+def review_codex(args, prompt: str, environ, deadline: float, timeout: float, share: float) -> dict:
     """Answer through the Codex CLI (the ChatGPT plan). Raises oc.Fail with a short reason when it cannot."""
     exe = find_codex(environ)
     if exe is None:
         raise oc.Fail("codex executable not found")
     text_in = (f"=== SYSTEM INSTRUCTIONS ===\n{args.system_prompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n" if args.system_prompt else "") + prompt
-    budget = min(timeout_of(environ) * CODEX_SHARE, deadline - time.monotonic())
+    budget = min(timeout * share, deadline - time.monotonic())
     with tempfile.TemporaryDirectory(prefix="bsw-codex-") as work:
         answer = Path(work) / "answer.txt"
         cmd = [exe, "exec", "-m", args.model, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-o", str(answer), "-"]
@@ -195,26 +216,34 @@ def review_codex(args, prompt: str, environ, deadline: float) -> dict:
 
 
 def review(args, prompt: str, environ) -> dict:
-    deadline = time.monotonic() + timeout_of(environ)
+    timeout, share, notes = settings_of(environ)
+    deadline = time.monotonic() + timeout
     try:
-        return review_codex(args, prompt, environ, deadline)
+        result = review_codex(args, prompt, environ, deadline, timeout, share)
+        if notes:
+            result["notes"] = notes
+        return result
     except Exception as e:  # any codex failure falls back, and is recorded
         codex_error = oc.redact(f"{type(e).__name__}: {e}" if not isinstance(e, oc.Fail) else str(e))[:400]
     try:
-        result = review_api(args, prompt, environ, deadline - time.monotonic())
+        result = review_api(args, prompt, environ, deadline - time.monotonic(), timeout)
     except oc.Fail as e:
         result = error_result(str(e))
     except Exception as e:
         result = error_result(f"unexpected {type(e).__name__}: {e}")
+    if result["is_error"]:  # the final error must show the codex failure too, not only the API's
+        result["result"] = f"codex: {codex_error}; api: {result['result']}"
     result["backend"] = "api"
-    result["codex_error"] = codex_error
+    result["codex_error"] = codex_error + ("; " + "; ".join(notes) if notes else "")
+    if notes:
+        result["notes"] = notes
     return result
 
 
-def review_api(args, prompt: str, environ, remaining: float) -> dict:
+def review_api(args, prompt: str, environ, remaining: float, timeout_total: float) -> dict:
     """The API fallback, given what is left of the one overall deadline. No retries: a retry could run past the deadline."""
     if remaining < MIN_API_SECONDS:
-        raise oc.Fail(f"only {max(remaining, 0):.1f} s of the {timeout_of(environ):.0f} s deadline remain, under the {MIN_API_SECONDS:.0f} s the API needs")
+        raise oc.Fail(f"only {max(remaining, 0):.1f} s of the {timeout_total:.0f} s deadline remain, under the {MIN_API_SECONDS:.0f} s the API needs")
     root = oc.find_main_root(HERE)
     key = oc.load_api_key(root, environ)
     base = environ.get("OPENAI_BASE_URL") or oc.DEFAULT_BASE_URL
