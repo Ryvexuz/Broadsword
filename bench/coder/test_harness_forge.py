@@ -12,7 +12,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
-import importlib.util, pathlib, re, tempfile, unittest
+import importlib.util, os, pathlib, re, tempfile, unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("coder_harness_under_test", HERE / "harness.py")
@@ -63,6 +63,28 @@ pub fn parse_duration(_input: &str) -> Result<u64, DurationError> {{
         self.assertTrue(r["compiles"], r["first_error"])
         self.assertEqual(r["failed_tests"], ["hidden_zero_capacity_panics"])
         self.assertIn("timed out", r["failure_detail"])
+
+    def test_list_timeout_is_an_error_result_and_the_batch_continues(self):
+        # CODER_BENCH_TEST_PROCESS_TIMEOUT_S can only make the limit stricter; 0.001 s cannot even start a process
+        t = task("01-duration")
+        ref = (t / "reference.rs").read_text(encoding="utf-8")
+        old = os.environ.get("CODER_BENCH_TEST_PROCESS_TIMEOUT_S")
+        os.environ["CODER_BENCH_TEST_PROCESS_TIMEOUT_S"] = "0.001"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                f = pathlib.Path(tmp) / "ref.rs"
+                f.write_text(ref, encoding="utf-8")
+                rs = H.grade_batch([(f, t), (f, t)])
+        finally:
+            if old is None:
+                del os.environ["CODER_BENCH_TEST_PROCESS_TIMEOUT_S"]
+            else:
+                os.environ["CODER_BENCH_TEST_PROCESS_TIMEOUT_S"] = old
+        self.assertEqual(len(rs), 2, "the batch must go on after a listing that times out")
+        for r in rs:
+            self.assertTrue(r["timed_out"])
+            self.assertEqual(r["passed"], 0)
+            self.assertIn("timed out", r["first_error"])
 
 
 if __name__ == "__main__":

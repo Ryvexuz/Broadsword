@@ -42,7 +42,8 @@ class RunTimeout(unittest.TestCase):
             self.assertEqual(len(results), 2, "both tasks must get a result, the first timeout must not abort the run")
             for r in results:
                 rec = json.loads(r.read_text(encoding="utf-8"))
-                self.assertTrue(rec["format_failure"])
+                self.assertTrue(rec["call_failed"])
+                self.assertFalse(rec["format_failure"])
                 self.assertIn("timed out after 1s", rec["first_error"])
                 self.assertFalse(rec["compiles"])
                 self.assertEqual(rec["passed"], 0)

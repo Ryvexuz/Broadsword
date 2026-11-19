@@ -105,6 +105,29 @@ class Regrade(unittest.TestCase):
             self.assertIn("$0.500+ (2 n/a)", buf.getvalue())
             self.assertNotIn("n/a  ", buf.getvalue().replace("(2 n/a)", ""))
 
+    def test_score_compile_column_ignores_ungraded_and_failed_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            base = {"provider": "claude", "model": "m", "effort": "default", "cost_usd": 0.1, "wall_s": 1.0,
+                    "passed": 0, "total": 2, "format_failure": False}
+            recs = {"01-duration": dict(base, compiles=False, graded=False),
+                    "02-ring-buffer": dict(base, compiles=False, graded=True, call_failed=True),
+                    "03-merge-intervals": dict(base, compiles=False, graded=True, call_failed=False),
+                    "04-ttl-lru": dict(base, compiles=True, graded=True, call_failed=False, passed=2)}
+            for task, rec in recs.items():
+                (out / f"{task}.json").write_text(json.dumps(dict(rec, task=task)), encoding="utf-8")
+            score = load("score")
+            sys.argv = ["score.py", str(out)]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                score.main()
+            lines = buf.getvalue().splitlines()
+            head = lines[0]
+            vals = lines[1]
+            ci, ki = head.index("compile"), head.index("call")
+            self.assertEqual(vals[ci:ci + 7].strip(), "1", "only the graded, non-failed-call task 03 counts")
+            self.assertEqual(vals[ki:ki + 4].strip(), "1")
+
 
 if __name__ == "__main__":
     unittest.main()

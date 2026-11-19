@@ -19,7 +19,7 @@ that is how the smoke test uses a fake CLI. The model sees only the task's spec.
 
 Per task it writes <out-dir>/<task>__<provider>__<model>__<effort>.{raw.json,answer.txt,rs,json}.
 The result .json holds: provider, model, effort, task, tokens, cost_usd, wall_s (the model call),
-harness_wall_s, compiles, passed, total, graded, format_failure, first_error, model_used.
+harness_wall_s, compiles, passed, total, graded, call_failed, format_failure, first_error, model_used.
 graded is false when the model call was made but grading failed; passed/compiles are then not real.
 """
 import importlib.util, json, os, pathlib, re, subprocess, sys, time, tomllib
@@ -154,18 +154,19 @@ def main():
         (out / f"{tag}.raw.json").write_bytes(res["raw"])
         (out / f"{tag}.answer.txt").write_text(res["answer"], encoding="utf-8")
         code, problem = extract_code(res["answer"])
-        if res.get("is_error") and not res["answer"]:
+        call_failed = bool(res.get("is_error") and not res["answer"])
+        if call_failed:
             problem = f"model call failed: {res.get('error')}"
         rec = {"provider": provider, "model": model, "effort": effort, "task": t.name, "tokens": res["tokens"],
                "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"], "harness_wall_s": None,
-               "compiles": False, "passed": 0, "total": total, "graded": True, "format_failure": problem is not None,
+               "compiles": False, "passed": 0, "total": total, "graded": True, "call_failed": call_failed, "format_failure": problem is not None and not call_failed,
                "first_error": problem, "model_used": res.get("model_used", [])}
         recs.append((tag, rec))
         if code is not None:
             rs = out / f"{tag}.rs"
             rs.write_text(code, encoding="utf-8")
             to_grade.append((rec, rs, t))
-        print(f"{tag}: model call {rec['wall_s']}s cost={rec['cost_usd']} format_failure={rec['format_failure']}", flush=True)
+        print(f"{tag}: model call {rec['wall_s']}s cost={rec['cost_usd']} call_failed={rec['call_failed']} format_failure={rec['format_failure']}", flush=True)
     # one Broadsword job grades every extracted solution (see harness.py)
     if to_grade:
         try:

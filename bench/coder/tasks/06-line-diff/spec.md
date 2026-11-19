@@ -47,5 +47,5 @@ Examples (old, new, then one minimal script):
 
 - Use only the Rust standard library. No external crates.
 - No `unsafe` code.
-- Inputs with a few thousand lines each, differing in only a few places, must be handled quickly, and memory use must stay reasonable (do not allocate a table with one cell for every pair of lines if the inputs are long).
+- Speed and memory: the inputs may have tens of thousands of lines each, and then they differ in only a few dozen places at most. Such an input must be diffed within a few seconds. So do not allocate a table with one cell for every pair of lines, and do not do work proportional to the product of the two lengths; the time must depend mainly on the length of the inputs plus the number of changes.
 - Provide a single complete Rust source file that compiles as a library crate root (`lib.rs`), edition 2021.

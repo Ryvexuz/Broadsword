@@ -92,7 +92,6 @@ def grade_inner(solution_path, task_dir):
     """Runs cargo test for one solution. Must be called inside a Broadsword job."""
     solution = pathlib.Path(solution_path).read_text(encoding="utf-8")
     tests = (task_dir / "tests.rs").read_text(encoding="utf-8")
-    total = len(re.findall(r"#\[test\]", tests))
     crate = WORK / "crates" / task_dir.name
     (crate / "src").mkdir(parents=True, exist_ok=True)
     (crate / "tests" / "common").mkdir(parents=True, exist_ok=True)
@@ -103,6 +102,10 @@ def grade_inner(solution_path, task_dir):
     (crate / "tests" / "common" / "mod.rs").write_text(
         (HERE / "support" / "common.rs").read_text(encoding="utf-8"), encoding="utf-8")
     env = dict(os.environ, CODER_BENCH_TEST_TIMEOUT_S=str(CFG["test_timeout_seconds"]))
+    # a test seam that can only make the limit stricter: the env value is used only if it is smaller
+    proc_timeout = CFG["test_process_timeout_seconds"]
+    if os.environ.get("CODER_BENCH_TEST_PROCESS_TIMEOUT_S"):
+        proc_timeout = min(proc_timeout, float(os.environ["CODER_BENCH_TEST_PROCESS_TIMEOUT_S"]))
     t0 = time.time()
     deadline = t0 + CFG["harness_timeout_seconds"]
     total = len(re.findall(r"#\[test\]", tests))   # only used when the tests cannot be listed (compile failure)
@@ -140,8 +143,13 @@ def grade_inner(solution_path, task_dir):
         return finish()
     res["compiles"] = True
     # 2. the test list comes from libtest itself (not from the text of tests.rs)
-    lp = subprocess.run([exe, "--list", "--format", "terse"], env=env, cwd=crate, capture_output=True,
-                        timeout=CFG["test_process_timeout_seconds"])
+    try:
+        lp = subprocess.run([exe, "--list", "--format", "terse"], env=env, cwd=crate, capture_output=True,
+                            timeout=proc_timeout)
+    except subprocess.TimeoutExpired:
+        res["timed_out"] = True
+        res["first_error"] = f"listing the tests timed out after {proc_timeout}s"
+        return finish()
     names = re.findall(r"^(\S+): test$", lp.stdout.decode("utf-8", errors="replace"), re.M)
     if lp.returncode != 0 or not names:
         res["compiles"] = False
@@ -161,13 +169,13 @@ def grade_inner(solution_path, task_dir):
         tp = subprocess.Popen([exe, "--exact", name, "--test-threads=1", "--color", "never"], env=env, cwd=crate,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
-            tout, _ = tp.communicate(timeout=CFG["test_process_timeout_seconds"])
+            tout, _ = tp.communicate(timeout=proc_timeout)
         except subprocess.TimeoutExpired:
             res["timed_out"] = True
             kill_tree(tp)
             tout, _ = tp.communicate()
             failed_tests.append(name)
-            details.append(f"---- {name} ---- killed after {CFG['test_process_timeout_seconds']}s")
+            details.append(f"---- {name} ---- killed after {proc_timeout}s")
             continue
         text = tout.decode("utf-8", errors="replace")
         if tp.returncode == 0 and re.search(r"^test result: ok\. 1 passed; 0 failed;", text, re.M):

@@ -40,12 +40,12 @@ It goes through Broadsword, never plain cargo: one `broadsword build/run`-style 
 broadsword run broadsword [--task <id>] -- python -I -B harness.py --inner <spec.json> <result.json>
 ```
 
-and the inner step runs cargo once per solution. So every grading gets the disk guard, the shared build folder, a Git checkpoint and a job log, and the wait for the build lock is paid once per batch (the lock can be busy for minutes). `prove.py` and `run.py` each grade all their solutions in one batch. Set `BENCH_BROADSWORD_TASK=<task id>` to run the job under a task's worktree.
+and the inner step builds each solution once and runs its test binary once per test. So every grading gets the disk guard, the shared build folder, a Git checkpoint and a job log, and the wait for the build lock is paid once per batch (the lock can be busy for minutes). `prove.py` and `run.py` each grade all their solutions in one batch. Set `BENCH_BROADSWORD_TASK=<task id>` to run the job under a task's worktree.
 
 Result per solution: `compiles`, `passed`, `failed`, `total`, `wall_s`, `first_error`, `timed_out`.
 
 - A solution that does not compile scores 0 and keeps the first compiler error.
-- `total` is the number of `#[test]` functions; `failed = total - passed`, so a crash that kills the test binary still fails the unfinished tests.
+- `total` is the number of tests libtest lists in the built test binary (`--list`); `failed = total - passed`, so a crash that kills the test binary still fails the unfinished tests.
 - **Per-test timeout:** every call into the solution runs inside `within(...)` (a thread with a timeout, `test_timeout_seconds` in `config.toml`), so a looping solution fails that test instead of hanging. Expecting a panic is `assert!(panics_within(|| ...))`, never `#[should_panic]` (a timeout panic would pass it). Each test process is also killed after `test_process_timeout_seconds` and the whole run after `harness_timeout_seconds`.
 - A test that panics, or a solution with `unsafe`, fails or does not compile; nothing else is skipped.
 
@@ -116,7 +116,7 @@ prints one row per model and effort, one column per task (passed/total), the tot
 
 ## Settings (`config.toml`)
 
-`broadsword_exe`, `broadsword_project`, `work_dir` (all relative to the Broadsword root, found as the nearest parent folder holding `build/bin/broadsword.exe`), `test_timeout_seconds`, `harness_timeout_seconds`, `model_timeout_seconds`, `lock_wait_seconds`. All are required.
+`broadsword_exe`, `broadsword_project`, `work_dir` (all relative to the Broadsword root, found as the nearest parent folder holding `build/bin/broadsword.exe`), `test_timeout_seconds`, `test_process_timeout_seconds`, `harness_timeout_seconds`, `model_timeout_seconds`, `lock_wait_seconds`. All are required.
 
 ## Known limits
 

@@ -227,7 +227,8 @@ class RunPy(unittest.TestCase):
         rec = json.loads((out / "01-duration__openai__gpt-fake__high.json").read_text(encoding="utf-8"))
         self.assertIsNone(rec["cost_usd"])
         self.assertEqual(rec["exit"], 1)
-        self.assertTrue(rec["format_failure"])
+        self.assertTrue(rec["call_failed"])
+        self.assertFalse(rec["format_failure"])
         self.assertIn("model call failed", rec["first_error"])
         self.assertIn("finish_reason='length'", rec["first_error"])
 
