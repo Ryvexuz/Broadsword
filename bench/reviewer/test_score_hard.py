@@ -53,6 +53,17 @@ class ScoreHard(unittest.TestCase):
             re.compile(b["catch"])
             self.assertTrue(b["file"].startswith("src/") and len(b["lines"]) == 2)
 
+    def test_every_catch_in_cases_json_compiles(self):
+        # the old score.py compiles each case's top-level `catch` with re.compile;
+        # Python 3.11+ refuses a global flag that is not at the start
+        cases = json.loads((HERE / "cases.json").read_text(encoding="utf-8"))
+        for c in cases:
+            if "catch" in c:
+                re.compile(c["catch"])
+        hard = [c for c in cases if c["id"] == "hard1"][0]
+        self.assertTrue(hard["catch"].startswith("(?i)"))
+        self.assertEqual(hard["catch"].count("(?i)"), 1)
+
     def test_perfect_review(self):
         s = score_hard.score_text(PERFECT, CASE)
         self.assertEqual(len(s["caught"]), 12, s)
