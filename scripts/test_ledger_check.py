@@ -66,10 +66,11 @@ class Repo:
                 "broadsword_toml_sha256": "f" * 64, "metrics": values, "samples": {"merged_tasks": merged}, "per_model": {}, "notes": []}
         (self.root / "state" / "baselines" / f"{name}.json").write_text(json.dumps(data), encoding="utf-8")
 
-    def run(self, since=None, max_days="7"):
+    def run(self, since=None, max_days="7", defaults=False):
         since = since or (today() - dt.timedelta(days=60)).isoformat()
+        extra = [] if defaults else ["--min-samples", "5", "--noise", "10"]
         return subprocess.run([sys.executable, "-I", "-B", str(self.root / "scripts" / "ledger_check.py"), "--since", since,
-                               "--max-pending-days", max_days, "--min-samples", "5", "--noise", "10"],
+                               "--max-pending-days", max_days, *extra],
                               capture_output=True, text=True, timeout=120)
 
 
@@ -106,6 +107,39 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("WORSE and not marked", res.stdout)
         self.assertIn("ledger: 1 problem", res.stdout)
+
+    def test_negated_or_future_marker_does_not_count(self):
+        for status in ("open, not reverted yet", "open, will be fixed", "open, to be reverted if it hurts",
+                       "open, never reverted in abc1234", "open, not fixed in abc1234"):
+            with self.subTest(status=status):
+                self.r.retro([row("S5", "Bigger batches", f"{status}; before: pre after: post-worse")])
+                res = self.r.run()
+                self.assertEqual(res.returncode, 1, res.stdout)
+                self.assertIn("not marked", res.stdout)
+
+    def test_clear_markers_count(self):
+        for status in ("reverted in abc1234; before: pre after: post-worse", "fixed, before: pre after: post-worse",
+                       "open, reverted in abc1234; before: pre after: post-worse",
+                       "hindered: slower, reverted; before: pre after: post-worse"):
+            with self.subTest(status=status):
+                self.r.retro([row("S5", "Bigger batches", status)])
+                res = self.r.run()
+                self.assertEqual(res.returncode, 0, res.stdout)
+                self.assertIn("marked", res.stdout)
+
+    def test_defaults_when_flags_omitted(self):
+        self.r.retro([row("S5", "Bigger batches", "open, before: pre after: post-worse")])
+        res = self.r.run(defaults=True)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("WORSE", res.stdout)
+
+    def test_row_removed_and_readded_is_dated_by_the_readd(self):
+        r = row("S5", "Comes back", "open, before: pre after: post-better")
+        self.r.retro([r], commit_date=today() - dt.timedelta(days=20))
+        self.r.retro([], commit_date=today() - dt.timedelta(days=10))
+        self.r.retro([r], commit_date=today() - dt.timedelta(days=1))
+        res = self.r.run(since=(today() - dt.timedelta(days=5)).isoformat())
+        self.assertIn("checked 1 of 1", res.stdout)
 
     def test_worse_row_marked_reverted_passes(self):
         self.r.retro([row("S5", "Bigger batches", "hindered, reverted in abc123; before: pre after: post-worse")])
