@@ -16,9 +16,13 @@ A file whose source bytes (sha256) were already archived under the same source p
 in the archive repo records them), so a second run copies nothing.
 
 Secrets (never relaxed)
-- Files named `.env*`, `*.pem`, `*.key`, `*.pfx`, `id_rsa*`, or with `secret` or `credential` in the name are refused by name.
-- A file whose content is a private-key block, or looks like a renamed `.env` (every non-comment line is `NAME=value` and one
-  name is secret-like), is refused by content. Refused files are listed, never copied.
+- Files whose name marks a secret are refused whole: the secret-file name rule of crates/broadsword/src/git.rs `is_secret_name`
+  (`.env`, `.envrc`, `.env.<name>`, `.env-*`, `.env_*`, any case, trailing dots and spaces dropped, each `:` piece of an NTFS
+  stream name checked; `.envoy.yaml` and `.environment` are ordinary), `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*` (also dsa,
+  ecdsa, ed25519), or `secret` or `credential` in the name. Refused files are listed, never copied.
+- A queue file whose content is a private-key block, or looks like a renamed `.env` (every non-comment line is `NAME=value` and
+  one name is secret-like), is refused by content. A failed-job LOG that trips the same content check is archived REDACTED
+  instead (key block and every `NAME=value` value replaced by `[REDACTED]`), because the sweep would delete it for good.
 - Every copied text is redacted first with the same rule as the reviewer's (`Secrets` in crates/broadsword/src/reviewer.rs):
   every value in `<root>/.env` of at least `redact_min_chars` characters, and the value of every secret-named environment
   variable, become `[REDACTED]`, longest first; plus the `sk-...` look-alike rule of clients/openai_mcp.py. The script reads the
@@ -35,7 +39,11 @@ Usage:
     python -I -B scripts/archive_evidence.py [--root <main checkout>] [--dry-run] [--date YYYY-MM-DD]
 `--dry-run` lists what would be copied (and the file count and bytes) and writes nothing, not even the archive repo.
 
-Exit codes: 0 done; 1 one or more files could not be read, or git failed; 2 bad command line or settings.
+A second run (the hourly cleanup and a manual run) is refused while one holds the OS lock `<state_dir>/evidence-archive.lock`
+(dry runs take no lock). The manifest is appended only after the archive commit succeeded.
+
+Exit codes: 0 done; 1 one or more files could not be read, git failed, the manifest cannot be read, or another run holds the
+lock; 2 bad command line or settings.
 Python 3.11+, standard library only.
 """
 
@@ -54,15 +62,22 @@ from pathlib import Path
 CONFIG_FILE = "broadsword.toml"
 ARCHIVE_NAME = "evidence-archive"  # inside state_dir
 MANIFEST = "manifest.tsv"
+LOCK_NAME = "evidence-archive.lock"  # inside state_dir, outside the archive repo
 REQUIRED_KEYS = ("state_dir", "scratch_dir", "redact_min_chars")
 KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_*\-]{3,}")  # the same rule as clients/openai_mcp.py
-NAME_REFUSED = re.compile(r"(^\.env)|(\.(pem|key|pfx|p12)$)|(^id_(rsa|dsa|ecdsa|ed25519))|secret|credential", re.IGNORECASE)
+NAME_REFUSED = re.compile(r"(\.(pem|key|pfx|p12)$)|(^id_(rsa|dsa|ecdsa|ed25519))|secret|credential", re.IGNORECASE)
 PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+PRIVATE_KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL)
+DOTENV_VALUE = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=).*$", re.MULTILINE)
 DOTENV_LINE = re.compile(r"^(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=")
 
 
 class Fail(Exception):
-    pass
+    """A named error. `code` is the exit code: 2 for bad settings, 1 for everything that went wrong while archiving."""
+
+    def __init__(self, message: str, code: int = 2):
+        super().__init__(message)
+        self.code = code
 
 
 # ---- settings -----------------------------------------------------------------------------------
@@ -132,9 +147,30 @@ def redact(text: str, secrets: list[str]) -> str:
 # ---- refusal ------------------------------------------------------------------------------------
 
 
-def refuse_reason(name: str, data: bytes) -> str | None:
-    if NAME_REFUSED.search(name):
+def is_secret_env_name(name: str) -> bool:
+    """The Rust rule `is_secret_name` (crates/broadsword/src/git.rs), ported exactly: `.env`, `.envrc`, `.env.<name>`, `.env-*`,
+    `.env_*`, any case; trailing dots and spaces dropped; every `:` piece (NTFS stream names) is checked."""
+    for piece in name.split(":"):
+        n = piece.rstrip(" .").lower()
+        if n == ".env" or n == ".envrc" or (len(n) > len(".env.") and n.startswith(".env.")) or n.startswith(".env-") or n.startswith(".env_"):
+            return True
+    return False
+
+
+def name_refusal(name: str) -> str | None:
+    if is_secret_env_name(name) or NAME_REFUSED.search(name):
         return "secret-like file name"
+    return None
+
+
+def scrub_content(text: str) -> str:
+    """For a log that trips the content check: private key blocks and every `NAME=value` value become [REDACTED]."""
+    text = PRIVATE_KEY_BLOCK.sub("[REDACTED]", text)
+    return DOTENV_VALUE.sub(r"\1[REDACTED]", text)
+
+
+def refuse_reason(name: str, data: bytes) -> str | None:
+    """The content check only (the name check is `name_refusal`)."""
     if PRIVATE_KEY.search(data):
         return "contains a private key block"
     lines = [ln.strip() for ln in data.decode("utf-8", errors="replace").splitlines()]
@@ -198,22 +234,58 @@ def find_sources(root: Path, cfg: dict) -> tuple[list[tuple[str, Path]], list[st
 def read_manifest(path: Path) -> set[tuple[str, str]]:
     seen = set()
     if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            raise Fail(f"cannot read the manifest {path} ({type(e).__name__}); fix or move it, nothing was archived", 1)
+        for line in text.splitlines():
             parts = line.split("\t")
             if len(parts) >= 3:
                 seen.add((parts[1], parts[2]))  # (source key, sha256)
     return seen
 
 
+def scrubbed_git_env(environ: dict[str, str]) -> dict[str, str]:
+    """The environment without any GIT_* variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE ... would aim git at another repo)."""
+    return {k: v for k, v in environ.items() if not k.upper().startswith("GIT_")}
+
+
 def git(archive: Path, *args: str) -> subprocess.CompletedProcess:
     cmd = ["git", "-c", "user.name=broadsword-archive", "-c", "user.email=archive@broadsword.invalid",
            "-c", "commit.gpgsign=false", *args]
-    return subprocess.run(cmd, cwd=archive, capture_output=True, text=True)
+    return subprocess.run(cmd, cwd=archive, capture_output=True, text=True, env=scrubbed_git_env(dict(os.environ)))
+
+
+def acquire_lock(path: Path):
+    """An OS lock on `path` (released when the file closes or the process dies, so a crash never leaves it stuck)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise Fail(f"another archive run holds the lock {path}; this run did nothing", 1)
+    return f
 
 
 def run(root: Path, dry_run: bool, date: str, environ: dict[str, str], out=print) -> int:
     cfg = load_settings(root)
     archive = root / cfg["state_dir"] / ARCHIVE_NAME
+    lock = None if dry_run else acquire_lock(root / cfg["state_dir"] / LOCK_NAME)
+    try:
+        return _run_locked(root, cfg, archive, dry_run, date, environ, out)
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def _run_locked(root: Path, cfg: dict, archive: Path, dry_run: bool, date: str, environ: dict[str, str], out) -> int:
     secrets = collect_secrets(root, environ, cfg["redact_min_chars"])
     sources, errors, missing = find_sources(root, cfg)
     manifest_path = archive / MANIFEST
@@ -228,15 +300,27 @@ def run(root: Path, dry_run: bool, date: str, environ: dict[str, str], out=print
         except OSError as e:
             errors.append(f"{path}: cannot read ({type(e).__name__}: {e})")
             continue
-        reason = refuse_reason(path.name, data)
+        reason = name_refusal(path.name)
         if reason:
             refused.append(f"{key}: {reason}")
             continue
+        reason = refuse_reason(path.name, data)
+        scrub = False
+        if reason:
+            if key.startswith("jobs/"):  # a failed-job log is lost at the next sweep: archive it redacted, not dropped
+                scrub = True
+                out(f"scrubbed {key}: {reason}; archived redacted")
+            else:
+                refused.append(f"{key}: {reason}")
+                continue
         digest = hashlib.sha256(data).hexdigest()
         if (key, digest) in seen:
             skipped += 1
             continue
-        red = redact(data.decode("utf-8", errors="surrogateescape"), secrets).encode("utf-8", errors="surrogateescape")
+        text = data.decode("utf-8", errors="surrogateescape")
+        if scrub:
+            text = scrub_content(text)
+        red = redact(text, secrets).encode("utf-8", errors="surrogateescape")
         to_copy.append((key, path, red, digest))
 
     total = sum(len(r) for _, _, r, _ in to_copy)
@@ -254,22 +338,33 @@ def run(root: Path, dry_run: bool, date: str, environ: dict[str, str], out=print
         day = archive / date
         archive.mkdir(parents=True, exist_ok=True)
         if not (archive / ".git").exists():
-            r = subprocess.run(["git", "init", "-q"], cwd=archive, capture_output=True, text=True)
+            r = git(archive, "init", "-q")
             if r.returncode != 0:
-                raise Fail(f"git init failed: {r.stderr.strip()}")
+                raise Fail(f"git init failed: {r.stderr.strip()}", 1)
         lines = []
         for key, _, red, digest in to_copy:
             dest = day / key
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(red)
             lines.append(f"{date}\t{key}\t{digest}\n")
-        with manifest_path.open("a", encoding="utf-8", newline="\n") as f:
-            f.writelines(lines)
         r = git(archive, "add", "-A")
-        if r.returncode == 0:
+        committed = False
+        if r.returncode == 0 and git(archive, "diff", "--cached", "--quiet").returncode != 0:  # nothing staged: a crashed earlier run
+            committed = True
             r = git(archive, "commit", "-q", "-m", f"archive {date}: {len(to_copy)} files, {total} bytes")
         if r.returncode != 0:
-            raise Fail(f"git failed in {archive}: {(r.stderr or r.stdout).strip()}")
+            raise Fail(f"git failed in {archive}: {(r.stderr or r.stdout).strip()}", 1)
+        # the manifest only after the commit succeeded: a failed commit leaves these files unrecorded, so the next run retries
+        with manifest_path.open("a", encoding="utf-8", newline="\n") as f:
+            f.writelines(lines)
+        r = git(archive, "add", MANIFEST)
+        if r.returncode == 0:
+            if committed:
+                r = git(archive, "commit", "-q", "--amend", "--no-edit")
+            else:
+                r = git(archive, "commit", "-q", "-m", f"manifest {date}")
+        if r.returncode != 0:
+            raise Fail(f"git failed in {archive}: {(r.stderr or r.stdout).strip()}", 1)
 
     out(f"{'dry run: ' if dry_run else ''}{len(to_copy)} files, {total} bytes {'would be copied' if dry_run else 'copied'}; "
         f"{skipped} already archived, {len(refused)} refused, {len(missing)} failed-job logs missing, {len(errors)} errors")
@@ -290,7 +385,7 @@ def main(argv: list[str]) -> int:
         return run(Path(args.root).resolve(), args.dry_run, date, dict(os.environ))
     except Fail as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
+        return e.code
 
 
 if __name__ == "__main__":

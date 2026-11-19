@@ -158,6 +158,80 @@ class Copying(Base):
         self.assertEqual(self.archived(), ["queue/q-ok.entry"])
 
 
+class Hardening(Base):
+    def git_out(self, repo, *args, env=None):
+        e = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, env=e).stdout.strip()
+
+    def test_a_held_lock_refuses_a_second_run_with_exit_1(self):
+        self.queue("q-1.entry", "x")
+        lock_path = self.root / "state" / "evidence-archive.lock"
+        f = open(lock_path, "a+b")  # the test's own OS lock, taken the way a running archive would
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r = self.run_cli()
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("lock", r.stderr)
+            self.assertEqual(self.archived(), [])
+            self.assertFalse(self.archive.exists())
+        finally:
+            f.close()
+        r = self.run_cli()  # released: the next run works (no stale lock)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.archived(), ["queue/q-1.entry"])
+
+    def test_manifest_is_written_only_after_the_commit_succeeds(self):
+        self.queue("q-1.entry", "x")
+        self.assertEqual(self.run_cli().returncode, 0)
+        manifest = self.archive / "manifest.tsv"
+        self.assertIn("queue/q-1.entry", manifest.read_text())
+        # a commit hook that fails: the files are staged but the manifest must not record them
+        self.queue("q-2.entry", "y")
+        hook = self.archive / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        r = self.run_cli("--date", "2026-11-20")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("q-2.entry", manifest.read_text())
+        hook.unlink()
+        r = self.run_cli("--date", "2026-11-20")  # retried, now recorded
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("queue/q-2.entry", manifest.read_text())
+        self.assertEqual(self.git_out(self.archive, "status", "--porcelain"), "")
+
+    def test_git_environment_cannot_redirect_the_archive_repo(self):
+        decoy = self.root / "decoy"
+        decoy.mkdir()
+        subprocess.run(["git", "init", "-q", str(decoy)], check=True, capture_output=True)
+        self.queue("q-1.entry", "x")
+        r = self.run_cli(env={"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy),
+                              "GIT_INDEX_FILE": str(decoy / "idx")})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.archive / ".git").is_dir())
+        self.assertEqual(self.git_out(self.archive, "log", "--oneline").count("\n"), 0)
+        self.assertEqual(self.git_out(self.archive, "rev-parse", "--show-toplevel").lower().replace("\\", "/"),
+                         self.archive.resolve().as_posix().lower())
+        self.assertEqual(subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=decoy, capture_output=True,
+                                        env={k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}).returncode, 1)
+        self.assertFalse((decoy / "2026-11-19").exists())
+
+    def test_unreadable_manifest_is_a_named_error_not_a_traceback(self):
+        self.queue("q-1.entry", "x")
+        self.archive.mkdir(parents=True)
+        (self.archive / "manifest.tsv").write_bytes(b"2026\tqueue/a\t\xff\xfe\xfa\n")
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("manifest", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.archived(), [])
+
+
 class Secrets(Base):
     def test_env_files_are_never_copied(self):
         self.queue(".env", f"OPENAI_API_KEY={FAKE_KEY}\n")
@@ -212,6 +286,88 @@ class Secrets(Base):
             self.assertTrue(mod.secret_name(n), n)
         for n in ["PATH", "REGION", "KEYBOARD", "PASSWORDS", "HOME"]:
             self.assertFalse(mod.secret_name(n), n)
+
+    def test_secret_file_name_rule_matches_git_rs(self):
+        mod = load(SCRIPT)
+        for n in [".env", ".ENV", ".envrc", ".env.local", ".env.", ".env ", ".env-prod", ".env_x", ".env-", ".env_", ".env::$DATA", "x:.env"]:
+            self.assertTrue(mod.name_refusal(n), n)
+        for n in [".envoy.yaml", ".environment", "env.txt", "my.env", ".envrcx", "notes.entry"]:
+            self.assertIsNone(mod.name_refusal(n), n)
+
+    def test_envoy_and_environment_files_are_archived_envrc_is_not(self):
+        self.queue(".envoy.yaml", "a: 1")
+        self.queue(".environment", "b")
+        self.queue(".envrc", "use nix")
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.archived(), ["queue/.environment", "queue/.envoy.yaml"])
+        self.assertIn("REFUSED queue/.envrc:", r.stdout)
+
+    def test_failed_log_that_trips_content_check_is_archived_redacted(self):
+        self.job("j-key", "failed", "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\nafter\n")
+        self.job("j-dotenv", "failed", f"# c\nSERVICE_API_KEY={FAKE_KEY}\nREGION=eu\n")
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.archived(), ["jobs/j-dotenv.log", "jobs/j-key.log"])
+        key = (self.archive / "2026-11-19" / "jobs" / "j-key.log").read_text()
+        self.assertEqual(key, "before\n[REDACTED]\nafter\n")
+        dot = (self.archive / "2026-11-19" / "jobs" / "j-dotenv.log").read_text()
+        self.assertEqual(dot, "# c\nSERVICE_API_KEY=[REDACTED]\nREGION=[REDACTED]\n")
+        self.assertNotIn(FAKE_KEY, self.all_archive_text())
+        self.assertNotIn("MIIabc", self.all_archive_text())
+        # a queue file with the same content is still refused whole
+        self.queue("renamed.txt", f"SERVICE_API_KEY={FAKE_KEY}\n")
+        r = self.run_cli("--date", "2026-11-20")
+        self.assertIn("REFUSED queue/renamed.txt", r.stdout)
+
+    def test_log_whose_name_marks_a_secret_is_still_refused_whole(self):
+        self.job("j-secret", "failed", "boom")
+        r = self.run_cli()
+        self.assertEqual(self.archived(), [])
+        self.assertIn("REFUSED jobs/j-secret.log", r.stdout)
+
+    FIXTURE = (
+        "# fixture\nREGION=eu-west-1\nGITHUB_PAT=ghp_abcdef123456\nexport DB_PASSWORD=\"hunter2hunter2\"\n"
+        "TINY=ab\nEMPTY=\nNOTE='quoted value here'\n"
+    )
+
+    def test_parser_and_redaction_agree_with_reviewer_and_openai_mcp_on_one_fixture(self):
+        mod = load(SCRIPT)
+        oc = load(OPENAI_MCP)
+        (self.root / ".env").write_text(self.FIXTURE)
+        values = mod.env_file_values(self.root)
+        self.assertEqual(values, ["eu-west-1", "ghp_abcdef123456", "hunter2hunter2", "ab", "quoted value here"])
+        secrets = mod.collect_secrets(self.root, {}, 6)
+        self.assertEqual(secrets, ["quoted value here", "ghp_abcdef123456", "hunter2hunter2", "eu-west-1"])
+        sample = "r=eu-west-1 p=ghp_abcdef123456 q=hunter2hunter2 t=ab n=quoted value here sk-live_abc123"
+        expected = "r=[REDACTED] p=[REDACTED] q=[REDACTED] t=ab n=[REDACTED] [REDACTED]"
+        self.assertEqual(mod.redact(sample, secrets), expected)
+        oc._SECRETS.clear()
+        oc._SECRETS.update(secrets)
+        self.assertEqual(oc.redact(sample), expected)
+        oc._SECRETS.clear()
+        # reviewer.rs: its own test asserts the same fixture's redaction ("r=[REDACTED] p=[REDACTED] q=[REDACTED] t=ab")
+        rs = (HERE.parent / "crates" / "broadsword" / "src" / "reviewer.rs").read_text(encoding="utf-8")
+        self.assertIn('"# c\\nREGION=eu-west-1\\nGITHUB_PAT=ghp_abcdef123456\\nexport DB_PASSWORD=\\"hunter2hunter2\\"', rs)
+        self.assertIn('"r=[REDACTED] p=[REDACTED] q=[REDACTED] t=ab"', rs)
+
+    def test_secret_name_lists_come_from_reviewer_rs(self):
+        import re
+        mod = load(SCRIPT)
+        rs = (HERE.parent / "crates" / "broadsword" / "src" / "reviewer.rs").read_text(encoding="utf-8")
+        m = re.search(r"fn secret_names_and_values\(\) \{\s*for n in \[(.*?)\] \{\s*assert!\(secret_name.*?for n in \[(.*?)\] \{", rs, re.S)
+        self.assertIsNotNone(m, "reviewer.rs test list not found")
+        yes, no = (re.findall(r'"([^"]+)"', g) for g in m.groups())
+        self.assertGreater(len(yes), 5)
+        self.assertGreater(len(no), 5)
+        for n in yes:
+            self.assertTrue(mod.secret_name(n), n)
+        for n in no:
+            self.assertFalse(mod.secret_name(n), n)
+        # and the function's own suffix list
+        fn = re.search(r"pub fn secret_name.*?\n\}", rs, re.S).group(0)
+        for suffix in re.findall(r'"(_[A-Z]+)"', fn):
+            self.assertTrue(mod.secret_name("X" + suffix), suffix)
 
     def all_archive_text(self):
         out = ""
