@@ -67,7 +67,8 @@ REQUIRED_KEYS = ("state_dir", "scratch_dir", "redact_min_chars")
 KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_*\-]{3,}")  # the same rule as clients/openai_mcp.py
 NAME_REFUSED = re.compile(r"(\.(pem|key|pfx|p12)$)|(^id_(rsa|dsa|ecdsa|ed25519))|secret|credential", re.IGNORECASE)
 PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")
-PRIVATE_KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL)
+PRIVATE_KEY_STR = re.compile(PRIVATE_KEY.pattern.decode("ascii"))
+PRIVATE_KEY_BLOCK =re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL)
 DOTENV_VALUE = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=).*$", re.MULTILINE)
 DOTENV_LINE = re.compile(r"^(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=")
 
@@ -163,17 +164,40 @@ def name_refusal(name: str) -> str | None:
     return None
 
 
+def split_lines(text: str, keepends: bool = False) -> list[str]:
+    """THE one line splitter: the content check, the scrub and the residual check all use it, so they always agree on where
+    a line ends (str.splitlines breaks on \\n, \\r, \\r\\n, \\v, \\f, \\x1c-\\x1e, \\x85, \\u2028 and \\u2029)."""
+    return text.splitlines(keepends)
+
+
 def scrub_content(text: str) -> str:
     """For a log that trips the content check: private key blocks and every `NAME=value` value become [REDACTED]."""
     text = PRIVATE_KEY_BLOCK.sub("[REDACTED]", text)
-    return DOTENV_VALUE.sub(r"\1[REDACTED]", text)
+    out = []
+    for raw in split_lines(text, keepends=True):
+        body = "".join(split_lines(raw))  # the line without its terminator
+        m = DOTENV_VALUE.match(body)
+        out.append(m.group(1) + "[REDACTED]" + raw[len(body):] if m else raw)
+    return "".join(out)
+
+
+def scrub_residue(text: str) -> str | None:
+    """After a scrub: why the text must still not be archived (fail closed), or None. A private key header, or any
+    `NAME=value` line whose value is not exactly [REDACTED], means the scrub missed something."""
+    if PRIVATE_KEY_STR.search(text):
+        return "a private key block survived the scrub"
+    for line in split_lines(text):
+        m = DOTENV_VALUE.match(line)
+        if m and line[len(m.group(1)):].strip() != "[REDACTED]":
+            return "a NAME=value line survived the scrub"
+    return None
 
 
 def refuse_reason(name: str, data: bytes) -> str | None:
     """The content check only (the name check is `name_refusal`)."""
     if PRIVATE_KEY.search(data):
         return "contains a private key block"
-    lines = [ln.strip() for ln in data.decode("utf-8", errors="replace").splitlines()]
+    lines = [ln.strip() for ln in split_lines(data.decode("utf-8", errors="replace"))]
     lines = [ln for ln in lines if ln and not ln.startswith("#")]
     if lines and all(DOTENV_LINE.match(ln) for ln in lines):
         if any(secret_name(re.sub(r"^export\s+", "", ln).split("=", 1)[0].strip()) for ln in lines):
@@ -233,7 +257,7 @@ def find_sources(root: Path, cfg: dict) -> tuple[list[tuple[str, Path]], list[st
 
 def read_manifest(path: Path) -> set[tuple[str, str]]:
     seen = set()
-    if path.is_file():
+    if path.exists() or path.is_symlink():  # a directory or a dangling link is NOT "absent": it is a named error below
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
@@ -320,6 +344,11 @@ def _run_locked(root: Path, cfg: dict, archive: Path, dry_run: bool, date: str, 
         text = data.decode("utf-8", errors="surrogateescape")
         if scrub:
             text = scrub_content(text)
+            residue = scrub_residue(redact(text, secrets))
+            if residue:  # fail closed: the scrub did not make it safe, so the file is refused whole
+                out(f"scrub failed for {key}: {residue}")
+                refused.append(f"{key}: {residue}; refused whole")
+                continue
         red = redact(text, secrets).encode("utf-8", errors="surrogateescape")
         to_copy.append((key, path, red, digest))
 
@@ -355,6 +384,7 @@ def _run_locked(root: Path, cfg: dict, archive: Path, dry_run: bool, date: str, 
         if r.returncode != 0:
             raise Fail(f"git failed in {archive}: {(r.stderr or r.stdout).strip()}", 1)
         # the manifest only after the commit succeeded: a failed commit leaves these files unrecorded, so the next run retries
+        before = manifest_path.read_bytes() if manifest_path.exists() else None
         with manifest_path.open("a", encoding="utf-8", newline="\n") as f:
             f.writelines(lines)
         r = git(archive, "add", MANIFEST)
@@ -364,6 +394,11 @@ def _run_locked(root: Path, cfg: dict, archive: Path, dry_run: bool, date: str, 
             else:
                 r = git(archive, "commit", "-q", "-m", f"manifest {date}")
         if r.returncode != 0:
+            # put the manifest back as it was, so the next run does not skip these sources as already archived
+            if before is None:
+                manifest_path.unlink(missing_ok=True)
+            else:
+                manifest_path.write_bytes(before)
             raise Fail(f"git failed in {archive}: {(r.stderr or r.stdout).strip()}", 1)
 
     out(f"{'dry run: ' if dry_run else ''}{len(to_copy)} files, {total} bytes {'would be copied' if dry_run else 'copied'}; "

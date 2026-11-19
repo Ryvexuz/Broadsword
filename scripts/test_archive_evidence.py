@@ -205,6 +205,35 @@ class Hardening(Base):
         self.assertIn("queue/q-2.entry", manifest.read_text())
         self.assertEqual(self.git_out(self.archive, "status", "--porcelain"), "")
 
+    def test_failed_manifest_amend_restores_the_manifest_so_the_next_run_retries(self):
+        self.queue("q-1.entry", "x")
+        self.assertEqual(self.run_cli().returncode, 0)
+        manifest = self.archive / "manifest.tsv"
+        before = manifest.read_bytes()
+        self.queue("q-2.entry", "y")
+        hook = self.archive / ".git" / "hooks" / "pre-commit"  # fails only when the manifest is part of the commit
+        hook.write_text("#!/bin/sh\ngit diff --cached --name-only | grep -q manifest.tsv && exit 1\nexit 0\n")
+        hook.chmod(0o755)
+        r = self.run_cli("--date", "2026-11-20")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(manifest.read_bytes(), before)
+        hook.unlink()
+        r = self.run_cli("--date", "2026-11-20")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("1 files", r.stdout)
+        self.assertIn("queue/q-2.entry", manifest.read_text())
+        self.assertEqual(self.git_out(self.archive, "status", "--porcelain"), "")
+
+    def test_manifest_that_is_a_directory_is_a_named_error(self):
+        self.queue("q-1.entry", "x")
+        (self.archive / "manifest.tsv").mkdir(parents=True)
+        for extra in ([], ["--dry-run"]):
+            r = self.run_cli(*extra)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("manifest", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.archived(), [])
+
     def test_git_environment_cannot_redirect_the_archive_repo(self):
         decoy = self.root / "decoy"
         decoy.mkdir()
@@ -319,6 +348,42 @@ class Secrets(Base):
         self.queue("renamed.txt", f"SERVICE_API_KEY={FAKE_KEY}\n")
         r = self.run_cli("--date", "2026-11-20")
         self.assertIn("REFUSED queue/renamed.txt", r.stdout)
+
+    SEPARATORS = {"cr": "\r", "vt": "\x0b", "ff": "\x0c", "fs": "\x1c", "gs": "\x1d", "rs": "\x1e", "nel": "\x85",
+                  "ls": " ", "ps": " ", "crlf": "\r\n"}
+
+    def test_scrub_covers_every_line_separator_the_check_splits_on(self):
+        for tag, sep in self.SEPARATORS.items():
+            jid = f"j-{tag}"
+            (self.root / "state" / "jobs" / f"{jid}.rec").write_text(f"id = {jid}\nlog = x\\{jid}.log\nstatus = failed\n")
+            text = f"# x{sep}DB_PASSWORD=hunter2hunter2\n"
+            (self.root / "scratch" / "logs" / "jobs" / f"{jid}.log").write_bytes(text.encode("utf-8"))
+        r = self.run_cli()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("hunter2hunter2", self.all_archive_text())
+        self.assertNotIn("hunter2hunter2", r.stdout + r.stderr)
+        for tag in self.SEPARATORS:  # each one is archived redacted (not silently dropped), or refused whole: never clear
+            p = self.archive / "2026-11-19" / "jobs" / f"j-{tag}.log"
+            self.assertTrue(p.exists(), tag)
+            self.assertIn("DB_PASSWORD=[REDACTED]", p.read_text(encoding="utf-8"), tag)
+
+    def test_scrub_that_still_leaves_a_secret_is_refused_whole(self):
+        mod = load(SCRIPT)
+        self.assertIsNotNone(mod.scrub_residue("A_KEY=abc\n"))
+        self.assertIsNotNone(mod.scrub_residue("-----BEGIN PRIVATE KEY-----\n"))
+        self.assertIsNone(mod.scrub_residue("# c\nA_KEY=[REDACTED]\n"))
+        self.job("j-fail", "failed", "# c\nDB_PASSWORD=hunter2hunter2\n")
+        orig = mod.scrub_content
+        mod.scrub_content = lambda t: t  # a scrub that missed everything
+        try:
+            lines = []
+            rc = mod.run(self.root, False, "2026-11-19", {}, out=lines.append)
+        finally:
+            mod.scrub_content = orig
+        self.assertEqual(rc, 0, lines)
+        self.assertEqual(self.archived(), [])
+        self.assertTrue(any("REFUSED jobs/j-fail.log" in ln for ln in lines), lines)
+        self.assertFalse(any("hunter2hunter2" in ln for ln in lines), lines)
 
     def test_log_whose_name_marks_a_secret_is_still_refused_whole(self):
         self.job("j-secret", "failed", "boom")
