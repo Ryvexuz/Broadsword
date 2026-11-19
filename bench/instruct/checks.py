@@ -6,7 +6,8 @@ A case lists checks; it passes only when every one returns None. grade(case, tex
 Conventions (also in README.md):
 - Line endings are normalised to \\n and every line is right-stripped. "Non-empty lines" are the lines left after
   dropping blank ones; blank lines are never counted and never penalised.
-- A "word" is a whitespace-separated token. A "sentence" is a run of text ending in . ! or ?.
+- A "word" is a whitespace-separated token. A "sentence" is a non-empty piece between . ! ? terminators; text after the last one counts, a final stop adds none; decimals and
+  common abbreviations (e.g., i.e., etc., Dr.) do not split.
 - Nothing is lenient about wrapping: a code fence or an intro line around a JSON answer, a table or a list is a failure.
 """
 import json, re
@@ -127,8 +128,20 @@ def c_no_markdown(text, p):
     return None
 
 
+ABBREVIATIONS = re.compile(r"\b(?:e\.g|i\.e|etc|vs|mr|mrs|ms|dr|approx|no)\.", re.I)
+
+
+def count_sentences(text):
+    """Sentences are the non-empty pieces between terminators (. ! ? followed by whitespace or the end).
+    Text after the last terminator counts as a sentence (models often omit the final stop); a final stop adds none.
+    Decimals (3.5) never split (no whitespace after the dot); common abbreviations (e.g. i.e. etc. vs. Mr. Dr. ...) are
+    blanked first so they do not split either."""
+    t = ABBREVIATIONS.sub(lambda m: m.group(0).replace(".", ""), text.strip())
+    return len([s for s in re.split(r"[.!?]+(?:\s+|$)", t) if s.strip()])
+
+
 def c_sentences(text, p):
-    n = len(re.findall(r"[.!?]+(?=\s|$)", text.strip()))
+    n = count_sentences(text)
     return None if n == p["n"] else f"expected exactly {p['n']} sentence(s), got {n}"
 
 
@@ -206,3 +219,9 @@ def grade(case, text):
         if msg:
             out.append((chk["type"], msg))
     return out
+
+
+# Strictness reviewed against real model style (README "What is strict on purpose"): trailing newline, leading or trailing
+# blank lines, trailing spaces and CRLF never matter. A missing final full stop never matters (sentences). Strict on
+# purpose because the prompt states the form exactly: a code fence or intro line, a bullet glyph other than the one named,
+# a final stop on a full_match/equals answer, any non-ASCII character in an ascii_only case, a header row that differs by one space.

@@ -142,6 +142,37 @@ class CaseSet(unittest.TestCase):
         with self.assertRaises(ValueError):
             CK.grade({"id": "x", "checks": [{"type": "nope"}]}, "a")
 
+    def test_sentences_real_model_style(self):
+        c = CASES["09-lowercase-no-commas"]
+        # the real Haiku answer: one lowercase sentence, no comma, no final full stop. Must pass.
+        real = "cats are independent creatures that spend much of their day sleeping and still manage to rule the household with quiet confidence"
+        self.assertEqual(CK.grade(c, real), [])
+        self.assertEqual(CK.grade(c, real + "."), [])  # a final stop adds no empty sentence
+        two = "cats sleep a lot. they hunt at night"  # two sentences, the last without a stop
+        self.assertIn(("sentences", "expected exactly 1 sentence(s), got 2"), CK.grade(c, two))
+        self.assertEqual(CK.count_sentences("Use tools, e.g. a hammer, and measure 3.5 cm. Then stop."), 2)
+        self.assertEqual(CK.count_sentences("Dr. Who i.e. the doctor arrived vs. the daleks!"), 1)
+        self.assertEqual(CK.count_sentences("Wait... what? Yes!"), 3)
+        self.assertEqual(CK.count_sentences(""), 0)
+
+    def test_blank_lines_and_trailing_newline_never_matter(self):
+        single = {"02-json-keys", "10-exact-answer", "12-date-format"}  # one-line answers: no per-line trailing spaces
+        for cid in ("01-bullets", "02-json-keys", "06-table-header", "07-first-last-line", "08-numbered",
+                    "10-exact-answer", "11-sorted-lines", "12-date-format", "18-keep-header", "20-lowercase-numbered"):
+            a = good_answer(cid)
+            variants = ["\n\n" + a + "\n\n", a + "\r\n", a.replace("\n", "\r\n") + "\r\n"]
+            if cid not in single:
+                variants.append("  \n" + a.replace("\n", "  \n") + "  \n")
+            for v in variants:
+                self.assertEqual(CK.grade(CASES[cid], v), [], f"{cid}: {v!r}")
+
+    def test_documented_strictness_stays_strict(self):
+        # by design (README): the rule in the prompt is exact, so these are FAILs, not tolerated
+        self.assertTrue(CK.grade(CASES["12-date-format"], "2024-02-29."))  # final stop on a date answer
+        self.assertTrue(CK.grade(CASES["13-char-limit-ascii"], "Bean There opens Monday — come in"))  # non-ASCII dash
+        self.assertTrue(CK.grade(CASES["01-bullets"], "• a\n• b\n• c\n• d"))  # bullet glyph, not '- '
+        self.assertTrue(CK.grade(CASES["02-json-keys"], "```json\n" + good_answer("02-json-keys") + "\n```"))
+
     def test_formatting_tolerances_are_only_whitespace(self):
         c = CASES["18-keep-header"]
         trailing = "\n".join(CAN.HEADER) + "  \nEND-OF-HEADER\n\n"  # trailing spaces and blank lines are ignored

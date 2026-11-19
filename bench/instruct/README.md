@@ -12,7 +12,13 @@ follows exact format, length and forbidden-content rules, e.g. whether gpt-6.2-a
 ## What each check measures
 
 Whitespace: line endings are normalised, trailing spaces and blank lines are ignored. Nothing else is lenient.
-A word is a whitespace-separated token; a sentence ends in `.`, `!` or `?`.
+A word is a whitespace-separated token. A sentence is a non-empty piece between `.` `!` `?` terminators: text after the last one counts
+(models often omit the final stop), a final stop adds none, decimals (`3.5`) and common abbreviations (`e.g.`, `i.e.`, `etc.`, `Dr.`) do not split.
+
+Strict on purpose, because each prompt states the form exactly: a code fence or intro line around JSON/table/list answers, a bullet glyph
+other than the one named (`•` for `-`), a final stop on a `full_match`/`equals` answer (a date, a number), any non-ASCII character
+(smart quotes, em dash) in an `ascii_only` case, a header row that differs by one space. Never matters: trailing newline, leading or
+trailing blank lines, trailing spaces, CRLF.
 
 | check | measures |
 |---|---|
