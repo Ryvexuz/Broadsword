@@ -10,11 +10,12 @@
 //! Refs (a ref cannot be both a file and a folder, so the ignored snapshots live in sibling folders):
 //! - `refs/broadsword/checkpoints/<id>` and `refs/broadsword/checkpoints-ignored/<id>`
 //! - `refs/broadsword/interrupted/<id>/<attempt>` and `refs/broadsword/interrupted-ignored/<id>/<attempt>`
-//! - `refs/broadsword/index/<id>`: the real index at checkpoint time
-//! - `refs/broadsword/interrupted-index/<id>/<attempt>`: the real index just before a rollback replaced it
+//! - `refs/broadsword/index/<id>`: the real index at checkpoint time, minus secret paths
+//! - `refs/broadsword/interrupted-index/<id>/<attempt>`: the real index just before a rollback replaced it, minus secret paths
 //!
-//! Secret files (see `is_secret_file`) do not exist for any of this: they are never read, stored, restored,
-//! overwritten or deleted, by a snapshot or by a rollback.
+//! Secret files (see `is_secret_path`) do not exist for any of this: they are never read, stored, restored,
+//! overwritten or deleted, by a snapshot or by a rollback. That includes the index: a secret file someone staged is left
+//! out of every stored index tree, and a rollback leaves the index entries of secret paths exactly as they are.
 //!
 //! Refs are only ever created (never overwritten or deleted), so no snapshot is ever lost.
 
@@ -48,13 +49,24 @@ impl Opts {
     }
 }
 
-/// THE one rule for what a secret file is: a file whose name starts with `.env` (`.env`, `.env.local`, `.envrc`, ...),
-/// at any depth, compared case-insensitively. Checkpoint capture, rollback and the queue's `--brief` check all call this
-/// function. `.envrc` counts on purpose: direnv files usually hold keys, and wrongly protecting a file costs nothing.
-/// Both `/` and a backslash separate folders.
-pub fn is_secret_file(path: &str) -> bool {
-    path.rsplit(['/', '\\']).next().is_some_and(|n| n.to_lowercase().starts_with(".env"))
+/// THE one rule for what a secret file is: a file whose NAME (last path part, at any depth) is exactly `.env`, or
+/// `.env.` followed by a name (`.env.local`, `.env.production`). Both `/` and a backslash separate folders. Letters
+/// compare case-insensitively on every platform (Windows file names are, and a `.ENV` is a secret wherever it is), and
+/// trailing dots and spaces are ignored (Windows drops them, so `.env ` and `.env.` are the file `.env`).
+/// Ordinary files that merely start with `.env` (`.envoy.yaml`, `.environment`, `.envrc`) are NOT secrets: they are
+/// checkpointed and rolled back like any other file. A FOLDER named `.env` (a Python venv) does not make its files secret.
+///
+/// Every place that captures, restores, deletes or lists files calls this function: checkpoint capture (`capture`), the
+/// stored index trees (`secret_free_tree`), rollback (`changes`, `Guard`) and the queue's `--brief` reader (`queue.rs`,
+/// through the older name `is_secret_file`, which is this same function).
+pub fn is_secret_path(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("").trim_end_matches([' ', '.']);
+    let name = name.to_ascii_lowercase();
+    name == ".env" || (name.len() > ".env.".len() && name.starts_with(".env."))
 }
+
+/// The older name of `is_secret_path` (the same function, not a second rule), kept so callers outside this module compile.
+pub use self::is_secret_path as is_secret_file;
 
 /// A project is a Git repo of its own when it has its own `.git` (folder, or file for a linked worktree).
 pub fn is_repo(dir: &Path) -> bool {
@@ -187,6 +199,45 @@ fn tree_of(dir: &Path, state: &Path, tag: &str, files: &[String], tracked_modes:
     result
 }
 
+/// NUL-separated `<meta>\t<path>` records of `ls-tree -z` / `ls-files -s -z`, raw (a path is never re-encoded), with the
+/// path decoded only to test it.
+fn entries(out: &[u8]) -> Vec<(&[u8], String)> {
+    out.split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let path = e.iter().position(|b| *b == b'\t').map(|t| &e[t + 1..]).unwrap_or(b"");
+            (e, String::from_utf8_lossy(path).into_owned())
+        })
+        .collect()
+}
+
+/// The ONE place an index tree is made fit to store or to restore: `tree` with every secret path (`is_secret_path`)
+/// left out, plus `extra` (raw `--index-info` records, kept as given), and the secret paths that were left out.
+/// When nothing is left out and nothing added, `tree` itself comes back and nothing is written.
+fn secret_free_tree(dir: &Path, state: &Path, tag: &str, tree: &str, extra: &[Vec<u8>]) -> Result<(String, Vec<String>), String> {
+    let out = git(dir, &["ls-tree", "-r", "-z", "--full-tree", tree], None, None)?;
+    let all = entries(&out);
+    let dropped: Vec<String> = all.iter().filter(|(_, p)| is_secret_path(p)).map(|(_, p)| p.clone()).collect();
+    if dropped.is_empty() && extra.is_empty() {
+        return Ok((tree.to_string(), dropped));
+    }
+    let mut input = Vec::new();
+    for raw in all.iter().filter(|(_, p)| !is_secret_path(p)).map(|(r, _)| *r).chain(extra.iter().map(Vec::as_slice)) {
+        input.extend_from_slice(raw); // `ls-tree` lines are a format `--index-info` reads as they are
+        input.push(0);
+    }
+    std::fs::create_dir_all(state).map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let idx = unique_index(state, tag);
+    let result = (|| {
+        if !input.is_empty() {
+            git(dir, &["update-index", "-z", "--index-info"], Some(&idx), Some(&input))?;
+        }
+        git_text(dir, &["write-tree"], Some(&idx))
+    })();
+    let _ = std::fs::remove_file(&idx);
+    Ok((result?, dropped))
+}
+
 pub struct Captured {
     pub tree: String,
     pub ignored_tree: Option<String>,
@@ -217,7 +268,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
     // Secret files are dropped here, before any blob is written: nothing below ever sees their bytes.
     let mut secret_skipped: Vec<String> = Vec::new();
     files.retain(|p| {
-        let secret = is_secret_file(p);
+        let secret = is_secret_path(p);
         if secret {
             secret_skipped.push(p.clone());
         }
@@ -232,7 +283,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
         if excluded(&p, opts) || !is_regular(dir, &p) {
             continue;
         }
-        if is_secret_file(&p) {
+        if is_secret_path(&p) {
             if !secret_skipped.contains(&p) {
                 secret_skipped.push(p);
             }
@@ -278,12 +329,21 @@ pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Che
     let ref_name = format!("{CHECKPOINT_REFS}/{id}");
     create_ref(dir, &ref_name, &commit)?;
     // `write-tree` only writes tree objects; it does not modify the index. It fails on unmerged entries: then none is kept.
-    let index_tree = git_text(dir, &["write-tree"], None).ok().filter(|t| !t.is_empty());
-    if let Some(t) = &index_tree {
-        let c = commit_tree(dir, t, parent.as_deref(), &format!("broadsword index at checkpoint {id}"))?;
-        create_ref(dir, &format!("{INDEX_REFS}/{id}"), &c)?;
-    }
-    Ok(Checkpoint { ref_name, commit, ignored_ref, skipped: cap.skipped, secret_skipped: cap.secret_skipped, index_tree })
+    // A secret file someone staged is left out of the stored tree (and listed with the other secret files by name).
+    let mut secret_skipped = cap.secret_skipped;
+    let index_tree = match git_text(dir, &["write-tree"], None).ok().filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let (t, dropped) = secret_free_tree(dir, state, &format!("{id}-idx"), &t, &[])?;
+            secret_skipped.extend(dropped);
+            secret_skipped.sort();
+            secret_skipped.dedup();
+            let c = commit_tree(dir, &t, parent.as_deref(), &format!("broadsword index at checkpoint {id}"))?;
+            create_ref(dir, &format!("{INDEX_REFS}/{id}"), &c)?;
+            Some(t)
+        }
+        None => None,
+    };
+    Ok(Checkpoint { ref_name, commit, ignored_ref, skipped: cap.skipped, secret_skipped, index_tree })
 }
 
 pub struct Rollback {
@@ -328,7 +388,7 @@ fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
         if f.len() < 5 {
             return Err(format!("unexpected diff-tree line: {meta}"));
         }
-        if is_secret_file(path) {
+        if is_secret_path(path) {
             continue; // a checkpoint made before this rule may hold one: it is never restored or deleted
         }
         v.push(Change { status: f[4].chars().next().unwrap_or('M'), mode: f[1].to_string(), sha: f[3].to_string(), path: path.to_string() });
@@ -385,7 +445,7 @@ impl Guard<'_> {
 
     /// Write the blob of `c` to its path. Ok(true) = written, Ok(false) = skipped.
     fn write(&mut self, c: &Change) -> Result<bool, String> {
-        if is_secret_file(&c.path) {
+        if is_secret_path(&c.path) {
             return Ok(false); // never written; not even listed as skipped: a secret file does not exist for rollback
         }
         if !self.may_change(&c.path)? {
@@ -409,7 +469,7 @@ impl Guard<'_> {
 
     /// Delete a file the job added (its bytes are in the snapshot), then the folders that leaves empty.
     fn remove(&mut self, rel: &str) -> Result<bool, String> {
-        if is_secret_file(rel) {
+        if is_secret_path(rel) {
             return Ok(false); // never deleted
         }
         let full = self.dir.join(safe_rel(rel)?);
@@ -446,7 +506,8 @@ impl Guard<'_> {
 ///    saved. Files that differ from, or are missing since, the checkpoint are restored byte for byte.
 /// 3. Ignored files in the checkpoint that changed or were deleted are restored; ignored files the job
 ///    created are left in place (and are in the snapshot).
-/// 4. The real index goes back to what it was at the checkpoint (or to HEAD if none was recorded).
+/// 4. The real index goes back to what it was at the checkpoint (or to HEAD if none was recorded), except that the
+///    entries of secret paths stay as they are now (see `is_secret_path`).
 ///
 /// HEAD and the branch are never touched. Empty folders are neither restored nor removed.
 #[allow(clippy::too_many_arguments)] // each argument is one recorded fact about the job; a struct would only rename them
@@ -540,14 +601,23 @@ pub fn rollback(
     let mut interrupted_index_ref = None;
     match git_text(dir, &["write-tree"], None) {
         Ok(tree) => {
+            let (tree, _) = secret_free_tree(dir, state, &format!("{id}-int-idx"), &tree, &[])?;
             let c = commit_tree(dir, &tree, parent.as_deref(), &format!("broadsword interrupted index of {id}"))?;
             let r = format!("{INTERRUPTED_INDEX_REFS}/{id}/{attempt}");
             create_ref(dir, &r, &c)?;
             interrupted_index_ref = Some(r);
-            match index_tree {
-                Some(t) => git_text(dir, &["read-tree", t], None)?,
-                None => git_text(dir, &["reset", "-q"], None)?,
+            // The index goes back to the checkpoint's (or to HEAD's when none was recorded), except for secret paths:
+            // their entries are left exactly as they are now (kept if staged, absent if not), never taken from the
+            // checkpoint. A checkpoint index tree made before this rule may hold one: it is dropped here.
+            let base = match (index_tree, &parent) {
+                (Some(t), _) => t.to_string(),
+                (None, Some(h)) => git_text(dir, &["rev-parse", "--verify", &format!("{h}^{{tree}}")], None)?,
+                (None, None) => git_text(dir, &["mktree"], None)?, // no commit yet: the empty tree
             };
+            let now = git(dir, &["ls-files", "-s", "-z"], None, None)?;
+            let keep: Vec<Vec<u8>> = entries(&now).into_iter().filter(|(_, p)| is_secret_path(p)).map(|(raw, _)| raw.to_vec()).collect();
+            let (restore, _) = secret_free_tree(dir, state, &format!("{id}-rst-idx"), &base, &keep)?;
+            git_text(dir, &["read-tree", &restore], None)?;
         }
         Err(e) => not_restored.push(format!("(the git index: it has unmerged entries and cannot be saved, so it was left untouched: {e})")),
     }
@@ -931,12 +1001,97 @@ mod tests {
 
     #[test]
     fn the_secret_file_rule() {
-        for yes in [".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".envrc"] {
-            assert!(is_secret_file(yes), "{yes}");
+        for yes in [".env", ".env.local", "sub/.env", "a\\b\\.ENV", ".Env.production", "x/y/.env.example", ".ENV.Local", ".env.", ".env ", "a/.env.x.y"] {
+            assert!(is_secret_path(yes), "{yes}");
         }
-        for no in ["env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", ""] {
-            assert!(!is_secret_file(no), "{no}");
+        for no in ["env.txt", "my.env", "a.env/file.txt", "environment", "src/env.rs", "", ".envrc", ".envoy.yaml", ".environment", ".env/key.txt", ".env.d/x", ".env-prod", "x.env.local"] {
+            assert!(!is_secret_path(no), "{no}");
         }
+        assert!(is_secret_file(".env.local") && !is_secret_file(".envoy.yaml"), "the older name is the same function");
+    }
+
+    /// Paths in a tree, recursively.
+    fn tree_paths(d: &Path, r: &str) -> Vec<String> {
+        git_text(d, &["ls-tree", "-r", "--name-only", "--full-tree", r], None).unwrap().lines().map(str::to_string).collect()
+    }
+
+    /// A secret file someone staged is never stored in `refs/broadsword/index/<id>`; the real index is not changed.
+    #[test]
+    fn a_staged_secret_file_is_left_out_of_the_stored_index_tree() {
+        let d = temp_repo("secret-idx");
+        fs::write(d.join(".env"), "SECRET=staged-aaa").unwrap();
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub").join(".env.local"), "SECRET=staged-bbb").unwrap();
+        fs::write(d.join(".envoy.yaml"), "envoy: staged").unwrap();
+        fs::write(d.join("staged.txt"), "ordinary staged").unwrap();
+        git_text(&d, &["add", "-f", ".env", "sub/.env.local", ".envoy.yaml", "staged.txt"], None).unwrap();
+        let index_before = git_text(&d, &["ls-files", "--stage"], None).unwrap();
+        let state = state_for("secret-idx");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        let paths = tree_paths(&d, "refs/broadsword/index/j");
+        assert!(!paths.iter().any(|p| is_secret_path(p)), "{paths:?}");
+        for p in [".envoy.yaml", "staged.txt", "tracked.txt"] {
+            assert!(paths.contains(&p.to_string()), "{p} is kept: {paths:?}");
+        }
+        assert_eq!(c.index_tree.as_deref(), Some(git_text(&d, &["rev-parse", "refs/broadsword/index/j^{tree}"], None).unwrap().as_str()));
+        assert_eq!(c.secret_skipped, [".env", "sub/.env.local"], "listed by name once each");
+        assert_eq!(git_text(&d, &["ls-files", "--stage"], None).unwrap(), index_before, "the real index is not changed");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Rollback: the saved interrupted index holds no secret path; the restored index takes everything from the checkpoint
+    /// except secret entries, which stay as they are now; look-alike names (`.envoy.yaml`, `.environment`) roll back.
+    #[test]
+    fn rollback_keeps_secret_index_entries_out_of_refs_and_as_they_are() {
+        let d = temp_repo("secret-rbidx");
+        fs::write(d.join(".envoy.yaml"), "envoy: original").unwrap();
+        fs::write(d.join(".environment"), "ENVIRONMENT=original").unwrap();
+        fs::write(d.join(".env"), "SECRET=at-checkpoint").unwrap();
+        git_text(&d, &["add", "-f", ".env"], None).unwrap();
+        let state = state_for("secret-rbidx");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        // the job changes the look-alikes, unstages .env, and stages a new secret and an ordinary file
+        fs::write(d.join(".envoy.yaml"), "envoy: job").unwrap();
+        fs::remove_file(d.join(".environment")).unwrap();
+        git_text(&d, &["rm", "-q", "--cached", ".env"], None).unwrap();
+        fs::write(d.join(".env.prod"), "SECRET=staged-by-job").unwrap();
+        fs::write(d.join("job.txt"), "job").unwrap();
+        git_text(&d, &["add", "-f", ".env.prod", "job.txt"], None).unwrap();
+        let staged_by_job = git_text(&d, &["ls-files", "--stage", ".env.prod"], None).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(fs::read(d.join(".envoy.yaml")).unwrap(), b"envoy: original");
+        assert_eq!(fs::read(d.join(".environment")).unwrap(), b"ENVIRONMENT=original");
+        assert_eq!(fs::read(d.join(".env.prod")).unwrap(), b"SECRET=staged-by-job", "secret files are never touched");
+        let int = tree_paths(&d, &r.interrupted_index_ref.expect("index saved"));
+        assert!(int.contains(&"job.txt".to_string()), "{int:?}");
+        assert!(!int.iter().any(|p| is_secret_path(p)), "the saved index holds no secret path: {int:?}");
+        let staged: Vec<String> = git_text(&d, &["ls-files"], None).unwrap().lines().map(str::to_string).collect();
+        assert!(!staged.contains(&"job.txt".to_string()), "ordinary entries go back to the checkpoint: {staged:?}");
+        assert!(!staged.contains(&".env".to_string()), "a secret entry is not taken from the checkpoint: {staged:?}");
+        assert_eq!(git_text(&d, &["ls-files", "--stage", ".env.prod"], None).unwrap(), staged_by_job, "a staged secret entry stays as it is");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// An index tree stored before this rule may hold a secret entry: a rollback never restores it into the index.
+    #[test]
+    fn rollback_drops_a_secret_entry_from_an_old_index_tree() {
+        let d = temp_repo("secret-oldidx");
+        let state = state_for("secret-oldidx");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        let blob = String::from_utf8_lossy(&git(&d, &["hash-object", "-w", "--no-filters", "--stdin"], None, Some(b"SECRET=old-index")).unwrap()).trim().to_string();
+        let mut input = git(&d, &["ls-tree", "-z", c.index_tree.as_deref().unwrap()], None, None).unwrap();
+        input.extend_from_slice(format!("100644 blob {blob}\t.env.local").as_bytes());
+        input.push(0);
+        let old = String::from_utf8_lossy(&git(&d, &["mktree", "-z"], None, Some(&input)).unwrap()).trim().to_string();
+        assert!(tree_paths(&d, &old).contains(&".env.local".to_string()));
+        rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, Some(&old), &opts()).unwrap();
+        let staged = git_text(&d, &["ls-files"], None).unwrap();
+        assert!(!staged.lines().any(|p| p == ".env.local"), "{staged}");
+        assert!(staged.lines().any(|p| p == "tracked.txt"), "{staged}");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
     }
 
     /// Does the object database hold a blob with exactly these bytes?
