@@ -6,7 +6,7 @@ root = "."                 # everything is relative to this folder
 disk_floor_gb = 20         # pause and clean up below this much free space
 cleanup_every_hours = 1
 scratch_max_age_hours = 24
-max_agents = 6              # the most tasks running on the board at once (task start refuses at the cap); 10 was tried 2026-11-19 and was WORSE (build-lock p90 26 -> 88 s, test median 82 -> 100 s; evidence/scale-up-2026-11.md); retry after tp3
+max_agents = 14             # the most tasks running on the board at once (task start refuses at the cap); scale-up (Lazlo 2026-11-19): +4 per step while merges/h rise with no more failures and RAM < 90%, no swap growth; lock wait and test time are warnings only (RETRO lesson 35)
 
 # Paths, relative to root
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time
