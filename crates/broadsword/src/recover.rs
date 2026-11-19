@@ -6,8 +6,10 @@
 //! - `build` / `test` / `check` only read and rebuild, so they are resumed (they take no checkpoint): re-run from the step they
 //!   were on, as a new job linked to the old one (old record -> `resumed`), at most `max_resumes` times
 //!   in a row, then the record is marked `failed`;
-//! - `run` may have changed files, so it is rolled back to its checkpoint (the only kind that has one; secret files,
-//!   `.env*`, are never part of a checkpoint or of the rollback), after saving the partial work
+//! - `run` may have changed files, so it is rolled back to its checkpoint (the only kind that has one; secret files are
+//!   never part of a checkpoint or of the rollback, and each one it leaves alone is named in the output: `.env`, `.envrc`,
+//!   `.env.<name>` and names starting with `.env-` or `.env_`, any case, plus an NTFS short name or stream of one, as
+//!   `git::is_secret_in` decides; `.envoy.yaml` and `.environment` are ordinary files), after saving the partial work
 //!   under `refs/broadsword/interrupted/<id>/<attempt>` (old record -> `rolled_back`). Nothing is deleted.
 //!
 //! A record whose Broadsword is still alive is another job genuinely running and is left alone.
@@ -278,15 +280,23 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     }
     let nonempty = |k: &str| Some(r.get(k).to_string()).filter(|t| !t.is_empty());
     let (index_tree, ign) = (nonempty("index_tree"), nonempty("checkpoint_ignored"));
-    let lens: Vec<u64> = r.get("ignored_skipped_len").split('|').filter_map(|n| n.parse().ok()).collect();
-    let skipped: Vec<(String, u64)> = r.get("ignored_skipped").split('|').filter(|p| !p.is_empty()).zip(lens).map(|(p, n)| (p.to_string(), n)).collect();
+    // Lists in a record are `record::encode_list` values (a name may hold `|` or a line break); old records read the same.
+    let lens = record::decode_list(r.get("ignored_skipped_len"));
+    let skipped: Vec<(String, u64)> = record::decode_list(r.get("ignored_skipped"))
+        .into_iter()
+        .zip(lens)
+        .filter(|(p, _)| !p.is_empty())
+        .filter_map(|(p, n)| n.parse().ok().map(|n| (p, n)))
+        .collect();
     let rb = git::rollback(&dir, &cfg.state_dir, &id, &ckpt, ign.as_deref(), &skipped, index_tree.as_deref(), &git::Opts::for_project(cfg, &dir))
         .map_err(|e| format!("rollback of {id} failed, record left as running so it can be retried: {e}"))?;
     r.set("interrupted", rb.interrupted_ref.as_str());
     r.set("interrupted_ignored", rb.interrupted_ignored_ref.clone().unwrap_or_default());
     r.set("interrupted_index", rb.interrupted_index_ref.clone().unwrap_or_default());
-    r.set("not_restored", rb.not_restored.join("|"));
-    r.set("not_protected", rb.not_protected.join("|"));
+    r.set("not_restored", record::encode_list(&rb.not_restored));
+    r.set("not_protected", record::encode_list(&rb.not_protected));
+    r.set("secret_left", record::encode_list(&rb.secret_skipped));
+    r.set("index_secrets_left", record::encode_list(&rb.index_secrets));
     let partial = !rb.not_restored.is_empty();
     if !partial {
         r.set("status", record::ROLLED_BACK);
@@ -312,6 +322,17 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
     }
     for p in &rb.not_protected {
         println!("  not protected by the checkpoint (it was over the ignored-file size cap): {p}");
+    }
+    // Secret files are never saved, restored, overwritten or deleted, and never silently: each one is named (names only,
+    // never content; control characters escaped, as a name can hold a line break).
+    for p in record::decode_list(r.get("secret_skipped")) {
+        println!("  secret file the checkpoint did not save, left as it is: {}", p.escape_debug());
+    }
+    for p in &rb.secret_skipped {
+        println!("  secret file left exactly as it is (a rollback never restores, overwrites or deletes one): {}", p.escape_debug());
+    }
+    for p in &rb.index_secrets {
+        println!("  secret index entry left as it is: {}", p.escape_debug());
     }
     println!("  see the partial work: git -C {} diff {ckpt} {}", dir.display(), rb.interrupted_ref);
     if partial {

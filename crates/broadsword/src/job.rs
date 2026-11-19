@@ -640,20 +640,23 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                         rec.set("checkpoint_commit", c.commit);
                         rec.set("checkpoint_ignored", c.ignored_ref.unwrap_or_default());
                         rec.set("index_tree", c.index_tree.unwrap_or_default());
+                        // Names are shown with control characters escaped (a name can hold a line break); the record keeps
+                        // them whole through `record::encode_list`, which `recover` reads back with `decode_list`.
+                        let shown = |names: Vec<&String>| names.iter().map(|n| n.escape_debug().to_string()).collect::<Vec<_>>().join(", ");
                         if !c.secret_skipped.is_empty() {
                             // names only, never content
-                            println!("checkpoint: secret file(s) not saved (by design): {}", c.secret_skipped.join(", "));
-                            rec.set("secret_skipped", c.secret_skipped.join("|"));
+                            println!("checkpoint: secret file(s) not saved (by design): {}", shown(c.secret_skipped.iter().collect()));
+                            rec.set("secret_skipped", record::encode_list(&c.secret_skipped));
                         }
                         if !c.skipped.is_empty() {
                             eprintln!(
                                 "broadsword: warning: {} ignored file(s) were NOT saved in the checkpoint (over the {} MB checkpoint_ignored_max_mb limit): {}",
                                 c.skipped.len(),
                                 cfg.checkpoint_ignored_max_mb,
-                                c.skipped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ")
+                                shown(c.skipped.iter().map(|(p, _)| p).collect())
                             );
-                            rec.set("ignored_skipped", c.skipped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join("|"));
-                            rec.set("ignored_skipped_len", c.skipped.iter().map(|(_, n)| n.to_string()).collect::<Vec<_>>().join("|"));
+                            rec.set("ignored_skipped", record::encode_list(&c.skipped.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>()));
+                            rec.set("ignored_skipped_len", record::encode_list(&c.skipped.iter().map(|(_, n)| n.to_string()).collect::<Vec<_>>()));
                         }
                     }
                     Err(e) => {

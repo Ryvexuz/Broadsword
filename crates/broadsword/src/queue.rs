@@ -228,11 +228,12 @@ fn canon_inside(cfg: &Config, canon_root: &Path, dir: &Path) -> PathBuf {
 }
 
 /// A brief file must be a small UTF-8 text file INSIDE the root (after canonicalising, so `..` and links count), not inside
-/// `state_dir` (queue records, job logs) or `build_dir`, and not a secrets file (checked on the name given and on the resolved name).
+/// `state_dir` (queue records, job logs) or `build_dir`, and not a secret file (`git::is_secret_path`, checked on the name given and
+/// on the resolved name).
 /// A brief is stored, shown and sent to a model, so it may never be any file the caller can read.
 fn read_brief(cfg: &Config, path: &str) -> Result<String, String> {
-    if crate::git::is_secret_file(path) {
-        return Err(format!("`{path}` looks like an .env file; a brief is sent to a model and secrets must never be"));
+    if crate::git::is_secret_path(path) {
+        return Err(format!("`{path}` is a secret file (`.env`, `.envrc`, `.env.<name>`, `.env-*`, `.env_*` or a short name or stream of one); a brief is sent to a model and secrets must never be"));
     }
     let real = std::fs::canonicalize(path).map_err(|e| format!("cannot read the brief file `{path}`: {e}"))?;
     let canon_root = std::fs::canonicalize(&cfg.root).map_err(|e| format!("cannot resolve the project root: {e}"))?;
@@ -244,8 +245,8 @@ fn read_brief(cfg: &Config, path: &str) -> Result<String, String> {
             return Err(format!("the brief `{path}` is inside {name}; queue records, job logs and build output are never briefs (they are sent to a model)"));
         }
     }
-    if crate::git::is_secret_file(&real.to_string_lossy()) {
-        return Err(format!("`{path}` resolves to an .env file ({}); a brief is sent to a model and secrets must never be", real.display()));
+    if crate::git::is_secret_path(&real.to_string_lossy()) {
+        return Err(format!("`{path}` resolves to a secret file ({}); a brief is sent to a model and secrets must never be", real.display()));
     }
     let p = real.as_path();
     let meta = std::fs::metadata(p).map_err(|e| format!("cannot read the brief file `{path}`: {e}"))?;

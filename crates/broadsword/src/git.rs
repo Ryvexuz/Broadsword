@@ -145,7 +145,7 @@ fn long_name(p: &Path) -> Option<String> {
 ///
 /// Every place that captures, deletes or lists files calls this function: checkpoint capture (`capture`), the stored index
 /// trees (`secret_free_tree`, and the index entries rollback keeps), rollback's deletes (`changes`, `Guard::remove`) and,
-/// through `is_secret_path`, the queue's `--brief` reader (`queue.rs`, as `is_secret_file`). Rollback's RESTORES use
+/// through `is_secret_path`, the queue's `--brief` reader (`queue.rs`). Rollback's RESTORES use
 /// `is_secret_to_restore`: the same rule except the missing-alias clause.
 pub fn is_secret_in(base: &Path, path: &str) -> bool {
     secret_check(base, path, Missing::Strict)
@@ -195,8 +195,6 @@ pub fn is_secret_path(path: &str) -> bool {
     is_secret_in(Path::new(""), path)
 }
 
-/// The older name of `is_secret_path` (the same function, not a second rule), kept so callers outside this module compile.
-pub use self::is_secret_path as is_secret_file;
 
 /// A project is a Git repo of its own when it has its own `.git` (folder, or file for a linked worktree).
 pub fn is_repo(dir: &Path) -> bool {
@@ -490,8 +488,11 @@ pub struct Rollback {
     /// Ignored files the checkpoint itself skipped (over the cap) that are missing or changed now.
     pub not_protected: Vec<String>,
     /// Paths rollback would have restored or deleted but left exactly as they are because they are (or now name) a
-    /// secret file. Never silent: `rollback` prints each one.
+    /// secret file. Never silent: `recover` prints each one.
     pub secret_skipped: Vec<String>,
+    /// Secret paths whose index entries rollback left exactly as they are (staged now, or in the checkpoint's index tree
+    /// and so never restored from it). Never silent: `recover` prints each one.
+    pub index_secrets: Vec<String>,
 }
 
 fn safe_rel(p: &str) -> Result<PathBuf, String> {
@@ -753,6 +754,7 @@ pub fn rollback(
     // index with unmerged entries cannot be saved, so it is left completely alone and reported.
     let mut not_restored = not_restored;
     let mut interrupted_index_ref = None;
+    let mut index_secrets: Vec<String> = Vec::new();
     match git_text(dir, &["write-tree"], None) {
         Ok(tree) => {
             let (tree, _) = secret_free_tree(dir, state, &format!("{id}-int-idx"), &tree, &[])?;
@@ -769,9 +771,16 @@ pub fn rollback(
                 (None, None) => git_text(dir, &["mktree"], None)?, // no commit yet: the empty tree
             };
             let now = git(dir, &["ls-files", "-s", "-z"], None, None)?;
-            let keep: Vec<Vec<u8>> = entries(&now).into_iter().filter(|(_, p)| is_secret_in(dir, p)).map(|(raw, _)| raw.to_vec()).collect();
-            let (restore, _) = secret_free_tree(dir, state, &format!("{id}-rst-idx"), &base, &keep)?;
+            let mut keep: Vec<Vec<u8>> = Vec::new();
+            for (raw, p) in entries(&now).into_iter().filter(|(_, p)| is_secret_in(dir, p)) {
+                keep.push(raw.to_vec());
+                index_secrets.push(p);
+            }
+            let (restore, dropped) = secret_free_tree(dir, state, &format!("{id}-rst-idx"), &base, &keep)?;
             git_text(dir, &["read-tree", &restore], None)?;
+            index_secrets.extend(dropped);
+            index_secrets.sort();
+            index_secrets.dedup();
         }
         Err(e) => not_restored.push(format!("(the git index: it has unmerged entries and cannot be saved, so it was left untouched: {e})")),
     }
@@ -785,16 +794,12 @@ pub fn rollback(
         not_restored,
         not_protected,
         secret_skipped: std::mem::take(&mut guard.secret_skipped),
+        index_secrets,
     })
     };
-    let rb = apply().map_err(|e| {
+    apply().map_err(|e| {
         format!("{e}. The work as it was before this attempt is saved in {interrupted_ref}; steps before the failure may already have been applied")
-    })?;
-    // No silent skip: every path left alone as a secret is named (names only, never content) in the recover output.
-    for p in &rb.secret_skipped {
-        println!("  secret file left exactly as it is (a rollback never restores, overwrites or deletes one): {p}");
-    }
-    Ok(rb)
+    })
 }
 
 #[cfg(test)]
@@ -1174,7 +1179,6 @@ mod tests {
         ] {
             assert!(!is_secret_path(no), "{no}");
         }
-        assert!(is_secret_file(".env-prod") && !is_secret_file(".envoy.yaml"), "the older name is the same function");
         // NTFS streams and drive-relative names: every `:` piece is judged
         for yes in [".env:s", ".env::$DATA", ".ENV.local:x:$DATA", "C:.env", "sub/.envrc:s", "a.txt:.env"] {
             assert!(is_secret_path(yes), "{yes}");

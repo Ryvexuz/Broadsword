@@ -3,11 +3,46 @@
 //! A record is written when a job starts and rewritten at every step and at the end. Each write goes
 //! to `<id>.rec.tmp` and is renamed over the record, so a kill can never leave a half-written record.
 //! Records are never deleted by cleanup (they are the evidence recovery works from).
-//! Values are one line: a backslash is written `\\` and a newline `\n`.
+//! Values are one line: a backslash is written `\\`, a newline `\n` and a carriage return `\r` (none is ever dropped).
+//! A value that holds a LIST (file names) is made with `encode_list` and read with `decode_list`, so a name holding `|`,
+//! a backslash or a line break comes back whole.
 
 use crate::config::Config;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// One record value from a list: the items joined by `|`, with a `\` or `|` inside an item written `\\` or `\|`.
+/// (Line breaks need nothing here: the record escapes them when it is saved.)
+pub fn encode_list<S: AsRef<str>>(items: &[S]) -> String {
+    items.iter().map(|i| i.as_ref().replace('\\', "\\\\").replace('|', "\\|")).collect::<Vec<_>>().join("|")
+}
+
+/// The items of an `encode_list` value: split only on a `|` that is not escaped, then `\\` -> `\` and `\|` -> `|`.
+/// A record written before lists were escaped still reads the same (its names held no `|`), and any other backslash is
+/// kept as it is. An empty value is an empty list.
+pub fn decode_list(v: &str) -> Vec<String> {
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let mut items = vec![String::new()];
+    let mut it = v.chars();
+    while let Some(c) = it.next() {
+        let cur = items.last_mut().expect("never empty");
+        match c {
+            '\\' => match it.next() {
+                Some(e @ ('\\' | '|')) => cur.push(e),
+                Some(o) => {
+                    cur.push('\\');
+                    cur.push(o);
+                }
+                None => cur.push('\\'),
+            },
+            '|' => items.push(String::new()),
+            o => cur.push(o),
+        }
+    }
+    items
+}
 
 pub const RUNNING: &str = "running";
 pub const DONE: &str = "done";
@@ -25,7 +60,7 @@ pub struct Record {
 }
 
 fn esc(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('\r', "").replace('\n', "\\n")
+    v.replace('\\', "\\\\").replace('\r', "\\r").replace('\n', "\\n")
 }
 
 fn unesc(v: &str) -> String {
@@ -35,6 +70,7 @@ fn unesc(v: &str) -> String {
         if c == '\\' {
             match it.next() {
                 Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
                 Some(o) => out.push(o),
                 None => out.push('\\'),
             }
@@ -179,6 +215,34 @@ mod tests {
         assert_eq!(back.get("missing"), "");
         assert_eq!(std::fs::read_to_string(&r.path).unwrap().lines().count(), 4, "newline must be escaped: one line per field");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A list survives names holding `|`, backslashes, a newline and a carriage return, through a saved and loaded record.
+    #[test]
+    fn lists_round_trip_through_a_record() {
+        let d = tmp("list");
+        let names = ["plain.txt", ".env.a|b", "a\\b\\", "\\|", "x\ny", "cr\r\nlf", "|", "trailing\\"];
+        let mut r = create(&d, "l").unwrap();
+        r.set("names", encode_list(&names));
+        r.set("raw", "a\r\nb");
+        r.save().unwrap();
+        let text = std::fs::read_to_string(&r.path).unwrap();
+        assert_eq!(text.lines().count(), 3, "one line per field: {text:?}");
+        assert!(!text.contains('\r'), "a carriage return is escaped, not written raw");
+        let back = load(&r.path).unwrap();
+        assert_eq!(decode_list(back.get("names")), names);
+        assert_eq!(back.get("raw"), "a\r\nb", "a carriage return is kept, never dropped");
+        assert_eq!(decode_list(""), Vec::<String>::new());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Records written before lists were escaped still read the same.
+    #[test]
+    fn old_unescaped_lists_still_parse() {
+        let back = Record::parse(Path::new("old.rec"), "id = old\nsecret_skipped = .env|.env.local|sub/.env\nignored_skipped_len = 600|10\nwin = a\\\\b|c\n");
+        assert_eq!(decode_list(back.get("secret_skipped")), [".env", ".env.local", "sub/.env"]);
+        assert_eq!(decode_list(back.get("ignored_skipped_len")), ["600", "10"]);
+        assert_eq!(decode_list(back.get("win")), ["a\\b", "c"], "an old lone backslash is kept");
     }
 
     #[test]

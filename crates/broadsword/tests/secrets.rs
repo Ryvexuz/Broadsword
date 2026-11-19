@@ -494,3 +494,52 @@ fn a_path_rollback_skips_as_secret_is_listed_in_the_recover_output() {
     assert!(so.lines().any(|l| l.contains("secret file left exactly as it is") && l.contains("notes.txt")), "the skip is listed: {so}");
     r.children.clear();
 }
+
+/// Brief requirement (records): a list in a job record survives names holding `|` and a newline. Two secret paths that
+/// exist only in the index (`.env.a|b` and `.env.c<newline>d`; Git allows them with core.protectNTFS off) are left out of the
+/// checkpoint, written to the record's `secret_skipped`, read back by `recover` and named there one per line (control
+/// characters shown escaped); their index entries are left as they are, and `recover` says so.
+#[test]
+fn secret_names_with_a_pipe_and_a_newline_round_trip_through_the_record_and_recover() {
+    let mut r = Root::new("pipe");
+    let p = r.project();
+    git(&p, &["config", "core.protectNTFS", "false"]);
+    let blob = git(&p, &["hash-object", "-w", "tracked.txt"]);
+    let mut info = Vec::new();
+    for name in [".env.a|b", ".env.c\nd"] {
+        info.extend_from_slice(format!("100644 {blob}\t{name}").as_bytes());
+        info.push(0);
+    }
+    let mut c = Command::new("git").args(["update-index", "-z", "--add", "--index-info"]).current_dir(&p).stdin(Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(c.stdin.as_mut().unwrap(), &info).unwrap();
+    drop(c.stdin.take());
+    assert!(c.wait().unwrap().success());
+    let staged = text(&git_out(&p, &["ls-files", "-z"]).stdout);
+    assert!(staged.split('\0').any(|f| f == ".env.a|b") && staged.split('\0').any(|f| f == ".env.c\nd"), "{staged:?}");
+    let line = if cfg!(windows) { "echo changed> tracked.txt & ping -n 30 127.0.0.1 >nul" } else { "echo changed > tracked.txt; sleep 30" };
+    let bs_pid = r.spawn(&["run", "p", "--", line]);
+    wait_until("the job to have changed tracked.txt", 90, || {
+        let recs = r.records();
+        recs.len() == 1 && !Root::field(&recs[0], "child_pid").is_empty() && fs::read_to_string(p.join("tracked.txt")).is_ok_and(|s| s.contains("changed"))
+    });
+    let rec = r.only_record();
+    let id = Root::field(&rec, "id");
+    // the record file: `|` inside a name escaped as `\|`, the list split only on a bare `|`, the newline escaped by the record
+    assert_eq!(Root::field(&rec, "secret_skipped"), r".env.a\\|b|.env.c\nd", "{rec}");
+    for rf in [format!("refs/broadsword/checkpoints/{id}"), format!("refs/broadsword/index/{id}")] {
+        let paths = tree_paths(&p, &rf);
+        assert!(!paths.iter().any(|f| f.starts_with(".env.")), "{rf}: {paths:?}");
+    }
+    kill_hard(bs_pid);
+    let out = r.run(&["recover", &id]);
+    let so = text(&out.stdout);
+    println!("{so}{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap(), "original\n");
+    let names = |what: &str| -> Vec<String> { so.lines().filter_map(|l| l.split_once(what).map(|(_, n)| n.to_string())).collect() };
+    assert_eq!(names("secret file the checkpoint did not save, left as it is: "), [".env.a|b", r".env.c\nd"], "read back whole from the record: {so}");
+    assert_eq!(names("secret index entry left as it is: "), [".env.a|b", r".env.c\nd"], "{so}");
+    let staged = text(&git_out(&p, &["ls-files", "-z"]).stdout);
+    assert!(staged.split('\0').any(|f| f == ".env.a|b") && staged.split('\0').any(|f| f == ".env.c\nd"), "index entries kept: {staged:?}");
+    r.children.clear();
+}
