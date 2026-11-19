@@ -32,9 +32,19 @@ def task_cost(r):
     return r["cost_usd"], 0 if r["cost_usd"] is not None else 1
 
 
-def usd(known, unknown):
+def pass_at(r):
+    """The attempt that first fully passed, or None. A one-shot record (no pass_at field) that fully passed is a pass at 1."""
+    if "pass_at" in r:
+        return r["pass_at"]
+    ok = (r.get("graded") is not False and r.get("compiles") and r.get("total") and r.get("passed") == r.get("total")
+          and not r.get("call_failed") and not r.get("format_failure"))
+    return 1 if ok else None
+
+
+def usd(known, unknown, plan=False):
+    """plan: a Codex (plan allowance) call has tokens but no price: shown as "plan", never $0 and never plain n/a."""
     if not known and unknown:
-        return "n/a"
+        return "plan" if plan else "n/a"
     return f"${sum(known):.3f}" + ("+" if unknown else "")
 
 
@@ -44,36 +54,44 @@ def attempts_table(groups, tasks):
     for (prov, model, effort), by_task in groups.items():
         if not any(r.get("max_attempts", 1) > 1 for r in by_task.values()):
             continue
-        cells, p1, passed, pc, pu, npc, npu, nopass = [], 0, 0, [], 0, [], 0, 0
+        cells, p1, passed, pc, pu, npc, npu, nopass, ungraded = [], 0, 0, [], 0, [], 0, 0, 0
+        uc, uu = [], 0
+        plan = prov == "codex"
         for t in tasks:
             r = by_task.get(t)
             if r is None:
                 cells.append("-")
                 continue
+            c, u = task_cost(r)
             if r.get("graded") is False:
+                # no pass has been shown, and its calls cost something: it counts as unresolved, never as free
+                ungraded += 1
+                uc += [c] if c is not None else []
+                uu += u + (1 if c is None and not u else 0)
                 cells.append("ungraded")
                 continue
-            c, u = task_cost(r)
-            at = r.get("pass_at")
+            at = pass_at(r)
             if at == 1:
                 p1 += 1
             if at:
                 passed += 1
                 pc += [c] if c is not None else []
                 pu += u + (1 if c is None and not u else 0)
-                cells.append(f"{at} {usd([c] if c is not None else [], u)}")
+                cells.append(f"{at} {usd([c] if c is not None else [], u, plan)}")
             else:
                 nopass += 1
                 npc += [c] if c is not None else []
                 npu += u + (1 if c is None and not u else 0)
-                cells.append(f"no pass {usd([c] if c is not None else [], u)}")
+                cells.append(f"no pass {usd([c] if c is not None else [], u, plan)}")
         n = len(by_task)
-        tail = usd(pc, pu) if passed else "-"
+        tail = usd(pc, pu, plan) if passed else "-"
         if nopass:
-            tail += f"; no pass at cost {usd(npc, npu)} ({nopass})"
-        total = sum(pc) + sum(npc)
-        unknown = bool(pu or npu)  # an unknown or plan-allowance cost is never $0: such models rank after the known ones
-        rows.append(((nopass, unknown, total), [f"{prov}:{model}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
+            tail += f"; no pass at cost {usd(npc, npu, plan)} ({nopass})"
+        if ungraded:
+            tail += f"; {ungraded} ungraded (cost {usd(uc, uu, plan)} so far, not counted as a pass)"
+        total = sum(pc) + sum(npc) + sum(uc)
+        unknown = bool(pu or npu or uu)  # an unknown or plan-allowance cost is never $0: such models rank after the known ones
+        rows.append(((nopass + ungraded, unknown, total), [f"{prov}:{model}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
     if not rows:
         return None
     head = ["model", "effort", "pass@1", "passed"] + [t.split("-")[0] + "-" + t.split("-", 1)[1][:8] for t in tasks] + ["cost-to-pass"]
@@ -119,7 +137,7 @@ def main():
         known = [c for c, _ in tcs if c is not None]
         missing = sum(1 for c, u in tcs if c is None or u)  # tasks with any attempt of unknown cost
         if not known:
-            cost = "n/a"
+            cost = "plan" if prov == "codex" else "n/a"
         elif missing:
             cost = f"${sum(known):.3f}+ ({missing} n/a)"
         else:

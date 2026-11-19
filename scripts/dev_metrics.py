@@ -306,7 +306,7 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
 
         for v in rs:
             add(openai if is_openai(v.get("model")) else claude, v.get("tokens"))
-        usd = 0.0
+        usd, usd_unknown = 0.0, 0
         for e in es:
             if e.get("reviewer_model") and (e.get("verdict") or e.get("review_calls")):
                 bucket = openai if is_openai(e.get("reviewer_model")) else claude
@@ -318,7 +318,7 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
                 try:
                     usd += float(e["cost_usd"])
                 except (KeyError, ValueError):
-                    pass  # a missing review cost adds nothing; the table says only gating $ is shown
+                    usd_unknown += 1  # counted, so the table can say the $ is a lower bound
             if e.get("shadow_model"):  # Codex on the plan allowance: tokens only, never $0
                 add(openai, e.get("shadow_tokens"))
         first = next((e for e in es if e.get("verdict")), None)
@@ -326,7 +326,8 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
         adj = [v for v in verdicts if first and str(v.get("entry", "")).strip().lower() == fid]  # case and spaces never hide an adjudication
         out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "coder_runs": len(coder_rs),
                     "wall": (ended - (started or created)) if ended and (started or created) else None,
-                    "claude": claude, "openai": openai, "usd": usd,
+                    "claude": claude, "openai": openai, "usd": usd, "usd_unknown": usd_unknown,
+                    "first_reviewer": first.get("reviewer_model") if first else None,
                     "first_verdict": first.get("verdict") if first else None,
                     "first_lines": len(blocking_lines(first)) if first else 0,
                     "first_adjudicated": [v.get("verdict") for v in adj]})
@@ -380,16 +381,21 @@ def completion(tasks, entries, runs):
             print(f"  {label:<20}  {fmt(m)} / {fmt(w)}  (lower bounds, part unknown: {lower}; no number, left out: {nothing})")
         print(f"  coder runs recorded for {sum(1 for r in done if r['coder_runs'])} of {len(done)} done tasks (the rest: no coder tokens in the sums above)")
         m, w = stats([r["usd"] for r in done])
-        print(f"  review $            {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (gating reviews only; coder $ and Codex shadow are not priced: plan, not $0)")
-        firsts = [r for r in done if r["first_verdict"]]
-        passed = sum(1 for r in firsts if r["first_verdict"].startswith("PASS"))
-        print(f"  first-pass PASS     {passed}/{len(firsts)}" + (f" = {passed / len(firsts):.0%}" if firsts else ""))
-        lines = sum(r["first_lines"] for r in firsts)
-        split = {}
-        for r in firsts:
-            for v in r["first_adjudicated"]:
-                split[v] = split.get(v, 0) + 1
-        print(f"  BLOCKING, 1st review  {lines} in {len(firsts)} reviews; adjudicated {dict(sorted(split.items())) or 'none'}, not adjudicated {max(lines - sum(split.values()), 0)}")
+        unpriced = sum(r["usd_unknown"] for r in done)
+        print(f"  review $            {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (gating reviews only; coder $ and Codex shadow are not priced: plan, not $0)"
+              + (f"; {unpriced} review(s) without a price in {sum(1 for r in done if r['usd_unknown'])} task(s): lower bounds" if unpriced else ""))
+        # coders are compared under the same gating reviewer only: the first-pass numbers never mix reviewers
+        firsts_all = [r for r in done if r["first_verdict"]]
+        for reviewer in sorted({r["first_reviewer"] or "?" for r in firsts_all}):
+            firsts = [r for r in firsts_all if (r["first_reviewer"] or "?") == reviewer]
+            passed = sum(1 for r in firsts if r["first_verdict"].startswith("PASS"))
+            print(f"  first-pass PASS under {reviewer}  {passed}/{len(firsts)}" + (f" = {passed / len(firsts):.0%}" if firsts else ""))
+            lines = sum(r["first_lines"] for r in firsts)
+            split = {}
+            for r in firsts:
+                for v in r["first_adjudicated"]:
+                    split[v] = split.get(v, 0) + 1
+            print(f"  BLOCKING, 1st review under {reviewer}  {lines} in {len(firsts)} reviews; adjudicated {dict(sorted(split.items())) or 'none'}, not adjudicated {max(lines - sum(split.values()), 0)}")
         m, w = stats([r["rounds"] - 1 for r in done if r["rounds"]])
         print(f"  fix rounds          {fmt(m, g)} / {fmt(w)}")
 

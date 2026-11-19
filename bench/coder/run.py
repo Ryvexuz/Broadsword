@@ -8,12 +8,12 @@ Usage (from anywhere):
                     no MCP, prompt on stdin, JSON output
             openai  one Chat Completions request (see openai_provider.py); key from OPENAI_API_KEY or the root .env.
                     Options: --price-in/--price-out (USD per 1M tokens; cost_usd is null without both), --max-tokens,
-                    --timeout, --retries, --backoff, --base-url, --root. Costs real money: only for a model Lazlo named.
-  --attempts N      (1 to 3, default 1) up to N tries per task: a task that does not fully pass is asked again with the
+                    --timeout, --http-retries, --backoff, --base-url, --root. Costs real money: only for a model Lazlo named.
+  --retries N       (alias --attempts N; 1 to 3, default 1) up to N tries per task: a task that does not fully pass is asked again with the
                     spec plus the names of the failing hidden tests (names only; "did not compile" / "no single code
                     block" when there are none). Attempt 1 is the one-shot result (pass@1). Round k asks only the tasks
-                    that have not passed, and each round is graded as one batch. Not the same as the openai --retries
-                    (HTTP retries on 429/5xx). With N = 1 the result JSON is exactly the one-shot format.
+                    that have not passed, and each round is graded as one batch. The openai provider's HTTP
+                    retries on 429/5xx are --http-retries (--retries is the attempt budget for every provider). With N = 1 the result JSON is exactly the one-shot format.
   python -I -B run.py regrade <out-dir>   grades the saved .rs files again (no model call), after a run whose
                     grading failed (its result JSONs say graded=false); updates the JSONs
   task      folder names under tasks/ (01-duration ...); none given = all six
@@ -29,7 +29,7 @@ graded is false when the model call was made but grading failed; passed/compiles
 With --attempts N > 1 the JSON also holds (the fields above describe the LAST attempt): attempts_made, max_attempts,
 pass_at (number of the first attempt that fully passed, null = no pass), cost_usd_total (sum over the attempts' known
 costs, null if none known), cost_unknown_attempts, wall_s_total, and attempts (one object per attempt with the same
-fields plus failed_tests). Attempt files: <tag>.* holds the latest, <tag>__aK.* the K-th (K >= 2).
+fields plus failed_tests). Attempt files: <tag>.* holds the latest, <tag>__aK.* the K-th (K >= 1).
 """
 import importlib.util, json, os, pathlib, re, subprocess, sys, time, tomllib
 
@@ -138,17 +138,22 @@ MAX_ATTEMPTS = 3  # the largest --attempts accepted
 
 
 def take_attempts(argv):
-    """Pulls `--attempts N` (or --attempts=N) out of argv. Returns (remaining argv, N); N is 1 when it is not given."""
+    """Pulls the attempt budget (`--retries N` or `--attempts N`, also with =) out of argv. Returns (remaining argv, N); N is 1
+    when it is not given. The openai provider's HTTP retries are `--http-retries X`: they are passed on as `--retries X`."""
     rest, n, i = [], 1, 0
     while i < len(argv):
         a = argv[i]
-        if a == "--attempts" or a.startswith("--attempts="):
+        name = a.split("=", 1)[0]
+        if name in ("--attempts", "--retries", "--http-retries"):
             v = a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else "")
             if "=" not in a:
                 i += 1
-            if not v.isdigit() or not 1 <= int(v) <= MAX_ATTEMPTS:
-                sys.exit(f"--attempts must be a whole number from 1 to {MAX_ATTEMPTS}")
-            n = int(v)
+            if name == "--http-retries":
+                rest += ["--retries", v]  # the openai provider's own option (HTTP retries on 429/5xx)
+            else:
+                if not v.isdigit() or not 1 <= int(v) <= MAX_ATTEMPTS:
+                    sys.exit(f"{name} must be a whole number from 1 to {MAX_ATTEMPTS}")
+                n = int(v)
         else:
             rest.append(a)
         i += 1
@@ -169,8 +174,10 @@ def retry_prompt(base, rec):
         note = "Your previous answer did not contain exactly one fenced rust code block."
     elif not rec["compiles"]:
         note = "Your previous solution did not compile."
-    else:
-        note = "Your previous solution failed these hidden tests (names only): " + ", ".join(rec.get("_failed") or []) + "."
+    elif rec.get("_failed"):
+        note = "Your previous solution failed these hidden tests (names only): " + ", ".join(rec["_failed"]) + "."
+    else:  # the harness gave no failing names (for example the tests could not be listed): say only that it did not pass
+        note = "Your previous solution did not pass all of the hidden tests."
     return f"{base}\n\n{note} Write the complete corrected Rust source file now, in one ```rust block."
 
 
@@ -188,7 +195,7 @@ def main():
     if provider not in PROVIDERS:
         sys.exit(f"provider must be one of {sorted(PROVIDERS)}")
     if OPENAI_OPTS and provider != "openai":
-        sys.exit("--price-in/--price-out/--max-tokens/--timeout/--retries/--backoff/--base-url/--root are for provider openai only")
+        sys.exit("--price-in/--price-out/--max-tokens/--timeout/--http-retries/--backoff/--base-url/--root are for provider openai only")
     check_workdir()
     if provider == "openai":
         OP.prepare(model, effort, OPENAI_OPTS, CFG["model_timeout_seconds"])  # settings and key checked before any task
@@ -218,7 +225,7 @@ def main():
             sent = st["prompt"]
             t = st["dir"]
             tag = f"{t.name}__{provider}__{model}__{effort}"
-            atag = tag if rnd == 1 else f"{tag}__a{rnd}"
+            atag = tag if attempts == 1 else f"{tag}__a{rnd}"  # N > 1: every attempt keeps its own files, <tag>.* is the latest
             t0 = time.time()
             res = PROVIDERS[provider](sent, model, effort)
             dt = time.time() - t0

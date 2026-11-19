@@ -126,6 +126,30 @@ class Completion(unittest.TestCase):
         rows = self.costs([task("t1")], entries, [], verdicts)
         self.assertEqual(rows["t1"]["first_adjudicated"], ["real"])
 
+    def completion_text(self, tasks, entries, runs=()):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dm.completion(tasks, entries, list(runs))
+        return buf.getvalue()
+
+    def test_first_pass_is_reported_per_gating_reviewer_never_mixed(self):
+        tasks = [task("t1"), task("t2")]
+        entries = [entry("q-0001", "t1", "PASS", reviewer_model="haiku"),
+                   entry("q-0002", "t2", "FAIL", reviewer_model="opus", blocking="a:1 - x")]
+        rows = self.costs(tasks, entries, [])
+        self.assertEqual(rows["t1"]["first_reviewer"], "haiku")
+        out = self.completion_text(tasks, entries)
+        self.assertIn("first-pass PASS under haiku  1/1", out)
+        self.assertIn("first-pass PASS under opus  0/1", out)
+        self.assertNotIn("first-pass PASS     1/2", out)
+
+    def test_review_without_a_price_is_counted_not_silently_dropped(self):
+        tasks = [task("t1")]
+        entries = [entry("q-0001", "t1", "FAIL", cost_usd=""), entry("q-0002", "t1")]
+        rows = self.costs(tasks, entries, [])
+        self.assertEqual(rows["t1"]["usd_unknown"], 1)
+        self.assertIn("1 review(s) without a price", self.completion_text(tasks, entries))
+
 
 if __name__ == "__main__":
     unittest.main()

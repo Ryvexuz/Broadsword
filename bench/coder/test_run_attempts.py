@@ -241,7 +241,8 @@ class Attempts(unittest.TestCase):
                         "compiles": True, "passed": 3, "total": 3, "format_failure": False, "call_failed": False,
                         "graded": True, "max_attempts": 3, "attempts_made": 1, "pass_at": 1}
                 base.update(r)
-                (out / f"01-duration__claude__{base['model']}__default.json").write_text(json.dumps(base), encoding="utf-8")
+                base = {k: v for k, v in base.items() if v != "DEL"}  # "DEL" drops a default key (a one-shot record)
+                (out / f"{base['task']}__{base['provider']}__{base['model']}__default.json").write_text(json.dumps(base), encoding="utf-8")
             score = load("score")
             sys.argv = ["score.py", str(out)]
             buf = io.StringIO()
@@ -259,6 +260,78 @@ class Attempts(unittest.TestCase):
     def test_a_task_with_an_unknown_attempt_cost_shows_the_lower_bound_in_the_main_table(self):
         text = self.score_text([{"model": "m", "cost_usd": 0.1, "cost_usd_total": 0.1, "cost_unknown_attempts": 1}])
         self.assertIn("$0.100+ (1 n/a)", text.split("cost to pass")[0])
+
+    def real_shape_grade(self, items):
+        """The shapes bench/coder/harness.py really returns when a build fails or the tests cannot be listed: no
+        failed_tests key at all (see grade_inner: it is only set after the per-test loop)."""
+        out = []
+        for rs, task in items:
+            ok = "good" in rs.read_text(encoding="utf-8")
+            if ok:
+                out.append({"task": task.name, "compiles": True, "passed": 3, "failed": 0, "total": 3, "wall_s": 1.0,
+                            "first_error": None, "timed_out": False, "failed_tests": []})
+            elif "bad" in rs.read_text(encoding="utf-8"):  # tests could not be listed: compiled, nothing known per test
+                out.append({"task": task.name, "compiles": True, "passed": 0, "failed": 3, "total": 3, "wall_s": 1.0,
+                            "first_error": "listing the tests timed out after 5s", "timed_out": True})
+            else:
+                out.append({"task": task.name, "compiles": False, "passed": 0, "failed": 3, "total": 3, "wall_s": 1.0,
+                            "first_error": "error: nope", "timed_out": False})
+        return out
+
+    def test_a_harness_result_without_failed_tests_gets_the_fallback_wording(self):
+        run, out, prompts, rec = self.scripted('""', grade=self.real_shape_grade)
+        retry = prompts[1]  # call 2 follows attempt 1: compiled, but no test names
+        self.assertNotIn("(names only): .", "".join(prompts))
+        self.assertNotIn("(names only): ", retry)
+        self.assertIn("did not pass all of the hidden tests", retry)
+        self.assertEqual(rec["attempts"][0]["failed_tests"], [])
+
+    def test_attempt_one_files_are_kept_when_a_later_attempt_overwrites_the_latest(self):
+        run, out, prompts, rec = self.scripted('""')
+        tag = "01-duration__claude__fake-model__default"
+        self.assertIn("bad", (out / f"{tag}__a1.rs").read_text(encoding="utf-8"))
+        self.assertTrue((out / f"{tag}__a1.answer.txt").is_file())
+        self.assertTrue((out / f"{tag}__a1.raw.json").is_file())
+
+    def test_retries_flag_is_the_attempt_budget_and_http_retries_is_renamed(self):
+        run = load("run")
+        self.assertEqual(run.take_attempts(["a", "--retries", "3", "b"]), (["a", "b"], 3))
+        self.assertEqual(run.take_attempts(["a", "--retries=2"]), (["a"], 2))
+        self.assertEqual(run.take_attempts(["a", "--http-retries", "4"]), (["a", "--retries", "4"], 1))
+        with self.assertRaises(SystemExit):
+            run.take_attempts(["--retries", "9"])
+
+    def test_the_brief_command_with_retries_3_writes_attempts_and_cost_to_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            run, plog = self.setup_run(tmp)
+            out = tmp / "out"
+            self.run_main(run, ["run.py", str(out), "claude", "fake-model", "default", "--retries", "3", "01-duration"])
+            rec = json.loads((out / "01-duration__claude__fake-model__default.json").read_text(encoding="utf-8"))
+            self.assertEqual((rec["attempts_made"], rec["pass_at"]), (2, 2))
+            self.assertAlmostEqual(rec["cost_usd_total"], 0.5)
+
+    def test_a_one_shot_pass_in_a_group_with_multi_attempt_records_is_a_pass_at_1(self):
+        text = self.score_text([{"model": "m", "task": "01-duration", "cost_usd": 0.1, "cost_usd_total": 0.1,
+                                 "cost_unknown_attempts": 0},
+                                {"model": "m", "task": "02-ring-buffer", "cost_usd": 0.2, "max_attempts": "DEL", "pass_at": "DEL"}])
+        tbl = text.split("cost to pass")[1].split(chr(10))[2]
+        self.assertIn("2/2", tbl)
+        self.assertNotIn("no pass", tbl)
+
+    def test_a_model_with_only_ungraded_tasks_does_not_rank_as_free(self):
+        text = self.score_text([{"model": "aaa", "graded": False, "cost_usd": 0.4, "cost_usd_total": 0.4, "pass_at": None,
+                                 "passed": 0, "compiles": False},
+                                {"model": "zzz", "cost_usd": 0.5, "cost_usd_total": 0.5, "cost_unknown_attempts": 0}])
+        table = text.split("cost to pass")[1]
+        self.assertLess(table.index("claude:zzz"), table.index("claude:aaa"))
+        self.assertIn("1 ungraded", table)
+
+    def test_codex_call_without_a_price_is_marked_plan_not_n_a(self):
+        text = self.score_text([{"model": "gpt-x", "provider": "codex", "cost_usd": None, "cost_usd_total": None,
+                                 "cost_unknown_attempts": 1}])
+        self.assertIn("plan", text)
+        self.assertNotIn("n/a", text)
 
 
 if __name__ == "__main__":
