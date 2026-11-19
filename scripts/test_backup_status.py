@@ -288,6 +288,42 @@ class Push(Base):
         code, out = self.run_cli()
         self.assertEqual(code, 0, out)
 
+    def test_first_time_push_refused_when_remote_branch_exists(self):
+        # remote already has "brand-new" at an ancestor; we have no tracking ref for it
+        g(self.root, "push", "-q", "origin", "main:refs/heads/brand-new")
+        old = g(self.bare, "rev-parse", "brand-new")
+        g(self.root, "update-ref", "-d", "refs/remotes/origin/brand-new")   # the push made one; drop it
+        commit(self.root, "b.txt")
+        self.write_map([{"name": "root", "path": ".", "branch": "main",
+                         "remote": "origin", "remote_branch": "brand-new"}])
+        code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("root: remote branch brand-new exists but there is no tracking ref; "
+                      "run git fetch first", out)
+        self.assertEqual(old, g(self.bare, "rev-parse", "brand-new"))
+        self.assertIn("backup: 1 repos behind", out)
+
+    def test_unverifiable_state_is_never_first_time_published(self):
+        # tracking ref exists but its commit is not in this repo: cannot verify, so no push at all
+        other = self.base / "other"
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(self.bare), str(other)], check=True)
+        commit(other, "x.txt")
+        g(other, "push", "-q", "origin", "HEAD:refs/heads/unseen")
+        missing = g(other, "rev-parse", "HEAD")
+        refdir = self.root / ".git" / "refs" / "remotes" / "origin"   # update-ref refuses a missing object
+        refdir.mkdir(parents=True, exist_ok=True)
+        (refdir / "unseen").write_text(missing + "\n")
+        self.write_map([{"name": "root", "path": ".", "branch": "main",
+                         "remote": "origin", "remote_branch": "unseen"}])
+        before = self.remote_refs()
+        code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("cannot verify: tracking ref origin/unseen", out)
+        self.assertIn("is not a commit in", out)
+        self.assertNotIn("will push", out)
+        self.assertEqual(before, self.remote_refs())
+        self.assertEqual(missing, g(self.bare, "rev-parse", "unseen"))
+
     def test_first_time_push_skipped_when_local_branch_missing(self):
         self.write_map([{"name": "root", "path": ".", "branch": "nobranch",
                          "remote": "origin", "remote_branch": "brand-new"}])

@@ -47,7 +47,10 @@ script records what it pushed in the pushed repo itself (`refs/backup-pushed-bra
 
 A mapped branch with no tracking ref yet (never published) is reported "cannot verify"; `--push --yes`
 publishes it as a new remote branch with a plain push (branch only; tags follow on the next push). If the
-remote branch already exists and differs, the plain push is rejected and reported, never forced.
+remote branch already exists, `--push --yes` first checks with `git ls-remote --heads` (the one network
+call besides the push) and, if the branch is there, pushes nothing and says `remote branch <b> exists but
+there is no tracking ref; run git fetch first`; the repo stays BEHIND. A repo whose state cannot be
+verified (the tracking ref's commit is missing locally) is never first-time published at all.
 
 The no-force/no-delete rule is one real check (`check_plain_push`, not an `assert`), so it also holds
 under `python -O`; a push command that fails it is refused at planning time (exit 2). Remote URLs and

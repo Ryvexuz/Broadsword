@@ -129,7 +129,7 @@ def check_repo(root, entry, now):
             "oldest_age": None, "ref_age": None, "error": None, "remote_sha": None,
             "recorded": False, "first_time": False, "tags_unverified": False}
     sha = git(tracking, "rev-parse", "--verify", "--quiet",
-              "refs/remotes/%s^{commit}" % ref, check=False).stdout.strip()
+              "refs/remotes/%s" % ref, check=False).stdout.strip()   # not peeled: a ref to a missing object must still show up
     if sha and git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0:
         res["error"] = "tracking ref %s (%s) is not a commit in %s" % (ref, sha[:8], entry["path"])
         sha = ""
@@ -210,6 +210,26 @@ def push_cmd(root, entry, url, refspecs):
     return check_plain_push(["git", "-C", repo, "push", url, *refspecs])
 
 
+def remote_branch_exists(url, entry):
+    """First-time publish may only create the branch. True (and a message) when the remote already
+    has it, or when that cannot be checked; the repo is then not pushed and stays BEHIND."""
+    b = entry["remote_branch"]
+    try:
+        r = subprocess.run(["git", "ls-remote", "--heads", url, "refs/heads/%s" % b],
+                           capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as ex:
+        print("%s: cannot check remote branch %s: %s" % (entry["name"], b, scrub(ex)))
+        return True
+    if r.returncode != 0:
+        print("%s: cannot check remote branch %s: %s" % (entry["name"], b, scrub(r.stderr.strip())))
+        return True
+    if r.stdout.strip():
+        print("%s: remote branch %s exists but there is no tracking ref; run git fetch first"
+              % (entry["name"], b))
+        return True
+    return False
+
+
 def do_push(root, entry, cmd, refspecs):
     """Plain push. Returns True on success; any failure (git error, timeout) is reported, not raised."""
     repo = os.path.join(root, entry["path"])
@@ -265,16 +285,18 @@ def main(argv=None):
         try:
             for e, r in todo:
                 url, specs = push_plan(args.root, e, r)
-                plans.append((e, url, specs, push_cmd(args.root, e, url, specs)))
+                plans.append((e, url, specs, push_cmd(args.root, e, url, specs), bool(r.get("first_time"))))
         except (RuntimeError, OSError) as e:
             print("backup: cannot plan push: %s" % scrub(e))
             return 2
-        for e, url, specs, _cmd in plans:
+        for e, url, specs, _cmd, _first in plans:
             print("will push %s to %s: %s" % (e["name"], scrub(url), " ".join(specs)))
         if not args.yes:
             print("backup: --push publishes your work; nothing pushed. Add --yes to confirm.")
             return 2
-        for e, url, specs, cmd in plans:
+        for e, url, specs, cmd, first in plans:
+            if first and remote_branch_exists(url, e):
+                continue   # only CREATING a remote branch is allowed without a tracking ref
             do_push(args.root, e, cmd, specs)
         now = time.time()
         results = []
