@@ -194,7 +194,7 @@ fn validate_catches_bad_meshes() {
 
 #[test]
 fn bad_normals_are_refused_with_their_line_number() {
-    for (what, vn) in [("zero", "vn 0 0 0"), ("negative zero", "vn -0 0 -0"), ("overflowing length", "vn 3e38 3e38 3e38")] {
+    for (what, vn) in [("zero", "vn 0 0 0"), ("negative zero", "vn -0 0 -0")] {
         let text = format!("v 0 0 0\nv 1 0 0\nv 0 1 0\n{vn}\nf 1//1 2//1 3//1\n");
         let (line, msg) = err(&text);
         assert_eq!(line, 4, "{what}: the error must name the vn line ({msg})");
@@ -207,4 +207,26 @@ fn bad_normals_are_refused_with_their_line_number() {
     // A non-unit but valid normal is normalised, not refused (documented in README "OBJ").
     let ok = Mesh::from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 0.001\nf 1//1 2//1 3//1\n").unwrap();
     assert_eq!(ok.normals, vec![Vec3::new(0.0, 0.0, 1.0); 3]);
+    // Extreme but finite normals are normalised without underflow or overflow.
+    for (vn, want) in [
+        ("vn 1e-30 0 0", [1.0, 0.0, 0.0]),
+        ("vn 0 1e-38 0", [0.0, 1.0, 0.0]),
+        ("vn 3e38 3e38 0", [0.70710677, 0.70710677, 0.0]),
+        ("vn 3e38 3e38 3e38", [0.57735026, 0.57735026, 0.57735026]),
+    ] {
+        let m = Mesh::from_obj(&format!("v 0 0 0
+v 1 0 0
+v 0 1 0
+{vn}
+f 1//1 2//1 3//1
+")).unwrap_or_else(|e| panic!("{vn}: {e:?}"));
+        let n = m.normals[0];
+        assert!((n.length() - 1.0).abs() < 1e-6, "{vn}: length {}", n.length());
+        assert!((n.x - want[0]).abs() < 1e-6 && (n.y - want[1]).abs() < 1e-6 && (n.z - want[2]).abs() < 1e-6, "{vn}: {n:?}");
+    }
+    // The refusal says why.
+    let (_, msg) = err("v 0 0 0
+vn 0 0 0
+");
+    assert!(msg.contains("zero vector"), "{msg}");
 }

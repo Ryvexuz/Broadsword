@@ -78,7 +78,7 @@ impl Mesh {
     /// triangles). Comments, and the lines `o`, `g`, `s`, `usemtl` and `mtllib`, are ignored. Everything
     /// else is refused with its line number: other directives, `v/vt`, negative or zero or out-of-range
     /// indices (an index must refer to something already defined), polygons with five or more vertices,
-    /// non-finite numbers, a zero-length normal (other non-unit normals are normalised), and a file that mixes faces with and without normals. Vertices that are used
+    /// non-finite numbers, a zero-vector normal (every other finite non-unit normal is normalised), and a file that mixes faces with and without normals. Vertices that are used
     /// with different normals are duplicated, so the result has one normal per position.
     pub fn from_obj(text: &str) -> Result<Mesh, ObjError> {
         let mut positions: Vec<Vec3> = Vec::new();
@@ -110,12 +110,20 @@ impl Mesh {
                     if key == "v" {
                         positions.push(v);
                     } else {
-                        // Non-unit normals are normalised; a normal with no direction is refused.
-                        let len = v.length();
-                        if !(len.is_finite() && len > 0.0) {
-                            return obj_err(line_no, "`vn` has zero length (or its length is not finite) and no direction");
+                        // Non-unit normals are normalised (in f64, after scaling by the largest component, so
+                        // neither tiny nor huge values underflow or overflow); only a zero vector is refused.
+                        let comps = [f64::from(c[0]), f64::from(c[1]), f64::from(c[2])];
+                        let big = comps.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                        if big == 0.0 {
+                            return obj_err(line_no, "`vn` is the zero vector and has no direction");
                         }
-                        normals.push(v.normalized());
+                        let s = comps.map(|x| x / big);
+                        let len = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+                        let u = Vec3::new((s[0] / len) as f32, (s[1] / len) as f32, (s[2] / len) as f32);
+                        if !(u.x.is_finite() && u.y.is_finite() && u.z.is_finite()) {
+                            return obj_err(line_no, "`vn` cannot be normalised to a finite unit vector");
+                        }
+                        normals.push(u);
                     }
                 }
                 "vt" => {
