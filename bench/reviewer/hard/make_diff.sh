@@ -6,6 +6,7 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT="${1:-$HERE/../cases/hard1.diff}"
 mkdir -p "$(dirname "$OUT")"
+OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 cd "$HERE/crate/buggy"
 : > "$OUT"
 for f in src/*.rs; do

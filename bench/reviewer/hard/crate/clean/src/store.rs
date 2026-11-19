@@ -69,7 +69,7 @@ struct LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // Drop cannot report an error; a lock file that stays behind shows up as `Locked`.
+        // Drop cannot return an error, so the result of the removal is ignored.
         let _ = fs::remove_file(&self.path);
     }
 }

@@ -78,8 +78,15 @@ fn bug03_parent_dir_in_the_middle_is_refused() {
     let root = PathBuf::from("q");
     assert!(record_path(&root, "a/../../escape").is_err());
     assert!(record_path(&root, "a/b/../c").is_err());
-    let store = Store::open(&config("b03")).unwrap();
-    assert!(matches!(store.put("a/../../escape", b"x"), Err(StoreError::Path(_))));
+    // The queue folder sits three levels below a folder this test owns, so a record that
+    // escapes by two levels still lands inside `base`, which is removed before the assert.
+    let base = fresh_dir("b03");
+    let queue = base.join("x").join("y").join("q");
+    let cfg = Config::parse(&cfg_text(&queue)).unwrap();
+    let store = Store::open(&cfg).unwrap();
+    let result = store.put("a/../../escape", b"x");
+    fs::remove_dir_all(&base).unwrap();
+    assert!(matches!(result, Err(StoreError::Path(_))));
 }
 
 #[test]

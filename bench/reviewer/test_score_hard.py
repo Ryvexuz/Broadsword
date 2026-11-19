@@ -1,7 +1,7 @@
 """Tests for score_hard.py, with hand-written review texts. Run from bench/reviewer/:
   python -B -m unittest test_score_hard
 """
-import json, pathlib, re, shutil, subprocess, tempfile, unittest
+import json, pathlib, re, shutil, subprocess, sys, tempfile, unittest
 
 import score_hard
 
@@ -106,6 +106,34 @@ class ScoreHard(unittest.TestCase):
             _, rows = score_hard.score_dir(d)
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["model"], rows[0]["cost"], rows[0]["wall"], len(rows[0]["caught"])), ("opus", 0.31, 42.5, 12))
+
+    def test_score_hard_reads_every_key_run_py_writes(self):
+        """Runs run.py's own main() with only the claude CLI call replaced by a canned reply, then scores the file it wrote."""
+        import importlib.util, os, types
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("bench_run", HERE / "run.py")
+        run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run)
+        canned = json.dumps({"result": PERFECT, "total_cost_usd": 0.25, "usage": {}, "is_error": False,
+                             "modelUsage": {"m": {}}}).encode("utf-8")
+        fake = types.SimpleNamespace(stdout=canned, stderr=b"", returncode=0)
+        diff = self.built_diff()
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "cases").mkdir()
+            (d / "cases" / "hard1.diff").write_text(diff, encoding="utf-8")
+            (d / "cases.json").write_text((HERE / "cases.json").read_text(encoding="utf-8"), encoding="utf-8")
+            out = d / "out"
+            with mock.patch.object(run, "HERE", d), mock.patch.object(run, "WORKDIR", str(d / "work")),                     mock.patch.object(run.subprocess, "run", return_value=fake),                     mock.patch.object(sys, "argv", ["run.py", str(out), "opus", "high", "hard1"]):
+                run.main()
+            rec = json.loads((out / "hard1__opus__high.json").read_text(encoding="utf-8"))
+            for key in ("case", "model", "effort", "wall_s", "exit", "cost_usd", "result"):
+                self.assertIn(key, rec)
+            _, rows = score_hard.score_dir(out)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["model"], r["effort"], r["cost"], r["err"], len(r["caught"])), ("opus", "high", 0.25, False, 12))
+        self.assertEqual(r["wall"], rec["wall_s"])
 
     def test_run_py_sends_only_the_brief_and_the_diff(self):
         src = (HERE / "run.py").read_text(encoding="utf-8")
