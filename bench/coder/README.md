@@ -22,7 +22,7 @@ prove.py           prove the tasks are sound (references pass, wrong solutions f
 check_specs.py     check that no spec.md leaks test names or test data
 run.py             ask a model for each task, extract the code, grade it
 score.py           table of results
-support/common.rs  `within(...)`: the per-test timeout, copied next to the tests
+support/common.rs  `within(...)`, `panics_within(...)`: the per-test timeout, copied next to the tests
 tasks/<nn>-<name>/
     spec.md        what the model sees: behaviour, signatures, errors, constraints
     reference.rs   a correct solution
@@ -32,7 +32,7 @@ tasks/<nn>-<name>/
 
 ## How grading works
 
-`harness.py` writes the solution as `src/lib.rs` of a small crate (package `solution`, no dependencies, edition 2021, `#![forbid(unsafe_code)]` added on top) under `scratch/coder-bench/crates/<task>/`, puts `tests.rs` in as `tests/acceptance.rs`, and runs `cargo test --offline --test acceptance`.
+`harness.py` writes the solution as `src/lib.rs` of a small crate (package `solution`, no dependencies, edition 2021, `#![forbid(unsafe_code)]` added on top) under `scratch/coder-bench/crates/<task>/`, puts `tests.rs` in as `tests/acceptance.rs`, builds the test binary once (`cargo test --no-run`), takes the test list from libtest (`--list`) and runs the binary once per test by exact name. A test passes only if its own process exits 0 and libtest's summary says `1 passed; 0 failed`; printed `test x ... ok` lines are never read, so a solution cannot forge a score by printing them.
 
 It goes through Broadsword, never plain cargo: one `broadsword build/run`-style job per batch,
 
@@ -46,7 +46,7 @@ Result per solution: `compiles`, `passed`, `failed`, `total`, `wall_s`, `first_e
 
 - A solution that does not compile scores 0 and keeps the first compiler error.
 - `total` is the number of `#[test]` functions; `failed = total - passed`, so a crash that kills the test binary still fails the unfinished tests.
-- **Per-test timeout:** every call into the solution runs inside `within(...)` (a thread with a timeout, `test_timeout_seconds` in `config.toml`), so a looping solution fails that test instead of hanging. Each cargo run is also killed after `harness_timeout_seconds`.
+- **Per-test timeout:** every call into the solution runs inside `within(...)` (a thread with a timeout, `test_timeout_seconds` in `config.toml`), so a looping solution fails that test instead of hanging. Expecting a panic is `assert!(panics_within(|| ...))`, never `#[should_panic]` (a timeout panic would pass it). Each test process is also killed after `test_process_timeout_seconds` and the whole run after `harness_timeout_seconds`.
 - A test that panics, or a solution with `unsafe`, fails or does not compile; nothing else is skipped.
 
 ## Proof that the tasks are sound
@@ -62,7 +62,7 @@ python -I -B bench/coder/check_specs.py
 2. every wrong solution compiles and fails **at least one** test (a wrong solution that does not compile does not count: the tests must really bite);
 3. every task has at least two wrong solutions.
 
-`check_specs.py` fails if a `spec.md` contains a test function name, a string literal from `tests.rs` (2 or more characters) or an integer pair from the tests. The only allowed overlap is the `i64` limits the expression spec must state.
+`check_specs.py` fails if a `spec.md` contains a test function name, a string literal from `tests.rs` (2 or more characters) or a tuple of 2 or more numbers or `i64` constants, a list of string literals (1-character ones too), or 3 or more of one test's integers together in one spec sentence or example. The allowed overlaps (`ALLOWED`, `ALLOWED_NUMBERS`, `SKIP_NUMBER_SETS` in the script) each carry their reason.
 
 A task without a passing proof is not done.
 
@@ -70,7 +70,7 @@ A task without a passing proof is not done.
 
 1. Make `tasks/<nn>-<name>/` with `spec.md`, `reference.rs`, `tests.rs` and `wrong/`.
 2. In `spec.md` give the behaviour, the exact public signatures, the error cases and the constraints (std only, no `unsafe`, one `lib.rs` file). Do not mention tests. Use different example values from the ones in `tests.rs`.
-3. In `tests.rs` start with `mod common; use common::within; use solution::*;` and call the solution only through `within(...)` (closures must be `Send + 'static`). Name test functions `hidden_...`. Every `#[test]` is one scored test.
+3. In `tests.rs` start with `mod common; use common::within; use solution::*;` and call the solution only through `within(...)` (or `panics_within(...)` for an expected panic; no `#[should_panic]`) (closures must be `Send + 'static`). Name test functions `hidden_...`. Every `#[test]` is one scored test.
 4. Write at least two wrong solutions that are plausible, such as an off-by-one, a missed edge case, a non-minimal answer or a too-slow one. Each must compile.
 5. Run `prove.py` and `check_specs.py`. Fix the tests (never the proof rules) until both pass.
 
@@ -124,3 +124,11 @@ prints one row per model and effort, one column per task (passed/total), the tot
 - A timed-out test leaves its thread running until the test binary exits; that is fine for correctness but can slow the rest of the run.
 - Tests run in a debug build, so the performance tests (ttl-lru, line-diff) are sized for that.
 - One run per model and effort: model answers vary, so a single run is a sample, not a rank.
+
+## If grading fails after the model calls
+
+When the graded batch cannot run (busy lock, refused job, no result file), `run.py` still writes a result JSON per task with the model call's data (tokens, cost, time) and `graded: false` plus the error, and `score.py` shows those tasks as `ungraded`. Grade the saved `.rs` files later, without calling a model:
+
+```
+python -I -B bench/coder/run.py regrade <out-dir>
+```

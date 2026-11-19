@@ -38,9 +38,9 @@ There is often more than one minimal script; any minimal valid script is accepte
 
 Examples (old, new, then one minimal script):
 
-- `["a", "b", "c"]`, `["a", "c"]`: `Equal(a)`, `Delete(b)`, `Equal(c)`.
-- `["a", "b"]`, `["b", "a"]`: for example `Delete(a)`, `Equal(b)`, `Insert(a)`. That is 2 edits, and none shorter exists.
-- `[]`, `["x"]`: `Insert(x)`.
+- `["p", "q", "r"]`, `["p", "r"]`: `Equal(p)`, `Delete(q)`, `Equal(r)`.
+- `["m", "n"]`, `["n", "m"]`: for example `Delete(m)`, `Equal(n)`, `Insert(m)`. That is 2 edits, and none shorter exists.
+- `[]`, `["k"]`: `Insert(k)`.
 - `[]`, `[]`: the empty script.
 
 ## Constraints

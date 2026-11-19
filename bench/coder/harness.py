@@ -5,15 +5,17 @@ Usage:  python -I -B harness.py <solution.rs> <task>
 
 Prints one JSON object: task, compiles, passed, failed, total, wall_s, first_error, timed_out.
   - compiles=false scores 0 and keeps the first compiler error.
-  - total is the number of #[test] functions in the task's tests.rs; failed = total - passed,
-    so a crash that kills the test binary still counts the unfinished tests as failed.
-  - Each test has a timeout (config.toml test_timeout_seconds), enforced by support/common.rs.
-  - Each cargo run is also killed after harness_timeout_seconds.
+  - total is the number of tests libtest lists in the built test binary (`--list`); failed = total - passed.
+  - passed is NOT read from the printed `test x ... ok` lines (a solution can print such lines). The test
+    binary is built once, then run once per test by exact name; a test passes only if that run exits 0 and
+    libtest's summary says 1 passed, 0 failed.
+  - Each test has a timeout (config.toml test_timeout_seconds), enforced by support/common.rs; each test
+    process is also killed after test_process_timeout_seconds, and the whole run after harness_timeout_seconds.
 
 How it runs cargo (the Broadsword route): ONE job per call,
     broadsword run <project> [--task <id>] -- python -I -B harness.py --inner <spec.json> <result.json>
-Inside that job the inner mode runs `cargo test --offline --manifest-path <crate> --test acceptance`
-once per solution. So Broadsword's checkpoint, disk guard, shared build folder and job log apply, and the
+Inside that job the inner mode runs `cargo test --offline --manifest-path <crate> --test acceptance --no-run`
+once per solution, then the built test binary once per test. So Broadsword's checkpoint, disk guard, shared build folder and job log apply, and the
 wait for the build lock is paid once per batch, not once per solution. run.py and prove.py grade whole
 batches through grade_batch().
 
@@ -100,37 +102,86 @@ def grade_inner(solution_path, task_dir):
     (crate / "tests" / "acceptance.rs").write_text(tests, encoding="utf-8")
     (crate / "tests" / "common" / "mod.rs").write_text(
         (HERE / "support" / "common.rs").read_text(encoding="utf-8"), encoding="utf-8")
-    cmd = ["cargo", "test", "--offline", "--manifest-path", str(crate / "Cargo.toml"),
-           "--test", "acceptance", "--color", "never"]
     env = dict(os.environ, CODER_BENCH_TEST_TIMEOUT_S=str(CFG["test_timeout_seconds"]))
     t0 = time.time()
-    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    timed_out = False
+    deadline = t0 + CFG["harness_timeout_seconds"]
+    total = len(re.findall(r"#\[test\]", tests))   # only used when the tests cannot be listed (compile failure)
+    res = {"task": task_dir.name, "compiles": False, "passed": 0, "failed": total, "total": total,
+           "wall_s": 0.0, "first_error": None, "timed_out": False}
+
+    def finish():
+        res["wall_s"] = round(time.time() - t0, 1)
+        return res
+
+    # 1. build the test binary (once). Diagnostics are rendered on stderr, artifacts are JSON on stdout.
+    cmd = ["cargo", "test", "--offline", "--manifest-path", str(crate / "Cargo.toml"), "--test", "acceptance",
+           "--color", "never", "--no-run", "--message-format=json-render-diagnostics"]
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        out, _ = p.communicate(timeout=CFG["harness_timeout_seconds"])
+        out, err = p.communicate(timeout=CFG["harness_timeout_seconds"])
     except subprocess.TimeoutExpired:
-        timed_out = True
+        res["timed_out"] = True
         kill_tree(p)
-        out, _ = p.communicate()
-    wall = time.time() - t0
-    text = out.decode("utf-8", errors="replace")
-    # `test name ... ok` and, for #[should_panic] tests, `test name - should panic ... ok`
-    passed = len(re.findall(r"^test \S+(?: - should panic)? \.\.\. ok\s*$", text, re.M))
-    compile_failed = ("could not compile" in text) or ("running " not in text)
-    res = {"task": task_dir.name, "compiles": not compile_failed, "passed": 0, "failed": total, "total": total,
-           "wall_s": round(wall, 1), "first_error": None, "timed_out": timed_out}
-    if compile_failed:
-        m = re.search(r"^error(\[E\d+\])?:.*(?:\n.*){0,8}", text, re.M)
-        res["first_error"] = (m.group(0) if m else "harness could not run cargo test:\n" + text[-1500:])[:1500]
-    else:
-        res["passed"] = min(passed, total)
-        res["failed"] = total - res["passed"]
-        res["failed_tests"] = re.findall(r"^test (\S+)(?: - should panic)? \.\.\. FAILED", text, re.M)
-        if res["failed"]:
-            # the panic messages of the failing tests, to see WHY (kept short)
+        out, err = p.communicate()
+        res["first_error"] = "build timed out"
+        return finish()
+    err_text = err.decode("utf-8", errors="replace")
+    exe = None
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if j.get("reason") == "compiler-artifact" and j.get("executable") and (j.get("target") or {}).get("name") == "acceptance":
+            exe = j["executable"]
+    if p.returncode != 0 or not exe:
+        m = re.search(r"^error(\[E\d+\])?:.*(?:\n.*){0,8}", err_text, re.M)
+        res["first_error"] = (m.group(0) if m else "harness could not build the tests:\n" + err_text[-1500:])[:1500]
+        return finish()
+    res["compiles"] = True
+    # 2. the test list comes from libtest itself (not from the text of tests.rs)
+    lp = subprocess.run([exe, "--list", "--format", "terse"], env=env, cwd=crate, capture_output=True,
+                        timeout=CFG["test_process_timeout_seconds"])
+    names = re.findall(r"^(\S+): test$", lp.stdout.decode("utf-8", errors="replace"), re.M)
+    if lp.returncode != 0 or not names:
+        res["compiles"] = False
+        res["first_error"] = "harness could not list the tests: " + lp.stderr.decode(errors="replace")[-800:]
+        return finish()
+    res["total"] = len(names)
+    # 3. one process per test, by exact name. A test passes only if ITS OWN process exits 0 and libtest
+    #    reports exactly 1 passed, 0 failed. Lines a solution prints on stdout cannot fake that: the exit code
+    #    and the summary of the one-test run are libtest's. (A solution that calls process::exit(0) AND prints
+    #    a forged summary would still get through; that is deliberate sabotage, out of scope here.)
+    passed, failed_tests, details = 0, [], []
+    for name in names:
+        if time.time() > deadline:
+            res["timed_out"] = True
+            failed_tests.append(name)
+            continue
+        tp = subprocess.Popen([exe, "--exact", name, "--test-threads=1", "--color", "never"], env=env, cwd=crate,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            tout, _ = tp.communicate(timeout=CFG["test_process_timeout_seconds"])
+        except subprocess.TimeoutExpired:
+            res["timed_out"] = True
+            kill_tree(tp)
+            tout, _ = tp.communicate()
+            failed_tests.append(name)
+            details.append(f"---- {name} ---- killed after {CFG['test_process_timeout_seconds']}s")
+            continue
+        text = tout.decode("utf-8", errors="replace")
+        if tp.returncode == 0 and re.search(r"^test result: ok\. 1 passed; 0 failed;", text, re.M):
+            passed += 1
+        else:
+            failed_tests.append(name)
             m = re.search(r"^failures:\n\n(.*?)^failures:\n", text, re.M | re.S)
-            res["failure_detail"] = (m.group(1) if m else text[-1500:])[:3000]
-    return res
+            details.append((m.group(1) if m else text[-600:]).strip()[:600])
+    res["passed"] = passed
+    res["failed"] = res["total"] - passed
+    res["failed_tests"] = failed_tests
+    if failed_tests:
+        res["failure_detail"] = "\n".join(details)[:3000]
+    return finish()
 
 
 def grade_batch(items):

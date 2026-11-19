@@ -27,3 +27,11 @@ pub fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         Err(_) => panic!("timed out after {secs}s"),
     }
 }
+
+/// For a test that expects a panic (the job of #[should_panic], which has no timeout and would also
+/// accept our own "timed out" panic): runs `f` under the same per-test timeout and returns whether it
+/// panicked. A call that never returns still fails the test with "timed out", it never counts as the
+/// expected panic. Use as `assert!(panics_within(|| ...), "message")`.
+pub fn panics_within(f: impl FnOnce() + Send + 'static) -> bool {
+    within(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err())
+}

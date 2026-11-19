@@ -36,7 +36,7 @@ pub fn merge_intervals(intervals: &[(i64, i64)]) -> Result<Vec<(i64, i64)>, Merg
 
 ## Edge cases to handle
 
-- Values may be anywhere in the `i64` range, including `i64::MIN` and `i64::MAX`. The function must never panic or overflow: `(i64::MIN, -7)` and `(-6, i64::MAX)` are adjacent and merge to `(i64::MIN, i64::MAX)`, while `(5, i64::MAX)` and `(i64::MAX, i64::MAX)` merge into `(5, i64::MAX)`.
+- Values may be anywhere in the `i64` range, including `i64::MIN` and `i64::MAX`. The function must never panic or overflow: `(i64::MIN, -7)` and `(-6, i64::MAX)` are adjacent and merge into one interval that runs from `i64::MIN` to `i64::MAX`, while `(7, i64::MAX)` and `(i64::MAX - 3, i64::MAX)` overlap and merge into one interval from 7 to `i64::MAX`.
 
 ## Constraints
 

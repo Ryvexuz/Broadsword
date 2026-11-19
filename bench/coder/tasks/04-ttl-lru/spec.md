@@ -41,7 +41,7 @@ impl<K: Eq + Hash + Clone, V> TtlLru<K, V> {
 
 An entry written (by `put`) at time `t` expires at time `t + ttl` (use saturating addition so this never overflows).
 It is **live** while `now < t + ttl` and **expired** once `now >= t + ttl`.
-So with `ttl = 10`, an entry written at time 5 is live at times 5 to 14 and expired from time 15.
+So with `ttl = 6`, an entry written at time 20 is live at times 20 to 25 and expired from time 26.
 
 Reading an entry does not extend its life: only `put` sets the time.
 

@@ -1,5 +1,5 @@
 mod common;
-use common::within;
+use common::{panics_within, within};
 use solution::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -24,9 +24,10 @@ fn hidden_new_is_empty() {
 }
 
 #[test]
-#[should_panic]
 fn hidden_zero_capacity_panics() {
-    let _rb: RingBuffer<i32> = RingBuffer::new(0);
+    assert!(panics_within(|| {
+        let _rb: RingBuffer<i32> = RingBuffer::new(0);
+    }), "RingBuffer::new(0) must panic");
 }
 
 #[test]
@@ -184,29 +185,31 @@ impl Drop for Counted {
 
 #[test]
 fn hidden_elements_dropped_exactly_once() {
-    // Rc is not Send, so this test runs without `within`; its work is tiny and cannot loop forever.
-    let drops = Rc::new(Cell::new(0));
-    let mut rb = RingBuffer::new(2);
-    assert!(rb.push(Counted(1, drops.clone())).is_none());
-    assert!(rb.push(Counted(2, drops.clone())).is_none());
-    assert_eq!(drops.get(), 0);
-    let evicted = rb.push(Counted(3, drops.clone()));
-    assert_eq!(evicted.as_ref().map(|c| c.0), Some(1));
-    assert_eq!(drops.get(), 0, "evicted element is handed back, not dropped");
-    drop(evicted);
-    assert_eq!(drops.get(), 1);
-    let popped = rb.pop_oldest().unwrap();
-    assert_eq!(popped.0, 2);
-    drop(popped);
-    assert_eq!(drops.get(), 2);
-    rb.push(Counted(4, drops.clone()));
-    rb.push(Counted(5, drops.clone())); // evicts 3, returned and dropped immediately
-    assert_eq!(drops.get(), 3);
-    rb.clear();
-    assert_eq!(drops.get(), 5);
-    rb.push(Counted(6, drops.clone()));
-    drop(rb);
-    assert_eq!(drops.get(), 6);
+    // The Rc is made inside the closure (it is not Send), so the whole test runs under `within`.
+    within(|| {
+        let drops = Rc::new(Cell::new(0));
+        let mut rb = RingBuffer::new(2);
+        assert!(rb.push(Counted(1, drops.clone())).is_none());
+        assert!(rb.push(Counted(2, drops.clone())).is_none());
+        assert_eq!(drops.get(), 0);
+        let evicted = rb.push(Counted(3, drops.clone()));
+        assert_eq!(evicted.as_ref().map(|c| c.0), Some(1));
+        assert_eq!(drops.get(), 0, "evicted element is handed back, not dropped");
+        drop(evicted);
+        assert_eq!(drops.get(), 1);
+        let popped = rb.pop_oldest().unwrap();
+        assert_eq!(popped.0, 2);
+        drop(popped);
+        assert_eq!(drops.get(), 2);
+        rb.push(Counted(4, drops.clone()));
+        rb.push(Counted(5, drops.clone())); // evicts 3, returned and dropped immediately
+        assert_eq!(drops.get(), 3);
+        rb.clear();
+        assert_eq!(drops.get(), 5);
+        rb.push(Counted(6, drops.clone()));
+        drop(rb);
+        assert_eq!(drops.get(), 6);
+    });
 }
 
 #[test]

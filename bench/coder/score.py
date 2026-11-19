@@ -6,7 +6,9 @@ One row per provider, model and effort. One column per task (passed/total). Then
   score     passed tests over all tests, as a percentage (a task that is missing counts as not run: shown "-", not in the sums)
   compile   tasks that did not produce a compiling solution (compile errors and format failures)
   format    tasks where the answer did not hold exactly one code block
-  cost      sum of the CLI's cost in USD ("n/a" if any task has no cost)
+  cost      sum of the CLI's cost in USD. If some tasks have no cost (a failed or timed-out call), the sum of the
+            others with a "+" and the count: "$1.234+ (2 n/a)"; "n/a" only if no task has a cost
+  A task whose call was made but not graded (graded=false, see run.py regrade) shows "ungraded" and is not in the sums.
   time      sum of model-call seconds
 """
 import json, pathlib, sys
@@ -36,10 +38,20 @@ def main():
             if r is None:
                 cells.append("-")
                 continue
+            if r.get("graded") is False:
+                cells.append("ungraded")
+                continue
             cells.append(f"{r['passed']}/{r['total']}")
             passed += r["passed"]; total += r["total"]
         costs = [r["cost_usd"] for r in by_task.values()]
-        cost = "n/a" if any(c is None for c in costs) else f"${sum(costs):.3f}"
+        known = [c for c in costs if c is not None]
+        missing = len(costs) - len(known)
+        if not known:
+            cost = "n/a"
+        elif missing:
+            cost = f"${sum(known):.3f}+ ({missing} n/a)"
+        else:
+            cost = f"${sum(known):.3f}"
         rows.append([f"{prov}:{model}", effort] + cells +
                     [f"{passed}/{total} {100 * passed / total:.0f}%" if total else "-",
                      str(sum(1 for r in by_task.values() if not r["compiles"])),

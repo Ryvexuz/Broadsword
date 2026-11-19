@@ -1,5 +1,5 @@
 mod common;
-use common::within;
+use common::{panics_within, within};
 use solution::*;
 
 #[test]
@@ -18,15 +18,17 @@ fn hidden_basic_put_get() {
 }
 
 #[test]
-#[should_panic]
 fn hidden_zero_capacity_panics() {
-    let _c: TtlLru<u8, u8> = TtlLru::new(0, 5);
+    assert!(panics_within(|| {
+        let _c: TtlLru<u8, u8> = TtlLru::new(0, 5);
+    }), "TtlLru::new(0, 5) must panic");
 }
 
 #[test]
-#[should_panic]
 fn hidden_zero_ttl_panics() {
-    let _c: TtlLru<u8, u8> = TtlLru::new(5, 0);
+    assert!(panics_within(|| {
+        let _c: TtlLru<u8, u8> = TtlLru::new(5, 0);
+    }), "TtlLru::new(5, 0) must panic");
 }
 
 #[test]

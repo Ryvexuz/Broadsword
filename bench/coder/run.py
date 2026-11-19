@@ -9,6 +9,8 @@ Usage (from anywhere):
             openai  one Chat Completions request (see openai_provider.py); key from OPENAI_API_KEY or the root .env.
                     Options: --price-in/--price-out (USD per 1M tokens; cost_usd is null without both), --max-tokens,
                     --timeout, --retries, --backoff, --base-url, --root. Costs real money: only for a model Lazlo named.
+  python -I -B run.py regrade <out-dir>   grades the saved .rs files again (no model call), after a run whose
+                    grading failed (its result JSONs say graded=false); updates the JSONs
   task      folder names under tasks/ (01-duration ...); none given = all six
 
 BENCH_CWD must be OUTSIDE the project and have no CLAUDE.md, AGENTS.md or .git in it or any parent, so no
@@ -17,7 +19,8 @@ that is how the smoke test uses a fake CLI. The model sees only the task's spec.
 
 Per task it writes <out-dir>/<task>__<provider>__<model>__<effort>.{raw.json,answer.txt,rs,json}.
 The result .json holds: provider, model, effort, task, tokens, cost_usd, wall_s (the model call),
-harness_wall_s, compiles, passed, total, format_failure, first_error, model_used.
+harness_wall_s, compiles, passed, total, graded, format_failure, first_error, model_used.
+graded is false when the model call was made but grading failed; passed/compiles are then not real.
 """
 import importlib.util, json, os, pathlib, re, subprocess, sys, time, tomllib
 
@@ -94,8 +97,33 @@ def check_workdir():
     d.mkdir(parents=True, exist_ok=True)
 
 
+def regrade(out):
+    """Grades the saved .rs files of a results folder again, without calling a model. Updates the result JSONs
+    (compiles, passed, total, harness_wall_s, first_error, graded=true); the model data stays as it was."""
+    items = []
+    for f in sorted(out.glob("*.json")):
+        if f.name.endswith(".raw.json"):
+            continue
+        rec = json.loads(f.read_text(encoding="utf-8"))
+        rs = f.with_suffix(".rs")
+        if rs.is_file():
+            items.append((f, rec, rs, H.resolve_task(rec["task"])))
+    if not items:
+        sys.exit(f"no result with a saved .rs file in {out}")
+    results = H.grade_batch([(rs, t) for _, _, rs, t in items])
+    for (f, rec, _, _), h in zip(items, results):
+        rec.update(compiles=h["compiles"], passed=h["passed"], total=h["total"], harness_wall_s=h["wall_s"],
+                   first_error=h["first_error"], graded=True)
+        f.write_text(json.dumps(rec, indent=1), encoding="utf-8")
+        print(f"{f.stem}: compiles={rec['compiles']} passed={rec['passed']}/{rec['total']}", flush=True)
+
+
 def main():
     global OPENAI_OPTS
+    if len(sys.argv) >= 2 and sys.argv[1] == "regrade":
+        if len(sys.argv) != 3:
+            sys.exit("usage: run.py regrade <out-dir>")
+        return regrade(pathlib.Path(sys.argv[2]))
     sys.argv[1:], OPENAI_OPTS = OP.split_options(sys.argv[1:])
     if len(sys.argv) < 5:
         sys.exit(__doc__)
@@ -130,7 +158,7 @@ def main():
             problem = f"model call failed: {res.get('error')}"
         rec = {"provider": provider, "model": model, "effort": effort, "task": t.name, "tokens": res["tokens"],
                "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"], "harness_wall_s": None,
-               "compiles": False, "passed": 0, "total": total, "format_failure": problem is not None,
+               "compiles": False, "passed": 0, "total": total, "graded": True, "format_failure": problem is not None,
                "first_error": problem, "model_used": res.get("model_used", [])}
         recs.append((tag, rec))
         if code is not None:
@@ -140,10 +168,19 @@ def main():
         print(f"{tag}: model call {rec['wall_s']}s cost={rec['cost_usd']} format_failure={rec['format_failure']}", flush=True)
     # one Broadsword job grades every extracted solution (see harness.py)
     if to_grade:
-        results = H.grade_batch([(rs, t) for _, rs, t in to_grade])
-        for (rec, _, _), h in zip(to_grade, results):
-            rec.update(compiles=h["compiles"], passed=h["passed"], total=h["total"], harness_wall_s=h["wall_s"],
-                       first_error=h["first_error"])
+        try:
+            results = H.grade_batch([(rs, t) for _, rs, t in to_grade])
+        except SystemExit as e:
+            # busy lock, refused job, no result file: the paid model calls already happened, so keep their data.
+            # Each task still gets a result JSON (graded=false + the error); `run.py regrade <out-dir>` grades later.
+            err = f"grading failed: {e.code}"
+            print(err, file=sys.stderr, flush=True)
+            for rec, _, _ in to_grade:
+                rec.update(graded=False, first_error=err)
+        else:
+            for (rec, _, _), h in zip(to_grade, results):
+                rec.update(compiles=h["compiles"], passed=h["passed"], total=h["total"], harness_wall_s=h["wall_s"],
+                           first_error=h["first_error"], graded=True)
     for tag, rec in recs:
         (out / f"{tag}.json").write_text(json.dumps(rec, indent=1), encoding="utf-8")
         print(f"{tag}: compiles={rec['compiles']} passed={rec['passed']}/{rec['total']}", flush=True)

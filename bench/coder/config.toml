@@ -5,6 +5,7 @@ broadsword_exe = "build/bin/broadsword.exe"   # the stable Broadsword binary tha
 broadsword_project = "broadsword"             # project name given to `broadsword run`
 work_dir = "scratch/coder-bench"              # temp crates, harness lock and logs live here
 test_timeout_seconds = 10                     # one test that runs longer than this fails
+test_process_timeout_seconds = 60              # one test process (run by exact name) is killed past this
 harness_timeout_seconds = 900                 # the whole harness run (build + tests); killed past this
 model_timeout_seconds = 900                   # run.py kills one model call that runs longer than this
 lock_wait_seconds = 1800                     # wait this long for another harness run on the same task
