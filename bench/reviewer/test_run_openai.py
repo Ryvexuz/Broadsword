@@ -281,6 +281,20 @@ class RunOpenAI(unittest.TestCase):
         self.assertIn("max_output_tokens", r["error"])
         self.assertNotIn("reasoning", f.requests[0])
 
+    def test_responses_text_plus_refusal_is_an_error(self):
+        body = self.resp_body()
+        body["output"][1]["content"].append({"type": "refusal", "refusal": "I cannot help with that"})
+        f = Fake([(200, body)])
+        self.addCleanup(f.close)
+        code, _, _ = self.run_it(f, "gpt-resp", "default")
+        self.assertEqual(code, 1)
+        r = self.record("gpt-resp", "default")
+        self.assertTrue(r["is_error"])
+        self.assertEqual(r["exit"], 1)
+        self.assertIn("refused", r["error"])
+        self.assertIn("I cannot help with that", r["error"])
+        self.assertEqual(r["result"], "")
+
     def test_responses_chat_shaped_body_is_an_error(self):
         f = Fake([(200, ok_body())])
         self.addCleanup(f.close)

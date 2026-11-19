@@ -138,7 +138,7 @@ def parse_responses(raw):
             if isinstance(c, dict) and c.get("type") == "output_text" and isinstance(c.get("text"), str):
                 parts.append(c["text"])
             elif isinstance(c, dict) and c.get("type") == "refusal":
-                refusal = c.get("refusal")
+                refusal = c.get("refusal") or "(no reason given)"
     text = "".join(parts)
     if status != "completed":
         det = raw.get("incomplete_details")
@@ -147,8 +147,10 @@ def parse_responses(raw):
         if why == "max_output_tokens":
             e += " (the reasoning probably used up max_output_tokens; raise --max-tokens)"
         return "", e
+    if refusal is not None:  # any refusal item makes the case an error, even beside text
+        return "", f"the model refused: {refusal}"
     if not text.strip():
-        return "", (f"the model refused: {refusal}" if refusal else f"empty answer: status='completed', usage={usage}")
+        return "", f"empty answer: status='completed', usage={usage}"
     return text, None
 
 
