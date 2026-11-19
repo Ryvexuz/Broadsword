@@ -171,6 +171,60 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(data["metrics"]["coder_tokens_per_merged"], 1000)
         self.assertEqual(data["metrics"]["coder_runs_recorded"], 1)
 
+    def runs(self, *rows):
+        with open(self.r.root / "state" / "agent-runs.tsv", "a", encoding="utf-8") as f:
+            for tid, tok, secs in rows:
+                f.write(f"2026-11-18\tcoder\tsonnet\t{tid}\t{tok}\t{secs}\tdone\tx\n")
+
+    def metrics(self):
+        return json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))["metrics"]
+
+    def test_every_coder_run_of_a_merged_task_counts_retries_included(self):
+        tid = self.r.merged_task(T0 + 600, T0 + 1800)
+        self.runs((tid, 40000, 60), (tid, 25000, 60))
+        self.assertEqual(self.record().returncode, 0)
+        m = self.metrics()
+        self.assertEqual(m["coder_tokens_per_merged"], 65000)
+        self.assertEqual(m["coder_runs_recorded"], 2)
+
+    def test_coder_use_is_an_upper_bound_capped_at_the_task_overlap(self):
+        # Task ran 08:50-09:10; the window starts 09:00, so only 600 s of it overlap. The run logged 5000 s.
+        self.r.write("state/tasks/t-edge.task", {"id": "t-edge", "project": "broadsword", "status": "done", "created": T0 - 600,
+                                                 "started": T0 - 600, "ended": T0 + 600, "note": "merged directly", "title": "edge"})
+        self.runs(("t-edge", 1, 5000))
+        self.assertEqual(self.record().returncode, 0)
+        m = self.metrics()
+        self.assertNotIn("coder_use", m)
+        self.assertAlmostEqual(m["coder_use_upper_bound"], 600 / 7200)
+        self.assertIn("UPPER BOUND", bl.METRICS["coder_use_upper_bound"][3])
+
+    def test_coder_tokens_of_unmerged_finished_tasks_are_kept_in_and_reported_apart(self):
+        tid = self.r.merged_task(T0 + 600, T0 + 1800)
+        self.r.write("state/tasks/t-gone.task", {"id": "t-gone", "project": "broadsword", "status": "abandoned", "created": T0 + 700,
+                                                 "started": T0 + 700, "ended": T0 + 2000, "title": "dropped"})
+        self.runs((tid, 1000, 60), ("t-gone", 500, 60))
+        self.assertEqual(self.record().returncode, 0)
+        m = self.metrics()
+        self.assertEqual(m["coder_tokens_per_merged"], 1500)
+        self.assertEqual(m["coder_tokens_unmerged"], 500)
+        self.assertIn("did not merge", bl.METRICS["coder_tokens_unmerged"][3])
+        self.assertIn("done, failed or abandoned", bl.METRICS["coder_tokens_per_merged"][3])
+
+    def test_missing_main_branch_falls_back_to_head_with_a_note(self):
+        git(self.r.root, "checkout", "-q", "-b", "other")
+        git(self.r.root, "branch", "-q", "-D", "main")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("no branch `main`", res.stdout)
+
+    def test_a_broken_main_branch_is_an_input_error_not_a_head_fallback(self):
+        git(self.r.root, "checkout", "-q", "-b", "other")
+        (self.r.root / ".git" / "refs" / "heads" / "main").write_text("not a sha\n", encoding="utf-8")
+        res = self.record()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("main", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
     def test_record_never_overwrites_even_when_another_record_wins_the_race(self):
         """The other record lands after our existence check, while we measure: ours must fail, theirs must survive."""
         out = self.r.root / "state" / "baselines" / "race.json"
@@ -310,6 +364,24 @@ class CompareCliTests(unittest.TestCase):
                 self.assertEqual(res.returncode, 1, f"{label} {cmd}: {res.stderr}")
                 self.assertIn("after.json", res.stderr, label)
                 self.assertNotIn("Traceback", res.stderr, label)
+
+    def test_baseline_missing_a_metric_is_bad_input_but_a_later_metric_may_be_absent(self):
+        self.r.put_baseline("before", 20, 3.0)
+        self.r.put_baseline("after", 20, 2.1)
+        path = self.r.root / "state" / "baselines" / "after.json"
+        good = json.loads(path.read_text(encoding="utf-8"))
+        cmd = ("compare", "before", "after", "--min-samples", "5", "--noise", "10")
+        d = json.loads(json.dumps(good))
+        for m in bl.LATER_METRICS:
+            d["metrics"].pop(m)
+        path.write_text(json.dumps(d), encoding="utf-8")
+        self.assertEqual(self.r.run(*cmd).returncode, 0)
+        d["metrics"].pop("lead_median_s")
+        path.write_text(json.dumps(d), encoding="utf-8")
+        res = self.r.run(*cmd)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("after.json", res.stderr)
+        self.assertIn("lead_median_s", res.stderr)
 
     def test_flags_are_required(self):
         res = self.r.run("compare", "a", "b", "--min-samples", "5")

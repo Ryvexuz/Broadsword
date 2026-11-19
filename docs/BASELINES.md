@@ -12,7 +12,7 @@ python -I scripts/baseline.py list
 
 - `record` measures one window and writes `state/baselines/<name>.json`. That folder is outside Git, under `state/`. The file also stores main's commit and the `broadsword.toml` SHA-256, so a baseline says what it measured.
 - `record` never overwrites, even when two records race for one name (the file is created with an atomic link; the loser exits 1). A "before" is evidence, so pick a new name instead.
-- A baseline file is checked in full when read. A missing key or wrong type is bad input (exit 1) and names the file.
+- A baseline file is checked in full when read: the schema, name, commit, toml hash, window, samples (`merged_tasks` must be a whole number), per-model rows, and every metric in the table below (a number or null) must be there. A missing key or wrong type is bad input (exit 1) and names the file. Two metrics added later, `coder_use_upper_bound` and `coder_tokens_unmerged`, may be absent from older baselines (those are never rewritten); `compare` shows `-` for them.
 - Times need a zone, for example `2026-11-18T09:00:00Z`. A bare time is refused, because it would be read in the wrong zone.
 - `compare` prints each metric's before, after, change and verdict, then an overall verdict.
 - `--min-samples` and `--noise` are required, because the code has no defaults (the settings rule).
@@ -28,22 +28,23 @@ A task counts if it merged (ended) inside `[since, until)`. A queue entry, revie
 | throughput | `merged_per_hour` | higher | merged / window hours |
 | throughput | `lead_median_s`, `lead_p90_s` | lower | task `started` to `ended` (merge) |
 | pipeline | `idle_share` | lower | `dev_metrics.covered()` over task running spans |
-| pipeline | `coder_use` | higher | coder-role seconds of runs overlapping the window, from `state/agent-runs.tsv`, / window. Over 100% means coders ran in parallel. `dev_metrics.py` has no function for this (its `util` is computed inside its printing function), so baseline computes it with the same formula (seconds / window) but its own row selection; the two need not match |
+| pipeline | `coder_use_upper_bound` | context only | UPPER BOUND of coder use, from `state/agent-runs.tsv`. Runs have only a date and a duration, no start time, so a run overlapping a window edge cannot be clipped exactly. Each run's seconds are capped at its task's overlap with the window (the task's own started/ended), summed, / window. The true figure is at most this. Over 100% means coders ran in parallel. `dev_metrics.py` has no function for this, so baseline computes it itself |
 | quality | `review_rounds_per_merged` | lower | `.review` files of merged tasks, failed rounds included |
 | quality | `first_pass_fail_rate` | lower | merged tasks whose first review was FAIL |
 | quality | `reverted_or_reopened` | lower | `Revert...` commits on main in the window, plus tasks merged more than once |
 | quality | `main_check_failed` | lower | entries with status `merged_check_failed` |
 | quality | `direct_merges` | context only | tasks merged outside the queue |
 | cost | `review_usd_per_merged`, `review_tokens_per_merged` | lower | every review in the window, retries and rejected attempts included, / merged |
-| cost | `coder_tokens_per_merged` | lower | coder rows in `agent-runs.tsv` of tasks that ended inside the window / merged |
+| cost | `coder_tokens_per_merged` | lower | coder tokens of all tasks finished in the window (done, failed or abandoned; every run, retries included) / merged tasks |
+| cost | `coder_tokens_unmerged` | context only | how many of those tokens belong to tasks that did not merge |
 | queue | `entry_median_s` | lower | entry created to ended (one attempt's merge time) |
 | queue | `check_median_s`, `review_median_s`, `recheck_median_s` | lower | `dev_metrics.steps()`: `check`, `review`, `main_check` |
 | queue | `test_job_median_s` | lower | `state/jobs/*.rec` of kind `check` or `test` |
 | queue | `build_lock_wait_s` | lower | not recorded by Broadsword yet, so always `-` |
 
 - **Per model:** runs, tokens, USD and seconds per `role:model`, for example `reviewer:opus` or `coder:sonnet`. These are shown as context, with no verdict.
-- **Coder runs for use and per model:** a row counts when its task's running time overlaps the window. A row with no known task counts by its date.
-- **Coder tokens (cost):** only rows of tasks that ended inside the window count, so work still running at the window end never inflates the cost. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
+- **Coder runs for use and per model:** a row counts when its task's running time overlaps the window; its seconds are capped at the task's overlap with the window (an upper bound, see above). A row with no known task counts by its date, capped at the window length.
+- **Coder tokens (cost):** only rows of tasks that ended inside the window count, so work still running at the window end never inflates the cost. Abandoned or failed work that ended in the window stays in on purpose (cost to completion includes waste); `coder_tokens_unmerged` says how much of the total that is. This matches review cost, which counts finished attempts of the window. Rows of unfinished or unknown tasks are left out and counted in a note.
 - **Reviews with no cost recorded:** a review whose `cost_usd` (or token fields) is missing is not counted as zero. `record` counts them (`samples.reviews_without_cost`, `reviews_without_tokens`) and prints "N of M reviews have no cost recorded"; the USD and token figures are then lower bounds. A `cost_usd` that is present but not a number is bad input naming the file.
 - **Shared helpers:** `fields`, `num`, `steps` and `covered` (idle share) come from `scripts/dev_metrics.py`, and the review header parser comes from `scripts/review_costs.py`. Both are imported by path, not copied. Coder use and coder tokens are not in dev_metrics as functions, so they are baseline's own (see above).
 
