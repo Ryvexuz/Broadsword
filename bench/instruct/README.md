@@ -33,7 +33,7 @@ trailing blank lines, trailing spaces, CRLF.
 | lowercase | no uppercase letter |
 | no_markdown | none of `* # `` ` `` _` |
 | sentences | exactly N sentences |
-| keep_line | given lines appear unchanged, character for character (inner double spaces count) |
+| keep_line | the given lines are the non-empty lines at the stated position (`at`), in the given order, unchanged character for character (inner double spaces count). A swapped, moved or dropped line fails |
 | first_line / last_line | the first / last non-empty line is exactly the given text |
 | full_match / equals | the whole answer matches a regex / equals a text |
 | contains | required strings are present (guards against junk passing a pure length rule) |

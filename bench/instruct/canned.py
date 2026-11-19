@@ -62,6 +62,7 @@ BAD = {
     "05-keep-line": [
         ("REF: ZX-9041/b (do not edit)\nI will definitely write it separate from the rest, and it is occurring tomorrow.", "keep_line"),  # one space lost
         ("REF: ZX-9041/b  (do not edit)\nI will definately write it separate from the rest, and it is occurring tomorrow.", "contains"),
+        ("I will definitely write it separate from the rest, and it is occurring tomorrow.\nREF: ZX-9041/b  (do not edit)", "keep_line"),  # reference line moved off the first position
         ("Corrected text:\nI will definitely write it separate from the rest, and it is occurring tomorrow.", "keep_line"),  # line dropped
     ],
     "06-table-header": [
@@ -126,6 +127,8 @@ BAD = {
     ],
     "18-keep-header": [
         ("\n".join(HEADER[:3] + ["# Timezone: UTC (no daylight saving)", HEADER[4]]) + "\nEND-OF-HEADER", "keep_line"),  # double space collapsed
+        ("\n".join([HEADER[0], HEADER[2], HEADER[1], HEADER[3], HEADER[4]]) + "\nEND-OF-HEADER", "keep_line"),  # lines 2 and 3 swapped
+        ("\n".join(HEADER[1:] + HEADER[:1]) + "\nEND-OF-HEADER", "keep_line"),  # first line moved to the end
         ("\n".join(HEADER) + "\nEND", "last_line"),
         ("\n".join(HEADER), "lines_count"),
     ],

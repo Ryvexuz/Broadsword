@@ -146,10 +146,12 @@ def c_sentences(text, p):
 
 
 def c_keep_line(text, p):
-    have = set(norm(text).split("\n"))
-    for l in p["lines"]:
-        if l not in have:
-            return f"the line {l[:60]!r} must appear unchanged, character for character"
+    # "at" (required): the kept lines are the non-empty lines at positions at, at+1, ... in this exact order
+    got = nonempty(text)[p["at"]:p["at"] + len(p["lines"])]
+    for i, l in enumerate(p["lines"]):
+        if i >= len(got) or got[i] != l:
+            return (f"line {p['at'] + i + 1} must be {l[:60]!r}, unchanged, character for character and in this order; "
+                    f"got {(got[i] if i < len(got) else '(nothing)')[:60]!r}")
     return None
 
 

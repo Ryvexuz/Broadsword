@@ -7,7 +7,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
-import contextlib, importlib.util, io, json, os, pathlib, re, shutil, subprocess, tempfile, tomllib, unittest
+import contextlib, importlib.util, io, json, os, pathlib, re, shutil, subprocess, tempfile, tomllib, unittest, unittest.mock
 from collections import Counter
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -116,7 +116,7 @@ class CaseSet(unittest.TestCase):
             "lowercase": ({}, "abc", "aBc"),
             "no_markdown": ({}, "abc", "a*c"),
             "sentences": ({"n": 1}, "One.", "One. Two."),
-            "keep_line": ({"lines": ["x  y"]}, "a\nx  y", "a\nx y"),
+            "keep_line": ({"at": 1, "lines": ["x  y", "z"]}, "a\nx  y\nz", "a\nz\nx  y"),
             "first_line": ({"text": "A"}, "A\nB", "B\nA"),
             "last_line": ({"text": "A"}, "B\nA", "A\nB"),
             "full_match": ({"regex": r"\d+"}, "12", "12a"),
@@ -243,9 +243,9 @@ class RunScript(unittest.TestCase):
             tmp = pathlib.Path(tmp)
             cli = tmp / "fake_cli.py"
             cli.write_text(cli_text, encoding="utf-8")
-            os.environ["BENCH_CLAUDE"] = str(cli)
-            os.environ["BENCH_CWD"] = work  # outside the project: system temp
-            run = load("t_run", HERE / "run.py")
+            # patch.dict restores both variables (set or unset) when the block ends; run.py reads them at import
+            with unittest.mock.patch.dict(os.environ, {"BENCH_CLAUDE": str(cli), "BENCH_CWD": work}):  # work: system temp, outside the project
+                run = load("t_run", HERE / "run.py")
             run.CR.CFG["model_timeout_seconds"] = timeout
             out = tmp / "out"
             buf = io.StringIO()
@@ -256,7 +256,9 @@ class RunScript(unittest.TestCase):
             return res, sc.stdout
 
     def test_fake_cli_answer_is_recorded_and_scored(self):
+        before = (os.environ.get("BENCH_CLAUDE"), os.environ.get("BENCH_CWD"))
         res, score = self.run_main(FAKE_OK, 30, ["10-exact-answer", "12-date-format"])
+        self.assertEqual((os.environ.get("BENCH_CLAUDE"), os.environ.get("BENCH_CWD")), before, "the test must restore the environment")
         self.assertEqual(len(res), 2)
         r = res["10-exact-answer__claude__fake__default.json"]
         self.assertEqual((r["answer"], r["call_failed"], r["cost_usd"]), ("391", False, 0.002))

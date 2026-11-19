@@ -75,7 +75,7 @@ def build():
     add("05-keep-line", "short",
         "Fix the spelling mistakes in the text below and reply with the corrected text. The first line is a reference code: keep it exactly unchanged, character for character.\n\n"
         "REF: ZX-9041/b  (do not edit)\nI will definately write it seperate from the rest, and it is ocurring tomorrow.",
-        [{"type": "keep_line", "lines": ["REF: ZX-9041/b  (do not edit)"]},
+        [{"type": "keep_line", "at": 0, "lines": ["REF: ZX-9041/b  (do not edit)"]},
          {"type": "contains", "strings": ["definitely", "separate", "occurring"]},
          {"type": "forbidden", "words": ["definately", "seperate", "ocurring"]}])
     add("06-table-header", "short",
@@ -121,7 +121,7 @@ def build():
         [{"type": "min_words", "k": 15}, {"type": "max_words", "k": 40}, {"type": "forbidden", "words": ["service"], "mode": "substring"}])
     add("18-keep-header", "long", long_prompt(
         "RULES: Reply with exactly 6 lines. Lines 1 to 5 are the 5 header lines of the log (the ones starting with #), copied exactly, character for character. Line 6 is exactly END-OF-HEADER. Write nothing else.", log),
-        [{"type": "lines_count", "n": 6}, {"type": "keep_line", "lines": HEADER}, {"type": "last_line", "text": "END-OF-HEADER"}, {"type": "first_line", "text": HEADER[0]}])
+        [{"type": "lines_count", "n": 6}, {"type": "keep_line", "at": 0, "lines": HEADER}, {"type": "last_line", "text": "END-OF-HEADER"}, {"type": "first_line", "text": HEADER[0]}])
     add("19-level-table", "long", long_prompt(
         "RULES: Reply with a markdown table and nothing else. The header row is exactly `| Level | Count |`, then the separator row, then exactly 3 data rows for INFO, WARN and ERROR in that order, each giving how many log lines (not the # header lines) have that level.", log),
         [{"type": "table", "header": "| Level | Count |", "columns": 2, "rows": 3,

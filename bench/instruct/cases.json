@@ -94,6 +94,7 @@
   "checks": [
    {
     "type": "keep_line",
+    "at": 0,
     "lines": [
      "REF: ZX-9041/b  (do not edit)"
     ]
@@ -356,6 +357,7 @@
    },
    {
     "type": "keep_line",
+    "at": 0,
     "lines": [
      "# LOG EXPORT v2.3  |  host=node-07",
      "# Retention: 30 days  --  owner: ops-team",
