@@ -16,14 +16,14 @@ This file turns each line into commands with numbers. A milestone is done when e
 - `broadsword run` prints its own job lines first (`job:`, `source:`, `checkpoint:`, `build source:`), then the program's lines, then `--- summary ---` and `run: ok (...)` or `run: FAILED (exit N)`. "The output" below means the program's lines.
 - `broadsword test` ends with `test: ok — N passed, 0 failed`. Above it, each test prints `test <name> ... ok`.
 - Each check says what PASS is. Anything else is FAIL, including a check that cannot be run because a flag, file or test is missing.
-- Numbers marked *measured* come from crash-sim `abe471c`, stepped one physics substep at a time (h = 1 ms) by a scratch probe. They explain the thresholds; they are not themselves pass conditions.
+- Numbers marked *measured* explain the thresholds; they are not themselves pass conditions. Except where a line says *`--summary`*, they come from a scratch probe that is **not committed** (it lived in `scratch/t28-probe/` and may be wiped): a small Rust program with crash-sim at `abe471c` as a path dependency (this file was committed on top of `abe471c` and changes no code). To redo it: for each case build `Config { duration, dt: h, substeps: 1, drop_height, tilt, gravity, ..Config::default() }`, so one `Sim::advance()` is exactly one substep of length h; after every advance read `sim.pos` and `sim.vel` and record total energy E (as defined below, using `Beam::rest` and `BEAM_STIFFNESS`), max node speed (`sim.max_speed()`), the mean node y, and whether any node has `pos.y == 0.0` and `vel.y > 0.0` (an impact: the contact rule only leaves a node at y = 0 moving up when it reversed a contact faster than `REST_SPEED`). From these: the last impact; the last substep at which max node speed >= V (the settle time); max of E(t) - E(0); the largest E(t2) - E(t1), t1 <= t2, after the last impact; the largest max node speed in the final second. The cases are the drop heights, tilts, g and h named next to each figure (default: drop and tilt as `Config::default()`, g = 9.81, h = 1 ms). The static sag is a separate linear solve, not a run (method in "The numbers, and why" below). Figures marked *`--summary`* are reproducible with committed code: `broadsword run crash-sim -- cargo run --offline --release -- --summary` prints `first_contact_s=0.6390,peak_strain=0.045146,final_center_y=0.4999`.
 
 ## Shared definitions
 
 - **Substep:** one physics step of h = dt / substeps (default 0.01 / 10 = 1 ms). Its time is `step * dt + (k + 1) * h`, as `first_contact_s` uses. Every report below measures every substep, never only the output steps (audit S14: output sampling missed contacts).
 - **Impact:** a substep in which the contact rule bounces a node: the node ended the substep behind a collider plane (today only the ground, y < 0) while moving into it faster than `REST_SPEED` (0.2 m/s), so its normal velocity is reversed and scaled by `RESTITUTION`. Resting contact (slower than `REST_SPEED`) is not an impact, so a body lying on the ground has a last impact. `last_impact_s` is the time of the last impact in the run, or `none`.
 - **Total energy E:** kinetic plus gravitational plus elastic, in joules, with potential measured from y = 0:
-  E = sum over nodes of (1/2) m_i |v_i|^2 + m_i g y_i, plus sum over unbroken beams of (1/2) k_b (len_b - rest_b)^2, using each beam's current rest length (it changes when a beam yields, nb-34). With wheels (nb-39) add each wheel's (1/2) m_w |v_w|^2 + (1/2) I_w w^2 + m_w g y_w and the stored energy of every suspension spring, bump stop and tyre spring.
+  E = sum over nodes of (1/2) m_i |v_i|^2 + m_i g y_i, plus sum over unbroken beams of (1/2) k_b (len_b - rest_b)^2, using each beam's current rest length (it changes when a beam yields, nb-34). With wheels (nb-39) add each wheel's (1/2) m_w |v_w|^2 + (1/2) I_w w^2 + m_w g y_w and the stored energy of every suspension spring, bump stop and tyre spring. When gravity is tilted (`--slope-grip-frac`, check 3.4), every m g y term becomes -m (g_vec . r), which is the same thing when gravity is not tilted.
 - **Max node speed:** the largest |v_i| over all nodes (and wheel centres, once wheels exist) at one substep.
 - **Abort:** the run stops because `Sim::check()` fails (a non-finite position or velocity, or strain over `MAX_STRAIN_LIMIT` = 0.5). An abort is always a FAIL and always exit code 1.
 
@@ -57,7 +57,7 @@ max_speed_after_settle_by=<m/s, {:.3e}>      largest max node speed at t >= T
 energy_rise_after_settle_by_j=<J, {:.3e}>    the rule 3 value
 max_energy_gain_frac=<{:.3e}>                the rule 4 value
 peak_strain=<6 decimals>                     largest beam strain in the run (unbroken beams, elastic strain)
-final_center_y=<m, 7 decimals>               mean y of all nodes at the last substep
+final_center_y=<m, 10 decimals>              mean y of all nodes at the last substep
 settle: ok
 ```
 
@@ -73,7 +73,7 @@ All four come from the physics of today's cube, then checked against the measure
 - **E = 0.001 J.** That is the energy to lift the 8 kg cube by 13 micrometres. A contact or friction rule that adds energy while the cube is at rest builds past it quickly. *Measured:* the rise after the last impact is 2.1e-14 J (rounding).
 - **G = 1e-5.** The cube only ever loses energy. *Measured:* max E(t) - E(0) is 0 to 6 decimals in J (E(0) = 202.73 J), at every substep, for h from 0.25 to 2 ms. 1e-5 of E(0) is 0.002 J.
 - **Peak strain at most 0.10.** *Measured* 0.045146 on the default run (0.0437 to 0.0451 for h = 2 to 0.25 ms); the existing `stable_no_nan_no_penetration_low_strain` test uses the same 0.10. Above it means an explosion, not a bounce.
-- **Static sag, independent of the sim.** A cube at rest on a face is a statics problem with a known answer. Solving K u = f for the rest-shape cube (all 28 beams, k = 20000 N/m, 1 kg nodes, g = 9.81; bottom nodes held vertically only, because the ground drag holds no static sideways force, and the three rigid sideways motions removed) gives each top node a sag of 2.58875e-4 m, which is (19/36) m g / k, so the mean sag is (19/72) m g / k = 1.294375e-4 m. The resting `center_y` must be edge/2 - (19/72) m g / k = 0.4998706 (Earth) and 0.4999786 (Moon, g = 1.62), within 1% of the sag. *Measured:* 0.4998705 and 0.4999786 for every drop height, tilt and step size. This number comes from linear statics, not from a run, so it cannot be met by tuning damping or contact constants; if `BEAM_STIFFNESS` or `NODE_MASS` change, recompute it from the formula, never from the sim.
+- **Static sag, independent of the sim.** A cube at rest on a face is a statics problem with a known answer. Solving K u = f for the rest-shape cube (all 28 beams, k = 20000 N/m, 1 kg nodes, g = 9.81; bottom nodes held vertically only, because the ground drag holds no static sideways force, and the three rigid sideways motions removed by also holding node 0's x and z and node 1's z; the 24 x 24 system minus the held rows, by Gaussian elimination) gives each top node a sag of 2.58875e-4 m, which is (19/36) m g / k, so the mean sag is (19/72) m g / k = 1.294375e-4 m. The resting `center_y` must be edge/2 - (19/72) m g / k = 0.4998705625 (Earth) and 0.499978625 (Moon, g = 1.62), within 1% of the sag: +-1.294375e-6 m (Earth) and +-2.1375e-7 m (Moon). *Measured:* 0.4998705 and 0.4999786 (7 decimals) for every drop height, tilt and step size. This number comes from linear statics, not from a run, so it cannot be met by tuning damping or contact constants; if `BEAM_STIFFNESS` or `NODE_MASS` change, recompute it from the formula, never from the sim.
 
 ### Checks
 
@@ -88,14 +88,14 @@ PASS iff it prints nothing. FAIL: any output (an existing test was edited to fit
 
 **1.3 The default cube settles.**
 `broadsword run crash-sim -- cargo run --offline --release -- --duration 10 --settle-report --settle-by 6 --settle-hold 4 --settle-speed 0.001 --energy-rise 0.001 --energy-gain 0.00001 > scratch/s6-1-3.txt 2>&1`
-PASS iff `run: ok`, the output's last line is `settle: ok`, `peak_strain` <= 0.100000, and 0.4998692 <= `final_center_y` <= 0.4998719.
-FAIL: `run: FAILED`, any `settle: FAIL`, `peak_strain` above 0.1, or `final_center_y` outside the band. Expected values (*measured*, not gated): `last_impact_s` about 2.5, `settled_from_s` about 4.0, `peak_strain=0.045146`.
+PASS iff `run: ok`, the output's last line is `settle: ok`, `peak_strain` <= 0.100000, and 0.4998692682 <= `final_center_y` <= 0.4998718568. The band is 0.4998705625 +- 1.294375e-6 (1% of the sag), rounded inward to the 10 printed decimals, so a value that passes is always within 1%.
+FAIL: `run: FAILED`, any `settle: FAIL`, `peak_strain` above 0.1, or `final_center_y` outside the band. Expected values (*measured*, not gated): `last_impact_s` about 2.5, `settled_from_s` about 4.0, `peak_strain=0.045146` (*`--summary`* prints the same peak for its 5 s run).
 
 **1.4 The report can fail.** Same command with `--settle-by 2 --settle-hold 8` (the cube is still bouncing at 2 s).
 PASS iff `run: FAILED (exit 1)` and the last output line starts with `settle: FAIL speed`. FAIL: `settle: ok` (the report cannot see motion).
 
 **1.5 The result is physics, not a step-size artefact.** The 1.3 command three more times, adding `--substeps 5`, `--substeps 20` and `--substeps 40` (h = 2, 0.5 and 0.25 ms; all below the 3.78 ms limit).
-PASS iff each prints `settle: ok`, each `final_center_y` is in the 1.3 band, and each `peak_strain` is within 10% of the 1.3 value (*measured* within 3.2%). FAIL: any of these.
+PASS iff each prints `settle: ok`, each `final_center_y` is in the 1.3 band, and each `peak_strain` is within 10% of the 1.3 value (*`--summary`* with `--substeps 5`, `20`, `40`: 0.043699, 0.044286, 0.044246, within 3.2% of 0.045146). FAIL: any of these.
 
 What guards against tuning to the test in milestone 1: the static sag in 1.3 and 1.5 is predicted by an independent statics solve, so it fails if the stiffness or mass is changed to settle faster; 1.5 fails if settling only works at one step size; the grid in 1.1 fails if T, V or E were picked for one drop; 1.4 proves the report can say FAIL; 1.2 stops the old tests from being bent to the new code.
 
@@ -151,7 +151,7 @@ PASS iff `test: ok — N passed, 0 failed` and the file contains each of:
 `test cube_bsn_matches_default_cube ... ok`, `test canonical_file_round_trips_byte_identical ... ok`, and one passing test per refusal listed in nb-33 (nb-33, `tests/format.rs`);
 `test beam_past_yield_keeps_longer_rest ... ok`, `test energy_never_rises_through_yield ... ok`, `test cube_bsn_output_matches_default ... ok` (nb-34, `tests/deform.rs`; the last one runs `--body scenarios/cube.bsn` and compares its CSV byte for byte with the no-flag run);
 `test beam_breaks_at_expected_substep ... ok`, `test disconnected_node_falls_freely ... ok`, `test broken_beam_does_not_trip_strain_limit ... ok`, `test default_cube_output_unchanged ... ok` (nb-35, `tests/breaking.rs`);
-`test ground_plane_collider_keeps_cube_output ... ok`, `test box_wall_variants_differ_in_one_number ... ok` (nb-36, `tests/box_wall.rs`);
+`test ground_plane_collider_keeps_cube_output ... ok`, `test box_wall_variants_differ_in_one_number ... ok`, `test break_pull_files_differ_only_in_speed ... ok` (nb-36, `tests/box_wall.rs`);
 and every milestone 1 test from 1.1.
 FAIL: any failed or missing test.
 
@@ -176,13 +176,25 @@ PASS iff `settle: ok`, `crumple: ok`, and its `crumple_delta_m` is within 10% of
 **2.7 Breaks are counted and reported the same way twice.**
 `broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/box_wall.bsn --duration 10 --events > scratch/s6-2-7.txt 2>&1`
 The output is the CSV with its extra `broken_beams` column (nb-35), plus one line per break, `break t=<4 decimals> beam=<index> strain=<6 decimals>`. Read it with `grep -c "^break " scratch/s6-2-7.txt` and the CSV row starting `10.0000,`.
-PASS iff `run: ok` and the break-line count equals the `broken_beams` value of the `10.0000` row (zero is allowed: the nominal crash need not break anything; breaking itself is proven by the nb-35 tests in 2.1).
+PASS iff `run: ok` and the break-line count equals the `broken_beams` value of the `10.0000` row (zero is allowed here: the nominal crash need not break anything; that a beam breaks in a run is gated by 2.9).
 FAIL: the two numbers differ, or the column or row is missing.
 
-**2.8 It can be seen.** `broadsword test render > scratch/s6-2-8.txt 2>&1` and `git -C projects/render diff --name-status <nb-37 base commit> -- tests/golden`
-PASS iff `test: ok — N passed, 0 failed`, the file contains `test box_wall_final_frame_matches_golden ... ok`, and every line of the git output starts with `A` (only new golden images). FAIL: a failed test, or an `M` or `D` line (an existing golden image changed).
+**2.8 It can be seen.** `broadsword test render > scratch/s6-2-8.txt 2>&1`, then, in Git Bash from the Broadsword root, the golden-file diff of exactly the commits that nb-37's render half (board task `t-20261119-171333-35`) merged:
+```
+{ Q=$(sed -n 's/^note = merged by queue entry \(q-[0-9-]*\) as .*/\1/p' state/tasks/t-20261119-171333-35.task); git -C projects/render diff --name-status "$(sed -n 's/^base_head = //p' state/queue/$Q.entry)" "$(sed -n 's/^main_sha = //p' state/queue/$Q.entry)" -- tests/golden; } > scratch/s6-2-8-golden.txt 2>&1
+```
+How it finds the commits: when the queue merges a task it writes a line `note = merged by queue entry q-... as ...` (the entry id, then the merged commit) into the task file (`broadsword task show t-20261119-171333-35` prints the same as `note: ...`). That entry's `base_head` is main's HEAD the branch was rebased onto, and its `main_sha` is the commit main was fast-forwarded to, so the range is exactly nb-37's commits. The task file's own `base` is not used: the queue's rebase does not update it, so it can include other tasks' commits.
+PASS iff `test: ok — N passed, 0 failed`, `scratch/s6-2-8.txt` contains `test box_wall_final_frame_matches_golden ... ok`, and `scratch/s6-2-8-golden.txt` has at least one line and every line starts with `A` and a tab (only new golden images). FAIL: a failed test; an empty golden file (nb-37 added no golden image); a `sed:` or `fatal:` line (the task is not merged, or the entry is missing); or an `M`, `D` or `R` line (an existing golden image changed).
 
-What guards against tuning to the test in milestone 2: the material numbers need a stated source before the run (nb-36); the elastic control (2.4) must fail the same metric; the sensitivity runs (2.5) must move in the direction physics predicts; the step-size run (2.6) must agree; and the variants may differ in one number only, so a variant cannot be tuned separately.
+**2.9 A beam breaks in a run, where the closed form says it must, and not where it says it must not** (nb-35 breaking and `--events`; nb-36 the two files and a per-group `velocity`).
+`scenarios/break_pull.bsn`: two 1 kg nodes at (0, 2, 0) and (1, 2, 0) m, in groups `left` (node 0) and `right` (node 1); one beam between them (beam 0, rest 1.000 m) of a material with the cube's stiffness k = 20000 N/m and damping c = 20 N s/m, `break_strain 0.010` and no `yield_strain`; `left` starts at velocity (-2.5, 0, 0) m/s and `right` at (2.5, 0, 0) m/s. `scenarios/break_pull_slow.bsn` is the same file with the two speeds 0.75 m/s instead of 2.5 m/s (`break_pull_files_differ_only_in_speed` in 2.1 checks that nothing else differs).
+Why these numbers: the stretch x of the beam is a damped oscillator with reduced mass mu = m/2 = 0.5 kg, so omega0 = sqrt(k / mu) = 200 rad/s and zeta = c / (2 sqrt(k mu)) = 0.1. From x = 0 with x' = v_rel, its first and largest peak is x_max = (v_rel / omega0) exp(-(zeta / sqrt(1 - zeta^2)) atan(sqrt(1 - zeta^2) / zeta)) = 0.8626 v_rel / omega0, at t = atan(sqrt(1 - zeta^2) / zeta) / (omega0 sqrt(1 - zeta^2)) = 0.0074 s. Gravity pulls both nodes the same way and does not stretch the beam, and the nodes are in the air until about 0.64 s. v_rel = 5 m/s gives a peak strain of 0.02157, 2.16 x `break_strain`, so the beam must break before 0.0074 s; v_rel = 1.5 m/s gives 0.00647, 0.65 x, so it must never break (later peaks are smaller). At h = 1 ms, omega0 h = 0.2, well inside the step limit, and symplectic Euler stays within a few percent of the closed form, far less than either margin. The material is a test material for the breaking rule, not a real one; it needs no source because the check compares the run with the closed form, not with a measurement.
+`broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/break_pull.bsn --duration 1 --events > scratch/s6-2-9.txt 2>&1`
+`broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/break_pull_slow.bsn --duration 1 --events > scratch/s6-2-9-slow.txt 2>&1`
+PASS iff both print `run: ok`; `scratch/s6-2-9.txt` has exactly one line starting `break `, of the form `break t=T beam=0 strain=S` with T <= 0.0074 and S >= 0.010000, and the `broken_beams` value of its CSV row starting `1.0000,` is 1; and `scratch/s6-2-9-slow.txt` has no line starting `break ` and the `broken_beams` value of its `1.0000,` row is 0.
+FAIL: `run: FAILED` (an abort included); no break line in `s6-2-9.txt` (beams do not break in a run); a break later than 0.0074 s or at a strain below 0.010000; any break line in `s6-2-9-slow.txt` (it breaks below its threshold); or a `broken_beams` value that disagrees with the break lines.
+
+What guards against tuning to the test in milestone 2: the material numbers need a stated source before the run (nb-36); the elastic control (2.4) must fail the same metric; the sensitivity runs (2.5) must move in the direction physics predicts; the step-size run (2.6) must agree; the variants may differ in one number only, so a variant cannot be tuned separately; and the break (2.9) is predicted in closed form on both sides of the threshold, so a breaking rule that is too eager or too reluctant fails.
 
 ## Milestone 3: drive a car around and crash it
 
@@ -190,7 +202,8 @@ What guards against tuning to the test in milestone 2: the material numbers need
 
 - `scenarios/car_basic.bsn` (nb-38): about 4 x 1.8 x 1.4 m, about 1200 kg in total, four wheels, rear drive, front steer, every number with a source or a reason. It is mirror-symmetric left to right (the "level" check depends on it), has groups `front` (the front-most chassis nodes) and `rear` (the rear-most), and starts with every tyre's lowest point 0.20 m above the ground with the suspension at its rest length (this is the 0.2 m drop of nb-39).
 - `scenarios/pad_and_wall.bsn` (nb-41): the car sections of `car_basic.bsn`, byte for byte, plus one wall plane far enough ahead for the run-up. The car that crashes is the car that was tested.
-- `scenarios/pad_lap.input` (nb-41): lines of `t throttle brake steer` (nb-40), first line `0 0 0 0`. It drives one loop of the pad, then straight into the wall, and its last line, at time t_last after the impact, is `<t_last> 0 1 0` (full brake). With `--input` and no `--duration`, a run ends at t_last.
+- `scenarios/pad_lap.input` (nb-41): lines of `t throttle brake steer` (nb-40), first line `0 0 0 0`. It drives one loop of the pad, then straight into the wall, and its last line is exactly `60 0 1 0`: full brake from t_last = 60 s on, after the car has hit the wall. With `--input` and no `--duration`, a run ends at t_last; with a longer `--duration`, the last line's values hold to the end.
+- `scenarios/full_brake.input` (nb-40): the single line `0 0 1 0` (full brake, no throttle, no steer, from t = 0), for check 3.4.
 
 ### The drive report (nb-40)
 
@@ -217,7 +230,8 @@ drive: ok
 - **Lap: heading >= 360 degrees, path >= 50 m, back within 5 m.** 360 degrees and back near the start is a closed loop; 50 m of path (a circle of radius 8 m) rules out spinning on the spot; 5 m is about one car length.
 - **No chassis node touches the ground before the wall.** A car on a flat pad at these speeds stays on its tyres; a touch means it rolled or bottomed out.
 - **Crumple >= 0.05 m, <= 1.0 m, drift <= 0.001 m** between `rear` and `front`. 0.05 m is far above any elastic residue (milestone 2 put that at 1e-4 m scale) and well below what a real car crushes at 50 km/h; 1.0 m would reach the cabin. The measured crush is recorded for milestone 4, which validates it against published data; milestone 3 does not gate on realism.
-- **Settle after the crash: T = t_last + 8 s, S = 4 s, V = 0.001 m/s, E = 0.01 J, G = 0.01.** A car body on its springs decays at zeta * omega; with the slowest values check 3.3 allows (1.0 Hz, zeta = 0.2) that is 1.26 /s, and from the 1.98 m/s of a 0.2 m drop to V takes ln(1.98 / 0.001) / 1.26 = 6.0 s, so 8 s has margin. E = 0.01 J is the energy to lift 1200 kg by about 1 micrometre. G is as milestone 2, with the engine's work subtracted (settle rule 4).
+- **t_last = 60 s, fixed.** The script must fit a lap and a run-up before it. A lap of at least 50 m at an average 5 m/s (18 km/h) takes about 10 to 15 s; the run-up from the lap's end to 50 km/h (13.9 m/s) at a modest 2 to 3 m/s^2 takes 5 to 7 s and 35 to 50 m, so the impact comes at about 20 to 30 s, and 60 s leaves at least twice that. The number is fixed so that 3.6 has no value to fill in later; if nb-41 cannot reach the wall before 60 s, it stops and reports, and the number is changed here first, never only in the script.
+- **Settle after the crash: T = t_last + 8 = 68 s, S = 4 s (the run lasts t_last + 12 = 72 s), V = 0.001 m/s, E = 0.01 J, G = 0.01.** The settle clock starts at t_last, when the brake goes full on with the car already against the wall. A car body on its springs decays at zeta * omega; with the slowest values check 3.3 allows (1.0 Hz, zeta = 0.2) that is 1.26 /s, and from the 1.98 m/s of a 0.2 m drop to V takes ln(1.98 / 0.001) / 1.26 = 6.0 s, so 8 s has margin. E = 0.01 J is the energy to lift 1200 kg by about 1 micrometre. G is as milestone 2, with the engine's work subtracted (settle rule 4).
 - **Ride frequency 1.0 to 2.0 Hz and damping ratio 0.2 to 0.5 per corner.** These are the usual passenger-car design ranges (for example Gillespie, *Fundamentals of Vehicle Dynamics*, SAE, on ride: about 1 to 1.5 Hz, damping ratio 0.2 to 0.4), widened a little. They are computed from the file's spring and damper rates and the measured corner load, so a car cannot be made to settle by making the suspension unrealistically stiff or overdamped.
 
 ### Checks
@@ -243,21 +257,32 @@ PASS iff `run: ok` and the last line is `settle: ok`. FAIL: anything else.
 (e) each corner's ride frequency (1 / 2 pi) sqrt(k / m_c) is in [1.0, 2.0] Hz and its damping ratio c / (2 sqrt(k m_c)) in [0.2, 0.5], with m_c = (tyre load - wheel weight) / g.
 PASS iff the test passes; FAIL if any of (a) to (e) fails.
 
-**3.4 Grip holds and then lets go** (nb-39). With the ground plane tilted by theta and full brake, mu being `car_basic.bsn`'s tyre grip coefficient:
-at tan(theta) = 0.8 mu, max node speed < 0.001 m/s at every substep from 5 s to 9 s (`braked_car_holds_below_grip_slope`);
-at tan(theta) = 1.2 mu, the car slides, and its mean acceleration down the slope from 2 s to 4 s is within 15% of g (sin theta - mu cos theta) (`braked_car_slides_above_grip_slope`).
-FAIL: creep at or above 0.001 m/s on the gentle slope, or a slide that does not match friction physics.
+**3.4 Grip holds and then lets go** (nb-39 the slope flag and report, nb-40 `full_brake.input`). Scenario: `scenarios/car_basic.bsn` itself, unchanged, braked by `scenarios/full_brake.input`.
+Tilt setup: `--slope-grip-frac f` (nb-39) turns the flat ground into a slope by tilting gravity instead of the plane: gravity becomes g (sin theta, -cos theta, 0) with tan theta = f x mu, where mu is the body's tyre grip coefficient (refused, exit 2, if the body has no tyres or its tyres' mu differ). On a flat infinite plane this is the same physics as tilting the plane by theta. Downhill is +x, along the car's long axis (nb-38), so the braked wheels resist it. The car starts as in 3.2, 0.2 m above the ground.
+`--slope-report` (nb-39; required flags `--slope-from <s>` and `--slope-to <s>`, no defaults) prints, after any other report lines:
+```
+slope_mu=<4 decimals>                the tyre grip coefficient mu
+slope_tan=<6 decimals>               tan theta = f x mu
+slope_accel_mps2=<4 decimals>        (u(to) - u(from)) / (to - from), u = the chassis centre-of-mass velocity along +x
+slope_predicted_mps2=<4 decimals>    g (sin theta - mu cos theta)
+```
+(a) Holds: `broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/car_basic.bsn --input scenarios/full_brake.input --duration 12 --slope-grip-frac 0.8 --settle-report --settle-by 8 --settle-hold 4 --settle-speed 0.001 --energy-rise 0.01 --energy-gain 0.01 > scratch/s6-3-4a.txt 2>&1`
+PASS iff `run: ok` and the output contains `settle: ok` (with `--input` it also prints the `final ...` line, so `settle: ok` need not be the last line): max node speed < 0.001 m/s at every substep from 8 s to 12 s, with T, S, V, E and G as in 3.2 (the car drops and settles as there, on a slope it must hold). This is also the rule of `braked_car_holds_below_grip_slope`.
+(b) Slides: `broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/car_basic.bsn --input scenarios/full_brake.input --duration 4 --slope-grip-frac 1.2 --slope-report --slope-from 2 --slope-to 4 > scratch/s6-3-4b.txt 2>&1`
+PASS iff `run: ok`, `slope_predicted_mps2` > 0, and |`slope_accel_mps2` - `slope_predicted_mps2`| <= 0.15 x `slope_predicted_mps2`. This is also the rule of `braked_car_slides_above_grip_slope`.
+FAIL: in (a), `run: FAILED` or any `settle: FAIL` (creep at or above 0.001 m/s on the gentle slope); in (b), `run: FAILED`, a missing slope line, or an acceleration more than 15% from the friction formula (a slide that does not follow friction physics).
 
 **3.5 Driving follows the formulas, not a script of positions** (nb-40).
 `same_input_same_bytes`: the same input file run twice gives byte-identical stdout.
 `launch_matches_torque_or_grip_limit`: from rest on flat ground at full throttle, the mean acceleration over the first 0.5 s is within 10% of F / M_eff, with F = min(total drive torque / tyre radius, mu x static load on the driven wheels) and M_eff = M + (sum of wheel inertias) / radius^2.
 `full_lock_circle_matches_kinematic_radius`: at a steady 2 m/s with full steer, the path radius is within 10% of wheelbase / tan(max steer angle) (low-speed kinematic steering; lateral acceleration is under 0.1 g, so tyre slip is small), and over two laps it varies by at most 5%.
-FAIL: any of these.
+PASS iff `scratch/s6-3-1.txt` (the 3.1 run) contains `test same_input_same_bytes ... ok`, `test launch_matches_torque_or_grip_limit ... ok` and `test full_lock_circle_matches_kinematic_radius ... ok`, each asserting the rule above.
+FAIL: any of the three missing or failed (a rule above is broken).
 
-**3.6 Headless: a lap of the pad and into the wall.** With t_last from `pad_lap.input` (nb-41 writes the literal numbers into the evidence file):
-`broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/pad_and_wall.bsn --input scenarios/pad_lap.input --duration <t_last + 12> --drive-report --lap-min-heading 360 --lap-min-path 50 --lap-close 5 --impact-min-kmh 45 --impact-max-kmh 55 --settle-report --settle-by <t_last + 8> --settle-hold 4 --settle-speed 0.001 --energy-rise 0.01 --energy-gain 0.01 --crumple-report --crumple-groups rear,front --crumple-min 0.05 --crumple-max 1.0 --crumple-drift 0.001 > scratch/s6-3-6.txt 2>&1`
-PASS iff `run: ok`, the output contains `drive: ok` and `settle: ok`, and the last line is `crumple: ok`. Record `wall_impact_speed_kmh` and `crumple_delta_m` in the evidence for milestone 4.
-FAIL: `run: FAILED`, or any `FAIL` line (an abort, which includes any NaN, is `settle: FAIL unstable ...`).
+**3.6 Headless: a lap of the pad and into the wall.** Every number is fixed in "The numbers, and why" above (t_last = 60 s, so the run lasts 72 s and settles by 68 s; impact 45 to 55 km/h); nothing is filled in later.
+`broadsword run crash-sim -- cargo run --offline --release -- --body scenarios/pad_and_wall.bsn --input scenarios/pad_lap.input --duration 72 --drive-report --lap-min-heading 360 --lap-min-path 50 --lap-close 5 --impact-min-kmh 45 --impact-max-kmh 55 --settle-report --settle-by 68 --settle-hold 4 --settle-speed 0.001 --energy-rise 0.01 --energy-gain 0.01 --crumple-report --crumple-groups rear,front --crumple-min 0.05 --crumple-max 1.0 --crumple-drift 0.001 > scratch/s6-3-6.txt 2>&1`
+PASS iff `run: ok`, the last line of `scenarios/pad_lap.input` is `60 0 1 0`, the output contains `drive: ok` and `settle: ok`, `wall_first_contact_s` is a number below 60.0000, and the last line is `crumple: ok`. Record `wall_impact_speed_kmh` and `crumple_delta_m` in the evidence for milestone 4.
+FAIL: `run: FAILED`; any `FAIL` line (an abort, which includes any NaN, is `settle: FAIL unstable ...`); a different last input line; or `wall_first_contact_s=none` or at or after 60.0000 (the settle window would not start after the crash).
 
 **3.7 A human drives it in the viewer** (nb-40 render half). Tell Lazlo first (nb-37: the PC shares RAM with the GPU; the viewer is software-rendered, but ask before long sessions).
 `broadsword run render -- cargo run --offline --release --example drive -- --body ../crash-sim/scenarios/pad_and_wall.bsn --save-input ../../scratch/s6-3-7.input > scratch/s6-3-7.txt 2>&1`
@@ -302,13 +327,14 @@ After 3.6 to 3.9 pass, the Stage 6 m1-m3 retro entry in `RETRO.md` is due (AGENT
 | 1.2, 2.2 old tests unchanged | every brief that touches crash-sim |
 | 2.1 format tests, `cube.bsn`, `box.bsn` | nb-33 |
 | 2.1 deform tests, `--body` | nb-34 |
-| 2.1 breaking tests, 2.7 | nb-35 |
-| 2.1 box_wall tests, 2.3 to 2.6, wall planes, crumple report, the five box_wall files | nb-36 (with nb-33's box and nb-34's plasticity) |
+| 2.1 breaking tests, 2.7, the breaking rule and `break` lines of 2.9 | nb-35 |
+| 2.1 box_wall tests, 2.3 to 2.6, wall planes, crumple report, the five box_wall files, per-group `velocity`, the two break_pull files of 2.9 | nb-36 (with nb-33's box and nb-34's plasticity) |
+| 2.9 run | nb-36 (after nb-35) |
 | 2.8 | nb-37 |
 | 3.1 car format tests, `car_basic.bsn` | nb-38 |
-| 3.1 vehicle tests, 3.2, 3.3, 3.4 | nb-39 |
-| 3.1 drive tests, 3.5, drive report, `final` line, drive work W(t), 3.7 viewer | nb-40 |
-| 3.1 m3_done tests, 3.6, 3.8, 3.9, `pad_and_wall.bsn`, `pad_lap.input`, evidence | nb-41 (3.9 with nb-37's replay) |
+| 3.1 vehicle tests, 3.2, 3.3, 3.4, `--slope-grip-frac`, `--slope-report` | nb-39 (3.4's runs with nb-40's `full_brake.input`) |
+| 3.1 drive tests, 3.5, drive report, `final` line, drive work W(t), `full_brake.input`, 3.7 viewer | nb-40 |
+| 3.1 m3_done tests, 3.6, 3.8, 3.9, `pad_and_wall.bsn`, `pad_lap.input` (last line `60 0 1 0`), evidence | nb-41 (3.9 with nb-37's replay) |
 
 ## What the briefs must take from this file
 
@@ -317,9 +343,9 @@ Where a brief and this file differ, this file sets the check; the brief's coder 
 - nb-31: `STIFFEST_MODE_EIGENVALUE` may only be used for the cube; the test names in 1.1.
 - nb-32: an "impact" (not every resting contact) sets `last_impact_s`; the energy-rise window starts at T, not at the last impact (a car on its springs keeps the integrator's energy swing well after its last impact); the flags, output lines, formats and exit codes above; the grid test. The energy function and the impact detection must be reachable by nb-36 (walls) and nb-39 (wheels), which do not claim `settle.rs`.
 - nb-33: box node mass 1 kg, long axis x, groups `back` and `front`.
-- nb-35: the strain abort and `max_beam_strain` skip broken beams (otherwise the first break aborts the run); the `break t= beam= strain=` line format.
-- nb-36: the four variant files and their one-number test; plane impacts in the settle report; the crumple flags and output.
-- nb-38: groups `front` and `rear`, left-right symmetry, tyres 0.20 m above the ground at start.
-- nb-39: the energy terms for wheels, springs and tyres; test names and rules in 3.3 and 3.4.
-- nb-40: `--drive-report`, the `final` line, W(t), the end of a run at t_last without `--duration`, `--save-input`.
-- nb-41: `pad_and_wall.bsn` embeds `car_basic.bsn`'s car byte for byte; the script's first and last lines; the render golden test of 3.9 and `evidence/stage-6-m3-human.input`.
+- nb-35: the strain abort and `max_beam_strain` skip broken beams (otherwise the first break aborts the run); the `break t= beam= strain=` line format; the 2.9 thresholds (break when |strain| exceeds `break_strain`, checked every substep).
+- nb-36: the four variant files and their one-number test; plane impacts in the settle report; the crumple flags and output; a `velocity` that can be set per group; `break_pull.bsn`, `break_pull_slow.bsn` and their speed-only test (2.9). Its claims need `scenarios/break_pull.bsn` and `scenarios/break_pull_slow.bsn` added.
+- nb-38: groups `front` and `rear`, left-right symmetry, tyres 0.20 m above the ground at start, long axis (the rolling direction) along x.
+- nb-39: the energy terms for wheels, springs and tyres, and the tilted-gravity potential; test names and rules in 3.3 and 3.4; `--slope-grip-frac`, `--slope-report` and its flags and lines.
+- nb-40: `--drive-report`, the `final` line, W(t), the end of a run at t_last without `--duration` and the last line holding after it, `--save-input`; `scenarios/full_brake.input` (its claims need it added).
+- nb-41: `pad_and_wall.bsn` embeds `car_basic.bsn`'s car byte for byte; the script's first line and its last line `60 0 1 0`, with the wall hit before 60 s; the render golden test of 3.9 and `evidence/stage-6-m3-human.input`.
