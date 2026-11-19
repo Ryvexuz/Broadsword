@@ -23,12 +23,10 @@ def load_cases():
 
 def classify(rec, case):
     """Returns ('PASS'|'FAIL'|'ERROR', [broken rules as (type, message)], error text)."""
-    answer = rec.get("answer") or ""
-    if rec.get("is_error") and not answer.strip():
+    # call_failed is decided once, in run.py (call_failed()); whatever text the failed call carried, it is never graded
+    if rec["call_failed"]:
         return "ERROR", [], str(rec.get("error") or "model call failed")
-    if rec.get("call_failed"):
-        return "ERROR", [], str(rec.get("error") or "model call failed")
-    broken = CK.grade(case, answer)
+    broken = CK.grade(case, rec.get("answer") or "")
     return ("FAIL" if broken else "PASS"), broken, ""
 
 

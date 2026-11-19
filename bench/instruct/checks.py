@@ -128,7 +128,7 @@ def c_no_markdown(text, p):
     return None
 
 
-ABBREVIATIONS = re.compile(r"\b(?:e\.g|i\.e|etc|vs|mr|mrs|ms|dr|approx|no)\.", re.I)
+ABBREVIATIONS = re.compile(r"\b(?:e\.g|i\.e|etc|vs|mr|mrs|ms|dr|approx)\.", re.I)
 
 
 def count_sentences(text):

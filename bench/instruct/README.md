@@ -42,7 +42,7 @@ trailing blank lines, trailing spaces, CRLF.
 
 ## Run (costs real money, ask Lazlo first)
 
-No provider code lives here: `run.py` imports the Claude CLI and OpenAI calls from `bench/coder/run.py`
+No provider code lives here, on purpose (one provider path for every bench): `run.py` imports the Claude CLI and OpenAI calls from `bench/coder/run.py`
 (which reuses `bench/reviewer`). Same environment and options as there:
 
     BENCH_CWD=<folder outside the project> python -I -B bench/instruct/run.py <out-dir> claude <model> default

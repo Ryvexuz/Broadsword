@@ -269,7 +269,7 @@
  {
   "id": "14-plain-text",
   "kind": "short",
-  "prompt": "Explain recursion in exactly two sentences. Plain text only: do not use any of the characters * # ` or _ .",
+  "prompt": "Explain recursion in exactly two sentences. Plain text only: do not use any of these four characters: asterisk, hash sign, backtick, underscore. Full stops are fine.",
   "checks": [
    {
     "type": "sentences",

@@ -234,6 +234,17 @@ class ScoreScript(unittest.TestCase):
 FAKE_OK = ("import json, sys\n"
            "sys.stdin.buffer.read()\n"
            "print(json.dumps({'result': '391', 'is_error': False, 'total_cost_usd': 0.002, 'usage': {'input_tokens': 5, 'output_tokens': 1}, 'modelUsage': {'fake': {}}}))\n")
+
+
+def _fake_err(result, is_error, subtype, exit_code):
+    return ("import json, sys\nsys.stdin.buffer.read()\n"
+            f"print(json.dumps({{'result': {result!r}, 'is_error': {is_error!r}, 'subtype': {subtype!r}, 'total_cost_usd': 0.001}}))\n"
+            f"sys.exit({exit_code})\n")
+
+
+FAKE_ERR_TEXT = _fake_err("API Error: overloaded", True, "success", 0)  # is_error with text in the answer
+FAKE_ERR_EXIT = _fake_err("391", False, "success", 1)  # a plausible answer but a non-zero exit
+FAKE_ERR_SUBTYPE = _fake_err("391", False, "error_max_turns", 0)  # a CLI error subtype with text
 FAKE_SLOW = "import time\ntime.sleep(60)\n"
 
 
@@ -264,6 +275,19 @@ class RunScript(unittest.TestCase):
         self.assertEqual((r["answer"], r["call_failed"], r["cost_usd"]), ("391", False, 0.002))
         self.assertRegex(score, r"10-exact-answer\s+claude/fake/default\s+PASS")
         self.assertRegex(score, r"12-date-format\s+claude/fake/default\s+FAIL\s+full_match")
+
+    def test_a_failed_call_with_text_is_an_error_not_a_fail(self):
+        for name, cli in (("is_error with text", FAKE_ERR_TEXT), ("non-zero exit", FAKE_ERR_EXIT), ("error subtype", FAKE_ERR_SUBTYPE)):
+            res, score = self.run_main(cli, 30, ["10-exact-answer"])
+            r = res["10-exact-answer__claude__fake__default.json"]
+            self.assertTrue(r["call_failed"], name)
+            self.assertTrue(r["answer"], f"{name}: the fake CLI does carry text, which is the point")
+            self.assertRegex(score, r"10-exact-answer\s+claude/fake/default\s+ERROR", name)
+            self.assertRegex(score, r"claude/fake/default\s+0\s+0\s+0\s+n/a\s+1\s+19\s", name)
+
+    def test_no_is_a_sentence_end_not_an_abbreviation(self):
+        self.assertEqual(CK.count_sentences("I said no. Then I left."), 2)
+        self.assertEqual(CK.count_sentences("The answer is no. It is yes. Maybe no."), 3)
 
     def test_timeout_is_an_error_not_a_fail_and_the_run_goes_on(self):
         res, score = self.run_main(FAKE_SLOW, 1, ["10-exact-answer", "12-date-format"])

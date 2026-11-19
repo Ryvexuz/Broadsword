@@ -105,7 +105,7 @@ def build():
         "Write a one-line announcement for a new coffee shop called Bean There; the name must appear. At most 120 characters in total, plain ASCII only (no emoji, no curly quotes), and no hashtags.",
         [{"type": "max_chars", "k": 120}, {"type": "ascii_only"}, {"type": "forbidden_chars", "chars": "#"}, {"type": "contains", "strings": ["Bean There"]}])
     add("14-plain-text", "short",
-        "Explain recursion in exactly two sentences. Plain text only: do not use any of the characters * # ` or _ .",
+        "Explain recursion in exactly two sentences. Plain text only: do not use any of these four characters: asterisk, hash sign, backtick, underscore. Full stops are fine.",
         [{"type": "sentences", "n": 2}, {"type": "no_markdown"}, {"type": "min_words", "k": 8}])
 
     add("15-top-warn", "long", long_prompt(

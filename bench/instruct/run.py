@@ -9,7 +9,8 @@ Usage:
             --price-in/--price-out/--max-tokens/--timeout/--retries/--backoff/--base-url/--root).
             Every real run costs money; OpenAI also needs the key: ask Lazlo first.
 Per case it writes <out-dir>/<case>__<provider>__<model>__<effort>.{raw.json,answer.txt,json}. Then: python -I -B score.py <out-dir>
-A failed call (refusal, timeout, CLI error) is recorded with is_error true and an empty answer; score.py excludes it.
+A failed call (refusal, timeout, CLI error) is recorded with call_failed true (is_error, a non-zero exit or an error subtype, whatever text came back); score.py excludes it.
+The Claude and OpenAI calls are imported from bench/coder/run.py on purpose: one provider path for every bench.
 """
 import importlib.util, json, pathlib, re, sys, time, tomllib
 
@@ -27,6 +28,20 @@ CR.CFG["model_timeout_seconds"] = CFG["model_timeout_seconds"]
 
 def safe(s):
     return re.sub(r"[^A-Za-z0-9._-]", "_", s)
+
+
+def call_failed(res):
+    """The ONE place that decides a call failed (so it is an ERROR in score.py, never a FAIL), whatever text came back:
+    is_error true, a non-zero exit code, or a CLI result whose subtype starts with 'error'. A timeout has is_error true."""
+    if res.get("is_error"):
+        return True
+    if res.get("exit") not in (0, None):
+        return True
+    try:
+        raw = json.loads(res["raw"])
+    except Exception:
+        return False  # openai raw is saved as JSON too; an unreadable raw is not by itself a failed call
+    return isinstance(raw, dict) and str(raw.get("subtype", "")).startswith("error")
 
 
 def main(argv=None):
@@ -57,13 +72,13 @@ def main(argv=None):
         dt = time.time() - t0
         (out / f"{tag}.raw.json").write_bytes(res["raw"])
         (out / f"{tag}.answer.txt").write_text(res["answer"], encoding="utf-8")
-        call_failed = bool(res.get("is_error") and not res["answer"].strip())
+        failed = call_failed(res)
         rec = {"provider": provider, "model": model, "effort": effort, "case": c["id"], "answer": res["answer"],
                "tokens": res["tokens"], "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"],
-               "is_error": res.get("is_error"), "call_failed": call_failed, "error": res.get("error"),
+               "is_error": res.get("is_error"), "call_failed": failed, "error": res.get("error"),
                "model_used": res.get("model_used", [])}
         (out / f"{tag}.json").write_text(json.dumps(rec, indent=1), encoding="utf-8")
-        print(f"{tag}: {rec['wall_s']}s cost={rec['cost_usd']} call_failed={call_failed}", flush=True)
+        print(f"{tag}: {rec['wall_s']}s cost={rec['cost_usd']} call_failed={failed}", flush=True)
 
 
 if __name__ == "__main__":
