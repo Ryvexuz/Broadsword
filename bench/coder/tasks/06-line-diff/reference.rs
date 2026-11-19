@@ -23,33 +23,65 @@ pub fn diff(old: &[&str], new: &[&str]) -> Vec<Edit> {
         script.push(Edit::Equal(l.to_string()));
     }
 
-    // lcs[i][j] = length of the longest common subsequence of a[i..] and b[j..]
-    let (n, m) = (a.len(), b.len());
-    let w = m + 1;
-    let mut lcs = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i * w + j] = if a[i] == b[j] {
-                lcs[(i + 1) * w + j + 1] + 1
+    // Myers' O((N+M)D) algorithm on the trimmed middle; memory is O(D^2) for the saved frontiers.
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    let max = n + m;
+    let off = max + 1;
+    let mut v = vec![0isize; (2 * max + 3) as usize];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found = 0isize;
+    'outer: for d in 0..=max {
+        trace.push(v[(off - d) as usize..=(off + d) as usize].to_vec());
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && v[(off + k - 1) as usize] < v[(off + k + 1) as usize]) {
+                v[(off + k + 1) as usize]
             } else {
-                lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
+                v[(off + k - 1) as usize] + 1
             };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[(off + k) as usize] = x;
+            if x >= n && y >= m {
+                found = d;
+                break 'outer;
+            }
+            k += 2;
         }
     }
-    let (mut i, mut j) = (0, 0);
-    while i < n || j < m {
-        if i < n && j < m && a[i] == b[j] {
-            script.push(Edit::Equal(a[i].to_string()));
-            i += 1;
-            j += 1;
-        } else if i < n && (j == m || lcs[(i + 1) * w + j] >= lcs[i * w + j + 1]) {
-            script.push(Edit::Delete(a[i].to_string()));
-            i += 1;
+    // Walk back from (n, m), collecting the edits in reverse.
+    let mut rev: Vec<Edit> = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (1..=found).rev() {
+        let snap = &trace[d as usize]; // frontier before round d; index k + d
+        let at = |k: isize| snap[(k + d) as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) { k + 1 } else { k - 1 };
+        let prev_x = at(prev_k);
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            rev.push(Edit::Equal(a[x as usize].to_string()));
+        }
+        if x == prev_x {
+            y -= 1;
+            rev.push(Edit::Insert(b[y as usize].to_string()));
         } else {
-            script.push(Edit::Insert(b[j].to_string()));
-            j += 1;
+            x -= 1;
+            rev.push(Edit::Delete(a[x as usize].to_string()));
         }
     }
+    while x > 0 && y > 0 {
+        x -= 1;
+        y -= 1;
+        rev.push(Edit::Equal(a[x as usize].to_string()));
+    }
+    rev.reverse();
+    script.extend(rev);
 
     for l in &old[old.len() - suf..] {
         script.push(Edit::Equal(l.to_string()));

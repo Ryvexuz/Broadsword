@@ -90,6 +90,8 @@ One OpenAI model on all six tasks (prices are the model's current list prices, w
 BENCH_CWD=<outside-folder> python -I -B bench/coder/run.py <out> openai <model> default --price-in <usd per 1M in> --price-out <usd per 1M out>
 ```
 
+Test for the claude provider timeout (fake CLI, no model call): `python -I -B -m unittest discover -s bench/coder -p "test_run_timeout.py" -v`.
+
 Every Claude model, at its default effort and at `high` (run from the project root; `<out>` is for example `scratch/coder-bench/results`, and `BENCH_CWD` any empty folder outside the project, for example one under the system temp folder):
 
 ```

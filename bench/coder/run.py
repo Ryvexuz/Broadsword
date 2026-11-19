@@ -45,8 +45,15 @@ def provider_claude(prompt, model, effort):
                    "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"]
     if effort != "default":
         args += ["--effort", effort]
-    p = subprocess.run(args, cwd=WORKDIR, input=prompt.encode("utf-8"), capture_output=True,
-                       timeout=CFG["model_timeout_seconds"])
+    try:
+        p = subprocess.run(args, cwd=WORKDIR, input=prompt.encode("utf-8"), capture_output=True,
+                           timeout=CFG["model_timeout_seconds"])
+    except subprocess.TimeoutExpired:
+        # a call past model_timeout_seconds is a failed call for this task; the run goes on with the next one
+        err = f"model call timed out after {CFG['model_timeout_seconds']}s"
+        return {"answer": "", "raw": json.dumps({"is_error": True, "error": err}).encode("utf-8"),
+                "tokens": {"input": None, "output": None, "cache_read": None, "cache_write": None},
+                "cost_usd": None, "exit": None, "is_error": True, "error": err, "model_used": []}
     try:
         r = json.loads(p.stdout)
     except Exception:

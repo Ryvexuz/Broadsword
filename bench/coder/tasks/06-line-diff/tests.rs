@@ -265,3 +265,28 @@ fn hidden_large_identical_and_large_one_sided() {
     assert_eq!(s.len(), 6_000);
     assert!(s.iter().all(|e| matches!(e, Delete(_))));
 }
+
+#[test]
+fn hidden_very_long_inputs_with_spread_out_changes() {
+    // 50,000 unique lines; the first and the last line are among the changes, so trimming the common
+    // prefix and suffix removes nothing. Unique lines, so the minimal script has exactly
+    // 5*2 (replaced) + 2 (deleted) + 2 (inserted) = 14 changes.
+    let old: Vec<String> = (0..50_000).map(|i| format!("line {i}")).collect();
+    let mut new = old.clone();
+    for &i in &[0usize, 12_000, 25_000, 37_000, 49_999] {
+        new[i] = format!("changed {i}");
+    }
+    new.remove(30_000);
+    new.remove(8_000);
+    new.insert(44_000, "added 0".to_string());
+    new.insert(18_000, "added 1".to_string());
+    let (o2, n2) = (old.clone(), new.clone());
+    let script = within(move || {
+        let o: Vec<&str> = o2.iter().map(|s| s.as_str()).collect();
+        let n: Vec<&str> = n2.iter().map(|s| s.as_str()).collect();
+        diff(&o, &n)
+    });
+    let got = apply(&old, &script).unwrap();
+    assert_eq!(got, new, "applying the script must give the new lines");
+    assert_eq!(script.iter().filter(|e| !matches!(e, Equal(_))).count(), 14);
+}
