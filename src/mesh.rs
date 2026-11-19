@@ -78,7 +78,7 @@ impl Mesh {
     /// triangles). Comments, and the lines `o`, `g`, `s`, `usemtl` and `mtllib`, are ignored. Everything
     /// else is refused with its line number: other directives, `v/vt`, negative or zero or out-of-range
     /// indices (an index must refer to something already defined), polygons with five or more vertices,
-    /// non-finite numbers, and a file that mixes faces with and without normals. Vertices that are used
+    /// non-finite numbers, a zero-length normal (other non-unit normals are normalised), and a file that mixes faces with and without normals. Vertices that are used
     /// with different normals are duplicated, so the result has one normal per position.
     pub fn from_obj(text: &str) -> Result<Mesh, ObjError> {
         let mut positions: Vec<Vec3> = Vec::new();
@@ -110,6 +110,11 @@ impl Mesh {
                     if key == "v" {
                         positions.push(v);
                     } else {
+                        // Non-unit normals are normalised; a normal with no direction is refused.
+                        let len = v.length();
+                        if !(len.is_finite() && len > 0.0) {
+                            return obj_err(line_no, "`vn` has zero length (or its length is not finite) and no direction");
+                        }
                         normals.push(v.normalized());
                     }
                 }

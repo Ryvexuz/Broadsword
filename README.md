@@ -109,7 +109,8 @@ Measured on the build machine while it was busy with other jobs: about 8 to 10 m
   (flat shading with each triangle's own normal) or has one unit normal per position (smooth, Gouraud).
   `Mesh::from_obj` reads `v`, `vn`, `vt` (ignored), and `f` with 3 or 4 vertices in the forms `v`, `v//vn`,
   `v/vt/vn`; quads are split on their first diagonal. It refuses everything else with the line number (other
-  directives, `v/vt`, negative or zero or not-yet-defined indices, polygons of five or more, non-finite numbers,
+  directives, `v/vt`, negative or zero or not-yet-defined indices, polygons of five or more, non-finite numbers, zero-length normals
+  (a non-unit `vn` is normalised, not refused; a length that overflows to infinity is refused too),
   faces with and without normals mixed). `car_mesh(segments)`, `car_body_mesh()`, `wheel_mesh(segments)` and
   `ground_plane_mesh(half)` are procedural; the car faces +X, is 4.0 long and rests on y = 0.
 - `Renderer::render(fb, camera, scene)` clears the framebuffer and a depth buffer, then runs two passes:

@@ -191,3 +191,20 @@ fn validate_catches_bad_meshes() {
     m.normals.clear(); // no normals at all is fine: flat shading
     assert!(m.validate().is_ok());
 }
+
+#[test]
+fn bad_normals_are_refused_with_their_line_number() {
+    for (what, vn) in [("zero", "vn 0 0 0"), ("negative zero", "vn -0 0 -0"), ("overflowing length", "vn 3e38 3e38 3e38")] {
+        let text = format!("v 0 0 0\nv 1 0 0\nv 0 1 0\n{vn}\nf 1//1 2//1 3//1\n");
+        let (line, msg) = err(&text);
+        assert_eq!(line, 4, "{what}: the error must name the vn line ({msg})");
+    }
+    // NaN and infinity are refused by the number check, also with the line number.
+    for vn in ["vn nan 0 0", "vn inf 0 0", "vn 0 -inf 1"] {
+        let text = format!("v 0 0 0\n# comment\nv 1 0 0\nv 0 1 0\n{vn}\nf 1//1 2//1 3//1\n");
+        assert_eq!(err(&text).0, 5, "{vn}");
+    }
+    // A non-unit but valid normal is normalised, not refused (documented in README "OBJ").
+    let ok = Mesh::from_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 0.001\nf 1//1 2//1 3//1\n").unwrap();
+    assert_eq!(ok.normals, vec![Vec3::new(0.0, 0.0, 1.0); 3]);
+}

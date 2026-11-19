@@ -276,6 +276,21 @@ impl LightSpace {
     }
 }
 
+/// Orders vertices by clip coordinates (x, y, z, w), then by attributes: a total order for finite numbers.
+fn clip_key_less(a: &Vtx, b: &Vtx) -> bool {
+    for k in 0..4 {
+        if a.clip[k] != b.clip[k] {
+            return a.clip[k] < b.clip[k];
+        }
+    }
+    for k in 0..4 {
+        if a.attr[k] != b.attr[k] {
+            return a.attr[k] < b.attr[k];
+        }
+    }
+    false
+}
+
 /// Clips a triangle against the near plane (z >= -w) in clip space, before the perspective divide.
 /// Returns the number of vertices of the resulting convex polygon (0, 3 or 4).
 fn clip_near(tri: &[Vtx; 3], out: &mut [Vtx; 4]) -> usize {
@@ -289,11 +304,14 @@ fn clip_near(tri: &[Vtx; 3], out: &mut [Vtx; 4]) -> usize {
             n += 1;
         }
         if (da >= 0.0) != (db >= 0.0) {
-            let t = da / (da - db);
-            let mut v = *a;
+            // Canonical order: interpolate from the endpoint that sorts first by clip coordinates, so a neighbour
+            // that walks the shared edge the other way computes bit-for-bit the same crossing.
+            let (p, q, dp, dq) = if clip_key_less(b, a) { (b, a, db, da) } else { (a, b, da, db) };
+            let t = dp / (dp - dq);
+            let mut v = *p;
             for k in 0..4 {
-                v.clip[k] = a.clip[k] + (b.clip[k] - a.clip[k]) * t;
-                v.attr[k] = a.attr[k] + (b.attr[k] - a.attr[k]) * t;
+                v.clip[k] = p.clip[k] + (q.clip[k] - p.clip[k]) * t;
+                v.attr[k] = p.attr[k] + (q.attr[k] - p.attr[k]) * t;
             }
             out[n] = v;
             n += 1;
@@ -520,5 +538,53 @@ impl Renderer {
         }
         stats.main_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(*stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bits(v: &Vtx) -> [u32; 8] {
+        let mut o = [0u32; 8];
+        for k in 0..4 {
+            o[k] = v.clip[k].to_bits();
+            o[4 + k] = v.attr[k].to_bits();
+        }
+        o
+    }
+
+    /// The vertices of the clipped polygon that are not one of the three inputs: the near-plane crossings.
+    fn crossings(tri: &[Vtx; 3]) -> Vec<[u32; 8]> {
+        let mut out = [tri[0]; 4];
+        let n = clip_near(tri, &mut out);
+        out[..n].iter().filter(|v| !tri.iter().any(|t| bits(t) == bits(v))).map(bits).collect()
+    }
+
+    #[test]
+    fn clip_near_gives_a_shared_edge_the_same_crossing_from_either_end() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move |lo: f32, hi: f32| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lo + (hi - lo) * ((state >> 40) as f32 / (1u64 << 24) as f32)
+        };
+        let mut vtx = |inside: bool| {
+            let w = next(0.2, 5.0);
+            let z = if inside { next(-0.9, 1.0) * w } else { next(-3.0, -1.01) * w };
+            Vtx { clip: [next(-2.0, 2.0), next(-2.0, 2.0), z, w], attr: [next(0.0, 1.0), next(0.0, 64.0), next(0.0, 64.0), next(0.0, 9.0)] }
+        };
+        let mut compared = 0;
+        for _ in 0..20_000 {
+            let (p, q) = (vtx(true), vtx(false));
+            // Two triangles on the edge p-q, which walk it in opposite directions (as neighbours do).
+            let third_a = vtx(true);
+            let third_b = vtx(true);
+            let ca = crossings(&[p, q, third_a]);
+            let cb = crossings(&[q, p, third_b]);
+            // Each triangle has one other crossing (on the edge to its third vertex); the shared one is in both lists.
+            assert!(ca.iter().any(|c| cb.contains(c)), "p-q crossing differs by direction: {ca:?} vs {cb:?}");
+            compared += 1;
+        }
+        assert_eq!(compared, 20_000);
     }
 }
