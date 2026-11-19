@@ -1,6 +1,6 @@
 # ADR 0001: where the shared core lives (math and file formats)
 
-**Status: Proposed (Lazlo decides).** Every option except "keep copies" changes the repo layout, so this is Lazlo's call.
+**Status: Accepted, option (a) (Lazlo, 2026-11-19: "approve ADR option (a)").** Keep the copies per repo; file formats are the contract between repos; move to (d2), never (b) or (c), when a trigger in "What would make this recommendation wrong" fires. Follow-ups F1 to F4 are applied to the briefs of nb-40, nb-37, nb-42 and nb-39.
 The recommendation below is the orchestrator's input to that decision, not the decision itself.
 
 - Date: 2026-11-19. Board task `t-20261119-171333-47` (brief nb-46).
