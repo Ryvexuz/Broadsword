@@ -412,7 +412,7 @@ install_dir=\"build/bin\"\n";
         let c = Config::from_text(text, Path::new("p")).unwrap();
         // The shipped file may have the shadow switched off (safety stop cfadd9e); either valid value is fine here.
         assert!(matches!(c.shadow_reviewer.as_str(), "openai" | "off"), "shipped shadow_reviewer: {}", c.shadow_reviewer);
-        assert_eq!(c.shadow_reviewer_model.as_str(), "gpt-5.6-sol");
+        assert_eq!(c.shadow_reviewer_model.as_str(), "gpt-6.1-sol");
         for key in ["shadow_reviewer", "shadow_reviewer_model", "shadow_reviewer_timeout_seconds"] {
             let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
             assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");

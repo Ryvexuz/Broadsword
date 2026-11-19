@@ -58,7 +58,7 @@ queue_lock_wait_seconds = 5        # a queue command waits at most this long for
 reviewer_max_calls_per_entry = 3   # the most reviewer calls (every real call counts: retries, resumes, re-runs) one queue entry may make; at the cap the entry is `blocked` ("review call cap reached")
 redact_min_chars = 6               # a .env or secret-named value shorter than this many characters is not redacted from text (it would blank ordinary words); it is still kept out of every child's environment
 # Shadow second reviewer (queue run): a second model reviews the same prompt and is only RECORDED, never gating. Program: clients/openai_review.py under the Python on PATH (-I -B); the key comes from the root .env
-shadow_reviewer = "off"             # SAFETY STOP 2026-11-19 (Lazlo): codex read-only sandbox can read files by absolute path (canary, audit A6), so an injected diff could leak .env; back to "openai" only after the canary fails; "openai" runs the shadow review after the gating review; "off" disables it
-shadow_reviewer_model = "gpt-5.6-sol"  # the OpenAI model that shadow-reviews (benchmark: 9 of 12 planted bugs, no false alarms)
+shadow_reviewer = "openai"          # "openai" runs the shadow review after the gating review; "off" disables it. Back on 2026-11-19 after the sandbox fix 178cae0: scripts/shadow_canary.py from main passed on gpt-5.6-sol and gpt-6.1-sol (codex is offered no tools); re-run it after every codex update
+shadow_reviewer_model = "gpt-6.1-sol"  # the OpenAI model that shadow-reviews (Lazlo 2026-11-19: shadows are gpt-6.1-sol, gpt-6.2-astra, gpt-6.2-sol; one model until the multi-shadow task lands)
 shadow_reviewer_timeout_seconds = 300  # a shadow call that runs longer is killed and recorded as shadow_verdict = ERROR; the merge goes on
 
