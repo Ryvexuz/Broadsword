@@ -33,6 +33,9 @@
     },
     "list_len": {
      "tags": 3
+    },
+    "item_types": {
+     "tags": "str"
     }
    }
   ]
@@ -126,7 +129,16 @@
     "type": "table",
     "header": "| Planet | Moons | Rings |",
     "columns": 3,
-    "rows": 3
+    "rows": 3,
+    "first_col": [
+     "Earth",
+     "Mars",
+     "Saturn"
+    ],
+    "numeric_cols": [
+     1,
+     2
+    ]
    },
    {
     "type": "contains",
@@ -189,10 +201,6 @@
    {
     "type": "forbidden_chars",
     "chars": ","
-   },
-   {
-    "type": "min_words",
-    "k": 4
    }
   ]
  },

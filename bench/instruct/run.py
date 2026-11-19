@@ -9,7 +9,7 @@ Usage:
             --price-in/--price-out/--max-tokens/--timeout/--retries/--backoff/--base-url/--root).
             Every real run costs money; OpenAI also needs the key: ask Lazlo first.
 Per case it writes <out-dir>/<case>__<provider>__<model>__<effort>.{raw.json,answer.txt,json}. Then: python -I -B score.py <out-dir>
-A failed call (refusal, timeout, CLI error) is recorded with call_failed true (is_error, a non-zero exit or an error subtype, whatever text came back); score.py excludes it.
+A failed call (refusal, timeout, CLI error) is recorded with call_failed true (is_error, a non-zero exit, an error subtype, unreadable raw output, a refusal field, or an empty answer; whatever text came back); score.py excludes it.
 The Claude and OpenAI calls are imported from bench/coder/run.py on purpose: one provider path for every bench.
 """
 import importlib.util, json, pathlib, re, sys, time, tomllib
@@ -31,17 +31,28 @@ def safe(s):
 
 
 def call_failed(res):
-    """The ONE place that decides a call failed (so it is an ERROR in score.py, never a FAIL), whatever text came back:
-    is_error true, a non-zero exit code, or a CLI result whose subtype starts with 'error'. A timeout has is_error true."""
+    """The ONE place that decides a call failed (so it is an ERROR in score.py, never a FAIL), whatever text came back.
+    Returns the reason (a non-empty string) or None. Failed: is_error true (a timeout has it), a non-zero exit code, a CLI
+    result whose subtype starts with 'error', raw output that is not readable JSON, a refusal field in an OpenAI reply, or an
+    empty / whitespace-only answer from a call that otherwise succeeded (a refusal that came back as a normal reply)."""
     if res.get("is_error"):
-        return True
+        return str(res.get("error") or "call failed (is_error)")
     if res.get("exit") not in (0, None):
-        return True
+        return str(res.get("error") or f"non-zero exit {res['exit']}")
     try:
         raw = json.loads(res["raw"])
     except Exception:
-        return False  # openai raw is saved as JSON too; an unreadable raw is not by itself a failed call
-    return isinstance(raw, dict) and str(raw.get("subtype", "")).startswith("error")
+        return "unreadable raw output (not JSON)"
+    if isinstance(raw, dict) and str(raw.get("subtype", "")).startswith("error"):
+        return f"CLI error subtype {raw['subtype']}"
+    try:
+        if raw["choices"][0]["message"].get("refusal"):
+            return "refusal"
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
+    if not (res.get("answer") or "").strip():
+        return "empty answer"
+    return None
 
 
 def main(argv=None):
@@ -72,10 +83,11 @@ def main(argv=None):
         dt = time.time() - t0
         (out / f"{tag}.raw.json").write_bytes(res["raw"])
         (out / f"{tag}.answer.txt").write_text(res["answer"], encoding="utf-8")
-        failed = call_failed(res)
+        reason = call_failed(res)
+        failed = reason is not None
         rec = {"provider": provider, "model": model, "effort": effort, "case": c["id"], "answer": res["answer"],
                "tokens": res["tokens"], "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"],
-               "is_error": res.get("is_error"), "call_failed": failed, "error": res.get("error"),
+               "is_error": res.get("is_error"), "call_failed": failed, "error": (res.get("error") or reason) if failed else None,
                "model_used": res.get("model_used", [])}
         (out / f"{tag}.json").write_text(json.dumps(rec, indent=1), encoding="utf-8")
         print(f"{tag}: {rec['wall_s']}s cost={rec['cost_usd']} call_failed={failed}", flush=True)

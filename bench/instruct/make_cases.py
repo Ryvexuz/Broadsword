@@ -65,7 +65,7 @@ def build():
     add("02-json-keys", "short",
         "Invent a fictional book. Reply with only a JSON object with exactly these keys: title (string), author (string), year (integer), tags (a list of exactly 3 strings). No code fence and no other text.",
         [{"type": "json_keys", "keys": ["title", "author", "year", "tags"],
-          "types": {"title": "str", "author": "str", "year": "int", "tags": "list"}, "list_len": {"tags": 3}}])
+          "types": {"title": "str", "author": "str", "year": "int", "tags": "list"}, "list_len": {"tags": 3}, "item_types": {"tags": "str"}}])
     add("03-word-limit", "short",
         "Explain what a hash map is in at most 29 words, and use the word 'key'. Reply with the explanation only.",
         [{"type": "max_words", "k": 29}, {"type": "min_words", "k": 5}, {"type": "contains", "strings": ["key"]}])
@@ -80,7 +80,8 @@ def build():
          {"type": "forbidden", "words": ["definately", "seperate", "ocurring"]}])
     add("06-table-header", "short",
         "Reply with a markdown table and nothing else. The header row must be exactly `| Planet | Moons | Rings |`, followed by the separator row and exactly 3 data rows, for Earth, Mars and Saturn (in that order). Moons and Rings are plain numbers.",
-        [{"type": "table", "header": "| Planet | Moons | Rings |", "columns": 3, "rows": 3},
+        [{"type": "table", "header": "| Planet | Moons | Rings |", "columns": 3, "rows": 3,
+          "first_col": ["Earth", "Mars", "Saturn"], "numeric_cols": [1, 2]},
          {"type": "contains", "strings": ["Earth", "Mars", "Saturn"]}])
     add("07-first-last-line", "short",
         "Write a 3-line note about spring. The first line must be exactly BEGIN, the last line must be exactly END, and the middle line is one sentence about spring. Write nothing else.",
@@ -91,7 +92,7 @@ def build():
         [{"type": "numbered", "n": 5}])
     add("09-lowercase-no-commas", "short",
         "Write exactly one sentence about cats. It must be all lowercase and must not contain any comma.",
-        [{"type": "sentences", "n": 1}, {"type": "lowercase"}, {"type": "forbidden_chars", "chars": ","}, {"type": "min_words", "k": 4}])
+        [{"type": "sentences", "n": 1}, {"type": "lowercase"}, {"type": "forbidden_chars", "chars": ","}])
     add("10-exact-answer", "short",
         "What is 17 * 23? Reply with the number only, as digits, and nothing else.",
         [{"type": "equals", "text": "391"}])

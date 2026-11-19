@@ -48,6 +48,7 @@ BAD = {
         ('{"title": "The Glass Orchard", "author": "Mira Voss", "year": 1987, "tags": ["a", "b"]}', "json_keys"),  # 2 tags
         ('{"title": "The Glass Orchard", "author": "Mira Voss", "year": 1987, "tags": ["a", "b", "c"], "isbn": "1"}', "json_keys"),  # extra key
         ("Here is the book: " + _JSON, "json_keys"),  # text around
+        ('{"title": "The Glass Orchard", "author": "Mira Voss", "year": 1987, "tags": [1, false, null]}', "json_keys"),  # three items, none a string
     ],
     "03-word-limit": [
         ("A hash table stores pairs and finds values quickly by hashing each name to a bucket index in the array.", "contains"),
@@ -69,6 +70,8 @@ BAD = {
         ("| Planet | Moons |\n| --- | --- |\n| Earth | 1 |\n| Mars | 2 |\n| Saturn | 146 |", "table"),
         ("Here is the table:\n| Planet | Moons | Rings |\n| --- | --- | --- |\n| Earth | 1 | 0 |\n| Mars | 2 | 0 |\n| Saturn | 146 | 7 |", "table"),
         ("| Planet | Moons | Rings |\n| --- | --- | --- |\n| Earth | 1 | 0 |\n| Mars | 2 | 0 |", "table"),  # 2 rows
+        ("| Planet | Moons | Rings |\n| --- | --- | --- |\n| Mars | 2 | 0 |\n| Earth | 1 | 0 |\n| Saturn | 146 | 7 |", "table"),  # Mars before Earth
+        ("| Planet | Moons | Rings |\n| --- | --- | --- |\n| Earth | one | none |\n| Mars | two | none |\n| Saturn | many | yes |", "table"),  # cells not numbers
         ("| Planet | Moons | Rings |\n| Earth | 1 | 0 |\n| Mars | 2 | 0 |\n| Saturn | 146 | 7 |", "table"),  # no separator
     ],
     "07-first-last-line": [

@@ -106,7 +106,7 @@ class CaseSet(unittest.TestCase):
             "bullets": ({"n": 2}, "- a\n- b", "- a\n- b\n- c"),
             "numbered": ({"n": 2}, "1. a\n2. b", "1. a\n3. b"),
             "lines_count": ({"n": 2}, "a\nb", "a"),
-            "json_keys": ({"keys": ["a"]}, '{"a": 1}', '{"b": 1}'),
+            "json_keys": ({"keys": ["a"], "item_types": {"a": "str"}}, '{"a": ["x"]}', '{"a": [1, false, null]}'),
             "max_words": ({"k": 2}, "a b", "a b c"),
             "min_words": ({"k": 2}, "a b", "a"),
             "max_chars": ({"k": 3}, "abc", "abcd"),
@@ -193,7 +193,7 @@ class ScoreScript(unittest.TestCase):
             d = pathlib.Path(tmp)
             write_result(d, "01-bullets", "m", good_answer("01-bullets"))  # PASS
             write_result(d, "02-json-keys", "m", "```json\n" + good_answer("02-json-keys") + "\n```")  # FAIL: fence
-            write_result(d, "10-exact-answer", "m", "")  # FAIL: empty answer, no error
+            write_result(d, "10-exact-answer", "m", "392")  # FAIL: wrong value (an empty answer is an ERROR, see RunScript)
             write_result(d, "12-date-format", "m", "", is_error=True, call_failed=True, error="model call timed out after 1s")  # ERROR
             write_result(d, "03-word-limit", "m", "", is_error=True, call_failed=True, error="the model refused: no")  # ERROR
             r = subprocess.run([sys.executable, "-I", "-B", str(HERE / "score.py"), str(d)], capture_output=True, text=True, encoding="utf-8")
@@ -276,6 +276,27 @@ class RunScript(unittest.TestCase):
         self.assertRegex(score, r"10-exact-answer\s+claude/fake/default\s+PASS")
         self.assertRegex(score, r"12-date-format\s+claude/fake/default\s+FAIL\s+full_match")
 
+    def test_call_failed_reasons(self):
+        ok = {"answer": "391", "raw": json.dumps({"result": "391"}), "exit": 0, "is_error": False}
+        run = load("t_run2", HERE / "run.py")
+        self.assertIsNone(run.call_failed(ok))
+        self.assertEqual(run.call_failed({**ok, "answer": ""}), "empty answer")
+        self.assertEqual(run.call_failed({**ok, "answer": " \n\t"}), "empty answer")
+        self.assertEqual(run.call_failed({**ok, "raw": "not json {"}), "unreadable raw output (not JSON)")
+        # OpenAI HTTP 200 with a refusal field, with and without text in the answer
+        refusal = json.dumps({"choices": [{"message": {"content": "", "refusal": "I can't help with that"}, "finish_reason": "stop"}]})
+        self.assertEqual(run.call_failed({**ok, "answer": "", "raw": refusal}), "refusal")
+        self.assertEqual(run.call_failed({**ok, "answer": "I can't help with that", "raw": refusal}), "refusal")
+        normal = json.dumps({"choices": [{"message": {"content": "391", "refusal": None}, "finish_reason": "stop"}]})
+        self.assertIsNone(run.call_failed({**ok, "raw": normal}))
+
+    def test_an_empty_reply_from_a_successful_call_is_an_error_not_a_fail(self):
+        res, score = self.run_main(_fake_err("", False, "success", 0), 30, ["10-exact-answer"])
+        r = res["10-exact-answer__claude__fake__default.json"]
+        self.assertTrue(r["call_failed"])
+        self.assertEqual(r["error"], "empty answer")
+        self.assertRegex(score, r"10-exact-answer\s+claude/fake/default\s+ERROR\s+empty answer")
+
     def test_a_failed_call_with_text_is_an_error_not_a_fail(self):
         for name, cli in (("is_error with text", FAKE_ERR_TEXT), ("non-zero exit", FAKE_ERR_EXIT), ("error subtype", FAKE_ERR_SUBTYPE)):
             res, score = self.run_main(cli, 30, ["10-exact-answer"])
@@ -284,6 +305,10 @@ class RunScript(unittest.TestCase):
             self.assertTrue(r["answer"], f"{name}: the fake CLI does carry text, which is the point")
             self.assertRegex(score, r"10-exact-answer\s+claude/fake/default\s+ERROR", name)
             self.assertRegex(score, r"claude/fake/default\s+0\s+0\s+0\s+n/a\s+1\s+19\s", name)
+
+    def test_case_09_asks_for_no_minimum_length(self):
+        self.assertEqual(CK.grade(CASES["09-lowercase-no-commas"], "cats sleep."), [])
+        self.assertEqual(CK.grade(CASES["09-lowercase-no-commas"], "cats"), [])
 
     def test_no_is_a_sentence_end_not_an_abbreviation(self):
         self.assertEqual(CK.count_sentences("I said no. Then I left."), 2)

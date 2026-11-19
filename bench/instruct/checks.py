@@ -74,6 +74,10 @@ def c_json_keys(text, p):
     for k, n in p.get("list_len", {}).items():
         if len(obj[k]) != n:
             return f"key {k!r} must be a list of exactly {n} items, got {len(obj[k])}"
+    for k, t in p.get("item_types", {}).items():
+        for item in obj[k]:
+            if not (isinstance(item, kinds[t]) and not (t == "int" and isinstance(item, bool))):
+                return f"every item of {k!r} must be of type {t}, got {item!r}"
     for k, v in p.get("values", {}).items():
         if obj[k] != v:
             return f"key {k!r} must be {v!r}, got {obj[k]!r}"
@@ -202,6 +206,12 @@ def c_table(text, p):
         if len(c) != p["columns"]:
             return f"a row has {len(c)} columns, expected {p['columns']}: {r[:60]!r}"
         cells.append(c)
+    if "first_col" in p and [c[0] for c in cells] != p["first_col"]:
+        return f"the first column must be {p['first_col']} in this order, got {[c[0] for c in cells]}"
+    for i in p.get("numeric_cols", []):
+        for c in cells:
+            if not re.fullmatch(r"\d+", c[i]):
+                return f"column {i + 1} must hold plain numbers, got {c[i]!r}"
     if "expect_rows" in p and cells != p["expect_rows"]:
         return f"the row values are wrong; expected {p['expect_rows']}, got {cells}"
     return None
