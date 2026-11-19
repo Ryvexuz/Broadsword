@@ -73,6 +73,20 @@ def redact(text: object) -> str:
     return KEY_PATTERN.sub("[REDACTED]", s)
 
 
+def redact_obj(value: object) -> object:
+    """A copy of a JSON-like structure with every string (dict keys too) passed through `redact()`.
+
+    Redacting the structure BEFORE it is serialized matters: `json.dumps` escapes quotes and backslashes, so a key holding
+    those characters no longer matches once it is inside JSON text."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {(redact(k) if isinstance(k, str) else k): redact_obj(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_obj(v) for v in value]
+    return value
+
+
 def out(text: str = "") -> None:
     print(redact(text), flush=True)
 
@@ -493,7 +507,7 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 def chat_completion(base_url: str, key: str, payload: dict, timeout: float, backoff: float, retries: int = 2) -> dict:
     """POST {base}/chat/completions. 429 and 5xx are retried at most `retries` times. Raises Fail with a clear message."""
     url = base_url.rstrip("/") + "/chat/completions"
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(redact_obj(payload)).encode("utf-8")  # the one place a request body is built
     for attempt in range(retries + 1):
         req = urllib.request.Request(
             url, data=data, method="POST",
@@ -661,8 +675,16 @@ def run_tool_call(args, server: McpServer, allowed: set[str], run: Run, messages
 # ---- main -------------------------------------------------------------------------------------
 
 
+class RedactingParser(argparse.ArgumentParser):
+    """argparse echoes bad values (`invalid int value: 'sk-...'`) itself; route its errors through `err()` instead."""
+
+    def error(self, message: str):  # type: ignore[override]
+        err(f"{self.prog}: error: {message}")
+        raise SystemExit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Let an OpenAI model use Broadsword's tools through its MCP server.")
+    p = RedactingParser(description="Let an OpenAI model use Broadsword's tools through its MCP server.")
     p.add_argument("--prompt", required=True, help="what to ask the model")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model name (default {DEFAULT_MODEL})")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL, help=f"API base URL (default {DEFAULT_BASE_URL})")
@@ -685,7 +707,7 @@ def write_log(path: Path, args, run: Run, messages: list[dict], offered: list[st
         "final": run.final, "stopped_at_max_turns": run.stopped_at_max, "error": error,
         "events": run.events, "messages": messages,
     }
-    text = redact(json.dumps(doc, indent=2, ensure_ascii=False))
+    text = redact(json.dumps(redact_obj(doc), indent=2, ensure_ascii=False))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text + "\n", encoding="utf-8")
 

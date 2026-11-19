@@ -354,6 +354,30 @@ class EndToEnd(RootCase):
         self.assertEqual(doc["events"][1]["exit_code"], 0)
         self.assertIn("messages", doc)
 
+    def test_prompt_containing_the_key_is_redacted_in_the_request_payload(self):
+        with FakeOpenAI([final("ok")]) as fake:
+            r = self.cli(fake.url, prompt=f"my key is {FAKE_KEY} and sk-other-9999")
+            self.assertEqual(fake.auth[0], "Bearer " + FAKE_KEY)  # the header still carries the real key
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        sent = json.dumps(fake.requests[0]["json"])
+        self.assertNotIn("SECRET123", sent)
+        self.assertNotIn("sk-other-9999", sent)
+        self.assertIn("[REDACTED]", fake.requests[0]["json"]["messages"][1]["content"])
+
+    def test_key_with_quote_and_backslash_is_absent_from_the_json_log(self):
+        key = 'abc"def\ghi-12345'  # not sk- shaped, and json.dumps escapes both characters
+        log = self.root / "scratch" / "m3-quote-log.json"
+        with FakeOpenAI([final(f"echo {key}")]) as fake:
+            r = self.cli(fake.url, "--json-log", str(log), key=key, prompt=f"say {key}")
+            self.assertEqual(fake.auth[0], "Bearer " + key)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = log.read_text(encoding="utf-8")
+        self.assertNotIn('abc"def', text)
+        self.assertNotIn("ghi-12345", text)
+        self.assertNotIn(json.dumps(key)[1:-1], text)
+        self.assertNotIn("ghi-12345", r.stdout + r.stderr)
+        self.assertNotIn("ghi-12345", json.dumps(fake.requests[0]["json"]))
+
     def test_json_log_outside_scratch_or_evidence_is_refused(self):
         with FakeOpenAI([final("x")]) as fake:
             r = self.cli(fake.url, "--json-log", str(MAIN_ROOT / "m3-outside-log.json"))
@@ -530,6 +554,21 @@ class Units(unittest.TestCase):
                 oc.load_api_key(Path(d), {})
             with self.assertRaises(oc.Fail):
                 oc.load_api_key(Path(d), {"OPENAI_API_KEY": "sk-bad key"})
+
+    def test_argparse_errors_never_echo_a_key_shaped_value(self):
+        for argv in (["--prompt", "x", "--max-turns", "sk-abcdef123456"], ["--prompt", "x", "--timeout", "sk-abcdef123456"],
+                     ["--prompt", "x", "sk-abcdef123456"], ["--prompt", "x", "--sk-abcdef123456"]):
+            r = subprocess.run([sys.executable, "-I", str(CLIENT), *argv], capture_output=True, text=True, encoding="utf-8", timeout=60)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertNotIn("sk-abcdef123456", r.stdout + r.stderr)
+            self.assertIn("error", r.stderr)
+
+    def test_redact_obj_walks_strings_keys_and_nesting(self):
+        oc._SECRETS.add('q"u\o')
+        doc = {'k q"u\o': ["a q\"u\o b", {"n": 3, "s": "sk-abc123"}], "t": None}
+        out = oc.redact_obj(doc)
+        self.assertEqual(out, {"k [REDACTED]": ["a [REDACTED] b", {"n": 3, "s": "[REDACTED]"}], "t": None})
+        oc._SECRETS.discard('q"u\o')
 
     def test_redact(self):
         oc._SECRETS.add("plainsecretvalue")
