@@ -1,0 +1,94 @@
+//! The solver interface: one physics substep on a node-beam state, behind a trait so the
+//! integrator can be swapped. `SymplecticEuler` is today's integrator, moved here unchanged
+//! in maths and order of operations (docs/PHYSICS.md, "Integrator").
+
+use crate::vec3::Vec3;
+use crate::{Beam, FRICTION_RATE, REST_SPEED, RESTITUTION};
+
+/// The state a solver advances: node positions and velocities (mutable), and the beams and
+/// per-node masses it reads, plus the gravitational acceleration. Beams carry their own
+/// stiffness and damping.
+pub struct State<'a> {
+    pub pos: &'a mut [Vec3],
+    pub vel: &'a mut [Vec3],
+    pub beams: &'a [Beam],
+    /// Mass of each node (kg), one per node.
+    pub mass: &'a [f64],
+    /// Gravitational acceleration, m/s^2, pointing down (-y).
+    pub gravity: f64,
+}
+
+/// Advances a state by one physics substep of length `h` seconds. A solver may keep its own
+/// working data between calls but must not need anything else from the caller.
+pub trait Solver {
+    fn step(&mut self, state: State<'_>, h: f64);
+}
+
+/// Semi-implicit (symplectic) Euler with the y = 0 ground contact rule.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SymplecticEuler;
+
+impl Solver for SymplecticEuler {
+    fn step(&mut self, s: State<'_>, h: f64) {
+        let State { pos, vel, beams, mass, gravity } = s;
+        let mut force: Vec<Vec3> = mass.iter().map(|&m| Vec3::new(0.0, -gravity * m, 0.0)).collect();
+        for bm in beams {
+            let d = pos[bm.b] - pos[bm.a];
+            let len = d.length();
+            if len < 1e-12 {
+                continue;
+            }
+            let dir = d * (1.0 / len);
+            let rel_v = (vel[bm.b] - vel[bm.a]).dot(dir);
+            let mag = bm.stiffness * (len - bm.rest) + bm.damping * rel_v;
+            let f = dir * mag;
+            force[bm.a] += f;
+            force[bm.b] += -f;
+        }
+        for i in 0..pos.len() {
+            // semi-implicit Euler: velocity first, then position with the new velocity
+            vel[i] += force[i] * (h / mass[i]);
+            pos[i] += vel[i] * h;
+            if pos[i].y < 0.0 {
+                pos[i].y = 0.0;
+                if vel[i].y < 0.0 {
+                    let vy = vel[i].y;
+                    vel[i].y = if -vy > REST_SPEED { -vy * RESTITUTION } else { 0.0 };
+                }
+                let keep = (1.0 - FRICTION_RATE * h).max(0.0);
+                vel[i].x *= keep;
+                vel[i].z *= keep;
+            }
+        }
+    }
+}
+
+/// The largest beam stiffness, the largest beam damping and the lightest node mass of a
+/// state: the (k, c, m) that the step-limit checks use. With no beams, k and c are 0.
+pub fn step_limit_params(beams: &[Beam], mass: &[f64]) -> (f64, f64, f64) {
+    let k = beams.iter().map(|b| b.stiffness).fold(0.0, f64::max);
+    let c = beams.iter().map(|b| b.damping).fold(0.0, f64::max);
+    let m = mass.iter().cloned().fold(f64::INFINITY, f64::min);
+    (k, c, m)
+}
+
+/// Gershgorin bound on the highest angular frequency (rad/s) of a state, ignoring damping:
+/// omega_max^2 <= 2 * max over nodes of (sum of the stiffnesses of the beams at that node)
+/// / lightest mass. Valid for any body, unlike `STIFFEST_MODE_EIGENVALUE`, which is true
+/// for the cube only.
+pub fn gershgorin_omega_max(n_nodes: usize, beams: &[Beam], mass: &[f64]) -> f64 {
+    let mut per_node = vec![0.0_f64; n_nodes];
+    for b in beams {
+        per_node[b.a] += b.stiffness;
+        per_node[b.b] += b.stiffness;
+    }
+    let ksum = per_node.iter().cloned().fold(0.0, f64::max);
+    let m = mass.iter().cloned().fold(f64::INFINITY, f64::min);
+    (2.0 * ksum / m).sqrt()
+}
+
+/// Largest step (s) for which symplectic Euler is stable for this state, ignoring damping:
+/// 2 / `gershgorin_omega_max` (the step must keep omega_max * h below 2).
+pub fn gershgorin_step_limit(n_nodes: usize, beams: &[Beam], mass: &[f64]) -> f64 {
+    2.0 / gershgorin_omega_max(n_nodes, beams, mass)
+}

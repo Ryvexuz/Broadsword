@@ -3,8 +3,10 @@
 //! Simple on purpose: spring-damper beams, symplectic Euler, y = 0 ground with
 //! restitution and friction. Std only, deterministic (no RNG, fixed step order).
 
+pub mod solver;
 pub mod vec3;
 
+use solver::{Solver, State, SymplecticEuler};
 use vec3::Vec3;
 
 pub const GRAVITY: f64 = 9.81;
@@ -146,14 +148,19 @@ impl Config {
             return Err("dt must be > 0, duration >= 0, substeps >= 1, drop-height >= 0, gravity > 0 (all finite)".into());
         }
         let h = self.dt / self.substeps as f64;
-        let limit = max_stable_step();
+        // The limits come from the stiffest beam and the lightest node of the body this
+        // config builds (today always the cube, whose numbers are the constants above).
+        let (_, beams, mass) = build_cube(self);
+        let (k, c, m) = solver::step_limit_params(&beams, &mass);
+        let omega_max = solver::gershgorin_omega_max(mass.len(), &beams, &mass);
+        let limit = solver::gershgorin_step_limit(mass.len(), &beams, &mass);
         if h > limit {
             return Err(format!(
- "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s, k = {BEAM_STIFFNESS}); raise --substeps or lower --dt",
-                (14.0 * BEAM_STIFFNESS / NODE_MASS).sqrt()
+ "physics step h = dt/substeps = {h:.6} s exceeds the stable limit {limit:.6} s (symplectic Euler needs omega_max*h < 2 with omega_max <= sqrt(14*k/m) = {:.0} rad/s, k = {k}); raise --substeps or lower --dt",
+                omega_max
             ));
         }
-        if let Some(e) = damped_step_error(h, BEAM_STIFFNESS, BEAM_DAMPING, NODE_MASS) {
+        if let Some(e) = damped_step_error(h, k, c, m) {
             return Err(e);
         }
         Ok(())
@@ -165,6 +172,10 @@ pub struct Beam {
     pub a: usize,
     pub b: usize,
     pub rest: f64,
+    /// Spring stiffness (N/m).
+    pub stiffness: f64,
+    /// Axial damping (N*s/m).
+    pub damping: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,80 +191,72 @@ pub struct Sim {
     pub pos: Vec<Vec3>,
     pub vel: Vec<Vec3>,
     pub beams: Vec<Beam>,
+    /// Mass of each node (kg).
+    pub mass: Vec<f64>,
     /// Time (s) of the first physics substep at which any node was at or below the
     /// ground (0.0 if the cube starts there); None until then. Set inside the substep
     /// loop, so it cannot miss a contact that starts and ends between two output samples.
     pub first_contact_s: Option<f64>,
+    solver: Box<dyn Solver>,
     step: u64,
 }
 
-impl Sim {
-    pub fn new(cfg: Config) -> Sim {
-        let e = cfg.edge;
-        let mut pos: Vec<Vec3> = (0..8)
-            .map(|i| {
-                Vec3::new(
-                    if i & 1 != 0 { e } else { 0.0 } - e / 2.0,
-                    if i & 2 != 0 { e } else { 0.0 } - e / 2.0,
-                    if i & 4 != 0 { e } else { 0.0 } - e / 2.0,
-                )
-            })
-            .collect();
-        if cfg.tilt {
-            let (s, c) = TILT_DEG.to_radians().sin_cos();
-            for p in pos.iter_mut() {
-                // rotate about x, then about z (cube is centred on the origin)
-                let (y, z) = (p.y * c - p.z * s, p.y * s + p.z * c);
-                let (x, y) = (p.x * c - y * s, p.x * s + y * c);
-                *p = Vec3::new(x, y, z);
-            }
-        }
-        let lowest = pos.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-        let shift = cfg.drop_height - lowest;
+/// The cube's start positions, beams and node masses for `cfg`.
+fn build_cube(cfg: &Config) -> (Vec<Vec3>, Vec<Beam>, Vec<f64>) {
+    let e = cfg.edge;
+    let mut pos: Vec<Vec3> = (0..8)
+        .map(|i| {
+            Vec3::new(
+                if i & 1 != 0 { e } else { 0.0 } - e / 2.0,
+                if i & 2 != 0 { e } else { 0.0 } - e / 2.0,
+                if i & 4 != 0 { e } else { 0.0 } - e / 2.0,
+            )
+        })
+        .collect();
+    if cfg.tilt {
+        let (s, c) = TILT_DEG.to_radians().sin_cos();
         for p in pos.iter_mut() {
-            p.y += shift;
+            // rotate about x, then about z (cube is centred on the origin)
+            let (y, z) = (p.y * c - p.z * s, p.y * s + p.z * c);
+            let (x, y) = (p.x * c - y * s, p.x * s + y * c);
+            *p = Vec3::new(x, y, z);
         }
-        // Every node pair is a beam: 12 edges + 12 face diagonals + 4 body diagonals = 28.
-        let mut beams = Vec::new();
-        for a in 0..8 {
-            for b in (a + 1)..8 {
-                beams.push(Beam { a, b, rest: (pos[a] - pos[b]).length() });
-            }
+    }
+    let lowest = pos.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let shift = cfg.drop_height - lowest;
+    for p in pos.iter_mut() {
+        p.y += shift;
+    }
+    // Every node pair is a beam: 12 edges + 12 face diagonals + 4 body diagonals = 28.
+    let mut beams = Vec::new();
+    for a in 0..8 {
+        for b in (a + 1)..8 {
+            beams.push(Beam { a, b, rest: (pos[a] - pos[b]).length(), stiffness: BEAM_STIFFNESS, damping: BEAM_DAMPING });
         }
+    }
+    let mass = vec![NODE_MASS; pos.len()];
+    (pos, beams, mass)
+}
+
+impl Sim {
+    /// A cube sim with the default solver, `SymplecticEuler`.
+    pub fn new(cfg: Config) -> Sim {
+        Sim::with_solver(cfg, Box::new(SymplecticEuler))
+    }
+
+    /// A cube sim advanced by the given solver.
+    pub fn with_solver(cfg: Config, solver: Box<dyn Solver>) -> Sim {
+        let (pos, beams, mass) = build_cube(&cfg);
         let first_contact_s = if pos.iter().any(|p| p.y <= 0.0) { Some(0.0) } else { None };
-        Sim { cfg, pos, vel: vec![Vec3::ZERO; 8], beams, first_contact_s, step: 0 }
+        let n = pos.len();
+        Sim { cfg, pos, vel: vec![Vec3::ZERO; n], beams, mass, first_contact_s, solver, step: 0 }
     }
 
     fn substep(&mut self, h: f64) {
-        let mut force = vec![Vec3::new(0.0, -self.cfg.gravity * NODE_MASS, 0.0); self.pos.len()];
-        for bm in &self.beams {
-            let d = self.pos[bm.b] - self.pos[bm.a];
-            let len = d.length();
-            if len < 1e-12 {
-                continue;
-            }
-            let dir = d * (1.0 / len);
-            let rel_v = (self.vel[bm.b] - self.vel[bm.a]).dot(dir);
-            let mag = BEAM_STIFFNESS * (len - bm.rest) + BEAM_DAMPING * rel_v;
-            let f = dir * mag;
-            force[bm.a] += f;
-            force[bm.b] += -f;
-        }
-        for i in 0..self.pos.len() {
-            // semi-implicit Euler: velocity first, then position with the new velocity
-            self.vel[i] += force[i] * (h / NODE_MASS);
-            self.pos[i] += self.vel[i] * h;
-            if self.pos[i].y < 0.0 {
-                self.pos[i].y = 0.0;
-                if self.vel[i].y < 0.0 {
-                    let vy = self.vel[i].y;
-                    self.vel[i].y = if -vy > REST_SPEED { -vy * RESTITUTION } else { 0.0 };
-                }
-                let keep = (1.0 - FRICTION_RATE * h).max(0.0);
-                self.vel[i].x *= keep;
-                self.vel[i].z *= keep;
-            }
-        }
+        self.solver.step(
+            State { pos: &mut self.pos, vel: &mut self.vel, beams: &self.beams, mass: &self.mass, gravity: self.cfg.gravity },
+            h,
+        );
     }
 
     pub fn sample(&self) -> Sample {
