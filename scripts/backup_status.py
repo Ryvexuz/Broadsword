@@ -57,6 +57,8 @@ def load_map(path):
     if not isinstance(repos, list) or not repos:
         raise ConfigError("map must have a non-empty 'repos' list")
     for r in repos:
+        if not isinstance(r, dict):
+            raise ConfigError("every map entry must be an object, got %r" % (r,))
         for k in REQUIRED:
             if not isinstance(r.get(k), str) or not r[k]:
                 raise ConfigError("map entry %r is missing required key %r" % (r.get("name"), k))
@@ -73,12 +75,11 @@ def fmt_age(seconds):
     return "%dd" % (seconds // 86400)
 
 
-def ref_age(tracking, ref, now):
-    """Age of the local remote-tracking ref (when it was last updated), or None."""
-    common = git(tracking, "rev-parse", "--git-common-dir").stdout.strip()
-    common = os.path.normpath(os.path.join(tracking, common))
-    loose = os.path.join(common, "refs", "remotes", *ref.split("/"))
-    for p in (loose, os.path.join(common, "packed-refs")):
+def ref_age(repo, full_ref, now):
+    """Age of a local ref (when it was last updated), or None."""
+    common = git(repo, "rev-parse", "--git-common-dir").stdout.strip()
+    common = os.path.normpath(os.path.join(repo, common))
+    for p in (os.path.join(common, *full_ref.split("/")), os.path.join(common, "packed-refs")):
         if os.path.exists(p):
             return now - os.path.getmtime(p)
     return None
@@ -93,19 +94,26 @@ def check_repo(root, entry, now):
             "oldest_age": None, "ref_age": None, "error": None, "remote_sha": None}
     sha = git(tracking, "rev-parse", "--verify", "--quiet",
               "refs/remotes/%s^{commit}" % ref, check=False).stdout.strip()
+    if sha and git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0:
+        res["error"] = "tracking ref %s (%s) is not a commit in %s" % (ref, sha[:8], entry["path"])
+        sha = ""
+    # A push from a repo other than the tracking repo is recorded in the pushed repo itself.
+    rec_ref = "refs/backup-pushed-branch/%s/%s" % (entry["remote"], entry["remote_branch"])
+    rec = git(repo, "rev-parse", "--verify", "--quiet", rec_ref + "^{commit}", check=False).stdout.strip()
+    age_from = (tracking, "refs/remotes/" + ref)
+    if rec and (not sha or git(repo, "merge-base", "--is-ancestor", sha, rec, check=False).returncode == 0):
+        sha, res["error"] = rec, None
+        age_from = (repo, rec_ref)
     if not sha:
-        res["error"] = "no local tracking ref %s" % ref
+        res["error"] = res["error"] or "no local tracking ref %s" % ref
         return res
     res["remote_sha"] = sha
-    if git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0:
-        res["error"] = "tracking ref %s (%s) is not a commit in %s" % (ref, sha[:8], entry["path"])
-        return res
     local = git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/%s^{commit}" % entry["branch"],
                 check=False).stdout.strip()
     if not local:
         res["error"] = "no local branch %s" % entry["branch"]
         return res
-    res["ref_age"] = ref_age(tracking, ref, now)
+    res["ref_age"] = ref_age(age_from[0], age_from[1], now)
     commits = git(repo, "rev-list", "--reverse", "%s..%s" % (sha, local)).stdout.split()
     res["ahead"] = len(commits)
     if commits:
@@ -154,23 +162,29 @@ def push_plan(root, entry, res):
 
 
 def do_push(root, entry, url, refspecs):
+    """Plain push. Returns True on success; any failure (git error, timeout) is reported, not raised."""
     repo = os.path.join(root, entry["path"])
     tracking = os.path.join(root, entry["tracking_path"])
     cmd = ["git", "-C", repo, "push", url, *refspecs]
     assert "--force" not in cmd and "-f" not in cmd and "--delete" not in cmd
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if r.returncode != 0:
-        print("%s: push FAILED: %s" % (entry["name"], r.stderr.strip()))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            print("%s: push FAILED: %s" % (entry["name"], r.stderr.strip()))
+            return False
+        # Record what is now on the remote, as git itself would for a named remote.
+        for spec in refspecs:
+            src = spec.split(":")[0]
+            sha = git(repo, "rev-parse", src).stdout.strip()
+            if src.startswith("refs/heads/"):
+                git(repo, "update-ref", "refs/backup-pushed-branch/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
+                if git(tracking, "cat-file", "-e", sha + "^{commit}", check=False).returncode == 0:
+                    git(tracking, "update-ref", "refs/remotes/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
+            else:
+                git(repo, "update-ref", "refs/backup-pushed/%s/%s" % (entry["remote"], src[len("refs/tags/"):]), sha)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        print("%s: push FAILED: %s" % (entry["name"], e))
         return False
-    # Record what is now on the remote, as git itself would for a named remote.
-    for spec in refspecs:
-        src = spec.split(":")[0]
-        sha = git(repo, "rev-parse", src).stdout.strip()
-        if src.startswith("refs/heads/"):
-            if git(tracking, "cat-file", "-e", sha + "^{commit}", check=False).returncode == 0:
-                git(tracking, "update-ref", "refs/remotes/%s/%s" % (entry["remote"], entry["remote_branch"]), sha)
-        else:
-            git(repo, "update-ref", "refs/backup-pushed/%s/%s" % (entry["remote"], src[len("refs/tags/"):]), sha)
     return True
 
 
@@ -216,7 +230,11 @@ def main(argv=None):
         now = time.time()
         results = []
         for entry in repos:
-            res = check_repo(args.root, entry, now)
+            try:
+                res = check_repo(args.root, entry, now)
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                res = {"name": entry["name"], "ref": "", "behind": True, "ahead": None, "tags": [],
+                       "oldest_age": None, "ref_age": None, "error": str(e), "remote_sha": None}
             results.append((entry, res))
             print(line_for(res))
     elif args.yes:

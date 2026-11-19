@@ -43,7 +43,7 @@ python -I -B scripts/backup_status.py --root <root> --map <map.json> --push --ye
 
 Plain pushes only: never `--force`, never a `+` refspec, never a delete; a rejected push is reported
 and left alone. Branch and unpushed tags are pushed as explicit refspecs. After a successful push the
-script updates the local tracking ref and records pushed tags under `refs/backup-pushed/<remote>/`.
+script records what it pushed in the pushed repo itself (`refs/backup-pushed-branch/<remote>/<branch>` and `refs/backup-pushed/<remote>/<tag>`), because a nested repo's commits are not in the root repo that holds the tracking ref. It also updates the tracking ref when that repo has the commit.
 
 ## Known limits
 
@@ -56,7 +56,7 @@ script updates the local tracking ref and records pushed tags under `refs/backup
 
 Windows Task Scheduler, hourly, status only:
 
-- Trigger: every 1 hour, run whether logged on or not is NOT needed; run only when logged on.
+- Trigger: every 1 hour, run only while Lazlo is logged on (no stored password needed).
 - Action: `python -I -B scripts\backup_status.py --root <root> --map <map.json>`, output appended to a log in `scratch\`.
 - Never schedule `--push`. Push stays by hand until Lazlo says otherwise.
 - Ideally the schedule would alert (phone alert, like the disk floor) when `backup:` reports behind for more than a day.

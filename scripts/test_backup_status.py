@@ -169,6 +169,35 @@ class Status(Base):
 
 
 class Push(Base):
+    def test_nested_repo_push_then_recheck_ok(self):
+        sub = self.root / "sub"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(sub)], check=True)
+        commit(sub, "s.txt")
+        g(sub, "push", "-q", str(self.bare), "main:refs/heads/sub-main")   # earlier, by hand
+        g(self.root, "fetch", "-q", "origin")    # root tracks origin/sub-main; root lacks sub's objects
+        commit(sub, "u.txt")
+        self.write_map([{"name": "sub", "path": "sub", "branch": "main", "remote": "origin",
+                         "remote_branch": "sub-main", "tracking_path": "."}])
+        # the root repo (tracking repo) never has sub's commits
+        code, out = self.run_cli()
+        self.assertEqual(code, 1, out)
+        code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.rstrip().endswith("backup: ok"), out)
+        self.assertEqual(g(self.bare, "rev-parse", "sub-main"), g(sub, "rev-parse", "main"))
+        code, out = self.run_cli()   # a fresh, separate status run agrees
+        self.assertEqual(code, 0, out)
+        commit(sub, "t.txt")
+        code, out = self.run_cli()
+        self.assertEqual(code, 1, out)
+        self.assertIn("ahead 1", out)
+
+    def test_non_object_map_entry_exit_2(self):
+        self.map.write_text(json.dumps({"repos": ["root"]}), encoding="utf-8")
+        code, out = self.run_cli()
+        self.assertEqual(code, 2, out)
+        self.assertIn("config error", out)
+
     def test_push_without_yes_refuses(self):
         commit(self.root, "b.txt")
         g(self.root, "tag", "v9")
@@ -202,6 +231,7 @@ class Push(Base):
         commit(self.root, "b.txt")
         g(self.root, "push", "-q", "origin", "HEAD:refs/heads/keepme")
         code, out = self.run_cli("--push", "--yes")
+        self.assertEqual(code, 1, out)
         self.assertIn("push FAILED", out)
         self.assertEqual(remote_main, g(self.bare, "rev-parse", "main"))
         self.assertIn("refs/heads/keepme", self.remote_refs())
