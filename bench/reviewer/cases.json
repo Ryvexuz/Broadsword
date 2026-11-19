@@ -50,11 +50,11 @@
     "diff": "cases/hard1.diff",
     "brief": "Task: add `jobq`, a small file-backed job queue library in Rust (std only). Each job is one record file in a queue folder; a job id may contain `/` to group jobs in sub-folders. Settings come from a `key = value` text file (queue_dir, api_token, max_attempts from 1 to 10, base_delay_ms, max_delay_ms, lease_secs, max_payload_bytes). `enqueue` refuses a duplicate id and a payload above max_payload_bytes. A worker claims a job for lease_secs seconds; a job whose lease has run out can be claimed again, a job with a live lease cannot, and a finished job never. `ack` marks a claimed job done. Only one claim or ack may change the store at a time. `claim_next` takes the first free job in id order and, while the store is busy, retries with exponential backoff (base_delay_ms doubled per attempt, never above max_delay_ms) up to max_attempts. Operations are logged to an in-memory log that can also append to a file. Done check: the crate builds, its unit tests pass, and enqueue, claim, lease expiry and ack work as described. The diff below is the src/ folder of the first commit.",
     "bug": "12 planted bugs and 3 decoys; see `bugs` and `decoys`. Proven by hard/prove.sh. Scored with score_hard.py.",
-    "catch": "(?i)(?:(max_attempts|config\\.rs:6\\d).{0,200}(1\\.\\.10|exclusive|off-by-one|inclusive|upper bound|boundary|\\b10\\b.{0,60}(reject|refus|invalid|fail|error))|(1\\.\\.10|exclusive range).{0,200}(max_attempts|\\b10\\b))|(?:(toctou|race|exists\\(\\)|check.{0,25}(then|before).{0,25}(write|creat)|create_new|not atomic|concurrent|two (threads|callers|puts|workers)).{0,250}(put|duplicate|exist|overwrit|same id|enqueue)|(put|duplicate|enqueue).{0,250}(toctou|race|exists\\(\\)|create_new|concurrent|overwrit|not atomic))|(?:path traversal|directory traversal|(\\.\\.|parent ?dir|dotdot).{0,200}(first component|only (the )?first|first only|components\\(\\)\\.next|middle|mid-?path|a/\\.\\./|escape|outside (the )?(root|queue))|(first component|components\\(\\)\\.next).{0,200}(\\.\\.|parent|escape|traversal))|(?:(token|secret|credential).{0,200}(log|debug|print|leak|expos|redact|plaintext)|(derive\\([^)]*debug|\\{:\\?\\}).{0,200}(token|secret|log|leak))|(?:^(?!.*log\\.rs).*(let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b))|(?:as u16|\\bu16\\b|65,?53[56]|(truncat|wrap)\\w*.{0,150}payload|payload.{0,150}(truncat|wrap))|(?:(from_millis|milli\\w*|\\bms\\b).{0,200}(lease|secs\\b|seconds)|(lease|lease_secs).{0,200}(from_millis|milli\\w*|\\bms\\b|wrong unit|unit))|(?:(now > rec\\.lease_until|inverted|reversed|backwards?|flipped|wrong (direction|comparison)).{0,250}(lease|claim)|(claim|lease).{0,250}(inverted|reversed|backwards?|flipped|steal|live lease|unexpired|(expired|stale).{0,40}(refus|reject)|(refus|reject).{0,40}expired|comparison|\\bnow >))|(?:mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|remain|(on|when|after) (an? )?(error|failure|failed)|guard)|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget))|(?:(backoff_stays_within_cap|10\\.\\.cfg\\.max_attempts|retry\\.rs:7\\d).{0,250}(empty|never|vacuous|zero|no iteration|nothing|always pass|useless|range)|(vacuous|never (fail|run|iterate|execut)|empty range|zero iterations|no iterations|always passes?|asserts? nothing).{0,250}(backoff|cap|retry\\.rs))|(?:(doc\\w*|comment).{0,200}(ignored|rejected?|unknown key|contradict|mismatch|says|claims)|unknown keys?.{0,200}(ignored|doc|comment|contradict|claims))|(?:(wrapping_shl|checked_shl|shift|overflow|wrap\\w*).{0,250}(backoff|attempt|delay|\\b64\\b|factor)|(backoff|attempt >= ?64|attempt 64).{0,250}(wrapping_shl|wrap\\w*|overflow|shift|resets?|drops?))",
+    "catch": "(?i)(?:(max_attempts|config\\.rs:6\\d).{0,200}(1\\.\\.10|exclusive|off-by-one|inclusive|upper bound|boundary|\\b10\\b.{0,60}(reject|refus|invalid|fail|error))|(1\\.\\.10|exclusive range).{0,200}(max_attempts|\\b10\\b))|(?:(toctou|race|exists\\(\\)|check.{0,25}(then|before).{0,25}(write|creat)|create_new|not atomic|concurrent|two (threads|callers|puts|workers)).{0,250}(put|duplicate|exist|overwrit|same id|enqueue)|(put|duplicate|enqueue).{0,250}(toctou|race|exists\\(\\)|create_new|concurrent|overwrit|not atomic))|(?:path traversal|directory traversal|(\\.\\.|parent ?dir|dotdot).{0,200}(first component|only (the )?first|first only|components\\(\\)\\.next|middle|mid-?path|a/\\.\\./|escape|outside (the )?(root|queue))|(first component|components\\(\\)\\.next).{0,200}(\\.\\.|parent|escape|traversal))|(?:(token|secret|credential).{0,200}(log|debug|print|leak|expos|redact|plaintext)|(derive\\([^)]*debug|\\{:\\?\\}).{0,200}(token|secret|log|leak))|(?:let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b)|(?:as u16|\\bu16\\b|65,?53[56]|(truncat|wrap)\\w*.{0,150}payload|payload.{0,150}(truncat|wrap))|(?:(from_millis|milli\\w*|\\bms\\b).{0,200}(lease|secs\\b|seconds)|(lease|lease_secs).{0,200}(from_millis|milli\\w*|\\bms\\b|wrong unit|unit))|(?:(now > rec\\.lease_until|inverted|reversed|backwards?|flipped|wrong (direction|comparison)).{0,250}(lease|claim)|(claim|lease).{0,250}(inverted|reversed|backwards?|flipped|steal|live lease|unexpired|(expired|stale).{0,40}(refus|reject)|(refus|reject).{0,40}expired|comparison|\\bnow >))|(?:mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|(on|when|after) (an? )?(error|failure|failed))|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget))|(?:(backoff_stays_within_cap|10\\.\\.cfg\\.max_attempts|retry\\.rs:7\\d).{0,250}(empty|never|vacuous|zero|no iteration|nothing|always pass|useless|range)|(vacuous|never (fail|run|iterate|execut)|empty range|zero iterations|no iterations|always passes?|asserts? nothing).{0,250}(backoff|cap|retry\\.rs))|(?:(?=.*unknown ?_?keys?)(?=.*(doc|comment|says|claims|contradict|mismatch|ignored)))|(?:(wrapping_shl|checked_shl|shift|overflow|wrap\\w*).{0,250}(backoff|attempt|delay|\\b64\\b|factor)|(backoff|attempt >= ?64|attempt 64).{0,250}(wrapping_shl|wrap\\w*|overflow|shift|resets?|drops?))",
     "known_false_positives": [
       "(?i)first\\.unwrap|peek.{0,150}(unwrap|panic)|lib\\.rs:4\\d.{0,200}(unwrap|panic)",
       "(?i)(config\\.rs:(29|3[0-4])|parse_u32|as u32|u32::MAX).{0,200}(truncat|overflow|cast|unchecked|lossy|wrap)|(truncat|overflow|lossy)\\w*.{0,150}(parse_u32|as u32)",
-      "(?i)log\\.rs.{0,250}(let _|ignor|swallow|discard|silent|drop|writeln|error)|(let _ = writeln|writeln!).{0,200}(ignor|swallow|discard|silent)"
+      "(?i)let _|ignor|swallow|discard|silent|drop|writeln|error|comment|doc"
     ],
     "bugs": [
       {
@@ -105,7 +105,7 @@
           182,
           183
         ],
-        "catch": "(?i)^(?!.*log\\.rs).*(let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b)"
+        "catch": "(?i)let _ = self\\.save|\\back\\b.{0,200}(swallow|ignor|discard|silent|always (returns? )?ok|ok\\(\\(\\)\\)|unconditional)|(swallow|ignor|discard|silent)\\w*.{0,150}\\b(save|write failure|persist)\\b"
       },
       {
         "id": "b06",
@@ -145,7 +145,7 @@
           157,
           169
         ],
-        "catch": "(?i)mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|remain|(on|when|after) (an? )?(error|failure|failed)|guard)|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget)"
+        "catch": "(?i)mem::forget|(lock|acquire|release).{0,250}(early return|not released|never released|leak|stuck|stays? locked|left behind|forever|permanent|(on|when|after) (an? )?(error|failure|failed))|(lockguard|raii|guard).{0,150}(unused|not used|bypass|forget)"
       },
       {
         "id": "b10",
@@ -165,7 +165,7 @@
           39,
           39
         ],
-        "catch": "(?i)(doc\\w*|comment).{0,200}(ignored|rejected?|unknown key|contradict|mismatch|says|claims)|unknown keys?.{0,200}(ignored|doc|comment|contradict|claims)"
+        "catch": "(?i)(?=.*unknown ?_?keys?)(?=.*(doc|comment|says|claims|contradict|mismatch|ignored))"
       },
       {
         "id": "b12",
@@ -207,7 +207,7 @@
           37,
           41
         ],
-        "catch": "(?i)log\\.rs.{0,250}(let _|ignor|swallow|discard|silent|drop|writeln|error)|(let _ = writeln|writeln!).{0,200}(ignor|swallow|discard|silent)"
+        "catch": "(?i)let _|ignor|swallow|discard|silent|drop|writeln|error|comment|doc"
       }
     ]
   }

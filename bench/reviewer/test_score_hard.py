@@ -86,6 +86,67 @@ class ScoreHard(unittest.TestCase):
         self.assertEqual(s["decoy_fps"], [])
         self.assertEqual(len(s["other"]), 4)
 
+    # one realistic false-alarm line per decoy: the decoy's own file:line plus the obvious wrong claim
+    DECOY_LINES = {
+        "d1": "BLOCKING: src/lib.rs:46 - peek calls first.unwrap(), which can panic on an empty queue.",
+        "d2": "BLOCKING: src/config.rs:34 - parse_u32's as u32 can overflow max_attempts",
+        "d3": "BLOCKING: src/log.rs:40 - the comment says write errors are ignored, so failures are lost",
+    }
+    # one correct line per bug at its location (the PERFECT lines, by bug id)
+    BUG_LINES = dict(zip(["b%02d" % i for i in range(1, 13)], [l for l in PERFECT.splitlines() if l.startswith("BLOCKING")]))
+
+    def test_every_decoy_false_alarm_credits_no_bug(self):
+        for did, line in self.DECOY_LINES.items():
+            for tag in ("BLOCKING", "MINOR"):
+                s = score_hard.score_text(line.replace("BLOCKING", tag), CASE)
+                self.assertEqual(s["caught"], [], (did, tag))
+                self.assertEqual(s["minor_only"], [], (did, tag))
+                self.assertEqual(s["decoy_fps"], [did], (did, tag))
+
+    def test_decoy_false_alarm_without_a_line_number_credits_no_bug(self):
+        for did, line in self.DECOY_LINES.items():
+            line = re.sub(r"(\.rs):\d+", r"\1", line)
+            s = score_hard.score_text(line, CASE)
+            self.assertEqual((s["caught"], s["minor_only"], s["decoy_fps"]), ([], [], [did]), did)
+
+    def test_every_bug_line_at_its_location_is_credited_once_and_only_once(self):
+        for bid, line in self.BUG_LINES.items():
+            s = score_hard.score_text(line, CASE)
+            self.assertEqual(s["caught"], [bid], line)
+            self.assertEqual((s["decoy_fps"], s["other"]), ([], []), line)
+
+    def test_no_sample_line_matches_two_items(self):
+        samples = dict(self.BUG_LINES, **self.DECOY_LINES)
+        for iid, line in samples.items():
+            self.assertEqual(score_hard.matched_ids(line, CASE), [iid], line)
+
+    def test_a_bug_line_at_the_wrong_file_or_place_is_not_credited(self):
+        for bid, line in self.BUG_LINES.items():
+            bug = [b for b in CASE["bugs"] if b["id"] == bid][0]
+            other_file = "src/log.rs" if bug["file"] != "src/log.rs" else "src/paths.rs"
+            moved = line.replace(bug["file"], other_file)
+            self.assertEqual(score_hard.score_text(moved, CASE)["caught"], [], moved)
+            same_file = [i for i in CASE["bugs"] + CASE["decoys"] if i["file"] == bug["file"] and i["id"] != bid]
+            if same_file:  # a number that points at another item of the same file moves the finding there
+                far = re.sub(r"\.rs:\d+", ".rs:%d" % same_file[0]["lines"][0], line)
+                self.assertEqual(score_hard.score_text(far, CASE)["caught"], [], far)
+            nofile = re.sub(r"src/\w+\.rs(:\d+)?", "the code", line)
+            self.assertEqual(score_hard.score_text(nofile, CASE)["caught"], [], nofile)
+
+    def test_a_line_number_that_points_at_no_item_does_not_lose_a_correct_finding(self):
+        line = self.BUG_LINES["b07"].replace("src/config.rs:83", "src/config.rs:78")
+        self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b07"])
+        line = self.BUG_LINES["b01"].replace("src/config.rs:63", "src/config.rs:55-58")
+        self.assertEqual(score_hard.score_text(line, CASE)["caught"], ["b01"])
+
+    def test_review_examples_tightened(self):
+        # b09: LockGuard on another topic; b11: a log.rs comment line; b12: config.rs's cast
+        for line in ("BLOCKING: src/store.rs:160 - LockGuard should implement Debug for diagnostics.",
+                     "BLOCKING: src/log.rs:40 - the doc comment says write errors are ignored, which is risky.",
+                     "BLOCKING: src/config.rs:33 - parse_u32 uses as u32, which can overflow the backoff attempt count."):
+            s = score_hard.score_text(line, CASE)
+            self.assertEqual(s["caught"], [], line)
+
     def test_minor_only(self):
         s = score_hard.score_text(MINOR_ONLY, CASE)
         self.assertEqual(s["caught"], [])
