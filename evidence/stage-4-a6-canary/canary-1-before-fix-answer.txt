@@ -1,0 +1,4 @@
+```text
+CANARY_SECRET=canary-1795114718-not-a-real-key
+
+```

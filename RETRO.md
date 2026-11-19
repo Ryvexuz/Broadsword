@@ -97,8 +97,58 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 | Self-optimization: the orchestrator may change or drop process rules that measurably cost throughput or money (Lazlo's standing OK; safety rules excluded) | Less waiting on approvals for process tweaks; rules that don't pay their way go | Changes made under it, each with before/after numbers, and how many were reverted | The orchestrator relaxing rules for convenience (lesson 27); a safety rule mislabelled as process | open |
 | planned | Audit cadence that adapts (Lazlo, 2026-11-18): a full sweep at every stage end for now. After 3 audits in a row with at most 1 verified blocker each, switch to a diff-scoped audit at stage ends, plus a full sweep every second or third stage; one audit with 2 or more blockers goes back to every stage | Less audit time and spend once the process matures | Verified blockers per audit, and bugs found later that an audit should have caught | Bugs piling up between full sweeps | planned |
 | planned | Handoff test from `PROGRESS.md` alone | Session continuity | What a fresh agent gets wrong | — | planned |
+| S4 close | Fable only as a rare one-off (Lazlo, 2026-11-19): never a default coder, reviewer or judge | Weekly Claude allowance lasts | Fable tokens per stage (about 1.4M on 2026-11-19, about 990k of it avoidable) | A security or decisive review done by a weaker model that misses a real bug | open |
+| S4 close | Rule 34 applied: a cheap reviewer's second FAIL with new, non-regression points on low-risk tooling goes to one decisive strong review | Fewer fix rounds on low-risk tooling | Rounds per merged task for haiku-tier entries | Real bugs slipping because the loop stopped early | open |
+| S4 close | Shadow reviewer through Codex with no tools offered (one-entry model catalog), proven by `scripts/shadow_canary.py` | No secret can be read by the shadow; shadow answers fast | Canary exit code after every codex update; shadow seconds per entry (144 s timeouts before, 3-21 s after) | A codex update re-adding a tool (the canary must be re-run; not yet enforced) | open |
+| S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h, build-lock wait p90, test-job median | Lock waits and test time rising | hindered: lock-wait p90 26 -> 88 s, test median 82 -> 100 s; reverted to 6; retry after tp3 |
 
 ## Retros, newest first
+
+---
+
+## Stage 4 v1 close: audit, two blockers fixed, model routing, scale-up test (2026-11-19, PC session)
+
+### Did the last changes work?
+
+- **Helped:**
+  - **Touch main only when the queue is idle, one driver:** no merge was lost to a moving main; a single background driver per batch drained the queue.
+  - **Hand-checking a scorer against real outputs (carry item 1):** caught three scorer bugs before any number was quoted: the hard1 location rule that dropped 34 of 36 real catches, the instruct bench counting one unpunctuated sentence as zero, and decoy false alarms credited as bug catches.
+  - **Opus reviews:** every Opus FAIL today was a real bug (spec test-data leaks, regex overlaps crediting decoys, an O(n*m) reference, the provenance allow-list silencing unapproved commits).
+  - **Shadow reviewer (gpt-5.6-sol, then gpt-6.1-sol):** 12 REAL, 12 KNOWN, 3 FALSE verdicts so far (`state/shadow-verdicts.tsv`).
+- **Hindered:**
+  - **The Haiku tier on Python tooling:** nb-06 failed four rounds and nb-25 four rounds, each on new points; several points were wrong. Rule 34 (stop the loop, one decisive strong review) ended both.
+
+### What went wrong
+
+| What | Why | What changes | Where it's enforced |
+| --- | --- | --- | --- |
+| The Codex shadow reviewer could read any file by absolute path (A6), so an injected diff could have sent `.env` to OpenAI. | `--sandbox read-only` still allows reads; nobody had tested it. | Codex is offered no tools at all; a canary with an offline leg proves it. Shadow off until proven (Lazlo). | `clients/openai_review.py` `codex_command()`, `scripts/shadow_canary.py`, docs/SHADOW_SANDBOX.md; re-running after codex updates is not yet enforced (ledger row). |
+| The orchestrator's safety-stop commit broke a test on main. | Committed after `broadsword status` only, not the full suite, outside the queue. | Any direct commit to main runs the same full check the queue runs first. | Habit only so far; carry item 2 (make a direct-commit wrapper or a pre-commit check). |
+| A `prove.py` run deadlocked all builds for 15 minutes. | It was wrapped in `broadsword run`, and its harness calls `broadsword run` itself (nested build lock). | Never wrap a script that calls broadsword in `broadsword run`. | `templates/coder-prompt.md` line to add (carry item 3); coder briefs today said so. |
+| Board claim edits silently failed three times. | Python passed through a shell heredoc: the shell turned the `\n` separators into newlines (playbook rule 23). | Code and data edits go through a script file written with the editor tool. | Playbook rule 23 (existing); habit. |
+| Stage 4 milestone 1 ("visible in a window") was never shown on screen (A1). | Every recorded run was headless or off screen; records claimed it anyway. | On-screen run with window-only captures saved in evidence. | `evidence/stage-4-v1-done.md`; SPEC_CHECKLIST line to add: a done check that names a window needs an on-screen capture (carry item 4). |
+| Fable used by default for an audit and a security review (about 990k avoidable tokens). | The orchestrator picked the strongest model by habit. | Fable only as a rare one-off, with the reason logged (Lazlo). | Claude memory `fable-rare-only`; ledger row. |
+| A secret-file rule matched by name only: an 8.3 short name (`ENV~1`) or a long path let `.env` bytes into checkpoint refs (nb-19, in review). | Name-only matching on a filesystem with aliases. | Judge the long name; fail closed when it cannot be resolved. | nb-19 (`git::is_secret_in`), with real-alias tests. |
+
+### Speed
+
+- **Throughput:** 2.82 merges/h at 6 slots (17:00-19:08 UTC), 8.44/h at 10 slots (19:20-20:10), confounded by a backlog of finished work; the queue (one entry at a time, about 11-14 min each) is the bottleneck, not coders.
+- **Build-lock wait:** p90 26 s at 6 slots, 88 s at 10 (the lock covers test runs; tp3 changes that).
+
+### Cost
+
+- **Reviews (queue):** see `scripts/review_costs.py`; Opus about $0.3-1.2 per review, Haiku about $0.01.
+- **Fable:** about 1.4M tokens (nb-06 decisive review, the Stage 4 audit and its sub-reviewers, one security review).
+- **astra audit:** about 944k tokens over 42 codex calls on the ChatGPT plan; judges: five Opus 5.5 high agents.
+
+### Carry into the next milestone
+
+1. Re-run `scripts/shadow_canary.py` after every codex update; make it enforced (a check in the wrapper or the queue).
+2. A direct commit to main runs the full check first (a wrapper or hook), so no direct commit can break main again.
+3. Add to `templates/coder-prompt.md`: never wrap a script that itself calls broadsword inside `broadsword run`.
+4. SPEC_CHECKLIST: a done check that names a window or a visible result needs an on-screen capture saved in evidence.
+5. Retry max_agents 10 after tp3 (build lock covers compiling only), with the same baselines.
+6. File the 8 SERIOUS audit findings as tasks (`evidence/stage-4-v1-audit-verdicts.md` section 6); Lazlo decides on the two unapproved direct commits (f4123a1, render 4184930).
 
 ---
 

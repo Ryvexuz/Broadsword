@@ -1,0 +1,12 @@
+job 20261119-203628-broadsword-run: still running (broadsword pid 21268), left alone
+job: run render (id 20261119-203629-render-run, log: C:\Users\MrComputer\Desktop\Broadsword\scratch\logs\jobs\20261119-203629-render-run.log)
+source: projects/render
+checkpoint: refs/broadsword/checkpoints/20261119-203629-render-run (7d0d095e2a)
+build source: projects/render (packages: render)
+   Compiling render v0.1.0 (C:\Users\MrComputer\Desktop\Broadsword\projects\render)
+    Finished `release` profile [optimized] target(s) in 0.38s
+     Running `C:\Users\MrComputer\Desktop\Broadsword\build\release\examples\car.exe --frames 600`
+car: 600 frames at 640x480, shadow map 1024x1024, 410 triangles (408 cast shadows, 193 drawn in the main pass)
+car: average frame time 6.036 ms = shadow pass 4.080 + main pass 1.936 + other 0.020; blit: none, no window in this mode
+--- summary ---
+run: ok (4.2 s)

@@ -1,0 +1,7 @@
+﻿pid=17000 handle=1837290 title='Broadsword render: replay' visible=True
+0.36s rect=(208,208)-(864,727) size=656x519 -> replay-t0.3s.png
+0.74s rect=(208,208)-(864,727) size=656x519 -> replay-t0.7s.png
+1.22s rect=(208,208)-(864,727) size=656x519 -> replay-t1.2s.png
+2.02s rect=(208,208)-(864,727) size=656x519 -> replay-t2.0s.png
+3.53s rect=(208,208)-(864,727) size=656x519 -> replay-t3.5s.png
+closed by CloseMainWindow=True, exit code 0
