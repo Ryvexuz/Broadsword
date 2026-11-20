@@ -213,20 +213,45 @@ fn some(s: &str) -> String {
     format!("{} path(s): {}{}", lines.len(), lines.iter().take(5).map(|l| l.trim_end()).collect::<Vec<_>>().join("; "), if lines.len() > 5 { "; ..." } else { "" })
 }
 
-/// The gating reviewer model for a risk level and the note on why (empty unless the fallback was used). For `high`, a high model of
-/// the coder's family is replaced by `reviewer_model_high_fallback`; Err names the problem when no allowed model is left.
-pub fn gating_model<'a>(cfg: &'a Config, risk: &str, coder: &str) -> Result<(&'a str, String), String> {
+/// Which kind of reviewer gates an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateBackend {
+    /// The Claude CLI (`reviewer_backend`).
+    Claude,
+    /// An OpenAI model through clients/openai_review.py (same cap and ledger as the shadow review).
+    Gpt,
+}
+
+/// The gating reviewer for a risk level.
+#[derive(Debug, Clone)]
+pub struct Gate {
+    pub backend: GateBackend,
+    pub model: String,
+    /// The note on why (empty unless the Claude fallback was chosen up front).
+    pub why: String,
+    /// For a GPT gate: the Claude model that gates in the same run when the GPT call is SKIPPED.
+    pub fallback: Option<String>,
+}
+
+/// The gating reviewer (backend and model) for a risk level. Low risk: `reviewer_model_low`. High risk: a coder of the
+/// `reviewer_model_high` family (Opus-coded work) is gated by `reviewer_model_high_gpt` (unless that is `off`), with
+/// `reviewer_model_high_fallback` as the Claude fallback for a skipped GPT call; any other coder is gated by `reviewer_model_high`.
+/// Err names the problem when no allowed model is left.
+pub fn gating_model(cfg: &Config, risk: &str, coder: &str) -> Result<Gate, String> {
+    let claude = |m: &str, why: String| Gate { backend: GateBackend::Claude, model: m.to_string(), why, fallback: None };
     if risk != "high" {
         let m = cfg.reviewer_model_low.as_str();
-        return if same_model(coder, m) { Err(format!("the reviewer model for low risk is `{m}`, the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_low in broadsword.toml")) } else { Ok((m, String::new())) };
+        return if same_model(coder, m) { Err(format!("the reviewer model for low risk is `{m}`, the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_low in broadsword.toml")) } else { Ok(claude(m, String::new())) };
     }
     let (hi, fb) = (cfg.reviewer_model_high.as_str(), cfg.reviewer_model_high_fallback.as_str());
     if !same_model(coder, hi) {
-        Ok((hi, String::new()))
-    } else if !same_model(coder, fb) {
-        Ok((fb, format!("fallback: coder is {}", reviewer::model_family(coder))))
-    } else {
+        Ok(claude(hi, String::new()))
+    } else if same_model(coder, fb) {
         Err(format!("reviewer_model_high `{hi}` and reviewer_model_high_fallback `{fb}` are both the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_high or reviewer_model_high_fallback in broadsword.toml"))
+    } else if cfg.reviewer_model_high_gpt != "off" && reviewer::shadow_family(coder) != reviewer::shadow_family(&cfg.reviewer_model_high_gpt) {
+        Ok(Gate { backend: GateBackend::Gpt, model: cfg.reviewer_model_high_gpt.clone(), why: format!("GPT gate; `{fb}` if the call is skipped"), fallback: Some(fb.to_string()) })
+    } else {
+        Ok(claude(fb, format!("fallback: coder is {}", reviewer::model_family(coder))))
     }
 }
 
@@ -269,6 +294,9 @@ fn is_open(status: &str) -> bool {
 const TEXT_KEYS: [&str; 10] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason"];
 
 /// What a shadow review records in the entry (cleared on a fresh attempt).
+/// How the GPT client is named in a review file and the entry.
+const SHADOW_CLIENT_LABEL: &str = "clients/openai_review.py";
+
 const SHADOW_KEYS: [&str; 9] = ["shadow_model", "shadow_model_used", "shadow_verdict", "shadow_reason", "shadow_blocking", "shadow_cost_usd", "shadow_tokens", "shadow_secs", "shadow_file"];
 
 fn process_secrets(cfg: &Config) -> reviewer::Secrets {
@@ -417,7 +445,7 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         return fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display()));
     }
     println!("{}", e.id());
-    println!("queued task {task_id} ({risk} risk, coder {coder}); `broadsword queue run` will review it with `{}` and merge it if it passes", gating_model(cfg, risk, coder).map_or_else(|_| "no allowed model (the entry will be blocked)".to_string(), |(m, why)| if why.is_empty() { m.to_string() } else { format!("{m} ({why})") }));
+    println!("queued task {task_id} ({risk} risk, coder {coder}); `broadsword queue run` will review it with `{}` and merge it if it passes", gating_model(cfg, risk, coder).map_or_else(|_| "no allowed model (the entry will be blocked)".to_string(), |g| if g.why.is_empty() { g.model } else { format!("{} ({})", g.model, g.why) }));
     ExitCode::SUCCESS
 }
 
@@ -478,6 +506,8 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("reviewer CLI", "reviewer_cli"),
         ("test hook", "test_hook"),
         ("review calls", "review_calls"),
+        ("gate", "gate"),
+        ("gate model used", "gate_model_used"),
         ("check job", "check_job"),
         ("check exit", "check_exit"),
         ("verdict", "verdict"),
@@ -700,7 +730,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
             "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail",
-            "reviewer_model", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
+            "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
         ] {
             e.set(k, "");
         }
@@ -1502,7 +1532,7 @@ impl<'a> Run<'a> {
         self.refuse_chained("preconditions")?;
         let coder = self.e.get("coder").to_string();
         let (model, why) = match gating_model(self.cfg, self.e.get("risk"), &coder) {
-            Ok((m, why)) => (m.to_string(), if why.is_empty() { String::new() } else { format!(" ({why})") }),
+            Ok(g) => (g.model, if g.why.is_empty() { String::new() } else { format!(" ({})", g.why) }),
             Err(msg) => return Err(self.blocked(&msg)),
         };
         let ahead = self.g(wtgit::rev_count(&dir, &format!("HEAD..{branch}")))?;
@@ -1646,8 +1676,8 @@ impl<'a> Run<'a> {
             return self.recorded_verdict_ok();
         }
         let (dir, branch) = (self.dir.clone(), self.branch());
-        let model = match gating_model(self.cfg, self.e.get("risk"), self.e.get("coder")) {
-            Ok((m, _)) => m.to_string(),
+        let gate = match gating_model(self.cfg, self.e.get("risk"), self.e.get("coder")) {
+            Ok(g) => g,
             Err(msg) => return Err(self.blocked(&msg)),
         };
         // Check, review and merge are bound to ONE commit: the one the check passed on. A branch that moved since (a commit added
@@ -1682,13 +1712,8 @@ impl<'a> Run<'a> {
             return Err(self.blocked(&format!("review call cap reached: this entry already made {calls} reviewer call(s) (reviewer_max_calls_per_entry = {}); no model was called, nothing merged. Cancel it and queue the task again if more reviews are wanted", self.cfg.reviewer_max_calls_per_entry)));
         }
         self.e.set("reviewed_tip", checked.clone());
-        self.e.set("reviewer_model", model.clone());
-        let effort = effort_for(self.cfg, self.e.get("risk")).to_string();
-        self.e.set("reviewer_effort", effort.clone());
         self.e.set("reviewer_cli", cli.path.clone());
         self.e.set("test_hook", if cli.test_hook { "true" } else { "false" });
-        // counted BEFORE the call, so a run that dies in the middle of it still paid for one
-        self.e.set("review_calls", (calls + 1).to_string());
         self.save()?;
         if cli.test_hook {
             println!("TEST HOOK ACTIVE: reviewer CLI is {}", cli.path);
@@ -1697,14 +1722,47 @@ impl<'a> Run<'a> {
         }
         let prompt = self.secrets.redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff));
         let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), self.cfg.redact_min_chars) } else { String::new() };
-        self.log("review", &format!("calling the {} reviewer `{model}` through {}{} on {} (diff {} bytes, commit {}, call {} of at most {}); this spends money and uses the network{short_note}", backend.name(), cli.path, if cli.test_hook { " [TEST HOOK]" } else { "" }, if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&checked), calls + 1, self.cfg.reviewer_max_calls_per_entry))?;
-        let review = match backend.call(self.cfg, &cli, &model, &effort, crate::reviewer::gate_system_prompt(self.e.get("risk")), &prompt) {
-            Ok(r) => r,
-            Err(CallError::Timeout(s)) => return Err(self.blocked(&format!("the reviewer `{model}` gave no answer within {s} s (reviewer_timeout_seconds) and was killed: no verdict, nothing merged. Run `queue run --entry {}` to ask again", self.e.id()))),
-            Err(CallError::Start(m) | CallError::Failed(m)) => return Err(self.blocked(&format!("the reviewer `{model}` could not be used: {m}. No verdict, nothing merged. Fix it, then `queue run --entry {}`", self.e.id()))),
+        // Which gate runs: a GPT gate first when the rule picked one; a SKIPPED GPT call falls back to Claude in this same run.
+        let mut model = gate.model.clone();
+        let mut gpt_answer = None;
+        self.e.set("gate", "claude");
+        if gate.backend == GateBackend::Gpt {
+            self.e.set("reviewer_model", model.clone());
+            self.e.set("reviewer_effort", "");
+            match self.gpt_gate(&model, &prompt)? {
+                Ok(answer) => {
+                    self.e.set("gate", "gpt");
+                    gpt_answer = Some(answer);
+                }
+                Err(reason) => {
+                    model = gate.fallback.clone().unwrap_or_default();
+                    self.e.set("gate", format!("fallback: GPT gate `{}` SKIPPED ({reason})", gate.model));
+                    self.log("review", &format!("the GPT gate `{}` was SKIPPED: {reason}; the Claude reviewer `{model}` gates this entry in the same run", gate.model))?;
+                }
+            }
+        }
+        let answered = if let Some((review, script, hook)) = gpt_answer {
+            self.e.set("reviewer_cli", format!("{script} ({SHADOW_CLIENT_LABEL})"));
+            self.e.set("test_hook", if hook { "true" } else { "false" });
+            (review, format!("openai ({SHADOW_CLIENT_LABEL})"), script, hook)
+        } else {
+            let effort = effort_for(self.cfg, self.e.get("risk")).to_string();
+            self.e.set("reviewer_model", model.clone());
+            self.e.set("reviewer_effort", effort.clone());
+            let n = self.take_review_call()?;
+            self.log("review", &format!("calling the {} reviewer `{model}` through {}{} on {} (diff {} bytes, commit {}, call {n} of at most {}); this spends money and uses the network{short_note}", backend.name(), cli.path, if cli.test_hook { " [TEST HOOK]" } else { "" }, if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&checked), self.cfg.reviewer_max_calls_per_entry))?;
+            let r = match backend.call(self.cfg, &cli, &model, &effort, crate::reviewer::gate_system_prompt(self.e.get("risk")), &prompt) {
+                Ok(r) => r,
+                Err(CallError::Timeout(s)) => return Err(self.blocked(&format!("the reviewer `{model}` gave no answer within {s} s (reviewer_timeout_seconds) and was killed: no verdict, nothing merged. Run `queue run --entry {}` to ask again", self.e.id()))),
+                Err(CallError::Start(m) | CallError::Failed(m)) => return Err(self.blocked(&format!("the reviewer `{model}` could not be used: {m}. No verdict, nothing merged. Fix it, then `queue run --entry {}`", self.e.id()))),
+            };
+            (r, backend.name().to_string(), cli.path.clone(), cli.test_hook)
         };
+        let (review, backend_name, cli_path, test_hook) = answered;
+        let used = if self.e.get("gate") == "gpt" && review.model_reported != Some(true) { "model not reported".to_string() } else { review.models_used.join(", ") };
+        self.e.set("gate_model_used", used);
         let verdict = reviewer::judge(&review);
-        let file = self.write_review(&model, &checked, &base, prompt.len(), &cli, &review, &verdict)?;
+        let file = self.write_review(&model, &checked, &base, prompt.len(), (&backend_name, &cli_path, test_hook), &review, &verdict)?;
         self.e.set("verdict", if verdict.pass { "PASS" } else { "FAIL" });
         self.e.set("blocking", verdict.blocking.join("\n"));
         self.e.set("minor", verdict.minor.join("\n"));
@@ -1713,13 +1771,48 @@ impl<'a> Run<'a> {
         self.e.set("tokens_out", review.output_tokens.map(|n| n.to_string()).unwrap_or_default());
         self.e.set("review_file", file.clone());
         self.save()?;
-        self.log("review", &format!("{} by `{model}`; {} blocking, {} minor; cost {} USD; full output in {file}", self.e.get("verdict"), verdict.blocking.len(), verdict.minor.len(), review.cost_usd.as_deref().unwrap_or("unknown")))?;
+        self.log("review", &format!("{} by `{model}` (gate: {}); {} blocking, {} minor; cost {} USD; full output in {file}", self.e.get("verdict"), self.e.get("gate"), verdict.blocking.len(), verdict.minor.len(), review.cost_usd.as_deref().unwrap_or("unknown")))?;
         self.s_shadow(&prompt)?;
         if verdict.pass {
             return Ok(());
         }
         let why = if verdict.note.is_empty() { verdict.blocking.join("; ") } else { format!("{} ({})", verdict.note, verdict.blocking.join("; ")) };
         Err(self.end(REJECTED, &format!("the `{model}` reviewer FAILED it: {why}. The task is still running and its worktree is kept: fix, commit, and queue it again with `queue add`. Full review: {file}"), EXIT_REJECTED))
+    }
+
+    /// Count one reviewer call (checked against `reviewer_max_calls_per_entry`, saved BEFORE the call, so a run that dies in the middle
+    /// of it still paid for one). Returns the number of this call.
+    fn take_review_call(&mut self) -> R<u64> {
+        let calls = self.e.get_num("review_calls").unwrap_or(0);
+        if calls >= self.cfg.reviewer_max_calls_per_entry {
+            return Err(self.blocked(&format!("review call cap reached: this entry already made {calls} reviewer call(s) (reviewer_max_calls_per_entry = {}); no model was called, nothing merged. Cancel it and queue the task again if more reviews are wanted", self.cfg.reviewer_max_calls_per_entry)));
+        }
+        self.e.set("review_calls", (calls + 1).to_string());
+        self.save()?;
+        Ok(calls + 1)
+    }
+
+    /// The GPT gate: the gating prompt to `model` through clients/openai_review.py, the same program (so the same daily cap and ledger,
+    /// call type `gate`) the shadow review uses. Ok(Err(reason)) means the call was SKIPPED (no python or script, cap reached, GPT
+    /// unavailable, error, timeout, output that is not the wrapper's JSON, or another model answering): the caller falls back to
+    /// Claude in the same run. Ok(Ok(..)) is an answer to judge like a Claude one: (review, script, test hook).
+    fn gpt_gate(&mut self, model: &str, prompt: &str) -> R<Result<(reviewer::Review, String, bool), String>> {
+        let (python, script) = match reviewer::resolve_shadow(self.cfg) {
+            Ok(p) => p,
+            Err(m) => return Ok(Err(m)),
+        };
+        let hook = std::env::var(reviewer::SHADOW_SCRIPT_ENV).is_ok_and(|v| !v.trim().is_empty());
+        let n = self.take_review_call()?;
+        self.log("review", &format!("calling the GPT gate `{model}` through {script}{} (call {n} of at most {}, at most {} s); this spends money (plan, then credits under the daily cap) and uses the network", if hook { " [TEST HOOK]" } else { "" }, self.cfg.reviewer_max_calls_per_entry, self.cfg.reviewer_timeout_seconds))?;
+        let one_line = |m: &str| m.lines().next().unwrap_or("").chars().take(300).collect::<String>();
+        Ok(match reviewer::call_gpt(self.cfg, &python, &script, model, reviewer::gate_system_prompt(self.e.get("risk")), prompt, "gate", self.cfg.reviewer_timeout_seconds) {
+            Err(CallError::Timeout(s)) => Err(format!("no answer within {s} s (reviewer_timeout_seconds)")),
+            Err(CallError::Start(m) | CallError::Failed(m)) => Err(one_line(&m)),
+            Ok(r) => match &r.invalid {
+                Some(why) => Err(one_line(why)),
+                None => Ok((r, script, hook)),
+            },
+        })
     }
 
     /// The SHADOW review: the same prompt to a second model (`shadow_reviewer`), run once after the gating verdict is recorded.
@@ -1733,6 +1826,9 @@ impl<'a> Run<'a> {
         }
         let model = self.cfg.shadow_reviewer_model.clone();
         self.e.set("shadow_model", model.clone());
+        if self.e.get("gate") == "gpt" {
+            return self.shadow_end("SKIPPED", "the gating review itself was GPT (no second GPT call for the same entry)");
+        }
         let coder = self.e.get("coder").to_string();
         if reviewer::shadow_family(&coder) == reviewer::shadow_family(&model) {
             return self.shadow_end("SKIPPED", &format!("the coder `{coder}` and the shadow model `{model}` are the same family (a model never reviews its own code)"));
@@ -1832,18 +1928,19 @@ verdict: {} (answer followed the format: {})
 
     /// The review file: header lines, then the reviewer's raw output. Returns its path relative to root. Written atomically.
     #[allow(clippy::too_many_arguments)]
-    fn write_review(&mut self, model: &str, tip: &str, base: &str, prompt_bytes: usize, cli: &reviewer::Cli, r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
+    fn write_review(&mut self, model: &str, tip: &str, base: &str, prompt_bytes: usize, via: (&str, &str, bool), r: &reviewer::Review, v: &reviewer::Verdict) -> R<String> {
         let attempt = self.e.get_num("attempt").unwrap_or(1);
         let name = if attempt <= 1 { format!("{}.review", self.e.id()) } else { format!("{}.{attempt}.review", self.e.id()) };
         let path = queue_dir(self.cfg).join(&name);
         let or_unknown = |o: Option<String>| o.unwrap_or_else(|| "unknown".into());
         let text = format!(
-            "entry: {}\nattempt: {attempt}\ntask: {}\nbackend: {}\nreviewer cli: {}\ntest_hook: {}\nmodel: {model}\nmodels reported by the backend: {}\nrisk: {}\ncoder: {}\nreviewed commit: {tip}\ndiff base: {base}\nprompt bytes: {prompt_bytes}\ncost_usd: {}\ninput tokens: {}\noutput tokens: {}\nverdict: {} (answer followed the format: {})\n{}blocking:\n{}\nminor:\n{}\n--- raw reviewer output (exactly as printed) ---\n{}\n",
+            "entry: {}\nattempt: {attempt}\ntask: {}\nbackend: {}\nreviewer cli: {}\ntest_hook: {}\ngate: {}\nmodel: {model}\nmodels reported by the backend: {}\nrisk: {}\ncoder: {}\nreviewed commit: {tip}\ndiff base: {base}\nprompt bytes: {prompt_bytes}\ncost_usd: {}\ninput tokens: {}\noutput tokens: {}\nverdict: {} (answer followed the format: {})\n{}blocking:\n{}\nminor:\n{}\n--- raw reviewer output (exactly as printed) ---\n{}\n",
             self.e.id(),
             self.e.get("task"),
-            self.cfg.reviewer_backend,
-            cli.path,
-            cli.test_hook,
+            via.0,
+            via.1,
+            via.2,
+            self.e.get("gate"),
             if r.models_used.is_empty() { "-".to_string() } else { r.models_used.join(", ") },
             self.e.get("risk"),
             self.e.get("coder"),

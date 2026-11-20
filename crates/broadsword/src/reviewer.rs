@@ -324,6 +324,11 @@ pub struct Review {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub models_used: Vec<String>,
+    /// The GPT wrapper's `model_reported`: true only when the backend named the answering model (codex 0.170.0 never does, so it is
+    /// false there). None for a Claude answer.
+    pub model_reported: Option<bool>,
+    /// The names the GPT wrapper's `model_used` lists (empty when none was reported).
+    pub reported_models: Vec<String>,
     /// Why this answer cannot be trusted as a review (not the CLI's JSON, no `modelUsage`, another model family answered).
     /// When set, the answer is a FAIL whatever its text says.
     pub invalid: Option<String>,
@@ -451,7 +456,7 @@ impl ReviewBackend for ClaudeCli {
         }
         let env: Vec<(String, String)> = std::env::vars().collect();
         let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
-        let out = run_cli(&cli.path, &args, &cwd, &remove, prompt, Duration::from_secs(cfg.reviewer_timeout_seconds))?;
+        let out = run_cli(&cli.path, &args, &cwd, &remove, &[], prompt, Duration::from_secs(cfg.reviewer_timeout_seconds))?;
         let mut rev = parse_claude_output(&out.stdout, out.code, &out.stderr)?;
         check_model(&mut rev, model);
         Ok(rev)
@@ -518,16 +523,40 @@ pub fn check_shadow_model(rev: &mut Review, requested: &str) {
 
 /// Call the shadow reviewer once, with the same prompt, the scrubbed environment and `shadow_reviewer_timeout_seconds`.
 pub fn call_shadow(cfg: &Config, python: &str, script: &str, model: &str, prompt: &str) -> Result<Review, CallError> {
+    call_gpt(cfg, python, script, model, SYSTEM_PROMPT, prompt, "shadow", cfg.shadow_reviewer_timeout_seconds)
+}
+
+/// The env var through which a caller tells clients/openai_review.py what kind of call this is (`gate` or `shadow`), for its ledger.
+pub const CALL_TYPE_ENV: &str = "OPENAI_REVIEW_CALL_TYPE";
+
+/// Call clients/openai_review.py once (the shadow review and the GPT gate both come here, so both pass the client's cap and ledger),
+/// with the scrubbed environment, `OPENAI_REVIEW_CALL_TYPE=<call_type>` and a kill after `timeout_s`. The answer must come from the
+/// requested model: a model named by the backend that is another one makes the review `invalid`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gpt(cfg: &Config, python: &str, script: &str, model: &str, system_prompt: &str, prompt: &str, call_type: &str, timeout_s: u64) -> Result<Review, CallError> {
     let cwd = cfg.scratch_dir.join("review-cwd");
     std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
     let mut args: Vec<String> = vec!["-I".into(), "-B".into(), script.into()];
-    args.extend(["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()));
+    args.extend(["-p", "--system-prompt", system_prompt, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()));
     let env: Vec<(String, String)> = std::env::vars().collect();
     let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
-    let out = run_cli(python, &args, &cwd, &remove, prompt, Duration::from_secs(cfg.shadow_reviewer_timeout_seconds))?;
+    let out = run_cli(python, &args, &cwd, &remove, &[(CALL_TYPE_ENV, call_type)], prompt, Duration::from_secs(timeout_s))?;
     let mut rev = parse_claude_output(&out.stdout, out.code, &out.stderr)?;
     check_shadow_model(&mut rev, model);
+    check_reported_models(&mut rev, model);
     Ok(rev)
+}
+
+/// When the backend DID name the answering model(s) (`model_reported`), every name must start with the requested one. When it did
+/// not (codex 0.170.0), nothing can be checked and nothing is wrong: the caller records "model not reported".
+pub fn check_reported_models(rev: &mut Review, requested: &str) {
+    if rev.invalid.is_some() || rev.model_reported != Some(true) {
+        return;
+    }
+    let want = requested.trim().to_lowercase();
+    if rev.reported_models.is_empty() || rev.reported_models.iter().any(|m| !m.to_lowercase().starts_with(&want)) {
+        rev.invalid = Some(format!("the answer names the model(s) {}, not the requested `{requested}`", if rev.reported_models.is_empty() { "(none, though it says it reported)".to_string() } else { rev.reported_models.join(", ") }));
+    }
 }
 
 pub struct CliOut {
@@ -538,11 +567,14 @@ pub struct CliOut {
 
 /// Run `program args` in `cwd` with `remove` variables dropped from its environment, `stdin` fed to it, killed (with its
 /// whole process tree) after `timeout`.
-pub fn run_cli(program: &str, args: &[String], cwd: &Path, remove: &[String], stdin: &str, timeout: Duration) -> Result<CliOut, CallError> {
+pub fn run_cli(program: &str, args: &[String], cwd: &Path, remove: &[String], set: &[(&str, &str)], stdin: &str, timeout: Duration) -> Result<CliOut, CallError> {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for k in remove {
         cmd.env_remove(k);
+    }
+    for (k, v) in set {
+        cmd.env(k, v);
     }
     let mut child = cmd.spawn().map_err(|e| CallError::Start(format!("cannot start the reviewer CLI `{program}` ({:?}); install it, put it on PATH, or point {CLI_ENV} at it", e.kind())))?;
     let mut to_stdin = child.stdin.take().expect("piped");
@@ -609,6 +641,12 @@ pub fn parse_claude_output(stdout: &str, code: i32, stderr: &str) -> Result<Revi
             if let Some(J::Obj(m)) = j.get("modelUsage") {
                 rev.models_used = m.iter().map(|(k, _)| k.clone()).collect();
             }
+            if let Some(J::Bool(b)) = j.get("model_reported") {
+                rev.model_reported = Some(*b);
+            }
+            if let Some(J::Arr(a)) = j.get("model_used") {
+                rev.reported_models = a.iter().filter_map(|x| x.str().map(String::from)).collect();
+            }
             if matches!(j.get("is_error"), Some(J::Bool(true))) {
                 return Err(CallError::Failed(format!("the reviewer reported an error: {}", if rev.text.is_empty() { last(stderr) } else { rev.text.chars().take(300).collect() })));
             }
@@ -654,6 +692,23 @@ mod tests {
         let expect = format!("{}{}\n\n{}", &SYSTEM_PROMPT[..at], gate_block!(), &SYSTEM_PROMPT[at..]);
         assert_eq!(SYSTEM_PROMPT_GATE, expect);
         assert!(SYSTEM_PROMPT_GATE.contains("Be specific: name the file and line (from the diff) and the concrete scenario that fails.\n\nRules for BLOCKING lines:"));
+    }
+
+    #[test]
+    fn a_named_answering_model_must_be_the_requested_one_and_an_unnamed_one_is_not_an_error() {
+        let parse = |used: &str, reported: bool| {
+            let j = format!(r#"{{"result":"VERDICT: PASS","modelUsage":{{"gpt-6.1-sol":{{}}}},"model_reported":{reported},"model_used":{used}}}"#);
+            let mut r = parse_claude_output(&j, 0, "").unwrap();
+            check_shadow_model(&mut r, "gpt-6.1-sol");
+            check_reported_models(&mut r, "gpt-6.1-sol");
+            r
+        };
+        assert!(parse("[]", false).invalid.is_none(), "codex 0.170.0: nothing reported, nothing wrong");
+        assert_eq!(parse("[]", false).model_reported, Some(false));
+        assert!(parse(r#"["gpt-6.1-sol-2026-01-01"]"#, true).invalid.is_none());
+        assert!(parse(r#"["gpt-5-mini"]"#, true).invalid.as_deref().unwrap_or("").contains("gpt-5-mini"));
+        assert!(parse(r#"["gpt-6.1-sol","gpt-5-mini"]"#, true).invalid.is_some(), "one of several names is another model");
+        assert!(parse("[]", true).invalid.is_some(), "claims to have reported but names nothing");
     }
 
     #[test]

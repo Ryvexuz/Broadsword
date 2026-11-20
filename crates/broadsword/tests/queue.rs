@@ -2254,3 +2254,153 @@ fn a_chain_rebase_a_killed_drain_left_half_done_is_aborted_and_the_entry_still_m
     assert!(r.show(&e2).contains("found a rebase left half done by an interrupted run and aborted it"), "{}", r.show(&e2));
     assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b"]);
 }
+
+// ---- the GPT gate for Opus-coded high-risk entries (fake client only: no real GPT call is ever made) ------------
+
+/// A stand-in for clients/openai_review.py as the GATE: answers as `FAKE_GATE_KIND` says and logs its arguments and
+/// OPENAI_REVIEW_CALL_TYPE to fake-out/gate-calls.log.
+const FAKE_GATE: &str = r#"import json, os, sys
+out = os.environ["FAKE_GATE_OUT_DIR"]
+os.makedirs(out, exist_ok=True)
+prompt = sys.stdin.buffer.read()
+args = sys.argv[1:]
+model = args[args.index("--model") + 1]
+open(os.path.join(out, "gate-calls.log"), "a", encoding="utf-8").write("type=" + os.environ.get("OPENAI_REVIEW_CALL_TYPE", "") + " " + " ".join(args).replace("\n", " ") + "\n")
+kind = os.environ["FAKE_GATE_KIND"]
+def reply(text, used=None, reported=False, usage_model=None):
+    print(json.dumps({"type": "result", "is_error": False, "result": text, "total_cost_usd": None, "usage": {"input_tokens": 70, "output_tokens": 9},
+        "modelUsage": {(usage_model or (used[0] if used and len(used) == 1 else model)): {}}, "model_reported": reported, "model_used": used or [], "backend": "codex"}))
+if kind == "pass":
+    reply("VERDICT: PASS\nBLOCKING: none\nMINOR: none")
+elif kind == "pass_reported":
+    reply("VERDICT: PASS\nBLOCKING: none\nMINOR: none", [model + "-2026-01-01"], True)
+elif kind == "fail":
+    reply("VERDICT: FAIL\nBLOCKING: src/lib.rs:9 - gpt says this is wrong\nMINOR: none")
+elif kind == "other_model":
+    reply("VERDICT: PASS\nBLOCKING: none\nMINOR: none", ["gpt-5-mini"], True)
+elif kind == "other_key":
+    reply("VERDICT: PASS\nBLOCKING: none\nMINOR: none", usage_model="gpt-5-mini")
+elif kind == "cap":
+    print(json.dumps({"type": "result", "is_error": True, "result": "daily_cap_reached: 20.0100 of 20", "total_cost_usd": None}))
+    sys.exit(1)
+elif kind == "garbage":
+    print("not json")
+"#;
+
+impl Root {
+    /// A root whose high-risk Opus-coded entries are gated by GPT (`reviewer_model_high_gpt = "gpt-6.1-sol"`).
+    fn with_gpt_gate(name: &str) -> Root {
+        let r = Root::with_shadow(name, 30);
+        let toml = r.dir.join("broadsword.toml");
+        let text = fs::read_to_string(&toml).unwrap();
+        assert!(text.contains("reviewer_model_high_gpt = \"off\""), "{text}");
+        fs::write(&toml, text.replace("reviewer_model_high_gpt = \"off\"", "reviewer_model_high_gpt = \"gpt-6.1-sol\"")).unwrap();
+        r
+    }
+
+    /// Run `args` with the GPT client replaced by the fake gate script answering as `kind`; the shadow uses the same script.
+    fn run_gate(&self, kind: &str, args: &[&str]) -> Out {
+        let script = self.dir.join("scratch/shadow/fake_gate.py");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, FAKE_GATE).unwrap();
+        let out = self.fake_out.to_string_lossy().into_owned();
+        let s = script.to_string_lossy().into_owned();
+        self.run_env(args, &[("BROADSWORD_SHADOW_REVIEWER_SCRIPT", &s), ("FAKE_GATE_KIND", kind), ("FAKE_GATE_OUT_DIR", &out)])
+    }
+
+    fn gate_log(&self) -> Vec<String> {
+        fs::read_to_string(self.fake_out.join("gate-calls.log")).map(|t| t.lines().map(String::from).collect()).unwrap_or_default()
+    }
+
+    /// An entry for a high-risk change coded by `coder`, ready to run.
+    fn high_entry(&self, coder: &str) -> String {
+        let id = self.started("src");
+        self.commit(&self.wt(&id), "src/lib.rs", &lib_with("\npub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n"), "task: add sub");
+        self.add(&id, "high", coder)
+    }
+}
+
+#[test]
+fn an_opus_coded_high_entry_is_gated_by_gpt_and_the_shadow_is_skipped() {
+    let r = Root::with_gpt_gate("gptgate");
+    let entry = r.high_entry("opus");
+    let o = r.run_gate("pass", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entry), "merged", "{}", r.show(&entry));
+    assert_eq!(r.field(&entry, "reviewer"), "gpt-6.1-sol");
+    assert_eq!(r.field(&entry, "gate"), "gpt");
+    assert_eq!(r.field(&entry, "verdict"), "PASS");
+    // codex 0.170.0 does not name the answering model: recorded as such, not a different model answering
+    assert_eq!(r.field(&entry, "gate model used"), "model not reported");
+    assert_eq!(r.calls(), 0, "no Claude reviewer was started");
+    let log = r.gate_log();
+    assert_eq!(log.len(), 1, "one GPT call, the gate itself (the shadow is skipped): {log:?}");
+    assert!(log[0].starts_with("type=gate ") && log[0].contains("--model gpt-6.1-sol") && log[0].contains("independent code reviewer") && !log[0].contains("Rules for BLOCKING lines:"), "{log:?}");
+    assert_eq!(r.field(&entry, "shadow verdict"), "SKIPPED");
+    assert!(r.field(&entry, "shadow reason").contains("gating review itself was GPT"), "{}", r.field(&entry, "shadow reason"));
+    assert_eq!(r.field(&entry, "review calls"), "1");
+}
+
+#[test]
+fn a_gpt_gate_that_names_the_model_is_recorded_and_a_gpt_fail_rejects_like_a_claude_fail() {
+    let r = Root::with_gpt_gate("gptnamed");
+    let entry = r.high_entry("opus");
+    let o = r.run_gate("pass_reported", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "gate"), "gpt");
+    assert_eq!(r.field(&entry, "gate model used"), "gpt-6.1-sol-2026-01-01");
+
+    let r = Root::with_gpt_gate("gptfail");
+    let entry = r.high_entry("opus");
+    let o = r.run_gate("fail", &["queue", "run"]);
+    assert_ne!(o.code, 0);
+    assert_eq!(r.status(&entry), "rejected", "{}", r.show(&entry));
+    assert_eq!(r.field(&entry, "verdict"), "FAIL");
+    assert!(r.show(&entry).contains("gpt says this is wrong"), "{}", r.show(&entry));
+    assert_eq!(r.calls(), 0, "a GPT FAIL is a verdict: no Claude fallback");
+}
+
+#[test]
+fn a_skipped_gpt_gate_falls_back_to_the_sonnet_gate_in_the_same_run() {
+    // the cap reached (what today is): the client answers is_error daily_cap_reached
+    for (kind, why) in [("cap", "daily_cap_reached"), ("other_model", "gpt-5-mini"), ("other_key", "gpt-5-mini"), ("garbage", "not its JSON answer")] {
+        let r = Root::with_gpt_gate(&format!("gptskip{kind}"));
+        let entry = r.high_entry("opus");
+        let o = r.run_gate(kind, &["queue", "run"]);
+        assert_eq!(o.code, 0, "{kind}: {}{}", o.stdout, o.stderr);
+        assert_eq!(r.status(&entry), "merged", "{kind}: {}", r.show(&entry));
+        assert_eq!(r.field(&entry, "reviewer"), "sonnet", "{kind}");
+        let gate = r.field(&entry, "gate");
+        assert!(gate.starts_with("fallback: ") && gate.contains("SKIPPED") && gate.contains(why), "{kind}: {gate}");
+        let calls = fs::read_to_string(r.fake_out.join("calls.log")).unwrap();
+        assert!(calls.contains("--model\u{1f}sonnet") && calls.contains("--effort\u{1f}high") && !calls.contains("--model\u{1f}opus"), "{kind}: {calls}");
+        assert_eq!(r.field(&entry, "review calls"), "2", "{kind}: the skipped GPT call and the Sonnet call");
+        let log = r.gate_log();
+        assert_eq!(log.len(), 2, "{kind}: the GPT gate, then the shadow (the gate was not GPT, so the shadow runs): {log:?}");
+        assert!(log[0].starts_with("type=gate ") && log[1].starts_with("type=shadow "), "{kind}: {log:?}");
+    }
+}
+
+#[test]
+fn a_sonnet_coded_high_entry_is_gated_by_opus_with_effort_high_and_makes_no_gpt_gate_call() {
+    let r = Root::with_gpt_gate("gptsonnet");
+    let entry = r.high_entry("sonnet");
+    let o = r.run_gate("pass", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "reviewer"), "opus");
+    assert_eq!(r.field(&entry, "gate"), "claude");
+    let calls = fs::read_to_string(r.fake_out.join("calls.log")).unwrap();
+    assert!(calls.contains("--model\u{1f}opus") && calls.contains("--effort\u{1f}high"), "{calls}");
+    assert!(r.gate_log().iter().all(|l| l.starts_with("type=shadow ")), "{:?}", r.gate_log());
+}
+
+#[test]
+fn with_the_gpt_gate_off_an_opus_coded_high_entry_goes_straight_to_sonnet() {
+    let r = Root::with_shadow("gptoff", 30);
+    let entry = r.high_entry("opus");
+    let o = r.run_gate("pass", &["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "reviewer"), "sonnet");
+    assert_eq!(r.field(&entry, "gate"), "claude");
+    assert_eq!(r.field(&entry, "review calls"), "1");
+}

@@ -50,6 +50,8 @@ const BASE: &[(&str, &str)] = &[
     ("reviewer_model_low", "\"haiku\""),
     ("reviewer_model_high", "\"opus\""),
     ("reviewer_model_high_fallback", "\"sonnet\""),
+    // "off" so no test can reach a real GPT call by accident; a GPT-gate test sets it and points BROADSWORD_SHADOW_REVIEWER_SCRIPT at a fake
+    ("reviewer_model_high_gpt", "\"off\""),
     ("reviewer_effort_high", "\"high\""),
     ("reviewer_timeout_seconds", "5"),
     ("reviewer_diff_max_kb", "200"),

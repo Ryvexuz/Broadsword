@@ -53,6 +53,7 @@ reviewer_cli = "claude"            # the CLI program, resolved on PATH. A machin
 reviewer_model_low = "haiku"       # reviewer for `queue add --risk low` (cheap first pass, ~$0.006 per review in the benchmark)
 reviewer_model_high = "opus"       # reviewer for `queue add --risk high`: deletion, locks, secrets, safety guards (~$0.18 per review). Must differ from the entry's --coder, or the fallback below is used
 reviewer_model_high_fallback = "sonnet"  # reviewer for a `--risk high` entry whose --coder is the reviewer_model_high family (Opus-coded work); it too must differ from the coder, or the entry is blocked
+reviewer_model_high_gpt = "gpt-6.1-sol"  # gating reviewer of a `--risk high` entry whose --coder is the reviewer_model_high family (Opus-coded work): an OpenAI model asked through clients/openai_review.py, so it is under the same $20/day cap and ledger as the shadow review (the shadow is skipped then). A SKIPPED call (cap reached, GPT unavailable, error, timeout, another model answering) falls back to reviewer_model_high_fallback in the same run. "off" = no GPT gate
 reviewer_effort_high = "high"      # `--effort` of the `--risk high` gating call (low, medium, high, xhigh or max); a low-risk call passes no flag
 reviewer_timeout_seconds = 900     # a reviewer call that runs longer is killed and the entry is `blocked` (no verdict, nothing merged)
 reviewer_diff_max_kb = 400         # a diff bigger than this is never sent to a reviewer (the entry is `blocked`: split the task)
