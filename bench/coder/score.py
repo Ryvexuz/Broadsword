@@ -18,6 +18,8 @@ One row per provider, model and effort. One column per task (passed/total). Then
             others with a "+" and the count: "$1.234+ (2 n/a)"; "n/a" only if no task has a cost
   A task whose call was made but not graded (graded=false, see run.py regrade) shows "ungraded" and is not in the sums.
   time      sum of model-call seconds
+A model label ends with " [model not reported]" when a result says model_reported=false (codex does not name the model that
+answered), so the row proves no model name: it shows only the model that was asked for. Older results without the field show no mark.
 Runs made with run.py --attempts N (N > 1) have cost_usd_total (sum over all attempts) and per-attempt data. Then the cost
 and time columns are the sums over all attempts, and a second table ranks the models by cost to pass, not cost per call:
   pass@1    tasks fully passed by the first attempt / tasks
@@ -130,7 +132,7 @@ def attempts_table(groups, tasks):
                 cells.append(f"no pass {usd([c] if c is not None else [], u, plan)}")
         n = len(by_task) - errs
         if not n:
-            rows.append(((10 ** 9, True, 0), [f"{prov}:{model}", effort, "-", "-"] + cells + [f"no valid runs ({errs} errored)"]))
+            rows.append(((10 ** 9, True, 0), [f"{prov}:{model}{label_mark(by_task)}", effort, "-", "-"] + cells + [f"no valid runs ({errs} errored)"]))
             continue
         tail = usd(pc, pu, plan) if passed else "-"
         if nopass:
@@ -141,11 +143,16 @@ def attempts_table(groups, tasks):
             tail += f"; {ungraded} ungraded (cost {usd(uc, uu, plan)} so far, not counted as a pass)"
         total = sum(pc) + sum(npc) + sum(uc) + sum(ec)
         unknown = bool(pu or npu or uu)  # an unknown or plan-allowance cost is never $0: such models rank after the known ones
-        rows.append(((nopass + ungraded, unknown, total), [f"{prov}:{model}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
+        rows.append(((nopass + ungraded, unknown, total), [f"{prov}:{model}{label_mark(by_task)}", effort, f"{p1}/{n}", f"{passed}/{n}"] + cells + [tail]))
     if not rows:
         return None
     head = ["model", "effort", "pass@1", "passed"] + [t.split("-")[0] + "-" + t.split("-", 1)[1][:8] for t in tasks] + ["cost-to-pass"]
     return [head] + [r for _, r in sorted(rows, key=lambda x: x[0])]
+
+
+def label_mark(by_task):
+    """" [model not reported]" when any result of the row says model_reported=false (never claim a model that was not proved)."""
+    return " [model not reported]" if any(r.get("model_reported") is False for r in by_task.values()) else ""
 
 
 def printable(rows):
@@ -198,7 +205,7 @@ def main():
             cost = f"${sum(known):.3f}+ ({missing} n/a)"
         else:
             cost = f"${sum(known):.3f}"
-        rows.append([f"{prov}:{model}", effort] + cells +
+        rows.append([f"{prov}:{model}{label_mark(by_task)}", effort] + cells +
                     [f"{passed}/{total} {100 * passed / total:.0f}%" if total else ("no valid runs" if errored and not valid else "-"),
                      str(sum(1 for r in valid.values() if r.get("graded") is not False and not r["compiles"])),
                      str(len(errored)),

@@ -8,7 +8,7 @@ Results so far: `evidence/reviewer-benchmark-claude.md`.
 
 ## Before any run
 
-1. Regenerate the diffs: `./make_cases.sh` (they are not committed).
+1. Regenerate the diffs: `./make_cases.sh` (they are not committed). Each diff holds **every file the commit touched** (tests, `broadsword.toml`, `.gitignore`, lock files), only `__pycache__` is left out, and the script refuses to finish if a touched file or `broadsword.toml` is missing. These diffs are 2-3 times longer than the old source-only ones (which hid `broadsword.toml` and drew false "setting not added" findings). **Catch rates, false-positive counts and costs from runs on the old source-only diffs are not comparable with runs on these**; say which diffs a result used.
 2. Ask Lazlo first. OpenAI runs cost real money and use the API key.
 3. The key comes from `OPENAI_API_KEY` or the root `.env` (never printed or written). If both exist and differ, the environment one is used and a warning is printed.
 

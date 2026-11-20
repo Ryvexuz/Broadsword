@@ -3,7 +3,7 @@
     "id": "a19ee1a",
     "kind": "silent failure",
     "diff": "cases/a19ee1a.diff",
-    "brief": "Task: a starter crash simulator in Rust (std only). A cube of 8 nodes and 28 spring-damper beams falls under gravity, hits a ground plane at y=0 and bounces, using semi-implicit Euler at a fixed timestep with substeps. It runs headless and prints CSV to stdout (t,min_y,center_y,max_beam_strain) for a default 5 s, with flags --duration --dt --substeps --drop-height --no-tilt. Done check: it builds, runs headless and prints the cube's height over time. The diff below is the src/ folder of the first commit.",
+    "brief": "Task: a starter crash simulator in Rust (std only). A cube of 8 nodes and 28 spring-damper beams falls under gravity, hits a ground plane at y=0 and bounces, using semi-implicit Euler at a fixed timestep with substeps. It runs headless and prints CSV to stdout (t,min_y,center_y,max_beam_strain) for a default 5 s, with flags --duration --dt --substeps --drop-height --no-tilt. Done check: it builds, runs headless and prints the cube's height over time. The diff below is the whole first commit: every file it touched, not only the src/ folder.",
     "bug": "An unstable run (for example a large dt with few substeps) blows up to inf/NaN, yet the program still prints the CSV rows and exits 0. The strain max uses fold(0.0, f64::max), which drops NaN, so the strain reads 0 for a blown-up state. Nothing makes an unstable run fail loudly.",
     "catch": "(?i)(nan|non-?finite|inf(inity)?\\b|blow[s ]?up|unstab|diverg|explod).{0,200}(exit|silent|0\\b|success|loud|detect|check|refus|report)|f64::max|fold\\(0\\.0|(exit|silent|success).{0,120}(nan|non-?finite|unstab|blow)",
     "known_false_positives": []

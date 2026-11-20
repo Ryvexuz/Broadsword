@@ -6,9 +6,15 @@ Usage (from anywhere):
 
   provider  claude  the headless Claude Code CLI, run like bench/reviewer/run.py: cwd = BENCH_CWD, no tools,
                     no MCP, prompt on stdin, JSON output
-            openai  one Chat Completions request (see openai_provider.py); key from OPENAI_API_KEY or the root .env.
-                    Options: --price-in/--price-out (USD per 1M tokens; cost_usd is null without both), --max-tokens,
-                    --timeout, --http-retries, --backoff, --base-url, --root. Costs real money: only for a model Lazlo named.
+            openai  one request (see openai_provider.py): Chat Completions, or the Responses API for the models that
+                    bench/models.json marks `responses`; a model not in that file is refused. Key from OPENAI_API_KEY or
+                    the root .env. Options: --price-in/--price-out (USD per 1M tokens; cost_usd is null without both),
+                    --max-tokens, --timeout, --http-retries, --backoff, --base-url, --root, --service-tier.
+                    Costs real money: only for a model Lazlo named.
+            codex   one run of the Codex CLI, no tool offered (ChatGPT plan quota, cost_usd null); effort must be
+                    default; no OpenAI option is accepted. model_used is filled only when a codex event names the model
+                    (codex-cli 0.170.0 does not): otherwise it is empty and the result says model_reported=false.
+                    Uses plan quota: only for a model Lazlo named.
   --retries N       (alias --attempts N; 1 to 3, default 1) up to N tries per task: a task that does not fully pass is asked again with the
                     spec plus the names of the failing hidden tests (names only; "did not compile" / "no single code
                     block" when there are none). Attempt 1 is the one-shot result (pass@1). Round k asks only the tasks
@@ -24,7 +30,8 @@ that is how the smoke test uses a fake CLI. The model sees only the task's spec.
 
 Per task it writes <out-dir>/<task>__<provider>__<model>__<effort>.{raw.json,answer.txt,rs,json}.
 The result .json holds: provider, model, effort, task, tokens, cost_usd, wall_s (the model call),
-harness_wall_s, compiles, passed, total, graded, call_failed, is_error, error, format_failure, first_error, model_used.
+harness_wall_s, compiles, passed, total, graded, call_failed, is_error, error, format_failure, first_error, model_used,
+model_reported (true only when the answering model was named in the reply or codex events; false for codex on 0.170.0) and backend.
 is_error is true (with the error text in error, as in the reviewer bench) for a provider error: an HTTP error such as 429 or
 no credits, a CLI error or non-zero exit, a timeout. call_failed is the same flag. score.py lists such runs separately and
 leaves them out of the percentages.
@@ -85,7 +92,11 @@ def provider_openai(prompt, model, effort):
     return OP.call(SYSTEM, prompt, model, effort)
 
 
-PROVIDERS = {"claude": provider_claude, "openai": provider_openai}
+def provider_codex(prompt, model, effort):
+    return OP.call_codex(SYSTEM, prompt, model, effort)
+
+
+PROVIDERS = {"claude": provider_claude, "openai": provider_openai, "codex": provider_codex}
 
 FENCE = re.compile(r"^```[^\n]*\n(.*?)^```[ \t]*$", re.M | re.S)
 
@@ -209,10 +220,12 @@ def main():
     if provider not in PROVIDERS:
         sys.exit(f"provider must be one of {sorted(PROVIDERS)}")
     if OPENAI_OPTS and provider != "openai":
-        sys.exit("--price-in/--price-out/--max-tokens/--timeout/--http-retries/--backoff/--base-url/--root are for provider openai only")
+        sys.exit("--price-in/--price-out/--max-tokens/--timeout/--http-retries/--backoff/--base-url/--root/--service-tier are for provider openai only")
     check_workdir()
     if provider == "openai":
         OP.prepare(model, effort, OPENAI_OPTS, CFG["model_timeout_seconds"])  # settings and key checked before any task
+    if provider == "codex":
+        OP.prepare_codex(model, effort, CFG["model_timeout_seconds"])  # effort and the codex executable checked before any task
     all_tasks = [d for d in sorted((HERE / "tasks").iterdir()) if d.is_dir()]
     want = sys.argv[5:]
     tasks = [d for d in all_tasks if not want or d.name in want]
@@ -251,7 +264,8 @@ def main():
             rec = {"provider": provider, "model": model, "effort": effort, "task": t.name, "tokens": res["tokens"],
                    "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"], "harness_wall_s": None,
                    "compiles": False, "passed": 0, "total": st["total"], "graded": True, "call_failed": call_failed, "is_error": call_failed, "error": error, "format_failure": problem is not None and not call_failed,
-                   "first_error": problem, "model_used": res.get("model_used", [])}
+                   "first_error": problem, "model_used": res.get("model_used", []),
+                   "model_reported": bool(res.get("model_reported", bool(res.get("model_used")))), "backend": res.get("backend", provider)}
             # attempt 1 keeps the file names of a one-shot run; later attempts add __aN, and <tag>.* always holds the latest
             for name in {atag, tag}:
                 (out / f"{name}.raw.json").write_bytes(res["raw"])
