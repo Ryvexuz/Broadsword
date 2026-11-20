@@ -1,16 +1,14 @@
 # Reference data the roadmap needs
 
-**Pass 1 of 2: Part A, the files on disk. Part B coverage and the spot-check run in pass 2, after the node plans merge.** This file is not finished: the section-6 coverage and the five-entry spot-check (done check 1) are not done yet. They move to task t-20261120-015238. The brief records the split: "So this task is now PASS 1 ... The section-6 coverage and the five spot-checks move to t-20261120-015238, after the plans merge."
+**Pass 2 of 2 (task t-20261120-015238, 2026-11-20): Part B now comes from the section 6 of the merged node plans, and the five-entry spot-check is done (see "Spot-check (pass 2)" under Part B).** Part A (the files on disk) is unchanged from pass 1.
 
-Status: first pass, 2026-11-19. Nothing was downloaded or fetched for this file (no network).
+Status: nothing was downloaded or fetched for this file (no network), in either pass.
 
 ## Read this first: what this table is built from
 
-The brief asks for every "section 6" entry in the merged `ra-<node>` plans. **No such plan has merged yet.** `docs/nodes/` on main holds only `README.md`, and no branch has a `docs/nodes/<node>.md` plan with a section 6 (checked 2026-11-19). So:
-
-- Part A (the Camry set) is **verified**: it is local, and was read from its `MANIFEST.md` and `SHA256SUMS.txt`.
-- Part B (everything else) is **derived from the done checks in `CAPABILITY_ROADMAP.md`**, not from plans. Licences, URLs and sizes there are from memory and are **unverified**; each row says so. Rows must be re-checked against the plans' section 6 once they merge.
-- Re-run this task after the plans merge: replace Part B with the plans' real entries and add any data set that Part B misses.
+- Part A (the Camry set) is **verified** as of pass 1: it is local, and was read from its `MANIFEST.md` and `SHA256SUMS.txt`.
+- Part B is built from the "## 6. Reference data" section of each merged plan in `docs/nodes/`: `1.1`, `1.2`, `1.3`, `1.4`, `1.5`, `1.6`, `1.7`, `1.8`, `2.8` and `sandbox`. `0.1.md` has no section 6. Every row names its plan file and section, and its licence is the plan's own wording. **Those plans say their URLs and licences are from memory; no row has been checked against the live source**, so a licence in Part B is "as the plan states it", not confirmed.
+- Part B rows for nodes without a merged plan keep their pass-1 text (from the roadmap's done checks, unverified) and are marked "no plan yet".
 
 ## Part A. Already local: `reference/camry-2013/`
 
@@ -92,39 +90,241 @@ Groups, with the nodes that use each (the per-file rows below carry source, size
 
 Total on disk for Part A is roughly 320 MB (CCSA zips 122 MB, NHTSA reports 113 MB, signal zips 48 MB, photos 30 MB, other PDFs 11 MB). Per-file sizes and SHA-256 are in the table above (source: `MANIFEST.md` and `SHA256SUMS.txt`). Signal data for tests 9121 and 9124: EV5 vehicle 1 is the 2491 kg barrier, not the car. UDS, ABF and TDMS variants exist and were not downloaded.
 
-## Part B. Named by the roadmap's done checks (unverified; replace from the plans' section 6)
+## Part B. Reference data named by the merged node plans (section 6) and by the roadmap
 
-Every row below is UNVERIFIED (written from memory). Every licence, size and URL in this part is from memory, not checked. Download nothing until Lazlo has seen the decisions.
+Built in pass 2 (2026-11-20) from the "## 6. Reference data" section of each merged plan in `docs/nodes/`, read in this worktree. Nothing was downloaded or fetched. Every licence is copied as the plan states it; **a plan's own words "from memory", "to confirm" and "unverified" carry over to its rows**, so no URL, licence or number in this part has been checked against the live source. Each row names its plan file and section. Size is "not stated" where the plan gives none.
 
-| Data set | Where to get it (to verify) | Licence | Rough size | Nodes (CAPABILITY_ROADMAP.md) | Redistributable in a repo? | Status |
+Section 6 per plan: `0.1.md` has **no section 6** (it has no numbered sections; it lists no data set, and its only external pin is the `actions/checkout` SHA, which the plan says to verify at push time). Every other merged plan has one: `1.1`, `1.2`, `1.3`, `1.4`, `1.5`, `1.6`, `1.7`, `1.8`, `2.8`, `sandbox`.
+
+Columns: Data set or source, Used for, Source as the plan gives it, Licence as the plan states it, Size, Plan and section, Status. Status is "plan row" for every row copied from a plan.
+
+### Node 0.1 (docs/nodes/0.1.md): no section 6
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
 |---|---|---|---|---|---|---|
-| Khronos glTF Sample Assets (models plus reference renders) | github.com/KhronosGroup/glTF-Sample-Assets | verify before use: **Mixed per model** (CC0, CC-BY, CC-BY-NC and others). Decision for Lazlo: choose models by licence. | hundreds of MB for the full set; a chosen subset is far smaller | 2.5 real-time renderer; 2.4 glTF import/export | Only per model, and not the NC ones; keep out of Git, fetch on demand | UNVERIFIED (written from memory) |
-| Ghia, Ghia and Shin (1982) lid-driven cavity tables | The paper (J. Comput. Phys. 48); the tables are small numeric data | verify before use: Published numbers; the paper is copyrighted. Typing the numbers into a test is usual practice but is **a decision for Lazlo**. | under 10 KB | 3.20 CFD | Probably the numbers only, with citation; unclear | UNVERIFIED (written from memory) |
-| Cornell box scene and reference image | Cornell University Program of Computer Graphics site | verify before use: Unclear (data is widely copied, no clear licence). Decision for Lazlo; can be rebuilt from the published dimensions instead. | under 5 MB | 3.5 path tracer | Rebuild from dimensions rather than copy | UNVERIFIED (written from memory) |
-| SVG conformance test subset (W3C SVG test suite) | w3.org SVG test suite pages | verify before use: W3C test suite licences (W3C Software and Document, or 3-clause BSD, depending on suite). Verify. | tens of MB | 1.3 2D vector renderer | Probably yes, with licence file; verify | UNVERIFIED (written from memory) |
-| LAPACK/SciPy reference outputs for numerics | Generated locally with SciPy (BSD-3) or LAPACK (modified BSD) | verify before use: Permissive for the tool; generated outputs are ours | small | 2.8 numerics core | Yes (we generate them)  | UNVERIFIED (written from memory) |
-| Dam-break benchmark data | Published experiments (for example Martin and Moyce 1952) or a generated reference | verify before use: Paper numbers: same question as Ghia. | small | 3.3 fluids | Numbers only, with citation; unclear | UNVERIFIED (written from memory) |
-| Published COMSOL thermal-expansion tutorial result | COMSOL tutorial documentation | verify before use: Vendor copyright. **Decision for Lazlo**; prefer an analytic or open reference problem. | small | 3.21 multiphysics | Unclear; avoid copying | UNVERIFIED (written from memory) |
-| Test image for colour management matching | To be chosen (an open one, or generated) | verify before use: Unknown until chosen | small | 1.11 colour management | Generate our own: yes | UNVERIFIED (written from memory) |
-| IIHS crash test reports (named in DEVELOPMENT_PLAN stage 4 step 4 as an alternative to NHTSA) | iihs.org | verify before use: IIHS copyright, terms not checked. Decision for Lazlo. | PDFs only | Crash sim validation | No, unless licence allows | UNVERIFIED (written from memory) |
+| none | The plan has no section 6 and names no data set. | - | - | - | `0.1.md` (no section 6) | no section 6 |
+
+### Node 1.1 (docs/nodes/1.1.md section 6)
+
+The plan: "Every value below is from memory of Microsoft's documentation and must be confirmed against the page by the brief that uses it (W2 for decode values, W6 for the pointer API, W8 for injection, W10 for XInput)."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| `POINTER_PEN_INFO`: pressure 0-1024, tilt X and Y -90 to 90, rotation 0-359 | pen decode values (brief W2) | https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-pointer_pen_info | "Microsoft Learn text. The MicrosoftDocs repositories publish docs under CC BY 4.0; confirm before quoting any text. Only numeric facts are used." | not stated | `1.1.md` section 6 | plan row |
+| `POINTER_INFO`: `ptPerformanceCount` (hardware timestamp, QueryPerformanceCounter clock) and `dwTime` | pointer API (brief W6) | https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-pointer_info | "same" (as the row above) | not stated | `1.1.md` section 6 | plan row |
+| `GetPointerPenInfo` and `GetPointerPenInfoHistory` (several samples can arrive in one message) | pointer API (brief W6) | https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpointerpeninfo | "same" | not stated | `1.1.md` section 6 | plan row |
+| `CreateSyntheticPointerDevice` and `InjectSyntheticPointerInput` | injection (brief W8) | https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-injectsyntheticpointerinput | "same" | not stated | `1.1.md` section 6 | plan row |
+| `XINPUT_GAMEPAD`: stick range -32768..32767, triggers 0-255, dead zones 7849, 8689 and 30 | XInput (brief W10) | https://learn.microsoft.com/en-us/windows/win32/api/xinput/ns-xinput-xinput_gamepad | "same" | not stated | `1.1.md` section 6 | plan row |
+| `QueryPerformanceCounter` and `QueryPerformanceFrequency` | timestamps | https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps | "same" | not stated | `1.1.md` section 6 | plan row |
+| `WM_MOUSEWHEEL` (`WHEEL_DELTA` = 120) | wheel decode | https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-mousewheel | "same" | not stated | `1.1.md` section 6 | plan row |
+| Virtual-key codes | key decode | https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes | "same" | not stated | `1.1.md` section 6 | plan row |
+| Windows SDK headers (`winuser.h`, `xinput.h`) | offline cross-check of every constant above | "installed with the Windows SDK on the PC, if present" | "Windows SDK licence; read only, never copied into the repo" | not stated | `1.1.md` section 6 | plan row |
+| Sample sets, published latency results, tablet traces | none | "None." Thresholds are budgets and loose human-check bounds. | not applicable | - | `1.1.md` section 6 | plan row: none used |
+
+### Node 1.2 (docs/nodes/1.2.md section 6)
+
+The plan: "List only; nothing is downloaded."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| WGSL specification, including "Floating Point Accuracy" | the source for the float threshold | https://www.w3.org/TR/WGSL/ | "W3C Software and Document licence (as published by the W3C; to confirm when citing)" | not stated | `1.2.md` section 6 | plan row |
+| wgpu documentation and examples (pinned version) | API reference; "Used to read, not as test data." | https://docs.rs/wgpu and https://github.com/gfx-rs/wgpu | "MIT OR Apache-2.0" | not stated | `1.2.md` section 6 | plan row |
+| external image, mesh or benchmark set | none: inputs are generated in code, expected values come from std-only CPU references in this repo | - | "no third-party data to license" | - | `1.2.md` section 6 | plan row: none used |
+| Khronos glTF sample models (node 2.5) and SVG test suite (node 1.3) | "Later nodes may add references ... They are not part of 1.2." | - | - | - | `1.2.md` section 6 | not part of 1.2; see the glTF row under "no plan yet" and the 1.3 rows |
+
+### Node 1.3 (docs/nodes/1.3.md section 6)
+
+The plan: "Listing only: nothing is downloaded or copied in this task. The URLs are from memory and must be confirmed (and the licences read from the source) by whoever picks them." This replaces the pass-1 row "SVG conformance test subset (W3C SVG test suite)".
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| SVG 1.1 (Second Edition) | the specification the subset and the gradient and stroke formulas come from | https://www.w3.org/TR/SVG11/ | "W3C Document licence (to confirm when citing). Only formulas and element names are used; no text is copied." | not stated | `1.3.md` section 6 | plan row |
+| W3C SVG 1.1 test suite (cases and reference PNGs) | a candidate for "the SVG conformance suite" | https://www.w3.org/Graphics/SVG/Test/ | "W3C test-suite licence; whether the files may be committed to a repo is **to confirm**." | not stated | `1.3.md` section 6 | plan row; commit question open |
+| resvg test suite (SVG files and reference PNGs) | "a second candidate" for renderer tests | https://github.com/linebender/resvg ("location from memory; the project has moved between owners") | "To confirm. The repo is Rust, and its licence for the tests is not stated here from memory." | not stated | `1.3.md` section 6 | plan row; licence unknown |
+| PNG specification | the decoder (chunks, filters, zlib and deflate) | https://www.w3.org/TR/png/ and RFC 1950 and RFC 1951 | "W3C and IETF text; formulas and format facts only." | not stated | `1.3.md` section 6 | plan row |
+| Bezier flattening and stroking background (error bound, joins) | V2 and V4 | "Any one textbook or paper chosen by V2 and V4 and cited in the file" | "To confirm per source; no text is copied." | not stated | `1.3.md` section 6 | plan row; source not chosen |
+| `projects/render/src` (rasterizer and `tests/golden.rs`) | existing code to cross-check by hand: the golden pattern | local path | "Own code." | not stated | `1.3.md` section 6 | plan row |
+| published tolerance | none: tolerances in section 1 are starting values (c2 and c12); V10 measures and records it | - | not applicable | - | `1.3.md` section 6 | plan row: none used |
+
+### Node 1.4 (docs/nodes/1.4.md section 6)
+
+The plan: "List only; nothing is downloaded. Licences are from memory and are confirmed when the file is first used."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| Unicode `BidiCharacterTest.txt` and `BidiTest.txt` | conformance data for UAX 9 | https://www.unicode.org/Public/UCD/latest/ucd/BidiCharacterTest.txt and https://www.unicode.org/Public/UCD/latest/ucd/BidiTest.txt | "Unicode terms of use (data files; copyright and permission notice kept in the fixture header)" | not stated | `1.4.md` section 6 | plan row |
+| Unicode `GraphemeBreakTest.txt` (UAX 29) and `LineBreakTest.txt` (UAX 14) | cluster and wrap tests in X7 | https://www.unicode.org/Public/UCD/latest/ucd/auxiliary/GraphemeBreakTest.txt and https://www.unicode.org/Public/UCD/latest/ucd/auxiliary/LineBreakTest.txt | "Same licence." | not stated | `1.4.md` section 6 | plan row |
+| HarfBuzz shaping tests | inputs and expected glyph output for fonts and features; source of expected ids for check 1.4.3, "only for fonts that are also licensed to vendor" | https://github.com/harfbuzz/harfbuzz/tree/main/test/shaping | "the HarfBuzz licence (an MIT-style licence)" | not stated | `1.4.md` section 6 | plan row |
+| rustybuzz tests | same use as the HarfBuzz tests | https://github.com/harfbuzz/rustybuzz | "MIT" | not stated | `1.4.md` section 6 | plan row |
+| Noto fonts (Latin, Arabic, Hebrew, Devanagari) | fonts for shaping checks | https://github.com/notofonts and https://fonts.google.com/noto | "SIL Open Font License 1.1 (https://openfontlicense.org). Redistribution in the repo needs the licence text kept with the files." | not stated | `1.4.md` section 6 | plan row |
+| OpenType specification (GSUB, GPOS, cmap, hmtx, glyf, CFF) | "Read, not copied." | https://learn.microsoft.com/en-us/typography/opentype/spec/ | not stated in the plan | not stated | `1.4.md` section 6 | plan row; licence not stated |
+| Unicode Standard Annexes 9, 14 and 29 | "Read, not copied." | https://www.unicode.org/reports/tr9/ , https://www.unicode.org/reports/tr14/ , https://www.unicode.org/reports/tr29/ | not stated in the plan | not stated | `1.4.md` section 6 | plan row; licence not stated |
+| Frame budget 60 fps = 16.67 ms | plain arithmetic | "no source needed" | not applicable | - | `1.4.md` section 6 | plan row |
+| external image set | none: the visual reference for 1.4.11 is a browser's rendering of the same text on Lazlo's PC, compared by eye and not stored; the one-million-line document is generated | - | not applicable | - | `1.4.md` section 6 | plan row: none used |
+
+### Node 1.5 (docs/nodes/1.5.md section 6)
+
+The plan: "Listing only: nothing is downloaded or copied into the repo. Facts below are from memory and are confirmed against the page by the brief that uses them."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| 60 Hz frame time (16.67 ms) and the "two frames is a visible hitch" rule | frame budget | "definition (1 s / 60); no external benchmark is compared against" | not applicable | - | `1.5.md` section 6 | plan row |
+| The 10,000-edit undo bar | undo check | `CAPABILITY_ROADMAP.md` node 0.6 Done-when (this repo) | not applicable | - | `1.5.md` section 6 | plan row |
+| `StretchDIBits` | presenting a CPU framebuffer | https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchdibits | "Microsoft Learn text; numeric and API facts only, no text copied" | not stated | `1.5.md` section 6 | plan row |
+| `QueryPerformanceCounter` | frame timing | https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps | "same" | not stated | `1.5.md` section 6 | plan row |
+| `timeBeginPeriod` | frame pacing, "if S10 uses it" | https://learn.microsoft.com/en-us/windows/win32/api/timeapi/nf-timeapi-timebeginperiod | "same" | not stated | `1.5.md` section 6 | plan row |
+| `LoadLibraryW` and `GetProcAddress` | plugin host | https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryw | "Microsoft Learn text; API facts only" | not stated | `1.5.md` section 6 | plan row |
+| Rust: a panic that reaches an `extern "C"` function boundary aborts the process (stable since Rust 1.81, from memory) | the fact the host-process containment of `bad_panic` relies on | https://doc.rust-lang.org/nomicon/unwinding.html and the Rust 1.81 release notes | "MIT OR Apache-2.0 (Rust documentation); fact only" | not stated | `1.5.md` section 6 | plan row |
+| `catch_unwind` | in-process containment of Rust groups | https://doc.rust-lang.org/std/panic/fn.catch_unwind.html | "MIT OR Apache-2.0; fact only" | not stated | `1.5.md` section 6 | plan row |
+| PGM (P5) image format | the atlas | https://netpbm.sourceforge.net/doc/pgm.html | "Netpbm documentation; the format is a fact, nothing copied" | not stated | `1.5.md` section 6 | plan row |
+| Dear ImGui docking branch; Blender workspaces | design references for docking and per-mode layouts, read only | https://github.com/ocornut/imgui and https://docs.blender.org/manual/en/latest/interface/window_system/workspaces.html | "Dear ImGui is MIT; Blender is GPL (its code is never read for copying, only its manual for ideas)" | not stated | `1.5.md` section 6 | plan row |
+| Sample sets, golden images, published UI benchmarks | none: the checks compare the shell with its own saved bytes and with budgets | "None." | not applicable | - | `1.5.md` section 6 | plan row: none used |
+
+### Node 1.6 (docs/nodes/1.6.md section 6)
+
+The plan: "List only; nothing is downloaded. No test data from outside is used, with one exception: the published FNV-1a test vectors below (a few short constants, named with their URL)."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| Rust Reference: `extern` functions and the C ABI, and `repr(C)` | read, for the ABI rules and for the rule that a panic must not unwind across `extern "C"` | https://doc.rust-lang.org/reference/items/external-blocks.html and https://doc.rust-lang.org/reference/type-layout.html | "MIT OR Apache-2.0 (the Rust Reference's own; to confirm when citing)" | not stated | `1.6.md` section 6 | plan row |
+| Python `ctypes` documentation | read, for check 1.6.9b | https://docs.python.org/3/library/ctypes.html | "PSF (documentation)" | not stated | `1.6.md` section 6 | plan row |
+| FNV-1a hash definition (64 bit) and its test vectors | the descriptor hash constants, as in node 1.2; "test vectors are taken from that page and written into `tests/descriptor.rs` with the URL in a comment" | http://www.isthe.com/chongo/tech/comp/fnv/ | "Public domain (stated on the page; to confirm)" | "a few short constants" | `1.6.md` section 6 | plan row |
+| Prior art, "read for ideas only, not code": Unreal `UPROPERTY` documentation, Unity serialization rules, crates `bevy_reflect` and `serde` | design ideas; "None of this is a dependency." | https://dev.epicgames.com/documentation/en-us/unreal-engine/ , https://docs.unity3d.com/Manual/script-Serialization.html , https://docs.rs/bevy_reflect , https://serde.rs | "Epic's and Unity's pages are proprietary documentation (no text is copied); `bevy_reflect` and `serde` are MIT OR Apache-2.0 (from memory; confirm before quoting)" | not stated | `1.6.md` section 6 | plan row |
+| every other input | generated in code or written by hand; expected values hand-worked | - | "no other third-party data to licence" | - | `1.6.md` section 6 | plan row: none used |
+
+### Node 1.7 (docs/nodes/1.7.md section 6)
+
+The plan: "Listing only: nothing is downloaded or copied into the repo. This node has **no published numeric benchmark** to compare against ... These URLs are written from memory and are unverified."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| "Build Systems a la Carte", Mokhov, Mitchell and Peyton Jones, 2018 | dirty marking, lazy demand and minimal rebuild as a general idea | https://www.microsoft.com/en-us/research/publication/build-systems-a-la-carte/ | "Paper copyright its authors; read only, no text copied" | not stated | `1.7.md` section 6 | plan row |
+| Topological sorting (Kahn's algorithm) | the evaluator and the cycle check | https://en.wikipedia.org/wiki/Topological_sorting | "CC BY-SA 4.0 (facts only, no text copied)" | not stated | `1.7.md` section 6 | plan row |
+| Blender Manual, node editors | prior art for typed sockets, node groups and a shared node editor; "used to decide that groups expose inner sockets" | https://docs.blender.org/manual/en/latest/interface/controls/nodes/index.html | "CC BY-SA 4.0 (read only ...)" | not stated | `1.7.md` section 6 | plan row |
+| `std::panic::catch_unwind` | what it does and does not catch | https://doc.rust-lang.org/std/panic/fn.catch_unwind.html | "MIT or Apache-2.0 (standard library docs)" | not stated | `1.7.md` section 6 | plan row |
+| Linear congruential generator constants (multiplier 6364136223846793005, increment 1442695040888963407) | seeded generator | https://en.wikipedia.org/wiki/Linear_congruential_generator | "CC BY-SA 4.0 (two constants, from memory: confirm against the page before use)" | two constants | `1.7.md` section 6 | plan row |
+| The Rustonomicon, FFI chapter | C ABI conventions: `extern "C"`, `#[repr(C)]`, opaque pointers, UTF-8 pointer plus length | https://doc.rust-lang.org/nomicon/ffi.html | "MIT or Apache-2.0" | not stated | `1.7.md` section 6 | plan row |
+| Sample sets, published performance results, reference graphs | none: the 50 ms budget is frame-time reasoning; reference graph shapes A and B are defined in section 5 | "None." | not applicable | - | `1.7.md` section 6 | plan row: none used |
+
+### Node 1.8 (docs/nodes/1.8.md section 6)
+
+The plan: "Listing only: nothing is downloaded or copied into the repo. Every value is from memory and must be confirmed against the page by the brief that uses it."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| CSS easing: cubic Bezier `cubic-bezier(x1, y1, x2, y2)` and its solve-for-x rule | easing curve | https://www.w3.org/TR/css-easing-1/ | "W3C document licence; only the formula is used" | not stated | `1.8.md` section 6 | plan row |
+| glTF 2.0 animation samplers `STEP`, `LINEAR`, `CUBICSPLINE` and the cubic Hermite formula (Appendix C) | interpolation | https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html | "Khronos specification, Creative Commons Attribution; only the formula is used" | not stated | `1.8.md` section 6 | plan row |
+| OpenTimelineIO data model (Timeline, Track, Clip, `RationalTime`, `TimeRange`) | "the model to compare names and edge cases against" | https://github.com/AcademySoftwareFoundation/OpenTimelineIO | "Apache-2.0" | not stated | `1.8.md` section 6 | plan row |
+| Blender manual, animation (keyframes, F-curves, interpolation, Graph Editor) | ideas only | https://docs.blender.org/manual/en/latest/animation/index.html | "Creative Commons BY-SA 4.0 (documentation text; only ideas are used)" | not stated | `1.8.md` section 6 | plan row |
+| Premiere Pro time base of 254,016,000,000 ticks per second | a number; "t1 checks the property independently" | "Adobe Premiere Pro SDK documentation (page to be found by the brief)" | "Adobe documentation; the figure is a number" | one figure | `1.8.md` section 6 | plan row; no URL |
+| NTSC frame rates 24000/1001, 30000/1001, 60000/1001 | rational frame rates | https://en.wikipedia.org/wiki/NTSC | "Creative Commons BY-SA; facts only" | not stated | `1.8.md` section 6 | plan row |
+| Audio sample rates 44,100 and 48,000 Hz (AES5) | two numbers | "AES5-2018, paywalled" | "not needed beyond the two numbers; list only" | two numbers | `1.8.md` section 6 | plan row |
+| Python `ctypes` | C ABI check | https://docs.python.org/3/library/ctypes.html | "PSF documentation licence" | not stated | `1.8.md` section 6 | plan row |
+| Sample sets, published scrub or edit benchmarks | none: thresholds are budgets and chosen stress figures | "None." | not applicable | - | `1.8.md` section 6 | plan row: none used |
+
+### Node 2.8 (docs/nodes/2.8.md section 6)
+
+The plan: "Listing only: nothing is downloaded or copied into the repo. The fixtures are generated locally (D3) ... **Every URL below was written from memory with no network access and is unverified** ... No sizes are given for documents; generated data sizes are in section 4." This replaces the pass-1 row "LAPACK/SciPy reference outputs for numerics", as the plan itself asks. Source and licence cells below carry the plan's "(to verify)" marking.
+
+| Data set | Used for | Source (to verify) | Licence as stated (to verify) | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| SciPy (`scipy.linalg`, `scipy.sparse`, `scipy.fft`, `scipy.integrate.solve_ivp`, `scipy.optimize`) | "The reference outputs of every fixture (N3)." | https://scipy.org and https://docs.scipy.org/doc/scipy/ | "BSD-3-Clause" | not stated | `2.8.md` section 6 | plan row |
+| NumPy (`numpy.linalg`, `numpy.random.default_rng`) | determinant, inverse, condition numbers, seeded inputs (N3) | https://numpy.org | "BSD-3-Clause" | not stated | `2.8.md` section 6 | plan row |
+| Reference LAPACK, including its test programs and input files (test-ratio threshold, 30 from memory) | `THRESH` and the forms of the test ratios (N2, N5); read only | https://github.com/Reference-LAPACK/lapack (`TESTING/`) | "Modified BSD" | not stated | `2.8.md` section 6 | plan row |
+| LAPACK Users' Guide, 3rd edition, chapter "Accuracy and Stability" | forward error bounded by condition number times backward error (section 1); eigenvalue and singular value bounds (n5); read only | https://www.netlib.org/lapack/lug/ | "Copyright SIAM and the authors; free to read online" | not stated | `2.8.md` section 6 | plan row |
+| Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd edition, SIAM 2002 | LU and Cholesky backward error; the `eps * log2(n)` growth of FFT error (n7) | "The book (no URL)" | "Copyright; read only" | not stated | `2.8.md` section 6 | plan row; no URL |
+| Demmel and Veselic, "Jacobi's method is more accurate than QR", SIAM J. Matrix Anal. Appl. 13(4), 1992 | choice of Jacobi rotations for `eigh` and one-sided Jacobi for SVD (N5) | "The paper (no URL)" | "Copyright; read only" | not stated | `2.8.md` section 6 | plan row; no URL |
+| Bluestein's algorithm (chirp-z) | prime and mixed FFT lengths (N7) | https://en.wikipedia.org/wiki/Chirp_Z-transform | "CC BY-SA 4.0 (facts only, no text copied)" | not stated | `2.8.md` section 6 | plan row |
+| Dormand and Prince, "A family of embedded Runge-Kutta formulae", J. Comput. Appl. Math. 6(1), 1980 | the DOPRI5 tableau (N8), cross-checked against SciPy's `RK45` source (`scipy/integrate/_ivp/rk.py`, BSD-3) | "The paper (no URL)" | "Copyright; the coefficients are facts" | not stated | `2.8.md` section 6 | plan row; no URL |
+| Hairer and Wanner, *Solving Ordinary Differential Equations II*, Springer | the stiff test problem of n10 (Robertson; its equations are facts) | "The book (no URL)" | "Copyright; read only" | not stated | `2.8.md` section 6 | plan row; no URL |
+| Hairer, Lubich and Wanner, *Geometric Numerical Integration*, Springer | bounded energy of symplectic methods (n9) | "The book (no URL)" | "Copyright; read only" | not stated | `2.8.md` section 6 | plan row; no URL |
+| Rosenbrock function and its derivatives as SciPy ships them | n11, n12 | https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.rosen.html | "BSD-3 (docs)" | not stated | `2.8.md` section 6 | plan row |
+| Moré, Garbow and Hillstrom, "Testing Unconstrained Optimization Software", ACM TOMS 7(1), 1981 | optimizer test problems and start points (n12) | "The paper (no URL)" | "Copyright; the problem definitions are facts" | not stated | `2.8.md` section 6 | plan row; no URL |
+| MINPACK (Levenberg-Marquardt, behind `least_squares(method='lm')`) | n12's LM comparison; "Read only; not linked." | https://www.netlib.org/minpack/ | "MINPACK licence (BSD-like, to verify)" | not stated | `2.8.md` section 6 | plan row; licence to verify |
+| Griewank and Walther, *Evaluating Derivatives*, 2nd edition, SIAM 2008 | forward (dual numbers) and reverse (tape) modes (N9) | "The book (no URL)" | "Copyright; read only" | not stated | `2.8.md` section 6 | plan row; no URL |
+| foundation's generator and its published test vector | the copied `Xoshiro256StarStar` (N2) | `projects/foundation/docs/rng.md`, foundation `be084c4` | "Lazlo's own repo; constants from public-domain reference C" | not stated | `2.8.md` section 6 | plan row; local path |
+| crash-sim's CG cases | n6's `pcg_matches_crash_sim_cases` | `state/next-batch-2026-11-20/n20-05-numerics-sparse-cg.md` (outside Git) | "Lazlo's own" | not stated | `2.8.md` section 6 | plan row; local path |
+| SuiteSparse Matrix Collection (optional, later) | larger real sparse matrices for a later brief; "Not in the first pass." | https://sparse.tamu.edu | "Per-matrix; to verify (D4)" | not stated | `2.8.md` section 6 | plan row; optional |
+| Published benchmarks or sample sets for timing | none: the Done-when is about matching outputs, not speed | "None." | not applicable | - | `2.8.md` section 6 | plan row: none used |
+
+### Sandbox node (docs/nodes/sandbox.md section 6)
+
+The plan: "Listing only: nothing is downloaded. Every fact below is from memory and is UNVERIFIED until X1 reads the page and tries it."
+
+| Data set | Used for | Source | Licence as stated | Size | Plan and section | Status |
+|---|---|---|---|---|---|---|
+| AppContainer isolation: objects, files, network, capabilities | design facts | https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation | "Microsoft Learn text; API facts only" | not stated | `sandbox.md` section 6 | plan row |
+| Launching a process in an AppContainer (`SECURITY_CAPABILITIES`) | API facts | https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer | "same" | not stated | `sandbox.md` section 6 | plan row |
+| `DeriveAppContainerSidFromAppContainerName`, `CreateAppContainerProfile` | API facts | https://learn.microsoft.com/en-us/windows/win32/api/userenv/ | "same" | not stated | `sandbox.md` section 6 | plan row |
+| Job objects and their limits | API facts | https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects | "same" | not stated | `sandbox.md` section 6 | plan row |
+| `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION` | API facts | https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information | "same" | not stated | `sandbox.md` section 6 | plan row |
+| `UpdateProcThreadAttribute` (handle list, child-process policy, security capabilities) | API facts | https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute | "same" | not stated | `sandbox.md` section 6 | plan row |
+| AppContainer loopback isolation and its exemption | API facts | https://learn.microsoft.com/en-us/previous-versions/windows/apps/hh780593(v=win.10) | "same" | not stated | `sandbox.md` section 6 | plan row |
+| Restricted tokens (the fallback) | API facts | https://learn.microsoft.com/en-us/windows/win32/secauthz/restricted-tokens | "same" | not stated | `sandbox.md` section 6 | plan row |
+| Chromium's Windows sandbox design (broker and target, job, token, AppContainer) | design reference | https://chromium.googlesource.com/chromium/src/+/main/docs/design/sandbox.md | "BSD-style; design ideas only, no code read for copying" | not stated | `sandbox.md` section 6 | plan row |
+| Sample sets, published escape suites | none: the probes are this repo's own, and the controls (x22) show each one can detect an escape | "None." | not applicable | - | `sandbox.md` section 6 | plan row: none used |
+
+### Roadmap rows with no plan yet
+
+These pass-1 rows are kept unchanged in substance: no merged plan has a section 6 for their node, so none replaces them. Their licences, URLs and sizes are still written from memory and **unverified** (pass 1). Status for each: **no plan yet**.
+
+| Data set | Where to get it (to verify) | Licence (pass 1, unverified) | Rough size | Nodes (CAPABILITY_ROADMAP.md) | Redistributable in a repo? | Status |
+|---|---|---|---|---|---|---|
+| Khronos glTF Sample Assets (models plus reference renders) | github.com/KhronosGroup/glTF-Sample-Assets | verify before use: **Mixed per model** (CC0, CC-BY, CC-BY-NC and others). Decision for Lazlo: choose models by licence. | hundreds of MB for the full set; a chosen subset is far smaller | 2.5 real-time renderer; 2.4 glTF import/export | Only per model, and not the NC ones; keep out of Git, fetch on demand | no plan yet (UNVERIFIED, from memory) |
+| Ghia, Ghia and Shin (1982) lid-driven cavity tables | The paper (J. Comput. Phys. 48); the tables are small numeric data | verify before use: Published numbers; the paper is copyrighted. Typing the numbers into a test is usual practice but is **a decision for Lazlo**. | under 10 KB | 3.20 CFD | Probably the numbers only, with citation; unclear | no plan yet (UNVERIFIED, from memory) |
+| Cornell box scene and reference image | Cornell University Program of Computer Graphics site | verify before use: Unclear (data is widely copied, no clear licence). Decision for Lazlo; can be rebuilt from the published dimensions instead. | under 5 MB | 3.5 path tracer | Rebuild from dimensions rather than copy | no plan yet (UNVERIFIED, from memory) |
+| Dam-break benchmark data | Published experiments (for example Martin and Moyce 1952) or a generated reference | verify before use: Paper numbers: same question as Ghia. | small | 3.3 fluids | Numbers only, with citation; unclear | no plan yet (UNVERIFIED, from memory) |
+| Published COMSOL thermal-expansion tutorial result | COMSOL tutorial documentation | verify before use: Vendor copyright. **Decision for Lazlo**; prefer an analytic or open reference problem. | small | 3.21 multiphysics | Unclear; avoid copying | no plan yet (UNVERIFIED, from memory) |
+| Test image for colour management matching | To be chosen (an open one, or generated) | verify before use: Unknown until chosen | small | 1.11 colour management | Generate our own: yes | no plan yet (UNVERIFIED, from memory) |
+| IIHS crash test reports (named in DEVELOPMENT_PLAN stage 4 step 4 as an alternative to NHTSA) | iihs.org | verify before use: IIHS copyright, terms not checked. Decision for Lazlo. | PDFs only | Crash sim validation | No, unless licence allows | no plan yet (UNVERIFIED, from memory) |
+
+Pass-1 rows replaced in pass 2 (removed, because a plan's section 6 replaces them): "SVG conformance test subset (W3C SVG test suite)", replaced by the node 1.3 rows; "LAPACK/SciPy reference outputs for numerics", replaced by the node 2.8 rows (the 2.8 plan asks for exactly this).
+
+### Spot-check (pass 2)
+
+Five rows with a URL or a named local path, checked against the plan text. No network was used: the URL checks compare the row to the plan's wording only (they do not show the URL is live), and the local-path checks use `Test-Path` against the main checkout at `C:\Users\MrComputer\Desktop\Broadsword` (the worktree does not contain `projects/`, `reference/` or `state/`, which are outside Git). Plan text was matched with exact-string search on the plan file.
+
+| # | Row checked | Claim in the doc | Check made | Result |
+|---|---|---|---|---|
+| 1 | Node 1.1, `POINTER_PEN_INFO` | URL `https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-pointer_pen_info`; values "pressure 0-1024, tilt X and Y -90 to 90, rotation 0-359"; licence as in the plan | Exact-string search of `docs/nodes/1.1.md` for the URL and for the value text | PASS: both strings found in `1.1.md` section 6. The URL was not opened (no network); it is the plan's unverified memory URL. |
+| 2 | Node 1.3, `projects/render/src` and `tests/golden.rs` | local path, licence "Own code." | Exact-string search of `docs/nodes/1.3.md`; `Test-Path` on `projects\render\src` and `projects\render\tests\golden.rs` in the main checkout | PASS: plan text found (both strings); both paths exist (`True`, `True`). |
+| 3 | Node 2.8, foundation generator | path `projects/foundation/docs/rng.md`, commit `be084c4`, licence "Lazlo's own repo; constants from public-domain reference C" | Exact-string search of `docs/nodes/2.8.md`; `Test-Path` on the file; `git cat-file -t be084c4` inside `projects/foundation`; read `rng.md` for the public-domain claim | PASS: plan text found; file exists; `be084c4` is a `commit`; `rng.md` says both generators "are ports of the public-domain reference C code by Blackman and Vigna". |
+| 4 | Node 2.8, crash-sim CG cases | path `state/next-batch-2026-11-20/n20-05-numerics-sparse-cg.md (outside Git)`, "Lazlo's own" | Exact-string search of `docs/nodes/2.8.md`; `Test-Path`; read the first lines | PASS: plan text found; file exists (`True`); first line is "# Brief: Sparse matrices and a preconditioned conjugate-gradient solve inside crash-sim". |
+| 5 | Node 1.4, Noto fonts | URLs `https://github.com/notofonts` and `https://fonts.google.com/noto`; licence "SIL Open Font License 1.1 (https://openfontlicense.org). Redistribution in the repo needs the licence text kept with the files." | Exact-string search of `docs/nodes/1.4.md` for the URLs and the whole licence sentence | PASS: both found verbatim in `1.4.md` section 6. Not opened online; licence is the plan's from-memory statement ("Licences are from memory and are confirmed when the file is first used"). |
+
+Not covered by the spot-check: no row's URL was fetched, so no licence in Part B is confirmed against its live source; that stays open (see Follow-up needed).
 
 ## Decisions for Lazlo (every non-free or unclear licence)
+
+Items 1 to 7 are from pass 1 and are unchanged except where noted. Items 8 to 14 are new in pass 2 and come from the plans' section 6 text.
 
 1. **CCSA Camry models (2012 v5a, 2015 BM v1) and their PDFs:** no stated licence. The manifest says keep them out of the repo and anything published. Question: is local-only research use enough for the crash sim, and may any derived mesh or reduced model be committed?
 2. **Toyota owner's manual:** copyright. Local reference only, never committed.
 3. **NHTSA tests and DOT HS 812 635:** US Government material, probably public domain, but the terms were not read here. Decide whether the small signal files may go into the repo (they are 0.4 to 10 MB each) or stay local only. The `dot.report` photos are a third-party site; treat as unclear.
-4. **Khronos glTF samples:** per-model licences; choose the subset and drop CC-BY-NC models.
-5. **Ghia, Martin and Moyce, COMSOL, Cornell box, IIHS:** copyrighted sources of small numeric data; decide whether quoting the numbers with a citation is acceptable.
-6. **W3C SVG test suite:** the licence differs by suite and was not checked (Part B row marked Verify). Decide which suite subset to use once its licence is read.
-7. **Colour-management test image:** licence unknown until an image is chosen. Decision: generate our own image so no licence is needed, or name an open image and check its licence.
+4. **Khronos glTF samples (no plan yet):** per-model licences; choose the subset and drop CC-BY-NC models.
+5. **Ghia, Martin and Moyce, COMSOL, Cornell box, IIHS (no plan yet):** copyrighted sources of small numeric data; decide whether quoting the numbers with a citation is acceptable.
+6. **W3C SVG test suite (now node 1.3 rows):** the plan says "W3C test-suite licence; whether the files may be committed to a repo is **to confirm**." Decide which suite subset to use once its licence is read, and whether the files may be committed or must stay outside Git.
+7. **Colour-management test image (no plan yet):** licence unknown until an image is chosen. Decision: generate our own image so no licence is needed, or name an open image and check its licence.
+8. **resvg test suite (1.3, second candidate for the SVG conformance suite):** the plan says "To confirm" and does not state the licence. Do not copy any of it until its licence is read.
+9. **Unicode conformance files (1.4: `BidiCharacterTest.txt`, `BidiTest.txt`, `GraphemeBreakTest.txt`, `LineBreakTest.txt`):** the plan says "Unicode terms of use (data files; copyright and permission notice kept in the fixture header)". Question: is committing these files with the notice acceptable, or should they be fetched at test time and kept out of Git? The terms were not read here.
+10. **Noto fonts (1.4):** SIL Open Font License 1.1 per the plan, "Redistribution in the repo needs the licence text kept with the files." Question: vendor them in the repo with the licence text, or keep them outside Git?
+11. **HarfBuzz and rustybuzz shaping tests (1.4):** MIT-style and MIT per the plan, used "only for fonts that are also licensed to vendor". Confirm the licence text of each test file before copying expected output.
+12. **Wikipedia-sourced facts (1.7 Kahn's algorithm and LCG constants, 1.8 NTSC, 2.8 Bluestein):** the plans say CC BY-SA 4.0, "facts only, no text copied". Rule to confirm: only numbers and formulas are used, so no share-alike text enters the repo; the two LCG constants in 1.7 are "from memory: confirm against the page before use".
+13. **Books and papers (2.8: Higham, Demmel and Veselic, Dormand and Prince, Hairer and Wanner, Hairer-Lubich-Wanner, Moré-Garbow-Hillstrom, Griewank and Walther; also LAPACK Users' Guide; 1.7 "Build Systems a la Carte"; 1.8 Premiere Pro tick figure, AES5):** copyright; the plans use them read-only, or for facts such as coefficients, equations and single numbers. Decide whether quoting those facts with a citation is acceptable (same question as item 5).
+14. **MINPACK (2.8) and SuiteSparse Matrix Collection (2.8, optional, later):** the plan says "MINPACK licence (BSD-like, to verify)" and SuiteSparse "Per-matrix; to verify (D4)". Neither may be linked or downloaded until the licence is read; SuiteSparse is not in the first pass.
+
+Also noted, no decision needed: Dear ImGui is MIT and Blender is GPL (1.5); Chromium's sandbox design is "BSD-style" (sandbox plan); Blender manual text is CC BY-SA 4.0 (1.7, 1.8); in each case the plan says only ideas are read and no code or text is copied.
 
 ## Disk planning
 
 - Part A is about 320 MB, already on disk, and outside every repo.
-- Part B downloads are unknown until section 6 arrives; the full Khronos sample set would be the largest item.
+- Part B downloads: no plan's section 6 states a size for any dataset. The plans download nothing; the only candidates with real size are the Unicode test files (small text files, size not stated), the Noto fonts (size not stated), the SVG and resvg test suites (size not stated, 1.3) and the full Khronos sample set (hundreds of MB, no plan yet), the largest item.
 - Check free space against `disk_floor_gb` in `broadsword.toml` before any download, and place downloads under `reference/` (outside Git) or `shared/`, never inside a worktree.
 
 ## Follow-up needed
 
-- Re-run after the `ra-<node>` plans merge; add every section-6 entry, with the plan file as the source of each row.
-- A reviewer spot-check of five entries against merged plans cannot happen until then (done check 1 is **not** met by this first pass; see Part B).
+- **Every URL and licence in Part B is still unverified.** The plans themselves say they were written from memory with no network (1.1, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 2.8, sandbox). The brief that first relies on a row must open the page, confirm it says what the plan quotes, and correct this file. Pass 2 was told to use no network, so none was checked.
+- **Rows with no plan yet:** Khronos glTF samples (nodes 2.5, 2.4), Ghia (3.20), Cornell box (3.5), dam-break (3.3), COMSOL (3.21), colour-management image (1.11), IIHS. Re-run this file when those plans merge.
+- **Plans not in this pass:** `0.1.md` has no section 6. Any node plan merged after this pass (anything in `docs/nodes/` other than `0.1`, `1.1` to `1.8`, `2.8`, `sandbox`) is not covered.
+- **Plan quirks to fix in the plans, not here:** `2.8.md` section 6 still says this file has one UNVERIFIED row for the node and that pass 2 should replace it; that is now done (the row is replaced by the 2.8 rows).
+- **Part A hash note:** `MANIFEST.md` still says it lists 6 files (out of date, from pass 1); not changed here because it lies outside this task's claim.
