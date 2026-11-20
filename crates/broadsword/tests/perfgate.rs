@@ -40,8 +40,18 @@ struct Out {
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let o = Command::new("git").args(args).current_dir(dir).stdin(Stdio::null()).output().unwrap();
-    assert!(o.status.success(), "git {args:?} in {}: {}", dir.display(), String::from_utf8_lossy(&o.stderr));
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&o.stderr)
+    );
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
 
@@ -54,7 +64,12 @@ fn init_project(p: &Path, name: &str, bench: &str) {
     fs::write(p.join("src/lib.rs"), LIB).unwrap();
     fs::write(p.join("examples/bench.rs"), bench).unwrap();
     git(p, &["init", "-q", "-b", "main"]);
-    for (k, v) in [("user.name", "t"), ("user.email", "t@localhost"), ("core.autocrlf", "false"), ("commit.gpgsign", "false")] {
+    for (k, v) in [
+        ("user.name", "t"),
+        ("user.email", "t@localhost"),
+        ("core.autocrlf", "false"),
+        ("commit.gpgsign", "false"),
+    ] {
         git(p, &["config", k, v]);
     }
     git(p, &["add", "."]);
@@ -71,19 +86,32 @@ impl Root {
     /// A root whose project `p` (in scratch/projects) has a bench printing `bench`; `train` is merge_train_max.
     fn new(name: &str, bench: &[(&str, f64)], train: u64) -> Root {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("pg-{name}-{}-{n}", std::process::id()));
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scratch")
+            .join(format!("pg-{name}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("scratch")).unwrap();
         let dir = fs::canonicalize(&dir).unwrap();
         let dir = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\"));
         init_project(&dir.join("scratch/projects/p"), "p", &bench_src(bench));
-        let toml = support::config(&[("projects_dir", "\"scratch/projects\""), ("build_lock_wait_seconds", "120"), ("reviewer_timeout_seconds", "30"), ("merge_train_max", &train.to_string())]);
+        let toml = support::config(&[
+            ("projects_dir", "\"scratch/projects\""),
+            ("build_lock_wait_seconds", "120"),
+            ("reviewer_timeout_seconds", "30"),
+            ("merge_train_max", &train.to_string()),
+        ]);
         fs::write(dir.join("broadsword.toml"), toml).unwrap();
-        let fake = dir.join("scratch/reviewer").join(Path::new(fake_claude()).file_name().unwrap());
+        let fake = dir
+            .join("scratch/reviewer")
+            .join(Path::new(fake_claude()).file_name().unwrap());
         fs::create_dir_all(fake.parent().unwrap()).unwrap();
         fs::copy(fake_claude(), &fake).unwrap();
         let fake_out = dir.join("fake-out");
-        Root { dir, fake, fake_out }
+        Root {
+            dir,
+            fake,
+            fake_out,
+        }
     }
 
     fn p(&self) -> PathBuf {
@@ -110,12 +138,24 @@ impl Root {
             .env("FAKE_CLAUDE_MODEL", "auto")
             .output()
             .unwrap();
-        Out { code: o.status.code().unwrap(), stdout: String::from_utf8_lossy(&o.stdout).into_owned(), stderr: String::from_utf8_lossy(&o.stderr).into_owned() }
+        Out {
+            code: o.status.code().unwrap(),
+            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
     }
 
     /// A started task claiming `claim`, with one commit writing `file` in its worktree, queued; returns (task, entry).
     fn queued(&self, claim: &str, file: &str, content: &str) -> (String, String) {
-        let o = self.run(&["task", "add", "p", "--title", "make p better", "--claim", claim]);
+        let o = self.run(&[
+            "task",
+            "add",
+            "p",
+            "--title",
+            "make p better",
+            "--claim",
+            claim,
+        ]);
         assert_eq!(o.code, 0, "{}", o.stderr);
         let id = o.stdout.trim().to_string();
         let o = self.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
@@ -123,7 +163,19 @@ impl Root {
         let wt = self.wt(&id);
         fs::write(wt.join(file), content).unwrap();
         git(&wt, &["add", file]);
-        git(&wt, &["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", &format!("task: {file}")]);
+        git(
+            &wt,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@localhost",
+                "commit",
+                "-q",
+                "-m",
+                &format!("task: {file}"),
+            ],
+        );
         let o = self.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]);
         assert_eq!(o.code, 0, "queue add: {}{}", o.stdout, o.stderr);
         (id, o.stdout.lines().next().unwrap().trim().to_string())
@@ -136,16 +188,32 @@ impl Root {
     }
 
     fn field(&self, entry: &str, key: &str) -> String {
-        self.show(entry).lines().find_map(|l| l.strip_prefix(&format!("{key}: "))).unwrap_or("").to_string()
+        self.show(entry)
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+            .unwrap_or("")
+            .to_string()
     }
 
     fn calls(&self) -> usize {
-        fs::read_to_string(self.fake_out.join("calls.log")).map(|t| t.lines().count()).unwrap_or(0)
+        fs::read_to_string(self.fake_out.join("calls.log"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
     }
 
     /// How many `run` jobs (bench runs) were started in this root.
     fn bench_jobs(&self) -> usize {
-        fs::read_dir(self.dir.join("state/jobs")).into_iter().flatten().flatten().filter(|e| fs::read_to_string(e.path()).unwrap_or_default().lines().any(|l| l == "kind = run")).count()
+        fs::read_dir(self.dir.join("state/jobs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l == "kind = run")
+            })
+            .count()
     }
 
     fn head(&self) -> String {
@@ -157,23 +225,53 @@ impl Root {
 fn a_case_slower_than_its_threshold_fails_the_entry_perf_failed_before_any_review() {
     // box +100% over its 10%; cube +20% is within its own 50%: each case is judged on its own threshold
     let r = Root::new("slow", &[("box", 2.0), ("cube", 1.2)], 1);
-    r.set_baseline("p", &baseline(true, &[("box", 1.0, 10.0), ("cube", 1.0, 50.0)]));
+    r.set_baseline(
+        "p",
+        &baseline(true, &[("box", 1.0, 10.0), ("cube", 1.0, 50.0)]),
+    );
     let main = r.head();
     let (task, entry) = r.queued("src/lib.rs", "src/lib.rs", &format!("{LIB}// a change\n"));
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
-    assert_eq!(r.field(&entry, "status"), "perf_failed", "{}", r.show(&entry));
+    assert_eq!(
+        r.field(&entry, "status"),
+        "perf_failed",
+        "{}",
+        r.show(&entry)
+    );
     let reason = r.field(&entry, "reason");
-    assert!(reason.contains("box: baseline 1.000 ms, now 2.000 ms, change +100.0% (threshold 10%): FAIL"), "{reason}");
-    assert!(reason.contains("cube: baseline 1.000 ms, now 1.200 ms, change +20.0% (threshold 50%): ok"), "{reason}");
-    assert!(reason.contains("LOADED"), "the reason says the baseline is LOADED: {reason}");
-    assert!(o.stdout.contains("baseline state/perf/p-baseline.json is LOADED"), "{}", o.stdout);
+    assert!(
+        reason
+            .contains("box: baseline 1.000 ms, now 2.000 ms, change +100.0% (threshold 10%): FAIL"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("cube: baseline 1.000 ms, now 1.200 ms, change +20.0% (threshold 50%): ok"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("LOADED"),
+        "the reason says the baseline is LOADED: {reason}"
+    );
+    assert!(
+        o.stdout
+            .contains("baseline state/perf/p-baseline.json is LOADED"),
+        "{}",
+        o.stdout
+    );
     assert_eq!(r.bench_jobs(), 2, "the bench ran perf_runs (2) times");
     assert_eq!(r.calls(), 0, "no model was asked");
     assert_eq!(r.head(), main, "nothing merged");
-    assert!(r.show(&entry).contains("perf gate:"), "queue show prints the perf report");
+    assert!(
+        r.show(&entry).contains("perf gate:"),
+        "queue show prints the perf report"
+    );
     let o = r.run(&["task", "show", &task]);
-    assert!(o.stdout.contains("status: running"), "the task stays running: {}", o.stdout);
+    assert!(
+        o.stdout.contains("status: running"),
+        "the task stays running: {}",
+        o.stdout
+    );
 }
 
 #[test]
@@ -185,10 +283,17 @@ fn a_faster_bench_passes_the_gate_and_the_reviewer_sees_the_perf_report() {
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.field(&entry, "status"), "merged");
     let show = r.show(&entry);
-    assert!(show.contains("box: baseline 4.000 ms, now 2.000 ms, change -50.0% (threshold 10%): ok") && show.contains("perf gate p: PASS"), "{show}");
+    assert!(
+        show.contains("box: baseline 4.000 ms, now 2.000 ms, change -50.0% (threshold 10%): ok")
+            && show.contains("perf gate p: PASS"),
+        "{show}"
+    );
     assert_eq!(r.bench_jobs(), 2);
     let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
-    assert!(stdin.contains("perf gate p: PASS") && stdin.contains("is LOADED"), "the review prompt carries the perf report");
+    assert!(
+        stdin.contains("perf gate p: PASS") && stdin.contains("is LOADED"),
+        "the review prompt carries the perf report"
+    );
 }
 
 #[test]
@@ -202,13 +307,29 @@ fn a_project_without_a_baseline_is_skipped_logged_and_never_benched() {
     assert_eq!(r.field(&entry, "status"), "merged");
     assert!(o.stdout.contains("perf gate p: skipped: the project has no baseline (state/perf/p-baseline.json does not exist)"), "{}", o.stdout);
     let show = r.show(&entry);
-    assert!(show.contains("perf: the entry's own check: perf gate p: skipped"), "the skip is logged in the entry: {show}");
-    assert_eq!(r.bench_jobs(), 0, "no bench ran for a project without a baseline");
+    assert!(
+        show.contains("perf: the entry's own check: perf gate p: skipped"),
+        "the skip is logged in the entry: {show}"
+    );
+    assert_eq!(
+        r.bench_jobs(),
+        0,
+        "no bench ran for a project without a baseline"
+    );
 }
 
 #[test]
 fn a_corrupt_baseline_fails_closed_and_runs_no_bench() {
-    for (name, text) in [("corrupt", "{\"loaded\": true, \"runs_per_case\": 3, \"cases\": {\"box\": {\"median_ms\": 1.0"), ("nothreshold", "{\"loaded\":true,\"runs_per_case\":3,\"cases\":{\"box\":{\"median_ms\":5.0}}}")] {
+    for (name, text) in [
+        (
+            "corrupt",
+            "{\"loaded\": true, \"runs_per_case\": 3, \"cases\": {\"box\": {\"median_ms\": 1.0",
+        ),
+        (
+            "nothreshold",
+            "{\"loaded\":true,\"runs_per_case\":3,\"cases\":{\"box\":{\"median_ms\":5.0}}}",
+        ),
+    ] {
         let r = Root::new(name, &[("box", 1.0)], 1);
         r.set_baseline("p", text);
         let main = r.head();
@@ -217,9 +338,20 @@ fn a_corrupt_baseline_fails_closed_and_runs_no_bench() {
         assert_eq!(o.code, 5, "{name}: {}{}", o.stdout, o.stderr);
         assert_eq!(r.field(&entry, "status"), "perf_failed", "{name}");
         let reason = r.field(&entry, "reason");
-        assert!(reason.contains("exists but cannot be used") && reason.contains("fails closed"), "{name}: {reason}");
-        assert_eq!(r.bench_jobs(), 0, "{name}: the bench is not run against an unusable baseline");
-        assert_eq!((r.calls(), r.head()), (0, main), "{name}: no review, nothing merged");
+        assert!(
+            reason.contains("exists but cannot be used") && reason.contains("fails closed"),
+            "{name}: {reason}"
+        );
+        assert_eq!(
+            r.bench_jobs(),
+            0,
+            "{name}: the bench is not run against an unusable baseline"
+        );
+        assert_eq!(
+            (r.calls(), r.head()),
+            (0, main),
+            "{name}: no review, nothing merged"
+        );
     }
 }
 
@@ -229,18 +361,36 @@ fn a_merge_train_runs_the_gate_on_its_tip_and_bisects_a_perf_failure_to_the_slow
     r.set_baseline("p", &baseline(false, &[("box", 2.0, 10.0)]));
     let main = r.head();
     let (t1, e1) = r.queued("src/lib.rs", "src/lib.rs", &format!("{LIB}// fine\n"));
-    let (t2, e2) = r.queued("examples/bench.rs", "examples/bench.rs", &bench_src(&[("box", 3.0)]));
+    let (t2, e2) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 3.0)]),
+    );
     let o = r.run(&["queue", "run", "--all"]);
     assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.field(&e1, "status"), "merged", "{}", r.show(&e1));
     assert_eq!(r.field(&e2, "status"), "perf_failed", "{}", r.show(&e2));
     let reason = r.field(&e2, "reason");
-    assert!(reason.contains("box: baseline 2.000 ms, now 3.000 ms, change +50.0% (threshold 10%): FAIL") && reason.contains("bisect of merge train"), "{reason}");
-    assert!(o.stdout.contains("baseline state/perf/p-baseline.json is quiet"), "{}", o.stdout);
+    assert!(
+        reason
+            .contains("box: baseline 2.000 ms, now 3.000 ms, change +50.0% (threshold 10%): FAIL")
+            && reason.contains("bisect of merge train"),
+        "{reason}"
+    );
+    assert!(
+        o.stdout
+            .contains("baseline state/perf/p-baseline.json is quiet"),
+        "{}",
+        o.stdout
+    );
     // the tip (both) failed, the bisect's first-entry check passed; entry 2 is the 2nd, so its tip was its own commit on the
     // chain (k = 2 needs a check alone): 3 checks x 2 bench runs
     assert_eq!(r.bench_jobs(), 6, "{}", o.stdout);
-    assert_eq!(git(&r.p(), &["rev-parse", "HEAD~1"]), main, "only entry 1 reached main");
+    assert_eq!(
+        git(&r.p(), &["rev-parse", "HEAD~1"]),
+        main,
+        "only entry 1 reached main"
+    );
     let o = r.run(&["task", "show", &t1]);
     assert!(o.stdout.contains("status: done"), "{}", o.stdout);
     let o = r.run(&["task", "show", &t2]);

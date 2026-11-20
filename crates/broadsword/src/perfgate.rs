@@ -79,18 +79,26 @@ pub enum Gate {
 
 /// `<state_dir>/perf/<project>-baseline.json`.
 pub fn baseline_path(cfg: &Config, project: &str) -> PathBuf {
-    cfg.state_dir.join("perf").join(format!("{project}-baseline.json"))
+    cfg.state_dir
+        .join("perf")
+        .join(format!("{project}-baseline.json"))
 }
 
 /// A path as it is shown: relative to the root when it is inside it.
 fn shown(cfg: &Config, p: &Path) -> String {
-    p.strip_prefix(&cfg.root).unwrap_or(p).display().to_string().replace('\\', "/")
+    p.strip_prefix(&cfg.root)
+        .unwrap_or(p)
+        .display()
+        .to_string()
+        .replace('\\', "/")
 }
 
 fn num(v: Option<&J>, what: &str) -> Result<f64, String> {
     match v {
         Some(J::Num(t)) => {
-            let x: f64 = t.parse().map_err(|_| format!("{what} is not a number: {t}"))?;
+            let x: f64 = t
+                .parse()
+                .map_err(|_| format!("{what} is not a number: {t}"))?;
             if x.is_finite() {
                 Ok(x)
             } else {
@@ -104,14 +112,18 @@ fn num(v: Option<&J>, what: &str) -> Result<f64, String> {
 
 /// A case name goes into reasons and logs: letters, digits, `_` and `-` only, 1 to 64 characters.
 fn valid_case_name(n: &str) -> bool {
-    !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !n.is_empty()
+        && n.len() <= 64
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Parse a baseline file's text. Every field the gate uses is required and checked: `loaded` (true or false), `runs_per_case` (a
 /// whole number from 1 to MAX_RUNS_PER_CASE), `cases` (an object with at least one case, no name twice), and per case `median_ms`
 /// (finite, above 0) and `threshold_pct` (finite, 0 or more). Other fields are ignored.
 pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
-    let v = json::parse(text.trim_start_matches('\u{feff}')).map_err(|e| format!("not valid JSON: {e}"))?;
+    let v = json::parse(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("not valid JSON: {e}"))?;
     if !matches!(v, J::Obj(_)) {
         return Err("not a JSON object".into());
     }
@@ -122,7 +134,9 @@ pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
     };
     let rpc = num(v.get("runs_per_case"), "`runs_per_case`")?;
     if rpc.fract() != 0.0 || rpc < 1.0 || rpc > MAX_RUNS_PER_CASE as f64 {
-        return Err(format!("`runs_per_case` must be a whole number from 1 to {MAX_RUNS_PER_CASE}, not {rpc}"));
+        return Err(format!(
+            "`runs_per_case` must be a whole number from 1 to {MAX_RUNS_PER_CASE}, not {rpc}"
+        ));
     }
     let members = match v.get("cases") {
         Some(J::Obj(m)) => m,
@@ -135,7 +149,9 @@ pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
     let mut cases: Vec<Case> = Vec::new();
     for (name, c) in members {
         if !valid_case_name(name) {
-            return Err(format!("case name {name:?} is not 1-64 letters, digits, `_` or `-`"));
+            return Err(format!(
+                "case name {name:?} is not 1-64 letters, digits, `_` or `-`"
+            ));
         }
         if cases.iter().any(|k| k.name == *name) {
             return Err(format!("case `{name}` appears twice"));
@@ -145,15 +161,30 @@ pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
         }
         let median_ms = num(c.get("median_ms"), &format!("`cases.{name}.median_ms`"))?;
         if median_ms <= 0.0 {
-            return Err(format!("`cases.{name}.median_ms` must be above 0, not {median_ms}"));
+            return Err(format!(
+                "`cases.{name}.median_ms` must be above 0, not {median_ms}"
+            ));
         }
-        let threshold_pct = num(c.get("threshold_pct"), &format!("`cases.{name}.threshold_pct`"))?;
+        let threshold_pct = num(
+            c.get("threshold_pct"),
+            &format!("`cases.{name}.threshold_pct`"),
+        )?;
         if threshold_pct < 0.0 {
-            return Err(format!("`cases.{name}.threshold_pct` must be 0 or more, not {threshold_pct}"));
+            return Err(format!(
+                "`cases.{name}.threshold_pct` must be 0 or more, not {threshold_pct}"
+            ));
         }
-        cases.push(Case { name: name.clone(), median_ms, threshold_pct });
+        cases.push(Case {
+            name: name.clone(),
+            median_ms,
+            threshold_pct,
+        });
     }
-    Ok(Baseline { loaded, runs_per_case: rpc as u64, cases })
+    Ok(Baseline {
+        loaded,
+        runs_per_case: rpc as u64,
+        cases,
+    })
 }
 
 /// Read a project's baseline file. Only a file that does not exist means "no baseline"; every other problem (a folder in its place,
@@ -183,9 +214,14 @@ pub fn parse_bench(text: &str) -> Result<Vec<(String, f64)>, String> {
             continue;
         }
         let v = json::parse(l).map_err(|e| format!("a case line is not valid JSON ({e}): {l}"))?;
-        let name = v.get("name").and_then(|n| n.str()).ok_or_else(|| format!("a case line has no string `name`: {l}"))?;
+        let name = v
+            .get("name")
+            .and_then(|n| n.str())
+            .ok_or_else(|| format!("a case line has no string `name`: {l}"))?;
         if !valid_case_name(name) {
-            return Err(format!("case name {name:?} is not 1-64 letters, digits, `_` or `-`"));
+            return Err(format!(
+                "case name {name:?} is not 1-64 letters, digits, `_` or `-`"
+            ));
         }
         let m = num(v.get("median_ms"), &format!("`median_ms` of case `{name}`"))?;
         if m < 0.0 {
@@ -253,7 +289,17 @@ pub fn judge(base: &Baseline, runs: &[Vec<(String, f64)>]) -> (bool, Vec<String>
         if slow {
             ok = false;
         }
-        lines.push(format!("{}: baseline {:.3} ms, now {now:.3} ms, change {change:+.1}% (threshold {}%): {}", c.name, c.median_ms, c.threshold_pct, if slow { "FAIL, slower than allowed" } else { "ok" }));
+        lines.push(format!(
+            "{}: baseline {:.3} ms, now {now:.3} ms, change {change:+.1}% (threshold {}%): {}",
+            c.name,
+            c.median_ms,
+            c.threshold_pct,
+            if slow {
+                "FAIL, slower than allowed"
+            } else {
+                "ok"
+            }
+        ));
     }
     for r in runs.iter().take(1) {
         for (n, m) in r {
@@ -269,7 +315,9 @@ pub fn judge(base: &Baseline, runs: &[Vec<(String, f64)>]) -> (bool, Vec<String>
 /// a culprit's own check): judge `project` at the commit its task's worktree holds now. `what` names the check in the output.
 pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
     if !cfg.perf_gate {
-        return Gate::Skipped(format!("perf gate {project}: off (perf_gate = \"off\"); no bench ran"));
+        return Gate::Skipped(format!(
+            "perf gate {project}: off (perf_gate = \"off\"); no bench ran"
+        ));
     }
     let path = baseline_path(cfg, project);
     let base = match find_baseline(&path) {
@@ -287,9 +335,24 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
     let mut runs: Vec<Vec<(String, f64)>> = Vec::new();
     let mut jobs: Vec<String> = Vec::new();
     for i in 1..=cfg.perf_runs {
-        println!("perf gate {project}: bench run {i} of {} ({what}): {command}", cfg.perf_runs);
+        println!(
+            "perf gate {project}: bench run {i} of {} ({what}): {command}",
+            cfg.perf_runs
+        );
         let mut info = JobInfo::default();
-        let code = job::run_job_info(cfg, JobSpec { kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task.to_string()) }, &mut info);
+        let code = job::run_job_info(
+            cfg,
+            JobSpec {
+                kind: "run".into(),
+                name: project.to_string(),
+                command: Some(command.clone()),
+                first_step: 0,
+                resumed_from: None,
+                resume_count: 0,
+                task: Some(task.to_string()),
+            },
+            &mut info,
+        );
         let id = info.id.clone().unwrap_or_else(|| "none".into());
         jobs.push(id.clone());
         if info.summary.is_empty() {
@@ -302,13 +365,20 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
         }
         let text = match info.log.as_deref().map(std::fs::read_to_string) {
             Some(Ok(t)) => t,
-            Some(Err(e)) => return Gate::NoVerdict(format!("the log of bench run {i} (job {id}) could not be read: {e}")),
+            Some(Err(e)) => {
+                return Gate::NoVerdict(format!(
+                    "the log of bench run {i} (job {id}) could not be read: {e}"
+                ))
+            }
             None => return Gate::NoVerdict(format!("bench run {i} (job {id}) has no log")),
         };
         match parse_bench(&text) {
             Ok(r) => runs.push(r),
             Err(m) => {
-                let reason = format!("the output of bench run {i} of {} (job {id}) cannot be used: {m}", cfg.perf_runs);
+                let reason = format!(
+                    "the output of bench run {i} of {} (job {id}) cannot be used: {m}",
+                    cfg.perf_runs
+                );
                 lines.push(format!("FAILED: {reason}"));
                 return Gate::Fail(reason, lines);
             }
@@ -321,11 +391,23 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
     lines.extend(case_lines.iter().cloned());
     lines.push(format!("bench jobs: {}", jobs.join(", ")));
     if ok {
-        lines.push(format!("perf gate {project}: PASS ({} bench run(s))", cfg.perf_runs));
+        lines.push(format!(
+            "perf gate {project}: PASS ({} bench run(s))",
+            cfg.perf_runs
+        ));
         println!("perf gate {project}: PASS");
         Gate::Pass(lines)
     } else {
-        let reason = format!("{} ({}): {}", if base.loaded { "slower than the LOADED baseline allows" } else { "slower than the baseline allows" }, shown(cfg, &baseline_path(cfg, project)), case_lines.join("; "));
+        let reason = format!(
+            "{} ({}): {}",
+            if base.loaded {
+                "slower than the LOADED baseline allows"
+            } else {
+                "slower than the baseline allows"
+            },
+            shown(cfg, &baseline_path(cfg, project)),
+            case_lines.join("; ")
+        );
         lines.push(format!("perf gate {project}: FAIL"));
         println!("perf gate {project}: FAIL");
         Gate::Fail(reason, lines)
@@ -344,7 +426,13 @@ mod tests {
         let b = parse_baseline(REAL).unwrap();
         assert!(b.loaded);
         assert_eq!(b.runs_per_case, 10);
-        assert_eq!(b.cases.iter().map(|c| (c.name.as_str(), c.threshold_pct)).collect::<Vec<_>>(), vec![("box", 10.0), ("cube", 18.93), ("settle", 14.98)]);
+        assert_eq!(
+            b.cases
+                .iter()
+                .map(|c| (c.name.as_str(), c.threshold_pct))
+                .collect::<Vec<_>>(),
+            vec![("box", 10.0), ("cube", 18.93), ("settle", 14.98)]
+        );
     }
 
     #[test]
@@ -352,23 +440,71 @@ mod tests {
         for (bad, why) in [
             ("", "empty"),
             ("[]", "array"),
-            (r#"{"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "no loaded"),
-            (r#"{"loaded":"yes","runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "loaded not bool"),
-            (r#"{"loaded":true,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "no runs_per_case"),
-            (r#"{"loaded":true,"runs_per_case":0,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "runs 0"),
-            (r#"{"loaded":true,"runs_per_case":2.5,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "runs fraction"),
-            (r#"{"loaded":true,"runs_per_case":100000,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#, "runs huge"),
+            (
+                r#"{"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "no loaded",
+            ),
+            (
+                r#"{"loaded":"yes","runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "loaded not bool",
+            ),
+            (
+                r#"{"loaded":true,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "no runs_per_case",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":0,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "runs 0",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":2.5,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "runs fraction",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":100000,"cases":{"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "runs huge",
+            ),
             (r#"{"loaded":true,"runs_per_case":10}"#, "no cases"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{}}"#, "empty cases"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"threshold_pct":1}}}"#, "no median"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":0,"threshold_pct":1}}}"#, "median 0"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":-1,"threshold_pct":1}}}"#, "median negative"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1}}}"#, "no threshold"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":-1}}}"#, "threshold negative"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":"10"}}}"#, "threshold string"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1e999,"threshold_pct":1}}}"#, "median infinite"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1},"box":{"median_ms":1,"threshold_pct":1}}}"#, "duplicate"),
-            (r#"{"loaded":true,"runs_per_case":10,"cases":{"a b":{"median_ms":1,"threshold_pct":1}}}"#, "bad name"),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{}}"#,
+                "empty cases",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"threshold_pct":1}}}"#,
+                "no median",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":0,"threshold_pct":1}}}"#,
+                "median 0",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":-1,"threshold_pct":1}}}"#,
+                "median negative",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1}}}"#,
+                "no threshold",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":-1}}}"#,
+                "threshold negative",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":"10"}}}"#,
+                "threshold string",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1e999,"threshold_pct":1}}}"#,
+                "median infinite",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"box":{"median_ms":1,"threshold_pct":1},"box":{"median_ms":1,"threshold_pct":1}}}"#,
+                "duplicate",
+            ),
+            (
+                r#"{"loaded":true,"runs_per_case":10,"cases":{"a b":{"median_ms":1,"threshold_pct":1}}}"#,
+                "bad name",
+            ),
         ] {
             assert!(parse_baseline(bad).is_err(), "{why} must be refused");
         }
@@ -377,16 +513,40 @@ mod tests {
     #[test]
     fn bench_output_is_read_from_its_case_lines_and_bad_lines_fail() {
         let log = "job: run p\n   Compiling p\n{\"name\":\"box\",\"runs\":3,\"median_ms\":2.000,\"min_ms\":1}\nnoise\n{\"name\":\"cube\",\"runs\":3,\"median_ms\":1.5}\n";
-        assert_eq!(parse_bench(log).unwrap(), vec![("box".to_string(), 2.0), ("cube".to_string(), 1.5)]);
+        assert_eq!(
+            parse_bench(log).unwrap(),
+            vec![("box".to_string(), 2.0), ("cube".to_string(), 1.5)]
+        );
         assert!(parse_bench("nothing here\n").is_err(), "no case line");
-        assert!(parse_bench("{\"name\":\"box\",\"median_ms\":oops}\n").is_err(), "not JSON");
+        assert!(
+            parse_bench("{\"name\":\"box\",\"median_ms\":oops}\n").is_err(),
+            "not JSON"
+        );
         assert!(parse_bench("{\"name\":\"box\"}\n").is_err(), "no median");
-        assert!(parse_bench("{\"name\":\"box\",\"median_ms\":-1}\n").is_err(), "negative");
-        assert!(parse_bench("{\"name\":\"box\",\"median_ms\":1}\n{\"name\":\"box\",\"median_ms\":1}\n").is_err(), "twice");
+        assert!(
+            parse_bench("{\"name\":\"box\",\"median_ms\":-1}\n").is_err(),
+            "negative"
+        );
+        assert!(
+            parse_bench("{\"name\":\"box\",\"median_ms\":1}\n{\"name\":\"box\",\"median_ms\":1}\n")
+                .is_err(),
+            "twice"
+        );
     }
 
     fn base(cases: &[(&str, f64, f64)]) -> Baseline {
-        Baseline { loaded: true, runs_per_case: 3, cases: cases.iter().map(|(n, m, t)| Case { name: n.to_string(), median_ms: *m, threshold_pct: *t }).collect() }
+        Baseline {
+            loaded: true,
+            runs_per_case: 3,
+            cases: cases
+                .iter()
+                .map(|(n, m, t)| Case {
+                    name: n.to_string(),
+                    median_ms: *m,
+                    threshold_pct: *t,
+                })
+                .collect(),
+        }
     }
 
     fn run(cases: &[(&str, f64)]) -> Vec<(String, f64)> {
@@ -397,13 +557,28 @@ mod tests {
     fn each_case_is_judged_on_the_median_of_the_runs_against_its_own_threshold() {
         let b = base(&[("box", 1.0, 10.0), ("cube", 1.0, 20.0)]);
         // box: median of 1.05, 1.30, 1.08 = 1.08 (+8%, under 10%); cube: +15%, under 20%
-        let (ok, lines) = judge(&b, &[run(&[("box", 1.05), ("cube", 1.15)]), run(&[("box", 1.30), ("cube", 1.15)]), run(&[("box", 1.08), ("cube", 1.15)])]);
+        let (ok, lines) = judge(
+            &b,
+            &[
+                run(&[("box", 1.05), ("cube", 1.15)]),
+                run(&[("box", 1.30), ("cube", 1.15)]),
+                run(&[("box", 1.08), ("cube", 1.15)]),
+            ],
+        );
         assert!(ok, "{lines:?}");
-        assert!(lines[0].starts_with("box: baseline 1.000 ms, now 1.080 ms, change +8.0% (threshold 10%): ok"), "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "box: baseline 1.000 ms, now 1.080 ms, change +8.0% (threshold 10%): ok"
+            ),
+            "{lines:?}"
+        );
         // cube +15% is over box's 10% but under its own 20%; box +12% is over its 10%
         let (ok, lines) = judge(&b, &[run(&[("box", 1.12), ("cube", 1.15)])]);
         assert!(!ok);
-        assert!(lines[0].contains("+12.0%") && lines[0].contains("FAIL"), "{lines:?}");
+        assert!(
+            lines[0].contains("+12.0%") && lines[0].contains("FAIL"),
+            "{lines:?}"
+        );
         assert!(lines[1].ends_with(": ok"), "{lines:?}");
         // exactly at the threshold passes; faster passes
         assert!(judge(&b, &[run(&[("box", 1.1), ("cube", 0.5)])]).0);
@@ -421,15 +596,29 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_no_baseline_but_a_folder_or_bad_file_is_bad() {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-perf-{}", std::process::id()));
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scratch")
+            .join(format!("bs-perf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("dir-baseline.json")).unwrap();
-        assert!(matches!(find_baseline(&d.join("none-baseline.json")), Found::None));
-        assert!(matches!(find_baseline(&d.join("dir-baseline.json")), Found::Bad(_)), "a folder in its place is not 'no baseline'");
+        assert!(matches!(
+            find_baseline(&d.join("none-baseline.json")),
+            Found::None
+        ));
+        assert!(
+            matches!(find_baseline(&d.join("dir-baseline.json")), Found::Bad(_)),
+            "a folder in its place is not 'no baseline'"
+        );
         std::fs::write(d.join("bad-baseline.json"), "{not json").unwrap();
-        assert!(matches!(find_baseline(&d.join("bad-baseline.json")), Found::Bad(_)));
+        assert!(matches!(
+            find_baseline(&d.join("bad-baseline.json")),
+            Found::Bad(_)
+        ));
         std::fs::write(d.join("ok-baseline.json"), REAL).unwrap();
-        assert!(matches!(find_baseline(&d.join("ok-baseline.json")), Found::Some(_)));
+        assert!(matches!(
+            find_baseline(&d.join("ok-baseline.json")),
+            Found::Some(_)
+        ));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
