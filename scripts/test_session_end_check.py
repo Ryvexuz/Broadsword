@@ -104,6 +104,20 @@ class Tests(Case):
         self.assertEqual(code, 0, out)
         self.assertIn("main_provenance: SKIPPED  not installed", self.line(out, "main_provenance"))
 
+    def test_summary_names_skipped_gates(self):
+        os.remove(os.path.join(self.root, "scripts", "main_provenance.py"))
+        self.child("shadow_report", GOOD)
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.splitlines()[-1], "session-end: ok (2 skipped: shadow_report, main_provenance)")
+
+    def test_summary_failing_and_skipped(self):
+        os.remove(os.path.join(self.root, "scripts", "main_provenance.py"))
+        self.child("ledger_check", "import sys\nsys.exit(1)\n")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1, out)
+        self.assertEqual(out.splitlines()[-1], "session-end: 1 failing, 1 skipped")
+
     def test_shadow_report_without_open_flag_is_skipped(self):
         self.child("shadow_report", GOOD)
         code, out, _ = self.run_check()

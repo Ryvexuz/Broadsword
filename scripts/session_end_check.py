@@ -9,7 +9,7 @@ Gates, in order, one line each: `<name>: ok | FAIL | SKIPPED  <reason>`
   5. records_updated    PROGRESS.md and LAB_LOG.md changed since --since (committed: commit time; uncommitted: file mtime)
   6. stale_tasks        no `running` task whose worktree had no commit and no job for longer than --stale-hours
 A child script that is missing is SKIPPED (not installed). shadow_report.py without an `--open` flag counts as not installed
-too. A child that crashes, times out or cannot be started is FAIL. Last line: `session-end: ok` or `session-end: N failing`.
+too. A child that crashes, times out or cannot be started is FAIL. Last line: `session-end: ok`, `session-end: ok (N skipped: names)` or `session-end: N failing[, M skipped]`.
 Exit 0 when nothing fails (SKIPPED does not fail), 1 otherwise, 2 for bad arguments.
 
 Needs from the caller: --since (session start, UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS][Z]), --timeout-seconds (per child),
@@ -252,7 +252,13 @@ def main(argv=None):
         for d in detail:
             print(f"    {d}")
     failing = sum(1 for r in results if r[1] == FAIL)
-    print("session-end: ok" if not failing else f"session-end: {failing} failing")
+    skipped = [r[0] for r in results if r[1] == SKIPPED]
+    if failing:
+        print(f"session-end: {failing} failing" + (f", {len(skipped)} skipped" if skipped else ""))
+    elif skipped:
+        print(f"session-end: ok ({len(skipped)} skipped: {', '.join(skipped)})")
+    else:
+        print("session-end: ok")
     return 1 if failing else 0
 
 
