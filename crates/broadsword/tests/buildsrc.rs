@@ -120,6 +120,11 @@ impl Root {
         fs::read_to_string(self.dir.join("state/build-sources/markprobe")).ok().map(|s| s.trim().to_string())
     }
 
+    /// The note of the binary target `markprobe` (state/build-sources/bin.markprobe).
+    fn bin_note(&self) -> Option<String> {
+        fs::read_to_string(self.dir.join("state/build-sources/bin.markprobe")).ok().map(|s| s.trim().to_string())
+    }
+
     fn job_records(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = fs::read_dir(self.dir.join("state/jobs")).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
         v.sort();
@@ -204,6 +209,43 @@ fn task_builds_the_worktrees_code_and_main_afterwards_is_not_stale() {
     // building the same source twice in a row cleans nothing
     let o = r.ok(&["build", "proj"]);
     assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
+}
+
+/// Finding 39: a worktree that renames the package but keeps the bin name builds over the same exe. The package note of
+/// `markprobe` still says main built it, so only a note per bin target can tell main's next build (and `install`, which reads
+/// the same notes: unit test `install_refuses_when_another_package_built_the_same_bin_name`) that the exe in the shared
+/// folder is not main's. On the code before the fix (46d6bbb) main's next build cleaned nothing (this test failed at the
+/// `cleaned` assertion; cargo itself re-linked main's exe there, so the probe was already right) and no bin note existed.
+#[test]
+fn a_renamed_package_with_the_same_bin_name_does_not_leave_its_exe_vouched_for_main() {
+    let r = Root::new("binname", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("source: projects/proj\n"), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-main");
+
+    // the worktree: package `markprobe-wt`, but the same library and binary names
+    let wt = r.worktree(&t1);
+    let manifest = "[package]\nname = \"markprobe-wt\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\nname = \"markprobe\"\n\n[[bin]]\nname = \"markprobe\"\npath = \"src/main.rs\"\n\n[workspace]\n";
+    fs::write(wt.join("Cargo.toml"), manifest).unwrap();
+    let source = format!("worktrees/proj/{t1}");
+    let o = r.ok(&["build", "proj", "--task", &t1]);
+    assert!(o.stdout.contains(&format!("source: {source} (task {t1})")), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-t1", "the worktree's package overwrote the exe of the same name");
+    assert_eq!(r.note().as_deref(), Some("projects/proj"), "the package note is still main's: this is the hole");
+
+    // main again: its package note is fresh, but the exe is not its own, so it is cleaned and rebuilt
+    let o = r.ok(&["build", "proj"]);
+    assert_eq!(r.probe(), "MARK-main", "main's build must give main's binary, not the renamed package's\n{}", o.stdout);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains(&format!("last built from {source}")), "{}", o.stdout);
+    assert_eq!(r.bin_note().as_deref(), Some("projects/proj"), "the bin note names main's folder again");
+    // and a second build of the same source cleans nothing
+    let o = r.ok(&["build", "proj"]);
+    assert!(!o.stdout.contains("cleaned"), "{}", o.stdout);
+
+    // the worktree once more: its build leaves a bin note that names the worktree, which is what `install` reads
+    r.ok(&["build", "proj", "--task", &t1]);
+    assert_eq!(r.bin_note().as_deref(), Some(source.as_str()), "the bin note names the folder that built the exe");
 }
 
 #[test]

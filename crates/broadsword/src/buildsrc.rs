@@ -28,6 +28,14 @@
 //! folder, and runs the tests from those copies: job.rs; a `run` keeps it to the end). Without it, job 2 could read the note, decide no clean is needed, and then job 1 would build its
 //! own source over the folder before job 2's cargo step runs.
 //!
+//! Binary targets: a package note alone cannot say whose exe is in the build folder, because two packages can build the same
+//! bin name (a worktree renames the package but keeps `[[bin]] name = "broadsword"`: its build overwrites `broadsword.exe`
+//! while main's package note stays valid). So `state/build-sources/bin.<name>` notes each bin target too (a package name has
+//! no `.`, so the names never collide). A package is stale when its own note or any of its bin notes names another folder, is
+//! missing or is a `run:` note, and `install` refuses when the bin note for `broadsword` names anything but the main checkout.
+//! Limit: a missing bin note is accepted by `install` (builds from before bin notes existed left none; every build since
+//! writes one), and a bin note is read and cleaned only through a package of the folder being built.
+//!
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
 //! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
 //!
@@ -81,7 +89,25 @@ pub fn read_note(cfg: &Config, package: &str) -> Option<String> {
     if !valid_package(package) {
         return None;
     }
-    let text = std::fs::read_to_string(notes_dir(cfg).join(package)).ok()?;
+    read_file_note(cfg, package)
+}
+
+/// The note file name of a binary target: `bin.<name>`. A package name has no `.`, so it never collides with a package note.
+fn bin_note_file(bin: &str) -> String {
+    format!("bin.{bin}")
+}
+
+/// The recorded source of the binary target `bin` (the exe `<build_dir>/debug/<bin>`), `None` if there is no (readable) note.
+/// Two packages can build the same bin name, so the package note alone does not say whose exe is in the build folder.
+pub fn read_bin_note(cfg: &Config, bin: &str) -> Option<String> {
+    if !valid_package(bin) {
+        return None;
+    }
+    read_file_note(cfg, &bin_note_file(bin))
+}
+
+fn read_file_note(cfg: &Config, file: &str) -> Option<String> {
+    let text = std::fs::read_to_string(notes_dir(cfg).join(file)).ok()?;
     let line = text.lines().next()?.trim().to_string();
     (!line.is_empty()).then_some(line)
 }
@@ -92,9 +118,21 @@ pub fn write_note(cfg: &Config, package: &str, source: &str) -> Result<(), Strin
     if !valid_package(package) {
         return Err(format!("`{package}` is not a valid package name"));
     }
+    write_file_note(cfg, package, source)
+}
+
+/// Record `source` as the last builder of the binary target `bin`, the same atomic way as `write_note`.
+pub fn write_bin_note(cfg: &Config, bin: &str, source: &str) -> Result<(), String> {
+    if !valid_package(bin) {
+        return Err(format!("`{bin}` is not a valid binary target name"));
+    }
+    write_file_note(cfg, &bin_note_file(bin), source)
+}
+
+fn write_file_note(cfg: &Config, file: &str, source: &str) -> Result<(), String> {
     let dir = notes_dir(cfg);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let (path, tmp) = (dir.join(package), dir.join(format!("{package}.tmp")));
+    let (path, tmp) = (dir.join(file), dir.join(format!("{file}.tmp")));
     let write = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, format!("{source}\n").as_bytes())?;
@@ -148,6 +186,43 @@ pub fn parse_packages(metadata: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// The binary targets (kind `bin`) of each package in `cargo metadata` output: (package, its bin names), in package order. A
+/// bin name is held to the same plain-name rule as a package name (it becomes a note file name). The package list itself is
+/// checked by `parse_packages` first (plain names, at least one), so both readers agree on which packages there are.
+pub fn parse_bins(metadata: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let names = parse_packages(metadata)?;
+    let j = json::parse(metadata).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let Some(json::J::Arr(pkgs)) = j.get("packages") else {
+        return Err("cargo metadata output: `packages` is not a list".into());
+    };
+    let mut out: Vec<(String, Vec<String>)> = names.into_iter().map(|n| (n, Vec::new())).collect();
+    for p in pkgs {
+        let n = p.get("name").and_then(json::J::str).ok_or("cargo metadata output: a package has no name")?;
+        // cargo always lists a package's targets; without them its bins cannot be noted, so that is an error (fail closed)
+        let Some(json::J::Arr(targets)) = p.get("targets") else {
+            return Err(format!("cargo metadata output: package `{n}` has no `targets` list"));
+        };
+        let bins = &mut out.iter_mut().find(|(name, _)| name == n).ok_or("cargo metadata output: a package changed between reads")?.1;
+        for t in targets {
+            let is_bin = match t.get("kind") {
+                Some(json::J::Arr(k)) => k.iter().any(|x| x.str() == Some("bin")),
+                _ => return Err(format!("cargo metadata output: a target of `{n}` has no `kind` list")),
+            };
+            if !is_bin {
+                continue;
+            }
+            let b = t.get("name").and_then(json::J::str).ok_or_else(|| format!("cargo metadata output: a binary target of `{n}` has no name"))?;
+            if !valid_package(b) {
+                return Err(format!("cargo metadata gave the binary target name `{b}` (package `{n}`), which is not a plain cargo name; refusing to use it in a file name"));
+            }
+            if !bins.iter().any(|x| x == b) {
+                bins.push(b.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// THE one place this module (and job.rs's test step) starts a cargo child, so every such child gets the scrubbed environment
 /// (`scrub::apply`: no secret-named variable, nothing holding a `.env` value) before the caller adds its own variables.
 pub fn cargo(cfg: &Config) -> Command {
@@ -170,9 +245,9 @@ pub fn metadata_json(cfg: &Config, dir: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The package names of the folder about to be built (from `metadata_json`).
-pub fn packages_of(cfg: &Config, dir: &Path) -> Result<Vec<String>, String> {
-    parse_packages(&metadata_json(cfg, dir)?)
+/// The packages of the folder about to be built with their binary targets (from `metadata_json`, see `parse_bins`).
+pub fn bins_of(cfg: &Config, dir: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
+    parse_bins(&metadata_json(cfg, dir)?)
 }
 
 // ---- cleaning ---------------------------------------------------------------------------
@@ -236,7 +311,7 @@ pub struct Prepared {
 /// needs no clean; it is rewritten to plain `source`, because the cargo step that follows rebuilds what is out of date and
 /// vouches for it. The caller holds the build lock. Err = nothing may be built (the message says why and what to do).
 pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, String> {
-    prepare_packages(cfg, dir, source, packages_of(cfg, dir)?, false)
+    prepare_packages(cfg, dir, source, bins_of(cfg, dir)?, false)
 }
 
 /// The preparation a `run` job makes before its command (the command may be `cargo test`, which would otherwise test the
@@ -247,7 +322,7 @@ pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, Strin
 /// Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped. A `cargo clean`
 /// that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
 pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
-    match packages_of(cfg, dir) {
+    match bins_of(cfg, dir) {
         Ok(packages) => Ok(prepare_packages(cfg, dir, source, packages, true)?.lines),
         Err(e) => {
             // The packages cannot be listed (a broken Cargo.toml the command may be there to repair), but whatever the command
@@ -256,6 +331,10 @@ pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<Str
             let (names, complete) = manifest_package_names(dir);
             for n in &names {
                 write_note(cfg, n, &wanted)?;
+                // a package's default binary carries the package's name (its `[[bin]]` names cannot be read here; a renamed
+                // bin is still covered for `install` by the folder marker when the list is incomplete, and by nothing when
+                // it is complete: a limit, since cargo cannot build a manifest it cannot read)
+                write_bin_note(cfg, n, &wanted)?;
             }
             if !complete {
                 write_unlisted_marker(cfg, source)?;
@@ -417,19 +496,34 @@ fn manifest_package_names(dir: &Path) -> (Vec<String>, bool) {
     (names, complete)
 }
 
-fn prepare_packages(cfg: &Config, dir: &Path, source: &str, packages: Vec<String>, as_run: bool) -> Result<Prepared, String> {
-    let notes: Vec<(String, Option<String>)> = packages.iter().map(|p| (p.clone(), read_note(cfg, p))).collect();
+/// Packages are noted by name AND by each binary target's name (`bin.<name>` notes): two packages can build the same exe
+/// name (a renamed package with `[[bin]] name = "broadsword"`), the later build overwrites the exe, and the package note of
+/// the first stays valid. A package is stale when its own note OR any of its bin notes differs from it (another folder, a
+/// `run:` note, or missing), and cleaning it (`cargo clean -p`, which removes the exes of ITS bin targets) is what removes a
+/// same-named exe another package left. Every note of a cleaned package, bins included, is then written before the build.
+fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String, Vec<String>)>, as_run: bool) -> Result<Prepared, String> {
+    let packages: Vec<String> = targets.iter().map(|(p, _)| p.clone()).collect();
+    let bins_of_pkg = |p: &str| -> &[String] { targets.iter().find(|(n, _)| n == p).map(|(_, b)| b.as_slice()).unwrap_or(&[]) };
     // A plain build also cleans a package whose note is `run:<this folder>` (the run may have replaced the built exe while
     // cargo's fingerprint stays fresh), and every package of the folder when a run in THIS folder left a folder marker (only
     // that folder's marker is removed, and only after every package here is cleaned).
     let marker = marker_file(cfg, source);
     let marked = !as_run && marker.exists();
-    let stale: Vec<(String, Option<String>)> = notes
+    let is_stale = |n: &Option<String>| -> bool {
+        n.as_deref().map(note_folder) != Some(source) || (!as_run && (marked || n.as_deref().is_some_and(|x| x.starts_with(RUN_NOTE_PREFIX))))
+    };
+    // the note that decides a package's staleness, and the one its `cleaned` line names: its own note when that is stale,
+    // else the first of its bin notes that is stale (another folder, a `run:` note where a plain build needs a clean, or
+    // missing), else its own note
+    let stale: Vec<(String, Option<String>)> = packages
         .iter()
-        .filter(|(_, n)| {
-            n.as_deref().map(note_folder) != Some(source) || (!as_run && (marked || n.as_deref().is_some_and(|x| x.starts_with(RUN_NOTE_PREFIX))))
+        .filter_map(|p| {
+            let own = read_note(cfg, p);
+            if is_stale(&own) {
+                return Some((p.clone(), own));
+            }
+            bins_of_pkg(p).iter().map(|b| read_bin_note(cfg, b)).find(|n| is_stale(n)).map(|n| (p.clone(), n))
         })
-        .cloned()
         .collect();
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
@@ -445,6 +539,9 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
             ));
         }
         write_note(cfg, p, &wanted)?;
+        for b in bins_of_pkg(p) {
+            write_bin_note(cfg, b, &wanted)?;
+        }
         lines.push(match was {
             Some(w) if w.starts_with(RUN_NOTE_PREFIX) && note_folder(w) == source => format!("cleaned `{p}` in the shared build folder (a `run` in this folder may have replaced its binary); its dependencies were kept"),
             Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {}); its other packages and all dependencies were kept", note_folder(w)),
@@ -454,10 +551,17 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
     if marked {
         std::fs::remove_file(&marker).map_err(|e| format!("cannot remove the build-source marker {}: {e}", marker.display()))?;
     }
-    // same folder: no clean; only the note's kind may change (run -> vouched by a build step, or a build -> run)
-    for (p, was) in &notes {
-        if was.as_deref().map(note_folder) == Some(source) && was.as_deref() != Some(wanted.as_str()) {
+    // same folder: no clean; only the note's kind may change (run -> vouched by a build step, or a build -> run), for the
+    // package note and each bin note alike (read again: a cleaned package's notes are already `wanted`)
+    let same_kind_only = |was: Option<String>| was.as_deref().map(note_folder) == Some(source) && was.as_deref() != Some(wanted.as_str());
+    for p in &packages {
+        if same_kind_only(read_note(cfg, p)) {
             write_note(cfg, p, &wanted)?;
+        }
+        for b in bins_of_pkg(p) {
+            if same_kind_only(read_bin_note(cfg, b)) {
+                write_bin_note(cfg, b, &wanted)?;
+            }
         }
     }
     Ok(Prepared { lines })
@@ -476,6 +580,24 @@ pub fn check_installable(cfg: &Config) -> Result<(), String> {
             "refusing to install: a `run` whose packages could not be listed left a folder marker for {} (in {}), so the `{pkg}` binary in the build folder may be its. Install stays refused while ANY such marker exists; a plain build, test or check of that same folder removes its marker, so repeat that for each folder named, then build the main checkout (`broadsword build {pkg}`, with no --task) and run `install` from the binary it built",
             folders.join(", "),
             unlisted_dir(cfg).display()
+        ));
+    }
+    // The package note says which checkout built the package; the bin note says whose exe is in the build folder (another
+    // package can build the same bin name over it). A missing bin note is accepted: builds from before bin notes existed
+    // left none, and every build since writes one for every bin target it builds. A bin note that exists but cannot be read
+    // (or is empty) is refused: something wrote it and nothing says what.
+    let bin_file = notes_dir(cfg).join(bin_note_file(pkg));
+    let bin_note = read_bin_note(cfg, pkg);
+    let bin_note_absent = matches!(std::fs::symlink_metadata(&bin_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    if bin_note.is_none() && !bin_note_absent {
+        return Err(format!(
+            "refusing to install: the binary-target note {} exists but cannot be read or is empty, so nothing says which checkout built the `{pkg}` exe in the build folder. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built",
+            bin_file.display()
+        ));
+    }
+    if let Some(other) = bin_note.filter(|s| s != MAIN_SOURCE) {
+        return Err(format!(
+            "refusing to install: the binary target `{pkg}` in the build folder was last built from `{other}` (a package of that folder builds a binary with this name), not from the main checkout. Its package note may still say the main checkout built the package, but the exe `{pkg}` is not the main checkout's. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
         ));
     }
     match read_note(cfg, pkg) {
@@ -706,6 +828,66 @@ mod tests {
         std::fs::remove_file(marker_file(&cfg, ".")).unwrap();
         assert!(check_installable(&cfg).is_err(), "a marker for another folder still refuses");
         std::fs::remove_file(marker_file(&cfg, "worktrees/p/t-1")).unwrap();
+        assert!(check_installable(&cfg).is_ok());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bin_targets_are_read_from_cargo_metadata() {
+        let m = r#"{"packages":[{"name":"a","targets":[{"kind":["lib"],"name":"a"},{"kind":["bin"],"name":"tool"},{"kind":["test"],"name":"t"},{"kind":["bin"],"name":"tool"}]},{"name":"b","targets":[]}],"version":1}"#;
+        assert_eq!(parse_bins(m).unwrap(), [("a".to_string(), vec!["tool".to_string()]), ("b".to_string(), vec![])]);
+        for bad in [
+            r#"{"packages":[{"name":"a","targets":[{"kind":["bin"],"name":"x/y"}]}]}"#,
+            r#"{"packages":[{"name":"a","targets":[{"kind":["bin"],"name":"x.y"}]}]}"#,
+            r#"{"packages":[{"name":"a","targets":[{"kind":["bin"]}]}]}"#,
+            r#"{"packages":[{"name":"a","targets":[{"name":"t"}]}]}"#,
+            r#"{"packages":[{"name":"a","targets":3}]}"#,
+            r#"{"packages":[{"name":"a"}]}"#,
+            r#"{"packages":[]}"#,
+            "{}",
+            "nope",
+        ] {
+            assert!(parse_bins(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bin_notes_are_their_own_files_and_never_a_package_note() {
+        let d = tmp("binnote");
+        let mut cfg = cfg_at(&d);
+        cfg.state_dir = d.join("state");
+        assert_eq!(read_bin_note(&cfg, "tool"), None);
+        write_bin_note(&cfg, "tool", "worktrees/p/t-1").unwrap();
+        assert_eq!(read_bin_note(&cfg, "tool").as_deref(), Some("worktrees/p/t-1"));
+        assert!(notes_dir(&cfg).join("bin.tool").is_file() && !notes_dir(&cfg).join("bin.tool.tmp").exists());
+        assert_eq!(read_note(&cfg, "tool"), None, "a bin note is not the package note of the same name");
+        assert_eq!(read_note(&cfg, "bin.tool"), None, "and no package name reaches it");
+        assert!(write_bin_note(&cfg, "../x", ".").is_err());
+        assert_eq!(read_bin_note(&cfg, "a b"), None);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Finding 39: the package note says main built `broadsword`, but a worktree package of another name built a bin called
+    /// `broadsword` over it. Install must look at the bin note too.
+    #[test]
+    fn install_refuses_when_another_package_built_the_same_bin_name() {
+        let d = tmp("instbin");
+        let mut cfg = cfg_at(&d);
+        cfg.state_dir = d.join("state");
+        let pkg = env!("CARGO_PKG_NAME");
+        write_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        assert!(check_installable(&cfg).is_ok(), "a main package note and no bin note (an older build): accepted");
+        write_bin_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        assert!(check_installable(&cfg).is_ok());
+        write_bin_note(&cfg, pkg, "worktrees/broadsword/t-1").unwrap();
+        let e = check_installable(&cfg).unwrap_err();
+        assert!(e.contains("binary target") && e.contains("worktrees/broadsword/t-1"), "{e}");
+        write_bin_note(&cfg, pkg, "run:.").unwrap();
+        assert!(check_installable(&cfg).is_err(), "a run note on the bin refuses too");
+        std::fs::write(notes_dir(&cfg).join(format!("bin.{pkg}")), "\n").unwrap();
+        let e = check_installable(&cfg).unwrap_err();
+        assert!(e.contains("cannot be read or is empty"), "an empty bin note refuses: {e}");
+        write_bin_note(&cfg, pkg, MAIN_SOURCE).unwrap();
         assert!(check_installable(&cfg).is_ok());
         std::fs::remove_dir_all(&d).unwrap();
     }
