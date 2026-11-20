@@ -17,7 +17,7 @@ Your task comes with three things: what to build, the files or folders you may c
 - Every new setting is a required key in `broadsword.toml`: never fall back to a default in code when a key is missing. Add the key to the real `broadsword.toml` and to every test config.
 - Before reusing reviewed code, read its known limitations (in `evidence/`) and check they're acceptable for the new use.
 - Run targeted tests as you go. Fix the cause of a failure. Never stub, fake or skip something to make a test pass; if you can't make it work, say so.
-- Before reporting done, run the self-check in the coder prompt (self-review against the reviewer's rubric, broadsword check, clippy, fmt --check) and paste the results. Work that skips it is not done.
+- Before you commit for the queue, run the self-check in the coder prompt: the self-review against the reviewer's rubric for every task, and `broadsword check`, clippy and `fmt --check` for Rust tasks. Paste the results; work that skips the parts that apply to it is not done.
 - Commit to your branch as you go. Do not merge; the orchestrator owns merging.
 - Never pipe a `broadsword` command into `head`, `tail`, `grep` or anything else; redirect long output to a file in the scratch folder. If a job is refused because another job was interrupted, stop and report it; never run `recover` on a job you didn't start.
 - Ideas outside the task go back to the orchestrator for `IDEAS.md`, not into code.
