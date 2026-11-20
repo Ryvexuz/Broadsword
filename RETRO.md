@@ -178,6 +178,17 @@ Written from `state/pc-progress.md`, the queue and board listings and `git log`.
 4. Check `max_queued` against the train: if active coders stay low while ready work waits, say why before raising anything.
 5. Make queue priority enforced by queue order (a follow-up task is not yet boarded).
 
+### Still open from the 2026-11-19 carry list
+
+Every item of the 2026-11-19 "Carry into the next milestone" list (Stage 4 v1 close entry below), with its status checked against main on 2026-11-20:
+
+1. Re-run `scripts/shadow_canary.py` after every codex update, enforced in the wrapper or queue: **NOT YET IN FORCE** (only the script, its test and `clients/openai_review.py` mention it; nothing runs it automatically).
+2. A direct commit to main runs the full check first: **NOT YET IN FORCE** (no hook in `.git/hooks`, no wrapper script; a habit only).
+3. `templates/coder-prompt.md`: never wrap a script that itself calls broadsword in `broadsword run`: **NOT YET IN FORCE** (grep of the file finds no such line).
+4. SPEC_CHECKLIST: a done check that names a window or visible result needs an on-screen capture saved in evidence: **NOT YET IN FORCE** (no such line in `SPEC_CHECKLIST.md`).
+5. Scale-up: max_agents 14, then +4 per step on merges/h, failures and RAM/swap: **done to step 1** (`max_agents = 14` in `broadsword.toml`); the next step to 18 is **open**. tp3 (build lock covers compiling only): not re-checked here.
+6. File the 8 SERIOUS audit findings as tasks: **open** (a grep of `task list` finds none); Lazlo's decision on the two direct commits (f4123a1, render 4184930): **done** (`docs/direct-merges.txt` rows 25 and 26 record his approval of 2026-11-19).
+
 ---
 
 ## Stage 4 v1 close: audit, two blockers fixed, model routing, scale-up test (2026-11-19, PC session)
