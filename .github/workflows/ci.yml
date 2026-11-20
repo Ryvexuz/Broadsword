@@ -1,0 +1,20 @@
+# CI for the Broadsword crate (roadmap node 0.1). scripts/check_ci_workflow.py checks this file against docs/nodes/0.1.md.
+# No secrets, no deploy steps; the only third-party action is actions/checkout, pinned to a full commit SHA.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build
+        run: cargo build --locked -p broadsword
+      - name: Test
+        run: cargo test --locked -p broadsword
