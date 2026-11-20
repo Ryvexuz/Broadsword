@@ -448,11 +448,22 @@ brief's measurements of 2026-11-20 02:02Z: 295 MB for 38,626 Rust lines = 7.6 KB
 | --- | --- | --- | --- |
 | Managed, low | 395.1 + build 70e6 x 2.7 KB = 189 GB + worktrees 81 GB + state 4.3 GB | 669.4 GB (ESTIMATE) | 1,297.1 GB (66.0%): above the line |
 | Managed, high | 395.1 + build 125e6 x 3.8 KB = 475 GB + worktrees 81 GB + state 32 GB | 983.1 GB (ESTIMATE) | 983.4 GB (50.0%): above the line |
-| Build output as measured today, no levers | 395.1 + 125e6 x 25.8 KB = 3,225 GB | 3,620 GB (ESTIMATE) | does not fit on C: at all |
+| Unmanaged, low (re-measured 7.6 KB/line, no levers) | 395.1 + build 70e6 x 7.6 KB = 532 GB + worktrees 81 GB + state 4.3 GB | 1,012.4 GB (ESTIMATE) | 954.1 GB (48.5%): above the line |
+| Unmanaged, high (re-measured 7.6 KB/line, no levers) | 395.1 + build 125e6 x 7.6 KB = 950 GB + worktrees 81 GB + state 32 GB | 1,458.1 GB (ESTIMATE) | 508.4 GB (25.9%): above the line, with 508.4 - 393.3 = 115.1 GB to spare |
+| Stale figure, for reference only (25.8 KB/line, line 409; it included output from before cleanup) | 395.1 + build 125e6 x 25.8 KB = 3,225 GB + worktrees 81 GB + state 32 GB | 3,733.1 GB (ESTIMATE) | does not fit on C: at all |
 
-So with the levers in section 8 the 20% line is probably not reached even at 125M lines, and the external drive is
-insurance plus a home for data that is large but rarely read. Without them, a single unmanaged build folder crosses the
-line at (1,571.4 - 393.3) GB / 25.8 KB = 1,178.1e9 / 25.8e3 = 45.7M lines (ESTIMATE, linear extrapolation).
+Both numbers the brief asks for, with the arithmetic. **Unmanaged build output** (everything built into one folder, no
+levers): at the old 25.8 KB per line (848 MB / 32,914 lines, line 409, which counted stale output from before cleanup) it
+is 70e6 x 25.8 KB = 1.81 TB to 125e6 x 25.8 KB = 3.22 TB. At the re-measured 7.6 KB per line it is 70e6 x 7.6 KB = 0.53 TB
+to 125e6 x 7.6 KB = 0.95 TB. The 7.6 KB figure is today's; the 25.8 KB one is not. **Managed** (the levers): 70e6 x 2.7 KB =
+0.19 TB to 125e6 x 3.8 KB = 0.48 TB of build output, about 0.1-0.5 TB hot (see the rounding note below).
+
+So even with no levers the 20% line is probably not reached at 125M lines (508.4 GB free in the high row), and the external
+drive is insurance plus a home for data that is large but rarely read; the levers widen the margin. Without them, a single
+unmanaged build folder crosses the line at (1,571.4 - 393.3) GB / 7.6 KB = 1,178.1e9 / 7.6e3 = 155.0M lines (ESTIMATE,
+linear extrapolation, build folder alone). With worktrees and state at the high figures (81 + 32 = 113 GB) it crosses at
+(1,178.1 - 113) GB / 7.6 KB = 1,065.1e9 / 7.6e3 = 140.1M lines. Both are beyond the 70-125M lines range, so on today's
+measure the answer to "could it really get to 3 TB?" is no; it could at the stale 25.8 KB per line, which is not today's.
 The managed figure "about 0.1-0.5 TB hot" in the brief is these rows rounded outward (0.19-0.48 TB from the per-line
 arithmetic); its 0.1 TB low end additionally assumes affected-only builds keep about half of the 0.19 TB hot, which is an
 assumption.
