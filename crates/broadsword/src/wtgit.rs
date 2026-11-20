@@ -71,10 +71,41 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// `git rev-parse HEAD`: the commit at the tip of the checked-out branch, resolved fresh. Why: it is the base of the new
-/// task branch, so a task never starts from a stale commit.
+/// `git rev-parse HEAD`: the commit at the tip of the checked-out branch, resolved fresh. Why: the merge queue fast-forwards
+/// the checked-out branch. NOT the task base or the "merged" test: those use the trunk (`trunk_branch`).
 pub fn head_commit(dir: &Path) -> Result<String, String> {
     ok(dir, &["rev-parse", "HEAD"])
+}
+
+/// The branch names a project's trunk may have. The trunk is the one of these that exists in the project's repo.
+pub const TRUNK_NAMES: [&str; 2] = ["main", "master"];
+
+/// THE RULE for a project's trunk (the branch tasks start from and are merged into): of the local branches `main` and
+/// `master`, the ONE that exists (`git show-ref --verify --quiet refs/heads/<name>` for each). It never depends on what the
+/// main checkout has checked out, so a feature branch checked out there can neither be a task's base nor make a branch look
+/// merged. Both or neither existing is an error naming both (no guess, no fallback to HEAD). Why: Broadsword's root and
+/// crash-sim use `main`, render uses `master`, and none has both.
+pub fn trunk_branch(dir: &Path) -> Result<String, String> {
+    let mut found = Vec::new();
+    for name in TRUNK_NAMES {
+        if branch_exists(dir, name)? {
+            found.push(name);
+        }
+    }
+    match found.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => Err(format!("the project at {} has neither `main` nor `master`; Broadsword bases tasks on and merges into the one of those two branches that exists, and does not fall back to HEAD. Create or rename the trunk branch (`git branch -m <old name> main`), then retry", dir.display())),
+        _ => Err(format!("the project at {} has both `main` and `master`, so its trunk cannot be told; Broadsword does not guess. Merge one into the other and delete or rename the one that is not the trunk, then retry", dir.display())),
+    }
+}
+
+/// `git rev-parse --verify refs/heads/<trunk>`: the commit at the tip of the trunk (`trunk_branch`), resolved fresh, with
+/// the trunk's name. Why: it is the base of a new task branch, so a task never starts from a stale commit or from whatever
+/// branch is checked out.
+pub fn trunk_commit(dir: &Path) -> Result<(String, String), String> {
+    let trunk = trunk_branch(dir)?;
+    let tip = branch_tip(dir, &trunk)?;
+    Ok((trunk, tip))
 }
 
 /// `git show-ref --verify --quiet refs/heads/<branch>`: does the local branch exist (exit 0) or not (exit 1)? Why: refuse to
@@ -181,14 +212,17 @@ pub fn is_worktree_of(project_dir: &Path, path: &Path) -> bool {
     }
 }
 
-/// `git merge-base --is-ancestor <commit> HEAD`: is the commit already part of the main checkout's current branch (exit 0)
-/// or not (exit 1)? Why: "merged" means the branch tip is reachable from where the project is now.
-pub fn is_merged_into_head(main_dir: &Path, commit_or_branch: &str) -> Result<bool, String> {
-    let o = run(main_dir, &["merge-base", "--is-ancestor", commit_or_branch, "HEAD"])?;
+/// `git merge-base --is-ancestor <commit> refs/heads/<trunk>`: is the commit already part of the project's trunk
+/// (`trunk_branch`; exit 0) or not (exit 1)? Returns the answer with the trunk's name. Why: "merged" means the branch tip is
+/// reachable from the trunk, not from whatever branch the main checkout has checked out. A trunk that cannot be told is an error.
+pub fn is_merged_into_trunk(main_dir: &Path, commit_or_branch: &str) -> Result<(bool, String), String> {
+    let trunk = trunk_branch(main_dir)?;
+    let r = format!("refs/heads/{trunk}");
+    let o = run(main_dir, &["merge-base", "--is-ancestor", commit_or_branch, &r])?;
     match o.code {
-        0 => Ok(true),
-        1 => Ok(false),
-        _ => Err(format!("git merge-base --is-ancestor {commit_or_branch} HEAD failed: {}", o.stderr)),
+        0 => Ok((true, trunk)),
+        1 => Ok((false, trunk)),
+        _ => Err(format!("git merge-base --is-ancestor {commit_or_branch} {r} failed: {}", o.stderr)),
     }
 }
 

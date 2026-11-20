@@ -50,6 +50,11 @@ struct Root {
 
 impl Root {
     fn new(name: &str) -> Root {
+        Root::with_trunk(name, "main")
+    }
+
+    /// Same, with project `p`'s first commit on a branch named `trunk` (`main` or `master`).
+    fn with_trunk(name: &str, trunk: &str) -> Root {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("wt-{name}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -63,7 +68,7 @@ impl Root {
         }
         let p = dir.join("projects/p");
         fs::write(p.join("a.txt"), "one\n").unwrap();
-        git(&p, &["init", "-q", "-b", "main"]);
+        git(&p, &["init", "-q", "-b", trunk]);
         git(&p, &["add", "."]);
         git(&p, &["commit", "-q", "-m", "first"]);
         let toml = support::config(&[("mcp_call_timeout_seconds", "600")]);
@@ -198,16 +203,26 @@ fn a_failed_worktree_rolls_the_task_back_to_open_with_no_half_state() {
     assert!(o.stderr.contains("not a Git repo") && o.stderr.contains("is still `open`"), "{}", o.stderr);
     assert_eq!(r.status_of(&q), "open");
 
-    // 3. the main checkout is on a detached HEAD
-    git(&r.p(), &["checkout", "-q", "--detach"]);
+    // 3. the trunk cannot be told: both `main` and `master` exist (refused, no guess and no fallback to HEAD)
+    git(&r.p(), &["branch", "master"]);
     let d = r.add("p", "docs");
     let o = r.run(&["task", "start", &d, "--owner", "c", "--worktree"]);
-    assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("detached"), "{}", o.stderr);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    assert!(o.stderr.contains("both `main` and `master`") && o.stderr.contains("is still `open`"), "{}", o.stderr);
     assert_eq!(r.status_of(&d), "open");
+    assert!(!r.branches().iter().any(|b| b == &format!("task/{d}")), "no branch made: {:?}", r.branches());
+    git(&r.p(), &["branch", "-d", "master"]);
+
+    // 3b. neither `main` nor `master` exists (the trunk was renamed): refused too
+    git(&r.p(), &["branch", "-m", "main", "trunk"]);
+    let o = r.run(&["task", "start", &d, "--owner", "c", "--worktree"]);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    assert!(o.stderr.contains("neither `main` nor `master`") && o.stderr.contains("is still `open`"), "{}", o.stderr);
+    assert_eq!(r.status_of(&d), "open");
+    assert!(!r.branches().iter().any(|b| b == &format!("task/{d}")), "no branch made: {:?}", r.branches());
+    git(&r.p(), &["branch", "-m", "trunk", "main"]);
 
     // 4. the folder already exists
-    git(&r.p(), &["checkout", "-q", "main"]);
     fs::create_dir_all(r.wt(&d)).unwrap();
     let o = r.run(&["task", "start", &d, "--owner", "c", "--worktree"]);
     assert_eq!(o.code, 1);
@@ -1256,4 +1271,90 @@ fn an_undo_after_a_failed_record_save_removes_a_clean_worktree_and_its_branch() 
     assert!(!r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
     assert_eq!(r.worktree_dirs().len(), 1, "{:?}", r.worktree_dirs());
     fs::remove_dir(&tmp).unwrap();
+}
+
+/// Check out a new branch `feature`, one commit ahead of `trunk`, in the main checkout. Returns (trunk tip, feature tip).
+fn feature_checked_out(r: &Root, trunk: &str) -> (String, String) {
+    let trunk_tip = git(&r.p(), &["rev-parse", trunk]);
+    git(&r.p(), &["checkout", "-q", "-b", "feature", trunk]);
+    fs::write(r.p().join("f.txt"), "feature\n").unwrap();
+    git(&r.p(), &["add", "f.txt"]);
+    git(&r.p(), &["commit", "-q", "-m", "feature work"]);
+    let feature_tip = git(&r.p(), &["rev-parse", "HEAD"]);
+    assert_ne!(trunk_tip, feature_tip);
+    (trunk_tip, feature_tip)
+}
+
+/// The task base is the trunk's tip, never the feature branch checked out in the main checkout.
+fn assert_base_is_trunk(trunk: &str) {
+    let r = Root::with_trunk(&format!("featbase-{trunk}"), trunk);
+    let (trunk_tip, _) = feature_checked_out(&r, trunk);
+    let id = r.add("p", "src");
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains(&format!("base: {trunk_tip}")), "{}", o.stdout);
+    assert_eq!(r.show(&id, "base").unwrap(), trunk_tip);
+    assert_eq!(git(&r.p(), &["rev-parse", &format!("task/{id}")]), trunk_tip);
+    assert!(!r.wt(&id).join("f.txt").exists(), "the feature's file must not be in the task's worktree");
+    assert_eq!(git(&r.p(), &["branch", "--show-current"]), "feature", "the main checkout is untouched");
+}
+
+#[test]
+fn a_feature_branch_checked_out_in_the_project_is_never_the_task_base() {
+    assert_base_is_trunk("main");
+}
+
+#[test]
+fn a_master_trunk_project_bases_tasks_on_master_not_the_checked_out_feature() {
+    assert_base_is_trunk("master");
+}
+
+/// A task merged only into the checked-out feature branch is NOT merged: `task done` keeps its worktree and branch and names
+/// the trunk; once it is merged into the trunk, `worktree remove` removes it.
+fn assert_merged_only_into_feature_is_kept(trunk: &str) {
+    let r = Root::with_trunk(&format!("featmerged-{trunk}"), trunk);
+    let id = r.started("src");
+    r.commit_in_wt(&id, "b.txt");
+    feature_checked_out(&r, trunk);
+    git(&r.p(), &["merge", "-q", "--no-edit", &format!("task/{id}")]); // into `feature`, not the trunk
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0, "done still succeeds: {}", o.stderr);
+    assert!(o.stdout.contains("worktree kept"), "{}", o.stdout);
+    assert!(o.stderr.contains(&format!("not merged into `{trunk}`")), "the message names the trunk: {}", o.stderr);
+    assert!(r.wt(&id).is_dir(), "the worktree stays: its work is not in the trunk");
+    assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "the branch stays: {:?}", r.branches());
+    let o = r.run(&["worktree", "remove", &id]);
+    assert_ne!(o.code, 0, "remove refuses: {}{}", o.stdout, o.stderr);
+    assert!(r.wt(&id).is_dir() && format!("{}{}", o.stdout, o.stderr).contains(&format!("not merged into `{trunk}`")), "remove keeps it too: {}{}", o.stdout, o.stderr);
+    // once it is really in the trunk, removal goes ahead (main checkout back on the trunk so `branch -d` agrees)
+    git(&r.p(), &["checkout", "-q", trunk]);
+    git(&r.p(), &["merge", "-q", "--no-edit", &format!("task/{id}")]);
+    let o = r.run(&["worktree", "remove", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(!r.wt(&id).exists(), "removed once merged into the trunk");
+    assert!(!r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
+}
+
+#[test]
+fn a_task_merged_only_into_the_checked_out_feature_branch_is_not_merged() {
+    assert_merged_only_into_feature_is_kept("main");
+}
+
+#[test]
+fn a_master_trunk_task_merged_only_into_a_feature_branch_is_not_merged() {
+    assert_merged_only_into_feature_is_kept("master");
+}
+
+#[test]
+fn a_task_merged_into_main_is_removed_while_a_branch_without_it_is_checked_out() {
+    let r = Root::new("mainonly");
+    let id = r.started("src");
+    r.commit_in_wt(&id, "b.txt");
+    r.merge_into_main(&id);
+    git(&r.p(), &["checkout", "-q", "-b", "elsewhere", "HEAD~1"]); // a branch that does NOT contain the task's commit
+    let o = r.run(&["task", "done", &id]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(!r.wt(&id).exists(), "merged into main: the worktree goes even though HEAD does not contain it");
+    // `git branch -d` judges against the checked-out branch and refuses: the branch (and its commits) is simply kept
+    assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
 }

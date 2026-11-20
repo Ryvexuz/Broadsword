@@ -24,8 +24,9 @@
 //!   branch;
 //! - a commit in the worktree's own HEAD reflog that is reachable from no ref (amended away, rebased, or made on a
 //!   detached HEAD) is not a reason to refuse: it is saved under `refs/broadsword/kept/<task id>/<short sha>` first;
-//! - the branch must be MERGED: its tip is an ancestor of the main checkout's HEAD (`--keep-branch` skips this one rule,
-//!   because the branch, which holds the commits, is kept);
+//! - the branch must be MERGED: its tip is an ancestor of the project's trunk, the one of the branches `main` and `master`
+//!   that exists (`wtgit::trunk_branch`; both or neither is an error), never of whatever branch the main checkout has
+//!   checked out (`--keep-branch` skips this one rule, because the branch, which holds the commits, is kept);
 //! - then `git worktree remove` (no `--force`), then `git branch -d` (no `-D`, so Git refuses an unmerged branch too, or
 //!   one checked out elsewhere: it is then kept), then empty parent folders under worktrees_dir are removed with
 //!   `remove_dir` only, and never through a symlink, junction or reparse point.
@@ -181,10 +182,9 @@ pub fn plan(cfg: &Config, t: &Record) -> Result<Plan, String> {
     if path.exists() {
         return Err(format!("{} already exists; it was not touched", path.display()));
     }
-    if wtgit::current_branch(&dir)?.is_none() {
-        return Err(format!("the main checkout of `{project}` ({}) is on a detached HEAD; check out a branch first, so the task's base is a branch tip", dir.display()));
-    }
-    let base = wtgit::head_commit(&dir)?;
+    // The base is the tip of the project's trunk (`main` or `master`, whichever exists), whatever the main checkout has
+    // checked out; a trunk that cannot be told is refused.
+    let (_trunk, base) = wtgit::trunk_commit(&dir).map_err(|e| format!("project `{project}`: {e}"))?;
     let token = format!("{}-{}", std::process::id(), task::now_secs());
     Ok(Plan { token, dir, branch, rel, path, base })
 }
@@ -429,8 +429,8 @@ pub fn remove_for(cfg: &Config, t: &Record, keep_branch: bool) -> Result<Removal
     let path = abs_path(cfg, t.get("worktree"))?;
     let exists = path.exists();
     let branch_there = wtgit::branch_exists(&dir, &branch)?;
-    let merged = branch_there && wtgit::is_merged_into_head(&dir, &branch)?;
-    let into = wtgit::current_branch(&dir)?.unwrap_or_else(|| "HEAD".into());
+    // merged = reachable from the trunk (not from the checked-out branch); only asked when the branch is there
+    let (merged, into) = if branch_there { wtgit::is_merged_into_trunk(&dir, &branch)? } else { (false, String::new()) };
 
     let (mut reasons, mut advice) = (Vec::new(), Vec::new());
     let mut kept_refs: Vec<String> = Vec::new();
@@ -789,9 +789,9 @@ fn state_of(cfg: &Config, t: &Record) -> (&'static str, &'static str) {
     let b = branch_of(t);
     let merged = match wtgit::branch_exists(&dir, &b) {
         Ok(false) => "no-branch",
-        Ok(true) => match wtgit::is_merged_into_head(&dir, &b) {
-            Ok(true) => "merged",
-            Ok(false) => "unmerged",
+        Ok(true) => match wtgit::is_merged_into_trunk(&dir, &b) {
+            Ok((true, _)) => "merged",
+            Ok((false, _)) => "unmerged",
             Err(_) => "unknown",
         },
         Err(_) => "unknown",
