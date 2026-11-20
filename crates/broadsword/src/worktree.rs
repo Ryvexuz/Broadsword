@@ -196,23 +196,81 @@ pub fn mark_creating(t: &mut Record, p: &Plan) {
     t.set("base", p.base.clone());
 }
 
-/// Step 2, outside the lock: make the worktree. On failure nothing is left that this call made.
-fn add(cfg: &Config, p: &Plan) -> Result<(), String> {
-    task::wait_for_gate(cfg, TEST_ADD_GATE_ENV, "worktree add");
-    let parent = p.path.parent().ok_or("bad worktree path")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    if let Err(e) = wtgit::worktree_add(&p.dir, &p.branch, &p.path, &p.base) {
-        // Git cleans up after itself; also drop what this call may have left, but only if it is empty and ours.
-        if is_real_dir(&p.path) {
-            let _ = std::fs::remove_dir(&p.path); // fails (and keeps it) unless empty
-        }
-        remove_empty_parents(cfg, parent);
-        if !e.contains("already exists") && wtgit::branch_tip(&p.dir, &p.branch).is_ok_and(|tip| tip == p.base) {
-            let _ = wtgit::branch_delete_if_merged(&p.dir, &p.branch); // an empty branch at base made by the failed add
-        }
-        return Err(e);
+/// Why `add` failed, and whether something is still there afterwards (then `msg` names it).
+pub struct AddFail {
+    pub msg: String,
+    pub left_behind: bool,
+}
+
+impl AddFail {
+    fn plain(msg: String) -> AddFail {
+        AddFail { msg, left_behind: false }
     }
-    Ok(())
+}
+
+/// Step 2, outside the lock: make the worktree. On failure, what this call made is removed again by safe means only, and
+/// whatever is still there afterwards is named in the error ("LEFT BEHIND ... nothing was deleted").
+fn add(cfg: &Config, p: &Plan) -> Result<(), AddFail> {
+    task::wait_for_gate(cfg, TEST_ADD_GATE_ENV, "worktree add");
+    let parent = p.path.parent().ok_or_else(|| AddFail::plain("bad worktree path".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| AddFail::plain(format!("cannot create {}: {e}", parent.display())))?;
+    let Err(e) = wtgit::worktree_add(&p.dir, &p.branch, &p.path, &p.base) else { return Ok(()) };
+    let left = clean_up_failed_add(p, !e.contains("already exists"));
+    remove_empty_parents(cfg, parent);
+    if left.is_empty() {
+        Err(AddFail::plain(e))
+    } else {
+        Err(AddFail { msg: format!("{e}\nLEFT BEHIND after the failed add, nothing was deleted: {}", left.join("; ")), left_behind: true })
+    }
+}
+
+/// After `git worktree add` failed. A failing post-checkout hook makes git exit non-zero AFTER it made the branch and the
+/// populated folder, and git does not undo either. `plan` found neither, so what is there now was made by this call,
+/// unless git said "already exists" (`ours` false: someone else made it in between, and nothing is touched). Order: the
+/// worktree first, with git's own `worktree remove` (never --force), and only when `status --porcelain --ignored` is empty,
+/// because `worktree remove` would silently delete ignored files; then the branch, with `branch -d`, only once its folder
+/// is gone and only while it is still at the base. Returns one line for everything that is still there.
+fn clean_up_failed_add(p: &Plan, ours: bool) -> Vec<String> {
+    let mut left = Vec::new();
+    let path = p.path.display();
+    if p.path.exists() || std::fs::symlink_metadata(&p.path).is_ok() {
+        if !ours {
+            left.push(format!("{path} was kept (it was not made by this start)"));
+        } else if is_real_dir(&p.path) && wtgit::is_worktree_of(&p.dir, &p.path) {
+            match wtgit::status_porcelain(&p.path) {
+                Ok(s) if s.trim().is_empty() => {
+                    if let Err(r) = wtgit::worktree_remove(&p.dir, &p.path) {
+                        left.push(format!("the worktree {path} was kept (git refused to remove it: {r})"));
+                    }
+                }
+                Ok(s) => left.push(format!("the worktree {path} was kept (it holds files git does not have: {})", s.lines().take(5).collect::<Vec<_>>().join(", "))),
+                Err(r) => left.push(format!("the worktree {path} was kept (its status could not be read: {r})")),
+            }
+        } else if is_real_dir(&p.path) {
+            let _ = std::fs::remove_dir(&p.path); // not a worktree of this project: only an empty folder goes
+            if p.path.exists() {
+                left.push(format!("the folder {path} was kept (it is not empty and not a worktree of this project)"));
+            }
+        } else {
+            left.push(format!("{path} was kept (it is not a plain folder)"));
+        }
+    }
+    match wtgit::branch_exists(&p.dir, &p.branch) {
+        Ok(false) => {}
+        Ok(true) if !ours => left.push(format!("the branch `{}` was kept (it was not made by this start)", p.branch)),
+        Ok(true) if p.path.exists() => left.push(format!("the branch `{}` was kept (its worktree is still there)", p.branch)),
+        Ok(true) => match wtgit::branch_tip(&p.dir, &p.branch) {
+            Ok(tip) if tip == p.base => {
+                if let Err(r) = wtgit::branch_delete_if_merged(&p.dir, &p.branch) {
+                    left.push(format!("the empty branch `{}` was kept ({r})", p.branch));
+                }
+            }
+            Ok(_) => left.push(format!("the branch `{}` was kept (it is no longer at its base {})", p.branch, p.base)),
+            Err(r) => left.push(format!("the branch `{}` was kept (its tip could not be read: {r})", p.branch)),
+        },
+        Err(r) => left.push(format!("the branch `{}` may still exist (it could not be checked: {r})", p.branch)),
+    }
+    left
 }
 
 /// Best-effort undo of a worktree whose record could not be saved: it is clean and its branch is at the base, so the same
@@ -239,7 +297,7 @@ pub enum Mode<'a> {
 
 /// The task was marked running but its worktree could not be made: back to `open`, owner and start time cleared, so a task
 /// is never left running without the worktree that was asked for.
-fn roll_back_start(t: &mut Record, why: &str) -> ExitCode {
+fn roll_back_start(t: &mut Record, why: &str, left_behind: bool) -> ExitCode {
     let id = t.id().to_string();
     for k in ["worktree", "branch", "base", "worktree_removed", "worktree_creating"] {
         t.set(k, "");
@@ -248,6 +306,7 @@ fn roll_back_start(t: &mut Record, why: &str) -> ExitCode {
     t.set("owner", "");
     t.set("started", "");
     match task::save(t) {
+        Ok(()) if left_behind => task::fail(task::EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\ntask {id} was rolled back to `open` (claims not held), but what is named as LEFT BEHIND above is still there: look at it and remove it yourself once nothing in it is needed, because starting {id} again will say the branch or folder already exists")),
         Ok(()) => task::fail(task::EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\ntask {id} was rolled back to `open` (claims not held, nothing half-made); fix the cause and start it again")),
         Err(e) => task::fail(task::EXIT_ERROR, format!("cannot start {id} with a worktree: {why}\nAND the rollback failed: {e}. Task {id} may still say `running` with `worktree_creating` set: run `broadsword task abandon {id}` or fix its record")),
     }
@@ -298,14 +357,14 @@ pub fn finish(cfg: &Config, id: &str, p: Plan, mode: Mode) -> ExitCode {
                 Err(e) => {
                     let left = undo(cfg, &p).map(|l| format!(" The new worktree could not be removed again: {l}")).unwrap_or_default();
                     match mode {
-                        Mode::Start { .. } => roll_back_start(&mut t, &format!("{e}.{left}")),
+                        Mode::Start { .. } => roll_back_start(&mut t, &format!("{e}.{left}"), !left.is_empty()),
                         Mode::Create => task::fail(task::EXIT_ERROR, format!("{e}; the new worktree was removed again.{left}")),
                     }
                 }
             }
         }
-        Err(e) if mine => match mode {
-            Mode::Start { .. } => roll_back_start(&mut t, &e),
+        Err(AddFail { msg: e, left_behind }) if mine => match mode {
+            Mode::Start { .. } => roll_back_start(&mut t, &e, left_behind),
             Mode::Create => {
                 t.set("worktree_creating", "");
                 for k in ["branch", "base"] {
@@ -315,7 +374,8 @@ pub fn finish(cfg: &Config, id: &str, p: Plan, mode: Mode) -> ExitCode {
                 task::fail(task::EXIT_ERROR, format!("no worktree was made for {id}: {e}{}", if saved.is_err() { " (and its record could not be reset: run `worktree create` again)" } else { "" }))
             }
         },
-        Err(e) => task::fail(task::EXIT_ERROR, format!("no worktree was made for {id}: {e}")),
+        Err(AddFail { msg: e, left_behind: true }) => task::fail(task::EXIT_ERROR, format!("the worktree step for {id} failed: {e}")),
+        Err(AddFail { msg: e, left_behind: false }) => task::fail(task::EXIT_ERROR, format!("no worktree was made for {id}: {e}")),
     }
 }
 

@@ -1140,3 +1140,72 @@ fn a_run_job_in_a_worktree_uses_the_shared_build_folder() {
     assert_eq!(norm(&td), norm(&want.to_string_lossy()), "run must point cargo at the main root's build folder");
     assert!(!r.wt(&a).join("build").join("debug").exists());
 }
+
+/// A post-checkout hook in the project repo (run by Git for Windows' own sh on Windows).
+fn set_hook(r: &Root, body: &str) {
+    let hooks = r.p().join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("post-checkout"), format!("#!/bin/sh\n{body}\n")).unwrap();
+}
+
+/// `git worktree add` runs post-checkout AFTER it made the branch and the populated folder; a hook that exits 1 makes the
+/// add fail but leaves both. The clean tree is removed with git's own `worktree remove` and the branch at base with
+/// `branch -d`, so the task is really back to `open` and starts again once the hook is fixed.
+#[test]
+fn a_failing_post_checkout_hook_leaves_no_branch_and_no_worktree_and_the_task_open() {
+    let r = Root::new("hookfail");
+    set_hook(&r, "exit 1");
+    let id = r.add("p", "src");
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("rolled back to `open`") && !o.stderr.contains("LEFT BEHIND"), "{}", o.stderr);
+    assert_eq!(r.status_of(&id), "open");
+    assert_eq!(r.worktree_dirs().len(), 1, "only the main checkout: {:?}", r.worktree_dirs());
+    assert!(!r.wt(&id).exists(), "no worktree folder");
+    assert!(!r.dir.join("worktrees/p").exists(), "no empty parent folder either");
+    assert!(!r.branches().iter().any(|b| b == &format!("task/{id}")), "no branch: {:?}", r.branches());
+    assert!(git_out(&r.p(), &["rev-parse", "--verify", "-q", &format!("refs/heads/task/{id}")]).code != 0, "refs/heads/task/{id} is gone");
+    // with the hook gone the same task starts
+    fs::remove_file(r.p().join(".git/hooks/post-checkout")).unwrap();
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(r.wt(&id).is_dir());
+    assert_eq!(r.status_of(&id), "running");
+}
+
+/// The hook runs inside the new worktree, leaves an untracked file and fails: git's own `worktree remove` refuses, so the
+/// worktree, the file and the branch are all kept and named, and the task is `open` with the leftovers in the message.
+#[test]
+fn a_failing_hook_that_dirties_the_worktree_keeps_it_and_the_branch_and_names_them() {
+    let r = Root::new("hookdirty");
+    set_hook(&r, "echo mine > hook-made.txt\nexit 1");
+    let id = r.add("p", "src");
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("LEFT BEHIND") && o.stderr.contains("nothing was deleted"), "{}", o.stderr);
+    assert!(o.stderr.contains(&format!("task/{id}")) && o.stderr.contains(&r.wt(&id).display().to_string().replace('/', "\\")), "names the branch and the path: {}", o.stderr);
+    assert!(o.stderr.contains("rolled back to `open`") && !o.stderr.contains("nothing half-made"), "{}", o.stderr);
+    assert_eq!(r.status_of(&id), "open");
+    assert_eq!(fs::read_to_string(r.wt(&id).join("hook-made.txt")).unwrap().trim(), "mine", "nothing was deleted");
+    assert_eq!(r.worktree_dirs().len(), 2, "git's record of the kept worktree stays: {:?}", r.worktree_dirs());
+    assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
+    assert!(!o.stderr.to_lowercase().contains("force"), "never suggests forcing: {}", o.stderr);
+}
+
+/// `git worktree remove` (no --force) deletes IGNORED files without asking; a hook that leaves one (a `.env`, notes) must
+/// not lose it: an ignored file counts as work too, so the worktree and branch are kept and named.
+#[test]
+fn a_failing_hook_that_leaves_an_ignored_file_keeps_the_worktree() {
+    let r = Root::new("hookignored");
+    fs::write(r.p().join(".gitignore"), "*.secret\n").unwrap();
+    git(&r.p(), &["add", ".gitignore"]);
+    git(&r.p(), &["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "ignore"]);
+    set_hook(&r, "echo keep > notes.secret\nexit 1");
+    let id = r.add("p", "src");
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("LEFT BEHIND") && o.stderr.contains(&format!("task/{id}")), "{}", o.stderr);
+    assert_eq!(r.status_of(&id), "open");
+    assert_eq!(fs::read_to_string(r.wt(&id).join("notes.secret")).unwrap().trim(), "keep", "the ignored file is kept");
+    assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
+}
