@@ -204,8 +204,14 @@ pub fn now_secs() -> u64 {
 pub fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
     let dir = tasks_dir(cfg);
     let mut v = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(v) };
-    for e in rd.flatten() {
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        // a board that was never used has no folder yet: that, and only that, is an empty board
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(v),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+    };
+    for e in rd {
+        let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
         let p = e.path();
         if p.extension().is_none_or(|x| x != EXT) {
             continue;
@@ -727,6 +733,24 @@ mod tests {
         let mut expected = vec![queue::QUEUED, queue::RUNNING, queue::APPROVED];
         expected.sort_unstable();
         assert_eq!(waiting, expected, "the waiting set changed: an approved entry waits for a merge train, not for its coder");
+    }
+
+    /// `start` decides the overlap check on this list: a tasks folder that cannot be listed is an error, never an empty board.
+    /// Only a folder that does not exist yet (a board never used) is an empty board.
+    #[test]
+    fn load_tasks_fails_loudly_when_the_tasks_folder_cannot_be_listed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("bs-load-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = Config::from_text(include_str!("../../../broadsword.toml"), &root).unwrap();
+        // no state/tasks folder at all: an empty board
+        assert!(load_tasks(&cfg).unwrap().is_empty());
+        // a FILE where the folder should be: read_dir fails with something other than NotFound
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        std::fs::write(tasks_dir(&cfg), "not a folder").unwrap();
+        let e = load_tasks(&cfg).expect_err("an unlistable tasks folder must be an error");
+        assert!(e.starts_with("cannot read ") && e.contains("tasks"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn n(s: &str) -> String {

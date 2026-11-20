@@ -876,3 +876,24 @@ fn a_ram_hook_file_outside_scratch_is_ignored() {
     assert!(o.stderr.contains("ignoring") && !o.stderr.contains("TEST HOOK ACTIVE"), "{}", o.stderr);
     assert_eq!(r.status_of(&a), "running");
 }
+
+#[test]
+fn an_unreadable_tasks_folder_is_an_error_never_an_empty_board() {
+    let r = Root::new("unreadable-board");
+    // a FILE where the tasks folder should be: read_dir fails with something other than NotFound
+    fs::create_dir_all(r.dir.join("state")).unwrap();
+    fs::write(r.dir.join("state").join("tasks"), "not a folder").unwrap();
+    let o = r.run(&["task", "list"]);
+    assert_ne!(o.code, 0, "list must not succeed on an unreadable board: {}", o.stdout);
+    assert!(o.stderr.contains("cannot read"), "stderr: {}", o.stderr);
+    let o = r.start("t-nonexistent", "someone");
+    assert_ne!(o.code, 0, "start must not succeed on an unreadable board: {}", o.stdout);
+    assert!(!o.stdout.contains("running"), "nothing may be marked running: {}", o.stdout);
+}
+
+#[test]
+fn a_missing_tasks_folder_is_an_empty_board() {
+    let r = Root::new("missing-board");
+    let o = r.run(&["task", "list"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+}
