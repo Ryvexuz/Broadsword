@@ -1969,7 +1969,9 @@ fn a_train_killed_mid_check_leaves_main_unmoved_and_the_next_drain_merges_all_th
 }
 
 /// The train's check runs in the last member's worktree. A file left there while the check runs (an agent still editing) means the
-/// check was not of the recorded commit alone: the check gives no verdict, nothing merges and main does not move.
+/// check was not of the recorded commit alone: the check gives no verdict, nothing merges and main does not move. The reason is that
+/// ONE entry's worktree, so only that entry ends `blocked` (as on the single-entry path) and the drain is not stopped: the others stay
+/// `approved`, and the next drain merges them without it instead of stopping on the same train again.
 #[test]
 fn a_train_whose_checked_worktree_changes_during_the_check_merges_nothing() {
     let r = train_root("traindirty", 4);
@@ -1986,12 +1988,24 @@ fn a_train_whose_checked_worktree_changes_during_the_check_merges_nothing() {
     fs::remove_file(&flag).unwrap();
     let status = child.wait().unwrap();
     assert_ne!(status.code(), Some(0), "the drain must not report success");
+    assert_eq!(status.code(), Some(3), "exit 3 (an entry blocked), not 1: the drain was not stopped as by an internal error");
     assert_eq!(r.head(), before, "main did not move");
-    for e in [&e1, &e2, &e3] {
+    for e in [&e1, &e2] {
         assert_eq!(r.status(e), "approved", "{e}: reason = {}", r.field(e, "reason"));
+        assert!(r.field(e, "reason").contains("waits for the next drain"), "{e}: reason = {}", r.field(e, "reason"));
     }
+    assert_eq!(r.status(&e3), "blocked", "only the entry whose worktree changed leaves: reason = {}", r.field(&e3, "reason"));
     assert!(r.field(&e3, "reason").contains("changed during the check"), "reason = {}", r.field(&e3, "reason"));
     assert!(r.field(&e3, "reason").contains("stray.txt"), "reason = {}", r.field(&e3, "reason"));
+    // the next drain does not stop on e3 again: e1 and e2 merge without it, e3 stays blocked
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(r.status(&e3), "blocked");
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b"], "nothing of e3 reached main");
+    assert_eq!(r.task_status(&t3), "running");
 }
 
 #[test]
@@ -2110,4 +2124,133 @@ fn a_train_killed_while_its_culprit_is_checked_alone_gets_its_worktree_back_on_i
     assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
     assert!(r.field(&e2, "reason").contains("only fail together"), "{}", r.field(&e2, "reason"));
     assert_eq!(r.head(), before, "nothing merged");
+}
+
+/// A git hook of the project (`hook`: pre-rebase, post-checkout, ...) that hangs while `hook-hang.flag` exists, only in the worktree
+/// of task `task`, and creates `hook-reached.flag` when it starts to hang. Returns (the flag, the reached file). Used to stop a drain
+/// at an exact point inside a git command it runs, with no seam in the program.
+fn hang_hook(r: &Root, hook: &str, task: &str) -> (PathBuf, PathBuf) {
+    let (flag, reached) = (r.dir.join("hook-hang.flag"), r.dir.join("hook-reached.flag"));
+    let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    let script = format!("#!/bin/sh\ncase \"$PWD\" in\n  *{task}*) ;;\n  *) exit 0 ;;\nesac\n[ -f \"{f}\" ] || exit 0\n: > \"{d}\"\nwhile [ -f \"{f}\" ]; do sleep 0.1; done\nexit 0\n", f = fwd(&flag), d = fwd(&reached));
+    let hooks = PathBuf::from(git(&r.p(), &["rev-parse", "--path-format=absolute", "--git-common-dir"])).join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join(hook), script).unwrap();
+    fs::write(&flag, "1").unwrap();
+    (flag, reached)
+}
+
+/// Is a rebase in progress in `wt`?
+fn in_rebase(wt: &Path) -> bool {
+    git_out(wt, &["status"]).stdout.contains("rebase in progress")
+}
+
+/// THE KILL WINDOW OF `train_link`: a drain killed after a chain rebase moved the branch but before the result was saved. The drain
+/// is stopped inside e2's chain rebase (a pre-rebase hook hangs; by then the intended `onto` must already be recorded), killed, and
+/// the rebase it was running is then finished by hand, exactly as git would have left it. e1 (the commit e2 is now chained on) is
+/// cancelled, so it never reaches main. e2 must never be reviewed or merged on that chained diff, by a train or on its own.
+#[test]
+fn a_drain_killed_after_a_chain_rebase_moved_the_branch_but_before_it_was_saved_never_reviews_the_chained_diff() {
+    let r = train_root("trainkillwin", 4);
+    let (t1, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (t2, e2) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let before = r.head();
+    let (flag, reached) = hang_hook(&r, "pre-rebase", &t2);
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    wait_for("e2's chain rebase to start", 240, || reached.exists());
+    let recorded = r.field(&e2, "train chain rebase begun onto (not recorded as finished)");
+    kill_tree(&mut child);
+    fs::remove_file(&flag).unwrap();
+    let tip1 = r.branch_tip(&t1);
+    assert_eq!(r.calls(), 2, "both were reviewed before the train");
+    assert_eq!(r.status(&e2), "approved");
+    // what the killed rebase would have done before its result was saved: e2's own commits onto e1's tip
+    let up = r.field(&e2, "base (main HEAD at rebase)");
+    git(&r.wt(&t2), &["rebase", "-q", "--onto", &tip1, &up, &format!("task/{t2}")]);
+    assert_eq!(git_out(&r.p(), &["merge-base", "--is-ancestor", &tip1, &format!("task/{t2}")]).code, 0, "e2 is chained on e1");
+    assert_eq!(r.run(&["queue", "cancel", &e1]).code, 0);
+    // a train: e2 is not the reviewed commit any more, and it carries e1's commit, which is not on main: blocked, not stale
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
+    assert!(r.field(&e2, "reason").starts_with("left a train:"), "{}", r.field(&e2, "reason"));
+    // on its own: refused before any review, never reviewed on the diff that holds e1's commit
+    let o = r.run(&["queue", "run", "--entry", &e2]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
+    assert_eq!(r.calls(), 2, "never reviewed again on the chained diff");
+    assert_eq!(r.head(), before, "nothing merged");
+    assert!(!r.p().join("src/a.txt").exists(), "e1's code never reached main through e2");
+    assert_eq!(recorded, tip1, "the intended onto was recorded before the rebase began");
+}
+
+/// `train_link` rebases whatever the worktree has checked out. An approved entry whose worktree the coder put on another branch
+/// never joins a train: it ends `blocked`, that branch is never rebased, and the other entries merge without it.
+#[test]
+fn an_approved_entry_whose_worktree_is_on_another_branch_is_blocked_and_that_branch_is_never_rebased() {
+    let (r, es, before) = killed_train("trainoffbranch");
+    let t2 = r.field(&es[1], "task");
+    let wt2 = r.wt(&t2);
+    git(&wt2, &["checkout", "-q", "-b", "side"]);
+    let side = r.commit(&wt2, "side.txt", "the coder's own work\n", "side work");
+    // e1 leaves, so e2 would be lifted off e1's commit onto main: a rebase of `side` if it were run
+    assert_eq!(r.run(&["queue", "cancel", &es[0]]).code, 0);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&es[1]), "blocked", "reason = {}", r.field(&es[1], "reason"));
+    assert!(r.field(&es[1], "reason").contains("is on `side`"), "{}", r.field(&es[1], "reason"));
+    assert_eq!(git(&r.p(), &["rev-parse", "side"]), side, "the coder's branch was never rebased");
+    assert_eq!(git(&wt2, &["symbolic-ref", "--short", "HEAD"]), "side", "the worktree was not touched");
+    assert_eq!(r.status(&es[2]), "merged", "reason = {}", r.field(&es[2], "reason"));
+    assert_eq!(train_subjects(&r)[1..], ["task: c with a hanging test"]);
+    assert_ne!(r.head(), before);
+    assert!(!r.p().join("side.txt").exists() && !r.p().join("src/b.txt").exists());
+}
+
+/// A rebase the coder started in the worktree after the review is the coder's own: a merge train never aborts it. The entry ends
+/// `blocked` with the rebase still in progress, and the other entries merge without it.
+#[test]
+fn a_rebase_the_coder_started_after_the_review_is_never_aborted_by_a_merge_train() {
+    let (r, es, _) = killed_train("traincoderrebase");
+    let t1 = r.field(&es[0], "task");
+    let wt1 = r.wt(&t1);
+    let tip1 = r.branch_tip(&t1);
+    let o = git_out(&wt1, &["rebase", "-x", "false", "HEAD~1"]);
+    assert_ne!(o.code, 0, "the exec stops the rebase: {}{}", o.stdout, o.stderr);
+    assert!(in_rebase(&wt1), "the coder's rebase is in progress: {}", git_out(&wt1, &["status"]).stdout);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&es[0]), "blocked", "reason = {}", r.field(&es[0], "reason"));
+    assert!(r.field(&es[0], "reason").contains("the coder's own"), "{}", r.field(&es[0], "reason"));
+    assert!(in_rebase(&wt1), "the coder's rebase was left alone: {}", git_out(&wt1, &["status"]).stdout);
+    assert_eq!(r.branch_tip(&t1), tip1);
+    for e in &es[1..] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(train_subjects(&r)[1..], ["task: b", "task: c with a hanging test"]);
+}
+
+/// The other side of the rule above: a chain rebase that a killed drain left half done IS the queue's own, and the next drain
+/// aborts it (the branch is back at its pre-rebase tip) and merges the entry. The drain is stopped inside e2's chain rebase by a
+/// post-checkout hook (git runs it when the rebase checks out `onto`, with the rebase already in progress).
+#[test]
+fn a_chain_rebase_a_killed_drain_left_half_done_is_aborted_and_the_entry_still_merges() {
+    let r = train_root("trainhalfrebase", 4);
+    let (_, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (t2, e2) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let tip2 = r.branch_tip(&t2);
+    let (flag, reached) = hang_hook(&r, "post-checkout", &t2);
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    wait_for("e2's chain rebase to check out onto", 240, || reached.exists());
+    kill_tree(&mut child);
+    fs::remove_file(&flag).unwrap();
+    assert!(in_rebase(&r.wt(&t2)), "the kill left e2's chain rebase half done: {}", git_out(&r.wt(&t2), &["status"]).stdout);
+    assert_eq!(r.branch_tip(&t2), tip2, "a rebase in progress has not moved the branch yet");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert!(r.show(&e2).contains("found a rebase left half done by an interrupted run and aborted it"), "{}", r.show(&e2));
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b"]);
 }

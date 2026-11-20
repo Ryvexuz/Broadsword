@@ -390,10 +390,9 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
     // LEFT-TRAIN RULE (see `Run::leave_train`): an earlier entry of this task left a merge train with its branch chained on other
     // entries' commits; while the branch still carries them and main does not, a new entry would review their code as this task's
     for x in all.iter().filter(|x| x.get("task") == task_id) {
-        let chained_on = chain_base_of(x);
-        match chained_onto(&dir, &branch, &chained_on) {
-            Ok(false) => {}
-            Ok(true) => {
+        match chained_base(&dir, &branch, x) {
+            Ok(None) => {}
+            Ok(Some(chained_on)) => {
                 let main = wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into());
                 return refuse(format!("its earlier queue entry {} {}", x.id(), left_train_text(&main, &branch, &chained_on)));
             }
@@ -503,6 +502,7 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("commit that was reviewed (before the train chained it)", "reviewed_orig_tip"),
         ("own commit before the train chained it", "alone_tip"),
         ("left a train chained on", "left_train_base"),
+        ("train chain rebase begun onto (not recorded as finished)", "train_onto"),
         ("worktree detached for its own check at", "alone_detached"),
         ("main check", "main_check"),
         ("last error", "error"),
@@ -699,7 +699,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
     if !resumed {
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
-            "train", "train_pos", "train_job", "train_up", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail",
+            "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail",
             "reviewer_model", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
         ] {
             e.set(k, "");
@@ -1157,12 +1157,27 @@ impl<'a> Run<'a> {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// Before an approved entry joins a train: still exactly the reviewed commit, clean worktree, clean main on the same branch. A
-    /// chain rebase that a killed drain left half done is aborted first (the branch is then back at its `pre_rebase` tip).
+    /// Before an approved entry joins a train: still exactly the reviewed commit, the worktree on its branch and clean, clean main on
+    /// the same branch. A chain rebase that a killed drain left half done is aborted first (the branch is then back at its
+    /// `pre_rebase` tip); any OTHER rebase in progress is the coder's own and is never aborted: the entry ends `blocked`.
     fn train_ready(&mut self) -> R<()> {
         self.locate()?;
-        self.abort_stale_rebase()?;
         let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
+        if self.g(wtgit::rebase_in_progress(&wt))? {
+            if self.own_chain_rebase()? {
+                self.abort_stale_rebase()?;
+            } else {
+                return Err(self.leave_train(BLOCKED, "a rebase is in progress in the task's worktree that no merge train started (the coder's own, begun after the review); it was left alone. Finish it or abort it (`git rebase --abort`), then run the entry again; nothing merged", EXIT_RETRY));
+            }
+        }
+        // `train_link` rebases whatever the worktree has checked out: it must be the task's own branch (as in `s_preconditions`)
+        match self.g(wtgit::current_branch(&wt))? {
+            Some(b) if b == branch => {}
+            other => {
+                let on = other.map(|b| format!("`{b}`")).unwrap_or_else(|| "a detached HEAD".into());
+                return Err(self.leave_train(BLOCKED, &format!("the task's worktree is on {on}, not `{branch}`; it cannot join a merge train (its chain rebase would move what is checked out there); nothing merged. Check out `{branch}` again, then run the entry"), EXIT_RETRY));
+            }
+        }
         let (reviewed, checked) = (self.e.get("reviewed_tip").to_string(), self.e.get("checked_tip").to_string());
         if self.e.get("verdict") != "PASS" || reviewed.is_empty() || reviewed != checked {
             return Err(self.leave_train(STALE, &format!("an approved entry without a recorded PASS for its checked commit (reviewed `{}`, checked `{}`) cannot join a merge train. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(&checked), self.e.id()), EXIT_RETRY));
@@ -1213,6 +1228,10 @@ impl<'a> Run<'a> {
         let r = self.keep_pre_rebase(&tip)?;
         self.e.set("pre_rebase", tip.clone());
         self.e.set("pre_rebase_ref", r.clone());
+        // KILL WINDOW: `train_onto` is SAVED (by the log line below) before the rebase starts and cleared only in the save that
+        // records the result. A drain killed after the rebase moved the branch but before that save leaves it set, so the left-train
+        // rule (`chained_base`) still sees the branch as chained on `onto`, and `train_ready` knows a rebase in progress is its own.
+        self.e.set("train_onto", onto);
         self.log("rebase", &format!("merge train {train_id}: chaining `{branch}` (tip {}) onto {}; its own commits start after {}; the old tip is saved in {r}", short(&tip), short(onto), short(&up)))?;
         match self.g(wtgit::rebase_onto(&wt, onto, &up))? {
             wtgit::Rebase::Done => {
@@ -1222,11 +1241,13 @@ impl<'a> Run<'a> {
                 }
                 if self.g(wtgit::rev_count(&dir, &format!("{onto}..{now}")))? == 0 {
                     self.e.set("train_up", onto);
+                self.e.set("train_onto", "");
                     return Err(self.leave_train(BLOCKED, &format!("after chaining onto the train `{branch}` has no commit left (its changes are already in the train); the old tip {} is saved in {r}", short(&tip)), EXIT_RETRY));
                 }
                 let now_ids = self.g(wtgit::patch_ids(&dir, &format!("{onto}..{now}")))?;
                 if now_ids != reviewed_ids {
                     self.e.set("train_up", onto);
+                self.e.set("train_onto", "");
                     self.e.set("rebased_tip", now.clone());
                     self.requeue(&format!("patch changed by the train rebase: merge train {train_id} chained `{branch}` onto the entries before it, and its rebased commits {} are not the same patches (git patch-id --stable) as the reviewed commits {}..{}; the old verdict does not cover them, so the entry goes back to `queued` and is reviewed again (the pre-train tip is saved in {r})", short(&now), short(&base), short(&orig)));
                     return Ok(None);
@@ -1235,6 +1256,7 @@ impl<'a> Run<'a> {
                     self.e.set("reviewed_orig_tip", orig.clone());
                 }
                 self.e.set("train_up", onto);
+                self.e.set("train_onto", "");
                 self.e.set("rebased_tip", now.clone());
                 self.e.set("checked_tip", now.clone());
                 self.e.set("reviewed_tip", now.clone());
@@ -1249,6 +1271,7 @@ impl<'a> Run<'a> {
                 if now != tip {
                     return Err(self.internal(&format!("the chain rebase conflicted and was aborted, but `{branch}` is at {} instead of {}: the old tip is saved in {r}", short(&now), short(&tip))));
                 }
+                self.e.set("train_onto", ""); // the branch is exactly as before: it was never chained onto `onto`
                 self.requeue(&format!("merge train {train_id}: chaining `{branch}` onto the entries before it conflicts in: {}. The rebase was aborted and the branch is exactly as before; the entry goes back to `queued` and is reviewed again on its own", files.join(", ")));
                 Ok(None)
             }
@@ -1257,6 +1280,7 @@ impl<'a> Run<'a> {
                 if now != tip {
                     return Err(self.internal(&format!("{m}; and `{branch}` is at {} instead of {}: the old tip is saved in {r}", short(&now), short(&tip))));
                 }
+                self.e.set("train_onto", "");
                 self.requeue(&format!("merge train {train_id}: `{branch}` could not be chained onto the entries before it: {m}. The branch is unchanged; the entry goes back to `queued`"));
                 Ok(None)
             }
@@ -1267,16 +1291,15 @@ impl<'a> Run<'a> {
     /// entries' commits that are not on main is never reviewed or merged on that diff; it ends `blocked` (`leave_train`). Once the
     /// branch no longer carries that commit (the coder rebased, or those entries reached main) the record forgets it and the run goes on.
     fn refuse_chained(&mut self, step: &str) -> R<()> {
-        let base = chain_base_of(&self.e);
-        if base.is_empty() {
-            return Ok(());
-        }
         let (dir, branch) = (self.dir.clone(), self.branch());
-        if self.g(chained_onto(&dir, &branch, &base))? {
+        if self.g(chained_base(&dir, &branch, &self.e))?.is_some() {
             return Err(self.leave_train(BLOCKED, "it was run while its branch still carries those entries' commits; nothing was reviewed or merged", EXIT_RETRY));
         }
-        if !self.e.get("left_train_base").is_empty() {
+        let base = chain_bases_of(&self.e).into_iter().next().unwrap_or_default();
+        let had = !self.e.get("left_train_base").is_empty() || !self.e.get("train_onto").is_empty();
+        if had {
             self.e.set("left_train_base", "");
+            self.e.set("train_onto", "");
             self.log(step, &format!("the branch no longer carries {}, the commit a merge train chained it on that is not on main: it runs as it is", short(&base)))?;
         }
         Ok(())
@@ -1296,9 +1319,13 @@ impl<'a> Run<'a> {
     /// chained on across attempts, so a later `queue run` or `queue add` refuses it too until the coder has rebased its own commits
     /// onto main (or those entries reached main). Otherwise the entry gets `status` as asked. A git error counts as chained.
     fn leave_train(&mut self, status: &str, reason: &str, code: u8) -> ExitCode {
-        let (dir, branch, base) = (self.dir.clone(), self.branch(), chain_base_of(&self.e));
-        let chained = chained_onto(&dir, &branch, &base).unwrap_or(true);
-        if !chained {
+        let (dir, branch) = (self.dir.clone(), self.branch());
+        let base = match chained_base(&dir, &branch, &self.e) {
+            Ok(b) => b,
+            // a git error counts as chained, on the first recorded base (an error needs one: no base is never chained)
+            Err(_) => Some(chain_bases_of(&self.e).into_iter().next().unwrap_or_default()),
+        };
+        let Some(base) = base else {
             if status == QUEUED {
                 let reason = self.secrets.redact(reason);
                 self.e.set("status", QUEUED);
@@ -1308,7 +1335,7 @@ impl<'a> Run<'a> {
                 return ExitCode::from(EXIT_RETRY);
             }
             return self.end(status, reason, code);
-        }
+        };
         let main = if self.e.get("main_branch").is_empty() { wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into()) } else { self.e.get("main_branch").to_string() };
         self.e.set("left_train_base", base.clone());
         let text = left_train_text(&main, &branch, &base);
@@ -1329,11 +1356,11 @@ impl<'a> Run<'a> {
             Err(m) => return TrainCheck::Blocked(m),
         };
         if head != commit {
-            return TrainCheck::Blocked(format!("the worktree of task {task_id} is at {} instead of {}: the interim check can only check a commit its worktree has checked out", short(&head), short(commit)));
+            return TrainCheck::EntryBlocked(format!("the worktree of task {task_id} is at {} instead of {}: the interim check can only check a commit its worktree has checked out", short(&head), short(commit)));
         }
         match wtgit::status_porcelain_plain(&self.wt) {
             Ok(s) if s.is_empty() => {}
-            Ok(s) => return TrainCheck::Blocked(format!("the worktree of task {task_id} has uncommitted or untracked changes ({}); the check would not be of commit {} alone, so it did not run", some(&s), short(commit))),
+            Ok(s) => return TrainCheck::EntryBlocked(format!("the worktree of task {task_id} has uncommitted or untracked changes ({}); the check would not be of commit {} alone, so it did not run", some(&s), short(commit))),
             Err(m) => return TrainCheck::Blocked(m),
         }
         println!("queue entry {}: check {project} --task {task_id} ({what}; commit {})", self.e.id(), short(commit));
@@ -1349,11 +1376,11 @@ impl<'a> Run<'a> {
             Err(m) => return TrainCheck::Blocked(format!("the worktree of task {task_id} could not be read after the check (job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
         };
         if head_after != commit {
-            return TrainCheck::Blocked(format!("the worktree of task {task_id} changed during the check (job {}): it was at {} when the check started and is at {} now; the check is not of that commit, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, short(commit), short(&head_after)));
+            return TrainCheck::EntryBlocked(format!("the worktree of task {task_id} changed during the check (job {}): it was at {} when the check started and is at {} now; the check is not of that commit, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, short(commit), short(&head_after)));
         }
         match wtgit::status_porcelain_plain(&self.wt) {
             Ok(s) if s.is_empty() => {}
-            Ok(s) => return TrainCheck::Blocked(format!("the worktree of task {task_id} changed during the check (job {}): it got uncommitted or untracked changes ({}); the check is not of commit {} alone, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, some(&s), short(commit))),
+            Ok(s) => return TrainCheck::EntryBlocked(format!("the worktree of task {task_id} changed during the check (job {}): it got uncommitted or untracked changes ({}); the check is not of commit {} alone, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, some(&s), short(commit))),
             Err(m) => return TrainCheck::Blocked(format!("the worktree of task {task_id} could not be read after the check (job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
         }
         match code {
@@ -1483,6 +1510,22 @@ impl<'a> Run<'a> {
             return Err(self.blocked(&format!("nothing to merge: `{branch}` has no commit that `{main_branch}` lacks")));
         }
         self.log("preconditions", &format!("ok: main `{main_branch}` clean, worktree clean, task running, {ahead} commit(s) to merge, reviewer `{model}`{why}, effort `{}`, differs from coder `{coder}`", effort_for(self.cfg, self.e.get("risk"))))
+    }
+
+    /// Is the rebase in progress in the task's worktree the chain rebase a killed train left (and so the queue's to abort)? Only when
+    /// all hold: `train_link` recorded that it began one onto `train_onto` and never finished it, the branch ref is still at the
+    /// recorded `pre_rebase` tip (a rebase moves the ref only when it completes), and the worktree's HEAD is on top of `train_onto`
+    /// (where that rebase replays the commits). Anything else is the coder's own rebase. A git error answers no (it is not aborted).
+    fn own_chain_rebase(&mut self) -> R<bool> {
+        let (onto, before) = (self.e.get("train_onto").to_string(), self.e.get("pre_rebase").to_string());
+        if onto.is_empty() || before.is_empty() {
+            return Ok(false);
+        }
+        let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
+        if self.g(wtgit::branch_tip(&dir, &branch))? != before {
+            return Ok(false);
+        }
+        Ok(wtgit::is_ancestor(&wt, &onto, "HEAD").unwrap_or(false))
     }
 
     fn abort_stale_rebase(&mut self) -> R<()> {
@@ -1959,8 +2002,13 @@ verdict: {} (answer followed the format: {})
 enum TrainCheck {
     Pass { job: String, summary: String, tail: String },
     Fail { job: String, summary: String, tail: String },
-    /// The check could not run to a verdict (refused, paused, wrong checkout, job could not start): no conclusion about the code.
+    /// The check could not run to a verdict for a reason that is not this entry's own (refused, paused, git could not be read, the
+    /// job could not start or end): no conclusion about the code, and the drain stops (the next one tries again).
     Blocked(String),
+    /// The check could not run to a verdict because of THIS entry's worktree: it was not exactly the commit to check, before or after
+    /// the job (another commit or branch checked out, uncommitted or untracked files). As on the single-entry path, only this entry
+    /// ends `blocked` (`leave_train`); the other members stay `approved` and the drain goes on, so one entry never stops every drain.
+    EntryBlocked(String),
 }
 
 /// What a check recorded: the job id, its summary lines and the end of its output.
@@ -1978,6 +2026,8 @@ enum Alone {
     /// It passes on its own commit: the failure only shows when it is combined with the entries before it.
     Fine,
     Unknown(String),
+    /// Its own worktree kept the check from a verdict (see `TrainCheck::EntryBlocked`).
+    EntryBlocked(String),
 }
 
 /// The entries the next train takes out of `items` (one `(project, claims)` per approved entry, oldest first), as indices into
@@ -2008,10 +2058,29 @@ fn pick_train(items: &[(String, Vec<String>)], max: usize, flush: bool) -> Vec<u
     Vec::new()
 }
 
-/// The commit a merge train chained this entry's branch onto: `left_train_base` (recorded when it left a train, kept across attempts),
-/// else `train_up` (the base of its own commits while it rides a train). Empty for an entry no train ever chained.
-fn chain_base_of(e: &Record) -> String {
-    if e.get("left_train_base").is_empty() { e.get("train_up").to_string() } else { e.get("left_train_base").to_string() }
+/// The commits a merge train may have chained this entry's branch onto, in this order: `left_train_base` (recorded when it left a
+/// train, kept across attempts), `train_onto` (a chain rebase begun onto it and never recorded as finished: a drain killed after the
+/// rebase moved the branch and before `train_link` saved it, see its KILL WINDOW note; `train_up` is then still the old base) and
+/// `train_up` (the base of its own commits while it rides a train). Empty for an entry no train ever chained.
+fn chain_bases_of(e: &Record) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in ["left_train_base", "train_onto", "train_up"] {
+        let v = e.get(k);
+        if !v.is_empty() && !out.iter().any(|x| x == v) {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
+/// LEFT-TRAIN RULE, for every caller: the first of `chain_bases_of(e)` that `branch` is still chained on (`chained_onto`), or `None`.
+fn chained_base(dir: &Path, branch: &str, e: &Record) -> Result<Option<String>, String> {
+    for base in chain_bases_of(e) {
+        if chained_onto(dir, branch, &base)? {
+            return Ok(Some(base));
+        }
+    }
+    Ok(None)
 }
 
 /// LEFT-TRAIN RULE, the test: does `branch` still carry `base` (a commit a merge train chained it onto) while main's HEAD does not?
@@ -2089,6 +2158,18 @@ fn leave_approved(cfg: &Config, members: Vec<(Run<'_>, std::time::Instant)>, why
     }
 }
 
+/// A train check gave no verdict because of ONE entry's worktree (`TrainCheck::EntryBlocked`): that entry leaves the train and ends
+/// `blocked` with the reason (the left-train rule decides the exact text, `leave_train`), as the single-entry path blocks only its own
+/// entry. The `others` merged nothing and stay `approved`: the next drain takes them again without it. The drain is NOT stopped.
+fn entry_leaves_blocked(cfg: &Config, train_id: &str, member: (Run<'_>, std::time::Instant), msg: &str, others: Vec<(Run<'_>, std::time::Instant)>, rows: &mut Vec<Row>, worst: &mut u8) {
+    let (mut r, t) = member;
+    let id = r.e.id().to_string();
+    println!("merge train {train_id}: entry {id} cannot be checked ({msg}); it leaves the train `blocked`, the other {} entr{} stay approved for the next drain", others.len(), if others.len() == 1 { "y" } else { "ies" });
+    let c = r.leave_train(BLOCKED, &format!("merge train {train_id} could not check this entry: {msg}. Put the task's worktree back on its branch at the reviewed commit with nothing else in it, then run the entry again; nothing of it was merged"), EXIT_RETRY);
+    finish_member(cfg, r, code_num(c), t, rows, worst);
+    leave_approved(cfg, others, &format!("entry {id} left merge train {train_id} (its worktree was not exactly the commit to check); nothing merged, this entry waits for the next drain"), rows, worst);
+}
+
 /// An internal error that hits every member (git or the record could not be used): each stays as it is, with the message.
 fn fail_members(cfg: &Config, members: Vec<(Run<'_>, std::time::Instant)>, msg: &str, rows: &mut Vec<Row>, worst: &mut u8) -> u8 {
     for (mut r, t) in members {
@@ -2146,7 +2227,9 @@ fn chain_tip(chain: &[(Run<'_>, std::time::Instant)], i: usize) -> String {
 ///    proven prefix instead would turn e2 into a plain `conflict` but put e1 on main while its partner is unknown; that is a later
 ///    choice for the measurement window, not this phase. Every round removes at least one entry, so it ends.
 /// 6. A main check that fails after the fast-forward: every entry of the merge is `merged_check_failed` (exit 6), main is NOT reset, the
-///    drain stops. A check that cannot run to a verdict leaves all its entries `approved` and stops the drain.
+///    drain stops. A check that cannot run to a verdict leaves all its entries `approved` and stops the drain, unless the reason is
+///    one entry's own worktree (`TrainCheck::EntryBlocked`): then only that entry ends `blocked`, the rest stay `approved` for the
+///    next drain, and this drain goes on.
 ///
 /// Returns 0, EXIT_ERROR or EXIT_MERGED_BAD (the drain stops on the last two).
 fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, rows: &mut Vec<Row>) -> u8 {
@@ -2220,6 +2303,8 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
         let mut good = PassInfo::default();
         let mut bad = PassInfo::default();
         let mut blocked: Option<String> = None;
+        // a check that gave no verdict because of ONE entry's worktree: that entry's 1-based position in the chain, and why
+        let mut entry_blocked: Option<(usize, String)> = None;
         let mut bisect_checks = 0u32;
         let mut bisect_secs = 0f64;
         let tip = chain_tip(&chain, m);
@@ -2232,8 +2317,9 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
             }
             TrainCheck::Fail { job, summary, tail } => bad = PassInfo { job, summary, tail },
             TrainCheck::Blocked(msg) => blocked = Some(msg),
+            TrainCheck::EntryBlocked(msg) => entry_blocked = Some((m, msg)),
         }
-        while blocked.is_none() && hi - lo > 1 {
+        while blocked.is_none() && entry_blocked.is_none() && hi - lo > 1 {
             let mid = (lo + hi) / 2;
             let tip_mid = chain_tip(&chain, mid);
             let tb = std::time::Instant::now();
@@ -2251,6 +2337,7 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                     bad = PassInfo { job, summary, tail };
                 }
                 TrainCheck::Blocked(msg) => blocked = Some(msg),
+                TrainCheck::EntryBlocked(msg) => entry_blocked = Some((mid, msg)),
             }
         }
         if bisect_checks > 0 {
@@ -2264,6 +2351,12 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
             println!("merge train {train_id}: the check could not give a verdict ({msg}); the {m} entries stay approved");
             leave_approved(cfg, chain, &format!("the merge train's check could not run to a verdict: {msg}"), rows, &mut worst);
             hard = EXIT_ERROR;
+            break;
+        }
+        if let Some((pos, msg)) = entry_blocked {
+            // ONE entry's worktree is the reason (see `TrainCheck::EntryBlocked`): only it leaves, the rest wait, the drain goes on
+            let member = chain.remove(pos - 1);
+            entry_leaves_blocked(cfg, &train_id, member, &msg, chain, rows, &mut worst);
             break;
         }
         if lo == m {
@@ -2292,10 +2385,17 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                     Alone::Fine
                 }
                 TrainCheck::Blocked(msg) => Alone::Unknown(msg),
+                TrainCheck::EntryBlocked(msg) => Alone::EntryBlocked(msg),
             }
         };
         let culprit_id = culprit.e.id().to_string();
         match alone {
+            Alone::EntryBlocked(msg) => {
+                let mut rest = chain;
+                rest.extend(after);
+                entry_leaves_blocked(cfg, &train_id, (culprit, ct), &msg, rest, rows, &mut worst);
+                break;
+            }
             Alone::Unknown(msg) => {
                 println!("merge train {train_id}: entry {culprit_id} could not be checked on its own ({msg}); every entry stays approved");
                 let mut all = chain;
