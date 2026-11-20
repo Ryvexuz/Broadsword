@@ -215,8 +215,7 @@ fn add(cfg: &Config, p: &Plan) -> Result<(), AddFail> {
     let parent = p.path.parent().ok_or_else(|| AddFail::plain("bad worktree path".into()))?;
     std::fs::create_dir_all(parent).map_err(|e| AddFail::plain(format!("cannot create {}: {e}", parent.display())))?;
     let Err(e) = wtgit::worktree_add(&p.dir, &p.branch, &p.path, &p.base) else { return Ok(()) };
-    let left = clean_up_failed_add(p, !e.contains("already exists"));
-    remove_empty_parents(cfg, parent);
+    let left = take_back(cfg, p, !e.contains("already exists"));
     if left.is_empty() {
         Err(AddFail::plain(e))
     } else {
@@ -224,13 +223,24 @@ fn add(cfg: &Config, p: &Plan) -> Result<(), AddFail> {
     }
 }
 
-/// After `git worktree add` failed. A failing post-checkout hook makes git exit non-zero AFTER it made the branch and the
-/// populated folder, and git does not undo either. `plan` found neither, so what is there now was made by this call,
-/// unless git said "already exists" (`ours` false: someone else made it in between, and nothing is touched). Order: the
-/// worktree first, with git's own `worktree remove` (never --force), and only when `status --porcelain --ignored` is empty,
-/// because `worktree remove` would silently delete ignored files; then the branch, with `branch -d`, only once its folder
-/// is gone and only while it is still at the base. Returns one line for everything that is still there.
-fn clean_up_failed_add(p: &Plan, ours: bool) -> Vec<String> {
+/// The ONE way this module takes back a worktree and branch that this start or create made: after a failed `git worktree
+/// add`, and (`undo`) after an add that worked but whose record could not be saved. In both cases a post-checkout hook may
+/// have run inside the new worktree and written files into it, so the same rule applies. A failing hook makes git exit
+/// non-zero AFTER it made the branch and the populated folder, and git does not undo either. `plan` found neither, so what
+/// is there now was made by this call, unless git said "already exists" (`ours` false: someone else made it in between,
+/// and nothing is touched). Order: the worktree first, with git's own `worktree remove` (never --force), and only when
+/// `status --porcelain --ignored` is empty, because `worktree remove` would silently delete ignored files; then the branch,
+/// with `branch -d`, only once its folder is gone and only while it is still at the base; then empty parent folders.
+/// Returns one line for everything that is still there (empty: nothing is left).
+fn take_back(cfg: &Config, p: &Plan, ours: bool) -> Vec<String> {
+    let left = take_back_worktree_and_branch(p, ours);
+    if let Some(parent) = p.path.parent() {
+        remove_empty_parents(cfg, parent);
+    }
+    left
+}
+
+fn take_back_worktree_and_branch(p: &Plan, ours: bool) -> Vec<String> {
     let mut left = Vec::new();
     let path = p.path.display();
     if p.path.exists() || std::fs::symlink_metadata(&p.path).is_ok() {
@@ -273,15 +283,11 @@ fn clean_up_failed_add(p: &Plan, ours: bool) -> Vec<String> {
     left
 }
 
-/// Best-effort undo of a worktree whose record could not be saved: it is clean and its branch is at the base, so the same
-/// safe commands remove it. Returns what is left, if anything.
+/// Undo of a worktree that was made but whose record could not be saved: `take_back`, the same rule as after a failed
+/// add (a hook that succeeded may still have written ignored files). Returns what is left, named, if anything.
 fn undo(cfg: &Config, p: &Plan) -> Option<String> {
-    if let Err(e) = wtgit::worktree_remove(&p.dir, &p.path) {
-        return Some(format!("{e}; remove {} by hand", p.path.display()));
-    }
-    let _ = wtgit::branch_delete_if_merged(&p.dir, &p.branch);
-    remove_empty_parents(cfg, p.path.parent()?);
-    None
+    let left = take_back(cfg, p, true);
+    (!left.is_empty()).then(|| format!("LEFT BEHIND, nothing was deleted: {}", left.join("; ")))
 }
 
 pub fn describe(p: &Plan) -> String {
@@ -355,10 +361,14 @@ pub fn finish(cfg: &Config, id: &str, p: Plan, mode: Mode) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    let left = undo(cfg, &p).map(|l| format!(" The new worktree could not be removed again: {l}")).unwrap_or_default();
+                    let left = undo(cfg, &p);
+                    let why = match &left {
+                        Some(l) => format!("{e}. The new worktree could not be removed again: {l}"),
+                        None => format!("{e}; the new worktree and its branch were removed again"),
+                    };
                     match mode {
-                        Mode::Start { .. } => roll_back_start(&mut t, &format!("{e}.{left}"), !left.is_empty()),
-                        Mode::Create => task::fail(task::EXIT_ERROR, format!("{e}; the new worktree was removed again.{left}")),
+                        Mode::Start { .. } => roll_back_start(&mut t, &why, left.is_some()),
+                        Mode::Create => task::fail(task::EXIT_ERROR, why),
                     }
                 }
             }

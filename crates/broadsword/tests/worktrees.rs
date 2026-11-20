@@ -1209,3 +1209,51 @@ fn a_failing_hook_that_leaves_an_ignored_file_keeps_the_worktree() {
     assert_eq!(fs::read_to_string(r.wt(&id).join("notes.secret")).unwrap().trim(), "keep", "the ignored file is kept");
     assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
 }
+
+/// The add SUCCEEDS (the hook exits 0) but its hook wrote an ignored file, and then the record cannot be saved, so the
+/// new worktree is undone. That undo must follow the same rule as the failed add: `git worktree remove` would silently
+/// delete the ignored file, so the worktree, the file and the branch are kept and named. No test seam: the hook makes the
+/// save really fail by putting a folder where the record's temp file must be written.
+#[test]
+fn an_undo_after_a_failed_record_save_keeps_an_ignored_file_a_hook_wrote() {
+    let r = Root::new("undoignored");
+    fs::write(r.p().join(".gitignore"), "*.secret\n").unwrap();
+    git(&r.p(), &["add", ".gitignore"]);
+    git(&r.p(), &["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "ignore"]);
+    let id = r.add("p", "src");
+    let tmp = r.dir.join("state/tasks").join(format!("{id}.task.tmp"));
+    let tmp_sh = tmp.display().to_string().replace('\\', "/");
+    set_hook(&r, &format!("echo keep > notes.secret\nmkdir \"{tmp_sh}\"\nexit 0"));
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(tmp.is_dir(), "the hook made the record save fail: {}", o.stderr);
+    assert!(o.stderr.contains("cannot write task record"), "the save failed: {}", o.stderr);
+    assert!(!o.stdout.contains("is running"), "{}", o.stdout);
+    assert_eq!(fs::read_to_string(r.wt(&id).join("notes.secret")).unwrap().trim(), "keep", "the ignored file survives the undo");
+    let shown = r.wt(&id).display().to_string().replace('/', "\\");
+    assert!(o.stderr.contains("LEFT BEHIND") && o.stderr.contains("nothing was deleted"), "{}", o.stderr);
+    assert!(o.stderr.contains(&shown) && o.stderr.contains("notes.secret"), "names the worktree and the ignored file: {}", o.stderr);
+    assert!(o.stderr.contains(&format!("task/{id}")), "names the kept branch: {}", o.stderr);
+    assert!(r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
+    assert_eq!(r.worktree_dirs().len(), 2, "the worktree is still git's: {:?}", r.worktree_dirs());
+    assert!(!o.stderr.to_lowercase().contains("force"), "never suggests forcing: {}", o.stderr);
+    fs::remove_dir(&tmp).unwrap();
+}
+
+/// Same failed save, but the hook left nothing: the undo still removes the clean worktree and the empty branch.
+#[test]
+fn an_undo_after_a_failed_record_save_removes_a_clean_worktree_and_its_branch() {
+    let r = Root::new("undoclean");
+    let id = r.add("p", "src");
+    let tmp = r.dir.join("state/tasks").join(format!("{id}.task.tmp"));
+    let tmp_sh = tmp.display().to_string().replace('\\', "/");
+    set_hook(&r, &format!("mkdir \"{tmp_sh}\"\nexit 0"));
+    let o = r.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+    assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("cannot write task record") && !o.stderr.contains("LEFT BEHIND"), "{}", o.stderr);
+    assert!(!r.wt(&id).exists(), "the clean worktree was removed");
+    assert!(!r.dir.join("worktrees/p").exists(), "and its empty parent");
+    assert!(!r.branches().iter().any(|b| b == &format!("task/{id}")), "{:?}", r.branches());
+    assert_eq!(r.worktree_dirs().len(), 1, "{:?}", r.worktree_dirs());
+    fs::remove_dir(&tmp).unwrap();
+}
