@@ -519,13 +519,43 @@ fn a_reviewer_model_equal_to_the_coder_blocks_the_entry_before_anything_runs() {
     assert!(r.field(&e, "reason").contains("same as the coder"), "{}", r.field(&e, "reason"));
     assert_eq!(r.calls(), 0);
     assert_eq!(r.branch_tip(&id), tip);
-    // high risk with coder opus is the same rule
+    // high risk with coder opus is blocked too once the fallback is also the coder's family
+    let toml = r.dir.join("broadsword.toml");
+    fs::write(&toml, fs::read_to_string(&toml).unwrap().replace("reviewer_model_high_fallback = \"sonnet\"", "reviewer_model_high_fallback = \"opus\"")).unwrap();
     let id2 = r.started("docs");
     r.commit(&r.wt(&id2), "docs/a.txt", "x\n", "task: docs");
     let e2 = r.add(&id2, "high", "opus");
     let o = r.run(&["queue", "run", "--entry", &e2]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e2), "blocked");
+    assert!(r.field(&e2, "reason").contains("reviewer_model_high_fallback"), "{}", r.field(&e2, "reason"));
+    assert_eq!(r.calls(), 0);
+}
+
+/// Runs one high-risk entry coded by `coder`; returns the reviewer test hook's call log and the entry as recorded.
+fn high_review(name: &str, coder: &str) -> (String, String) {
+    let r = Root::new(name, 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "high", coder);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged");
+    (fs::read_to_string(r.fake_out.join("calls.log")).unwrap(), r.show(&e))
+}
+
+#[test]
+fn an_opus_coded_high_entry_is_reviewed_by_sonnet() {
+    let (calls, out) = high_review("hifb", "opus");
+    assert!(calls.contains("--model\u{1f}sonnet") && !calls.contains("--model\u{1f}opus"), "{calls}");
+    assert!(out.contains("fallback: coder is opus"), "{out}");
+}
+
+#[test]
+fn a_sonnet_coded_high_entry_is_reviewed_by_opus() {
+    let (calls, out) = high_review("hiop", "sonnet");
+    assert!(calls.contains("--model\u{1f}opus") && !calls.contains("--model\u{1f}sonnet"), "{calls}");
+    assert!(!out.contains("fallback"), "{out}");
 }
 
 #[test]

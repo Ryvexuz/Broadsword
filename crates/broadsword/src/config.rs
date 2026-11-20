@@ -95,6 +95,8 @@ pub struct Config {
     /// The reviewer model for a `--risk low` / `--risk high` queue entry.
     pub reviewer_model_low: String,
     pub reviewer_model_high: String,
+    /// The `--risk high` reviewer when `reviewer_model_high` is the coder's own family.
+    pub reviewer_model_high_fallback: String,
     /// A reviewer call that runs longer than this is killed (no verdict, the entry is `blocked`).
     pub reviewer_timeout_seconds: u64,
     /// A diff bigger than this is never sent to a reviewer (the entry is `blocked`: split the task).
@@ -232,6 +234,7 @@ impl Config {
             reviewer_cli,
             reviewer_model_low: model("reviewer_model_low")?,
             reviewer_model_high: model("reviewer_model_high")?,
+            reviewer_model_high_fallback: model("reviewer_model_high_fallback")?,
             reviewer_timeout_seconds: positive("reviewer_timeout_seconds")?,
             reviewer_diff_max_kb: positive("reviewer_diff_max_kb")?,
             reviewer_brief_max_kb: positive("reviewer_brief_max_kb")?,
@@ -365,7 +368,7 @@ mod tests {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
@@ -399,7 +402,7 @@ install_dir=\"build/bin\"\n";
         let c = Config::from_text(text, Path::new("p")).unwrap();
         assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
         for key in [
-            "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
+            "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_model_high_fallback", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
             "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms",
         ] {
             let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
@@ -412,6 +415,7 @@ install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&with("reviewer_backend", "reviewer_backend = \"openai\""), Path::new("p")).is_err());
         assert!(Config::from_text(&with("reviewer_model_low", "reviewer_model_low = \"--evil\""), Path::new("p")).is_err());
         assert!(Config::from_text(&with("reviewer_model_high", "reviewer_model_high = \"a b\""), Path::new("p")).is_err());
+        assert!(Config::from_text(&with("reviewer_model_high_fallback", "reviewer_model_high_fallback = \"a b\""), Path::new("p")).is_err());
         assert!(Config::from_text(&with("reviewer_timeout_seconds", "reviewer_timeout_seconds = 0"), Path::new("p")).is_err());
         assert!(Config::from_text(&with("reviewer_cli", "reviewer_cli = \"\""), Path::new("p")).is_err());
         assert!(Config::from_text(&with("max_agents", "max_agents = 0"), Path::new("p")).is_err(), "max_agents = 0 would start nothing");
@@ -447,7 +451,7 @@ install_dir=\"build/bin\"\n";
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
@@ -488,7 +492,7 @@ worktrees_dir = \"worktrees\"\n";
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"

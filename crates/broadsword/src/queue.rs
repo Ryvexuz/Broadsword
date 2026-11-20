@@ -186,12 +186,20 @@ fn some(s: &str) -> String {
     format!("{} path(s): {}{}", lines.len(), lines.iter().take(5).map(|l| l.trim_end()).collect::<Vec<_>>().join("; "), if lines.len() > 5 { "; ..." } else { "" })
 }
 
-/// The reviewer model for a risk level (a setting each).
-pub fn reviewer_model_for<'a>(cfg: &'a Config, risk: &str) -> &'a str {
-    if risk == "high" {
-        &cfg.reviewer_model_high
+/// The gating reviewer model for a risk level and the note on why (empty unless the fallback was used). For `high`, a high model of
+/// the coder's family is replaced by `reviewer_model_high_fallback`; Err names the problem when no allowed model is left.
+pub fn gating_model<'a>(cfg: &'a Config, risk: &str, coder: &str) -> Result<(&'a str, String), String> {
+    if risk != "high" {
+        let m = cfg.reviewer_model_low.as_str();
+        return if same_model(coder, m) { Err(format!("the reviewer model for low risk is `{m}`, the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_low in broadsword.toml")) } else { Ok((m, String::new())) };
+    }
+    let (hi, fb) = (cfg.reviewer_model_high.as_str(), cfg.reviewer_model_high_fallback.as_str());
+    if !same_model(coder, hi) {
+        Ok((hi, String::new()))
+    } else if !same_model(coder, fb) {
+        Ok((fb, format!("fallback: coder is {}", reviewer::model_family(coder))))
     } else {
-        &cfg.reviewer_model_low
+        Err(format!("reviewer_model_high `{hi}` and reviewer_model_high_fallback `{fb}` are both the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_high or reviewer_model_high_fallback in broadsword.toml"))
     }
 }
 
@@ -347,7 +355,7 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         return fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display()));
     }
     println!("{}", e.id());
-    println!("queued task {task_id} ({risk} risk, coder {coder}); `broadsword queue run` will review it with `{}` and merge it if it passes", reviewer_model_for(cfg, risk));
+    println!("queued task {task_id} ({risk} risk, coder {coder}); `broadsword queue run` will review it with `{}` and merge it if it passes", gating_model(cfg, risk, coder).map_or_else(|_| "no allowed model (the entry will be blocked)".to_string(), |(m, why)| if why.is_empty() { m.to_string() } else { format!("{m} ({why})") }));
     ExitCode::SUCCESS
 }
 
@@ -779,15 +787,16 @@ impl<'a> Run<'a> {
         if !wt_status.is_empty() {
             return Err(self.blocked(&format!("the task's worktree is not clean ({}); commit or remove those changes, then run again (ignored files do not matter here)", some(&wt_status))));
         }
-        let (coder, model) = (self.e.get("coder").to_string(), reviewer_model_for(self.cfg, self.e.get("risk")).to_string());
-        if same_model(&coder, &model) {
-            return Err(self.blocked(&format!("the reviewer model for {} risk is `{model}`, the same as the coder (`{coder}`); a model never reviews its own code. Queue the task again with another --coder, or change reviewer_model_{} in broadsword.toml", self.e.get("risk"), self.e.get("risk"))));
-        }
+        let coder = self.e.get("coder").to_string();
+        let (model, why) = match gating_model(self.cfg, self.e.get("risk"), &coder) {
+            Ok((m, why)) => (m.to_string(), if why.is_empty() { String::new() } else { format!(" ({why})") }),
+            Err(msg) => return Err(self.blocked(&msg)),
+        };
         let ahead = self.g(wtgit::rev_count(&dir, &format!("HEAD..{branch}")))?;
         if ahead == 0 {
             return Err(self.blocked(&format!("nothing to merge: `{branch}` has no commit that `{main_branch}` lacks")));
         }
-        self.log("preconditions", &format!("ok: main `{main_branch}` clean, worktree clean, task running, {ahead} commit(s) to merge, reviewer `{model}` differs from coder `{coder}`"))
+        self.log("preconditions", &format!("ok: main `{main_branch}` clean, worktree clean, task running, {ahead} commit(s) to merge, reviewer `{model}`{why} differs from coder `{coder}`"))
     }
 
     fn abort_stale_rebase(&mut self) -> R<()> {
@@ -907,10 +916,10 @@ impl<'a> Run<'a> {
             return self.recorded_verdict_ok();
         }
         let (dir, branch) = (self.dir.clone(), self.branch());
-        let model = reviewer_model_for(self.cfg, self.e.get("risk")).to_string();
-        if same_model(self.e.get("coder"), &model) {
-            return Err(self.blocked(&format!("the reviewer model `{model}` is the same as the coder; a model never reviews its own code")));
-        }
+        let model = match gating_model(self.cfg, self.e.get("risk"), self.e.get("coder")) {
+            Ok((m, _)) => m.to_string(),
+            Err(msg) => return Err(self.blocked(&msg)),
+        };
         // Check, review and merge are bound to ONE commit: the one the check passed on. A branch that moved since (a commit added
         // after the check, live or before a resume) was never checked, so it is never reviewed and never merged.
         let checked = self.e.get("checked_tip").to_string();
