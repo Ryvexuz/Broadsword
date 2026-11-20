@@ -47,6 +47,9 @@ class PushRefused(RuntimeError):
 
 _USERINFO = re.compile(r"(://)[^/\s@]*@")
 _PLAIN_SPEC = re.compile(r"^refs/(heads|tags)/[^:+\s-][^:\s]*:refs/(heads|tags)/[^:+\s-][^:\s]*$")
+# The ONLY flag a push may carry: git's lease with an EMPTY expected value, which makes the remote refuse
+# the update when the branch already exists. It is how a first-time publish stays create-only.
+_CREATE_ONLY = re.compile(r"^--force-with-lease=refs/heads/([^:+\s-][^:\s]*):$")
 _FORBIDDEN_FLAGS = ("--force", "-f", "--delete", "-d", "--mirror", "--prune", "--all")
 
 
@@ -56,9 +59,17 @@ def scrub(text):
 
 
 def check_plain_push(cmd):
-    """The one guard that keeps pushes plain. A real check, not an assert (python -O removes those)."""
+    """The one guard that keeps pushes plain. A real check, not an assert (python -O removes those).
+    The single flag allowed is the create-only lease (see _CREATE_ONLY), and only when one of the
+    refspecs sends a branch to exactly that remote branch."""
     i = cmd.index("push")
     rest = cmd[i + 1:]
+    lease = None
+    if rest and rest[0].startswith("-"):
+        lease = _CREATE_ONLY.match(rest[0])
+        if not lease:
+            raise PushRefused("refusing push flag %r" % rest[0])
+        rest = rest[1:]
     if len(rest) < 2 or rest[0].startswith("-"):
         raise PushRefused("refusing push command without a plain url and refspecs")
     for a in rest[1:]:
@@ -66,6 +77,8 @@ def check_plain_push(cmd):
             raise PushRefused("refusing push flag %r" % a)
         if not _PLAIN_SPEC.match(a):
             raise PushRefused("refusing non-plain refspec %r" % a)
+    if lease and not any(a.split(":")[1] == "refs/heads/" + lease.group(1) for a in rest[1:]):
+        raise PushRefused("create-only lease %r matches no branch refspec" % cmd[i + 1])
     return cmd
 
 
@@ -204,10 +217,12 @@ def push_plan(root, entry, res):
     return url, refspecs
 
 
-def push_cmd(root, entry, url, refspecs):
-    """The full push command; refused unless plain (see check_plain_push)."""
+def push_cmd(root, entry, url, refspecs, first_time=False):
+    """The full push command; refused unless plain (see check_plain_push). A first-time publish
+    carries the create-only lease, so the remote refuses it if the branch appeared after our check."""
     repo = os.path.join(root, entry["path"])
-    return check_plain_push(["git", "-C", repo, "push", url, *refspecs])
+    flags = ["--force-with-lease=refs/heads/%s:" % entry["remote_branch"]] if first_time else []
+    return check_plain_push(["git", "-C", repo, "push", *flags, url, *refspecs])
 
 
 def remote_branch_exists(url, entry):
@@ -285,7 +300,8 @@ def main(argv=None):
         try:
             for e, r in todo:
                 url, specs = push_plan(args.root, e, r)
-                plans.append((e, url, specs, push_cmd(args.root, e, url, specs), bool(r.get("first_time"))))
+                plans.append((e, url, specs, push_cmd(args.root, e, url, specs, bool(r.get("first_time"))),
+                              bool(r.get("first_time"))))
         except (RuntimeError, OSError) as e:
             print("backup: cannot plan push: %s" % scrub(e))
             return 2

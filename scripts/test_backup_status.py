@@ -331,6 +331,52 @@ class Push(Base):
         self.assertEqual(code, 1, out)
         self.assertNotIn("refs/heads/brand-new", self.remote_refs())
 
+    def test_first_time_push_is_create_only_when_branch_appears_after_check(self):
+        # another writer creates "brand-new" at an ancestor between our ls-remote check and our push
+        self.write_map([{"name": "root", "path": ".", "branch": "main",
+                         "remote": "origin", "remote_branch": "brand-new"}])
+        commit(self.root, "b.txt")
+        ancestor = g(self.root, "rev-parse", "main~1")
+        orig = bs.remote_branch_exists
+
+        def racing(url, entry):
+            exists = orig(url, entry)   # the real check: the branch is absent right now
+            g(self.bare, "update-ref", "refs/heads/brand-new", ancestor)   # then the other writer wins
+            return exists
+        bs.remote_branch_exists = racing
+        try:
+            code, out = self.run_cli("--push", "--yes")
+        finally:
+            bs.remote_branch_exists = orig
+        self.assertEqual(code, 1, out)
+        self.assertIn("push FAILED", out)
+        self.assertEqual(ancestor, g(self.bare, "rev-parse", "brand-new"))   # not fast-forwarded
+        self.assertIn("backup: 1 repos behind", out)
+
+    def test_create_only_lease_is_the_only_flag_the_guard_allows(self):
+        spec = "refs/heads/m:refs/heads/nb"
+        lease = "--force-with-lease=refs/heads/nb:"
+        self.assertEqual(bs.check_plain_push(["git", "push", lease, "u", spec])[2], lease)
+        bad = [["git", "push", "--force-with-lease", "u", spec],
+               ["git", "push", "--force-with-lease=refs/heads/nb:abc123", "u", spec],
+               ["git", "push", "--force-with-lease=refs/heads/nb", "u", spec],
+               ["git", "push", "--force-with-lease=refs/heads/other:", "u", spec],   # no refspec to that branch
+               ["git", "push", "--force-with-lease=refs/tags/nb:", "u", "refs/tags/nb:refs/tags/nb"],
+               ["git", "push", lease, "--force", "u", spec],
+               ["git", "push", lease, "u", spec, "--force"],
+               ["git", "push", lease, "u", "+" + spec],
+               ["git", "push", "--force-with-lease=refs/heads/nb:", "--force-with-lease=refs/heads/nb:", "u", spec]]
+        for c in bad:
+            with self.assertRaises(bs.PushRefused, msg=c):
+                bs.check_plain_push(c)
+
+    def test_first_time_push_uses_lease_and_ordinary_push_does_not(self):
+        entry = {"name": "root", "path": ".", "remote_branch": "nb"}
+        first = bs.push_cmd(str(self.root), entry, "u", ["refs/heads/m:refs/heads/nb"], True)
+        self.assertIn("--force-with-lease=refs/heads/nb:", first)
+        plain = bs.push_cmd(str(self.root), entry, "u", ["refs/heads/m:refs/heads/nb"])
+        self.assertFalse([a for a in plain if a.startswith("--")])
+
     def test_guard_refuses_force_exit_2(self):
         commit(self.root, "b.txt")
         orig = bs.push_plan
