@@ -1662,6 +1662,27 @@ fn three_approved_entries_with_disjoint_claims_merge_as_one_train_with_one_check
 }
 
 #[test]
+fn an_opus_coded_high_entry_in_a_merge_train_is_gated_by_sonnet() {
+    // The train path (`queue run --all`) picks the gating reviewer through `gating_model` too: an Opus-coded high-risk entry is
+    // reviewed by reviewer_model_high_fallback (sonnet), never by opus, and still merges with its train-mate.
+    let r = train_root("trainfb", 4);
+    let (_, e1) = train_one(&r, "src/a.txt", "x\n");
+    let id2 = r.started("src/b.txt");
+    r.commit(&r.wt(&id2), "src/b.txt", "x\n", "task: src/b.txt");
+    let e2 = r.add(&id2, "high", "opus");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    let train = r.field(&e1, "merge train");
+    assert!(train.starts_with("tr-") && r.field(&e2, "merge train") == train, "both merged in one train: {train}");
+    let calls = fs::read_to_string(r.fake_out.join("calls.log")).unwrap();
+    assert!(calls.contains("--model\u{1f}sonnet") && !calls.contains("--model\u{1f}opus"), "{calls}");
+    assert!(r.show(&e2).contains("fallback: coder is opus"), "{}", r.show(&e2));
+}
+
+#[test]
 fn entries_with_overlapping_claims_never_share_a_train() {
     let r = train_root("trainclash", 4);
     let (_, e1) = train_one(&r, "src/a.txt", "x\n");
