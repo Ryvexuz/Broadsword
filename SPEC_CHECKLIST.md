@@ -54,3 +54,18 @@ Start from `templates/brief.md` for the brief and `templates/coder-prompt.md` fo
 - **Records:**
   - The Housekeeper (Haiku) writes `PROGRESS.md`, the `LAB_LOG.md` entry and the evidence file, from facts the orchestrator gives it.
   - The orchestrator checks them before committing.
+
+## Milestone close: profiling pass
+
+Run at every milestone close, before the stage audit. Lazlo, 2026-11-20: optimize performance early, before things get complex. Every command is run from the main checkout root through `build/bin/broadsword.exe` and was checked against `projects/crash-sim/examples` (`bench.rs`, `profile_step.rs`) and `projects/render/examples` (`drive.rs`) on 2026-11-20.
+
+1. **Quiet start.** Run `build/bin/broadsword.exe status` and write down the `cpu:` line before each run below. Run only when it shows 30% or less; if it shows more, run anyway and write "loaded, cpu N%" next to that result. Done: every result in the record has its CPU % or "loaded".
+2. **Phase profile.** Run `build/bin/broadsword.exe run crash-sim -- cargo run --offline --release --example profile_step`. It prints one `run N:` line per run (each must end `final state identical`) and a table of 8 phases with `share`. Done: the table is copied into the record and the run exited 0 (a non-zero exit, or a `run` line without `final state identical`, is a failure to fix, not a number).
+3. **Bench.** Run `build/bin/broadsword.exe run crash-sim -- cargo run --offline --release --example bench`. It prints one JSON line per case (`box`, `cube`, `settle`, `car`) with `median_ms`. Done: all four lines are copied into the record, and `car` is among them (to run one case: add `-- --case car` after the example name).
+4. **Compare with the last close.** Open the previous close's record and compare each phase `share` from item 2 and each `median_ms` from item 3. The record is a new file per close, `evidence/perf-close-<milestone>.md` (for example `evidence/perf-close-stage-6.md`); the previous one is the newest other `evidence/perf-close-*.md`. Done: the new file lists, for every phase and case, the old number, the new number and the change in %. If no earlier record exists, the file says "first record" and the numbers become the baseline.
+5. **Slowdowns get a task.** Every `median_ms` that is more than 10% above the previous close, measured on a quiet run (item 1), gets a board task (`build/bin/broadsword.exe task add crash-sim --title <text> --claim <path>`) whose title or brief holds both numbers. A slowdown measured on a loaded run is repeated once on a quiet machine first. Done: the record lists each slowdown with its task id, or says "no slowdown over 10%".
+6. **Viewer.** Build the sim, then run the viewer's scripted drive without a window:
+   - `build/bin/broadsword.exe run crash-sim -- cargo build --offline --release --bin crash-sim`
+   - `build/bin/broadsword.exe run render -- cargo run --offline --release --example drive -- --sim-exe ../../build/release/crash-sim.exe --body ../crash-sim/scenarios/car_basic.bsn --script 30 --no-window`
+
+   Done: the record holds the `summary:` line (`average fps`) and the `timing: per drawn frame` line, and states that 16.7 ms (60 fps) was or was not met. `drive` does not print a p99 frame time today (it prints the mean draw time and the p90 of the child round trip), so write "p99 frame time: not measured" until `drive` prints it; never put a p99 estimated from the average in the record.
