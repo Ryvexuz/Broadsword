@@ -46,18 +46,41 @@ use std::time::{Duration, Instant};
 /// or message.
 pub const CLI_ENV: &str = "BROADSWORD_REVIEWER_CLI";
 
-/// The reviewer's fixed system prompt: the one the reviewer benchmark (bench/reviewer/run.py) measured.
-pub const SYSTEM_PROMPT: &str = "You are an independent code reviewer. You did not write this code and you do not fix it.
+// The prompt pieces are macros so both prompts are built from the same text by `concat!` and cannot drift apart.
+macro_rules! prompt_head {
+    () => {
+        "You are an independent code reviewer. You did not write this code and you do not fix it.
 You are given a task description, its done check, and a diff. Decide whether the change really delivers what the task and done check require.
 Look for: bugs that break the done check or the stated rules, data loss, security problems, races, faked or silent success, and wrong documentation.
-Do not report style issues. Be specific: name the file and line (from the diff) and the concrete scenario that fails.
-
-Answer in exactly this format and nothing else:
+Do not report style issues. Be specific: name the file and line (from the diff) and the concrete scenario that fails."
+    };
+}
+macro_rules! prompt_tail {
+    () => {
+        "Answer in exactly this format and nothing else:
 VERDICT: PASS or FAIL
 BLOCKING: <file:line> - <one sentence: what fails, in which scenario>
 (one BLOCKING line per blocking problem; write \"BLOCKING: none\" if there are none)
 MINOR: <file:line> - <one sentence>
-(one MINOR line per minor problem; write \"MINOR: none\" if there are none)";
+(one MINOR line per minor problem; write \"MINOR: none\" if there are none)"
+    };
+}
+/// The "B2" rules block of the 2026-11 prompt-block replay (scratch/prompt-block-replay/b2-block.txt), for the gate only.
+macro_rules! gate_block {
+    () => {
+        "Rules for BLOCKING lines:
+1. The brief is the spec. A point it already settles (accepted deviation, documented limit, override, \"Adjudication\" or \"Fix round\" verdict, a named follow-up task) is never BLOCKING. Judge only what changed since the last review.
+2. CHECK RESULT covers only what the queue ran (the Rust build and tests). Done-check output for other commands is pasted in the brief; do not block because it is missing from CHECK RESULT.
+3. The brief's expected output for a done-check command (for example \"result: 19\") is the pass condition; matching it is not a failure.
+4. Never reverse your own point inside the same line. If you wrote \"which is fine\" or \"per spec\", delete the line."
+    };
+}
+
+/// The reviewer's fixed system prompt: the one the reviewer benchmark (bench/reviewer/run.py) measured. The shadow reviewer uses it.
+pub const SYSTEM_PROMPT: &str = concat!(prompt_head!(), "\n\n", prompt_tail!());
+
+/// The gating reviewer's prompt: `SYSTEM_PROMPT` with the rules block inserted before the answer format.
+pub const SYSTEM_PROMPT_GATE: &str = concat!(prompt_head!(), "\n\n", gate_block!(), "\n\n", prompt_tail!());
 
 // ---- the prompt -------------------------------------------------------------------------------
 
@@ -413,7 +436,7 @@ impl ReviewBackend for ClaudeCli {
     fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, prompt: &str) -> Result<Review, CallError> {
         let cwd = cfg.scratch_dir.join("review-cwd");
         std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
-        let mut args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
+        let mut args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT_GATE, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
         if !effort.is_empty() {
             args.extend(["--effort".to_string(), effort.to_string()]);
         }
@@ -613,6 +636,16 @@ pub fn check_model(rev: &mut Review, requested: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_prompt_is_shadow_prompt_plus_block() {
+        assert!(SYSTEM_PROMPT_GATE.contains("Rules for BLOCKING lines:"));
+        assert!(!SYSTEM_PROMPT.contains("Rules for BLOCKING lines:"));
+        let at = SYSTEM_PROMPT.find("Answer in exactly this format").expect("format marker");
+        let expect = format!("{}{}\n\n{}", &SYSTEM_PROMPT[..at], gate_block!(), &SYSTEM_PROMPT[at..]);
+        assert_eq!(SYSTEM_PROMPT_GATE, expect);
+        assert!(SYSTEM_PROMPT_GATE.contains("Be specific: name the file and line (from the diff) and the concrete scenario that fails.\n\nRules for BLOCKING lines:"));
+    }
 
     #[test]
     fn verdict_pass_and_fail() {
