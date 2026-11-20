@@ -57,6 +57,7 @@ const BASE: &[(&str, &str)] = &[
     ("reviewer_check_tail_kb", "8"),
     ("queue_lock_wait_seconds", "2"),
     ("reviewer_max_calls_per_entry", "3"),
+    ("merge_train_max", "1"),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),

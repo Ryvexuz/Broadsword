@@ -7,7 +7,10 @@
 //! STATUSES (the exit code of `queue run` in brackets):
 //!   queued               waiting for `queue run`
 //!   running              a `queue run` is working on it, or died while doing so (see "Crash and resume")
-//!   merged               fast-forwarded into the main checkout, main's check passed, `task done` ran [0]
+//!   approved             MERGE TRAIN only (merge_train_max > 1, `queue run --all`): the review PASSed, nothing is merged, the task stays
+//!                        running; the entry waits for a train (see MERGE TRAIN). An open entry (it blocks `queue add` for its task); `queue
+//!                        cancel` drops it; `queue run` on it alone resumes it (its deferred check is made first) [0]
+//!   merged              fast-forwarded into the main checkout, main's check passed, `task done` ran [0]
 //!   blocked              a precondition failed or a step could not run (dirty main, task not running, dirty worktree, reviewer
 //!                        model = coder model, diff too big, check could not run, reviewer unreachable or timed out); nothing
 //!                        was merged and nothing was changed except what the entry says; fix the cause, `queue run --entry` [3]
@@ -45,6 +48,23 @@
 //! To give up instead: `queue cancel <id>` on an interrupted entry aborts a leftover rebase, touches nothing else, and is refused
 //! once the merge step began (main may already hold the commit: resume instead).
 //!
+//! RUN --ALL. `queue run --all` drains the queue under ONE hold of queue.lock: interrupted entries first, then queued and stale ones
+//! oldest first, each at most once; an internal error (exit 1) or merged_check_failed (exit 6) stops it; a summary table follows and
+//! the exit code is the worst outcome (see `cmd_run_all`). This is the minimal drain the merge train needs; check-ahead and
+//! `--blocked` are not part of it.
+//!
+//! MERGE TRAIN (`merge_train_max` > 1, only in `queue run --all`; 1 = off, every entry as before). The per-entry review is unchanged
+//! (own diff, own brief, own gate reviewer, own shadow). What changes is what comes after it: an entry does NOT run its own check
+//! (the review prompt says so) and stops at `approved` when its review PASSes. Approved entries of one project whose task claims do not
+//! overlap form a train of up to merge_train_max entries (a lone one at the end of the drain too): their branches are chained one on
+//! top of the other (rebase), ONE check runs on the chain tip, main is fast-forwarded ONCE and checked ONCE, and every entry is `merged`
+//! with its train id, position and the shared check job. A failing check is bisected (see `run_train`): an entry that fails alone is
+//! `check_failed`, the entries proven good merge; entries that only fail together are all `conflict` and none merges. The review stays
+//! bound to its commits: an entry whose rebased commits are not the same patches (`git patch-id --stable`) as the reviewed ones goes
+//! back to `queued` and is reviewed again (`train_link`). Nothing unchecked ever reaches main: an entry whose check was deferred
+//! (`check_deferred = yes`) is checked on its own first if it is ever merged outside a train (`merge_phase`). The two places nb-18
+//! (check from a clean checkout of the exact commit) plugs in are `Run::check_commit` and `Run::check_alone`.
+//!
 //! LOCKS. `queue.lock` is held for the whole `queue run` (minutes), so one entry is processed at a time; a second `queue run` waits
 //! `queue_lock_wait_seconds`, then exits 4. `entries.lock` is held for milliseconds, around "is this task already queued, create
 //! the entry" and around choosing the next entry. Order is always queue.lock then entries.lock. The TASK BOARD lock is never held
@@ -75,6 +95,7 @@ use std::time::Duration;
 pub const QUEUED: &str = "queued";
 pub const RUNNING: &str = "running";
 pub const MERGED: &str = "merged";
+pub const APPROVED: &str = "approved";
 pub const BLOCKED: &str = "blocked";
 pub const CONFLICT: &str = "conflict";
 pub const STALE: &str = "stale";
@@ -217,11 +238,11 @@ fn same_model(a: &str, b: &str) -> bool {
     reviewer::model_family(a) == reviewer::model_family(b)
 }
 
-/// An entry is "open" while `queue run` can still act on it (queued, running, blocked, stale): it blocks `queue add` for its task.
+/// An entry is "open" while `queue run` can still act on it (queued, running, blocked, stale, approved): it blocks `queue add` for its task.
 /// Finished entries do not: merged, cancelled, rejected, and also check_failed, conflict and merged_check_failed, which `queue run`
 /// refuses to run again (the documented way on is a new `queue add`, or a human for merged_check_failed).
 fn is_open(status: &str) -> bool {
-    matches!(status, QUEUED | RUNNING | BLOCKED | STALE)
+    matches!(status, QUEUED | RUNNING | BLOCKED | STALE | APPROVED)
 }
 
 /// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
@@ -344,7 +365,20 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         Err(e) => return fail(EXIT_ERROR, format!("cannot read the queue, so nothing was queued: {e}")),
     };
     if let Some(x) = all.iter().find(|x| x.get("task") == task_id && is_open(x.status())) {
-        return fail(EXIT_RETRY, format!("task {task_id} is already in the queue as {} ({}); a task has one open entry at a time (queued, running, blocked and stale entries are open). Run it with `queue run --entry {}`, or cancel it with `queue cancel {}`, then add again", x.id(), x.status(), x.id(), x.id()));
+        return fail(EXIT_RETRY, format!("task {task_id} is already in the queue as {} ({}); a task has one open entry at a time (queued, running, blocked, stale and approved entries are open). Run it with `queue run --entry {}`, or cancel it with `queue cancel {}`, then add again", x.id(), x.status(), x.id(), x.id()));
+    }
+    // LEFT-TRAIN RULE (see `Run::leave_train`): an earlier entry of this task left a merge train with its branch chained on other
+    // entries' commits; while the branch still carries them and main does not, a new entry would review their code as this task's
+    for x in all.iter().filter(|x| x.get("task") == task_id) {
+        let chained_on = chain_base_of(x);
+        match chained_onto(&dir, &branch, &chained_on) {
+            Ok(false) => {}
+            Ok(true) => {
+                let main = wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into());
+                return refuse(format!("its earlier queue entry {} {}", x.id(), left_train_text(&main, &branch, &chained_on)));
+            }
+            Err(e) => return refuse(e),
+        }
     }
     let mut e = match record::create_ext(&queue_dir(cfg), &format!("q-{}", job::file_stamp(now_secs())), EXT) {
         Ok(r) => r,
@@ -441,6 +475,15 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("shadow seconds", "shadow_secs"),
         ("shadow file", "shadow_file"),
         ("main commit", "main_sha"),
+        ("merge train", "train"),
+        ("position in the train", "train_pos"),
+        ("train check job (shared by the whole train)", "train_job"),
+        ("train bisect", "train_bisect"),
+        ("check deferred to the train", "check_deferred"),
+        ("commit that was reviewed (before the train chained it)", "reviewed_orig_tip"),
+        ("own commit before the train chained it", "alone_tip"),
+        ("left a train chained on", "left_train_base"),
+        ("main check", "main_check"),
         ("last error", "error"),
     ] {
         if !e.get(k).is_empty() {
@@ -480,7 +523,7 @@ pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
                 println!("queue entry {id} was already cancelled");
                 return ExitCode::SUCCESS;
             }
-            QUEUED | BLOCKED | STALE => {
+            QUEUED | BLOCKED | STALE | APPROVED => {
                 let was = e.status().to_string();
                 e.set("status", CANCELLED);
                 e.set("reason", format!("cancelled while {was}"));
@@ -551,71 +594,273 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
     };
     // Choose and claim the entry under the short lock. Holding queue.lock already means no other run exists, so every
     // `running` entry is an interrupted one.
-    let mut e = {
-        let _l = match entries_lock(cfg) {
-            Ok(l) => l,
-            Err(c) => return c,
-        };
-        let all = match load_entries(cfg) {
-            Ok(a) => a,
-            Err(m) => return fail(EXIT_ERROR, m),
-        };
-        let chosen = match entry {
-            Some(id) => match all.iter().find(|x| x.id() == id) {
-                Some(x) if matches!(x.status(), QUEUED | RUNNING | STALE | BLOCKED) => x.clone(),
-                Some(x) => {
-                    let hint = match x.status() {
-                        REJECTED | CHECK_FAILED | CONFLICT => "fix the code, commit, and queue the task again with `queue add`",
-                        _ => "it is finished",
-                    };
-                    return fail(EXIT_BAD_INPUT, format!("queue entry {id} is `{}` and cannot be run; {hint}", x.status()));
-                }
-                None => return fail(EXIT_BAD_INPUT, format!("no queue entry with the exact id `{id}` (see `broadsword queue list`)")),
-            },
-            None => match all.iter().find(|x| x.status() == RUNNING).or_else(|| all.iter().find(|x| matches!(x.status(), QUEUED | STALE))) {
-                Some(x) => x.clone(),
-                None => {
-                    println!("the queue is empty: nothing is queued, interrupted or stale");
-                    return ExitCode::SUCCESS;
-                }
-            },
-        };
-        let mut e = chosen;
-        if e.status() != RUNNING {
-            // a fresh attempt: forget what the last attempt learned (its log and review file stay)
-            for k in [
-                "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "reviewer_model", "verdict",
-                "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
-            ] {
-                e.set(k, "");
-            }
-            for k in SHADOW_KEYS {
-                e.set(k, "");
-            }
-            e.set("attempt", (e.get_num("attempt").unwrap_or(0) + 1).to_string());
-            e.set("status", RUNNING);
+    let chosen = claim(cfg, |all| match entry {
+        Some(id) => match all.iter().find(|x| x.id() == id) {
+            Some(x) if matches!(x.status(), QUEUED | RUNNING | STALE | BLOCKED | APPROVED) => Ok(Some(x.clone())),
+            Some(x) => Err(not_runnable(x)),
+            None => Err(fail(EXIT_BAD_INPUT, format!("no queue entry with the exact id `{id}` (see `broadsword queue list`)"))),
+        },
+        None => Ok(all.iter().find(|x| x.status() == RUNNING).or_else(|| all.iter().find(|x| matches!(x.status(), QUEUED | STALE))).or_else(|| all.iter().find(|x| x.status() == APPROVED)).cloned()),
+    });
+    let e = match chosen {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            println!("the queue is empty: nothing is queued, interrupted or stale");
+            return ExitCode::SUCCESS;
         }
-        let me = std::process::id();
-        e.set("pid", me.to_string());
-        e.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
-        e.set("started", now_secs().to_string());
-        if let Err(err) = e.save() {
-            return fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display()));
-        }
-        e
+        Err(c) => return c,
     };
+    match begin(cfg, e) {
+        Ok(mut run) => run.go(),
+        Err((_, code)) => code,
+    }
+}
+
+/// `queue run` refuses a finished entry: exit 2 with the way on.
+fn not_runnable(x: &Record) -> ExitCode {
+    let hint = match x.status() {
+        REJECTED | CHECK_FAILED | CONFLICT => "fix the code, commit, and queue the task again with `queue add`",
+        _ => "it is finished",
+    };
+    fail(EXIT_BAD_INPUT, format!("queue entry {} is `{}` and cannot be run; {hint}", x.id(), x.status()))
+}
+
+/// Under entries.lock: let `pick` choose an entry from all of them (oldest first) and CLAIM it: a fresh attempt (anything but an
+/// interrupted `running` entry or an `approved` one) forgets what the last attempt learned (its log and review files stay) and becomes
+/// `running`; the claimer's pid is recorded either way. The caller holds queue.lock.
+fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, ExitCode>) -> Result<Option<Record>, ExitCode> {
+    let _l = entries_lock(cfg)?;
+    let all = load_entries(cfg).map_err(|m| fail(EXIT_ERROR, m))?;
+    let Some(mut e) = pick(&all)? else { return Ok(None) };
+    // An `approved` entry (review PASSed, waiting for a merge train) that is run on its own is RESUMED at its step `review`, like an
+    // interrupted one: its verdict stands, nothing is cleared (a deferred check is made before it can merge: see `merge_phase`).
+    let resumed = matches!(e.status(), RUNNING | APPROVED);
+    if e.status() == APPROVED {
+        e.set("status", RUNNING);
+    }
+    if !resumed {
+        // a fresh attempt: forget what the last attempt learned (its log and review file stay)
+        for k in [
+            "train", "train_pos", "train_job", "train_up", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail",
+            "reviewer_model", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
+        ] {
+            e.set(k, "");
+        }
+        for k in SHADOW_KEYS {
+            e.set(k, "");
+        }
+        e.set("attempt", (e.get_num("attempt").unwrap_or(0) + 1).to_string());
+        e.set("status", RUNNING);
+    }
+    let me = std::process::id();
+    e.set("pid", me.to_string());
+    e.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
+    e.set("started", now_secs().to_string());
+    e.save().map_err(|err| fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display())))?;
+    Ok(Some(e))
+}
+
+/// A claimed entry, ready to run: its project resolved (an unknown project ends it `blocked`: `Err((id, exit code))`).
+fn begin(cfg: &Config, mut e: Record) -> Result<Run<'_>, (String, ExitCode)> {
     let resumed = !e.get("step").is_empty();
     let dir = match job::resolve_project(&cfg.root, &cfg.projects_dir, e.get("project")) {
         Ok(d) => d,
         Err(m) => {
+            let id = e.id().to_string();
             let mut run = Run::new(cfg, e, PathBuf::new());
-            return run.end(BLOCKED, &format!("the project is unknown: {m}"), EXIT_RETRY);
+            return Err((id, run.end(BLOCKED, &format!("the project is unknown: {m}"), EXIT_RETRY)));
         }
     };
     println!("queue entry {}: {} (task {}, project {}, risk {}, coder {}, attempt {})", e.id(), if resumed { "RESUMING after an interrupted run, from step ".to_string() + e.get("step") } else { "starting".into() }, e.get("task"), e.get("project"), e.get("risk"), e.get("coder"), e.get("attempt"));
     e.set("error", "");
-    let mut run = Run::new(cfg, e, dir);
-    run.go()
+    Ok(Run::new(cfg, e, dir))
+}
+
+// ---- run --all ----------------------------------------------------------------------------
+//
+// TP4 SEAM: this is the MINIMAL drain the merge train needs (tp4, t-20261118-095351, is not merged at this base). tp4's own
+// `cmd_run_all` adds check-ahead (`queue_check_ahead`) and `--blocked`; when tp4 is ported onto this, it keeps the train hooks marked
+// "MERGE TRAIN" below (`approved`, `run_trains`, `settle_approved`, the `train` column) and adds its own parts around them.
+
+/// The exit code a `queue run` returned, as a number (ExitCode hides it).
+fn code_num(c: ExitCode) -> u8 {
+    (0..=u8::MAX).find(|n| ExitCode::from(*n) == c).unwrap_or(EXIT_ERROR)
+}
+
+/// How bad an outcome is, for "the exit code of `--all` is the worst outcome": merged_check_failed (6) is worst, then an internal
+/// error (1), rejected / check_failed (5), blocked / conflict / stale (3), bad input (2), busy (4), merged (0).
+fn badness(code: u8) -> u8 {
+    match code {
+        6 => 7,
+        1 => 6,
+        5 => 5,
+        3 => 4,
+        2 => 3,
+        4 => 2,
+        0 => 0,
+        _ => 6,
+    }
+}
+
+/// The next entry `--all` takes: an interrupted one first, then the oldest queued or stale one; never one this drain already took
+/// (`taken`), so an entry that ends stale or blocked is not run again in a loop. An `approved` entry (review PASSed, not merged) is
+/// picked last, and only when the merge train is off (`train` false): with the train on, the drain itself collects the approved
+/// entries into trains (`take_group`).
+fn next_for_all(all: &[Record], taken: &[String], train: bool) -> Option<Record> {
+    let fresh = |x: &&Record| !taken.iter().any(|t| t == x.id());
+    all.iter()
+        .filter(fresh)
+        .find(|x| x.status() == RUNNING)
+        .or_else(|| all.iter().filter(fresh).find(|x| matches!(x.status(), QUEUED | STALE)))
+        .or_else(|| if train { None } else { all.iter().filter(fresh).find(|x| x.status() == APPROVED) })
+        .cloned()
+}
+
+/// One line of the `--all` summary table.
+struct Row {
+    id: String,
+    task: String,
+    status: String,
+    code: u8,
+    secs: f64,
+    note: String,
+    /// `<train id>#<position>` for an entry a merge train handled, else empty.
+    train: String,
+}
+
+/// `queue run --all`: every runnable entry, in order, under ONE hold of queue.lock (so no second runner can race it and lose with
+/// exit 4): interrupted entries first, then queued and stale ones oldest first. Each entry is taken at most once per drain. An entry
+/// that ends blocked, conflict, stale, rejected or check_failed does not stop the rest; an internal error (exit 1: the entry stays
+/// `running`) and merged_check_failed (exit 6: main holds a commit whose check failed) STOP the drain, because what comes next would
+/// build on a main nobody has looked at. Prints a summary table; the exit code is the worst outcome (see `badness`).
+///
+/// MERGE TRAIN (merge_train_max > 1): an entry stops at `approved` after its review PASSed (its own check deferred), and approved
+/// entries are merged in trains (see `run_train`): whenever a full train is ready, and at the end of the drain for whatever is left.
+pub fn cmd_run_all(cfg: &Config) -> ExitCode {
+    let _q = match queue_lock(cfg) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let train = cfg.merge_train_max > 1;
+    let t0 = std::time::Instant::now();
+    let mut taken: Vec<String> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut stopped = String::new();
+    let mut approved: Vec<(Run, std::time::Instant)> = Vec::new();
+    if train {
+        // entries an earlier drain approved and then died before merging them: they join the trains first (they are the oldest)
+        let left: Vec<Record> = match claim_approved(cfg) {
+            Ok(l) => l,
+            Err(c) => return c,
+        };
+        for e in left {
+            let t = std::time::Instant::now();
+            taken.push(e.id().to_string());
+            match begin(cfg, e) {
+                Ok(mut r) => {
+                    r.defer_check = true;
+                    r.load_claims();
+                    approved.push((r, t));
+                }
+                Err((id, c)) => rows.push(row_for(cfg, &id, code_num(c), t)),
+            }
+        }
+    }
+    loop {
+        let e = match claim(cfg, |all| Ok(next_for_all(all, &taken, train))) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                // MERGE TRAIN: nothing else to run: every approved entry left (even a single one) goes into a last train
+                if train && !approved.is_empty() {
+                    let code = run_trains(cfg, &mut approved, true, &mut rows);
+                    if code == EXIT_ERROR || code == EXIT_MERGED_BAD {
+                        stopped = train_stop_note(code);
+                    }
+                    settle_approved(cfg, &mut approved, &mut rows);
+                }
+                break;
+            }
+            Err(c) => {
+                stopped = format!("the next entry could not be chosen (exit {})", code_num(c));
+                rows.push(Row { id: "-".into(), task: "-".into(), status: "-".into(), code: code_num(c), secs: 0.0, note: stopped.clone(), train: String::new() });
+                break;
+            }
+        };
+        taken.push(e.id().to_string());
+        let t = std::time::Instant::now();
+        let mut run = match begin(cfg, e) {
+            Ok(mut r) => {
+                r.defer_check = train;
+                r
+            }
+            Err((id, c)) => {
+                rows.push(row_for(cfg, &id, code_num(c), t));
+                continue;
+            }
+        };
+        let start = run.start_step();
+        let result = (|| -> R<ExitCode> {
+            run.until_review(start)?;
+            run.review_phase(start)?;
+            if train && start <= 3 {
+                run.approve() // MERGE TRAIN: the entry waits at `approved` for its train
+            } else {
+                run.merge_phase(start)
+            }
+        })();
+        let code = code_num(match result {
+            Ok(c) | Err(c) => c,
+        });
+        let id = run.e.id().to_string();
+        if run.e.status() == APPROVED {
+            // approved entries keep their Run until their train has finished with them
+            approved.push((run, t));
+        } else {
+            rows.push(row_for(cfg, &id, code, t));
+        }
+        let mut train_code = 0u8;
+        if train && !approved.is_empty() && code != EXIT_ERROR && code != EXIT_MERGED_BAD {
+            train_code = run_trains(cfg, &mut approved, false, &mut rows);
+        }
+        let hard = if code == EXIT_ERROR || code == EXIT_MERGED_BAD { code } else { train_code };
+        if hard == EXIT_ERROR || hard == EXIT_MERGED_BAD {
+            stopped = if hard == train_code && train_code != 0 { train_stop_note(hard) } else { format!("stopped after entry {id} (exit {code}): {}", if code == EXIT_ERROR { "it stays `running` at its step; fix the cause, then `queue run` resumes it" } else { "main holds a commit whose check failed; a human decides before anything else merges" }) };
+            settle_approved(cfg, &mut approved, &mut rows);
+            break;
+        }
+    }
+    let worst = rows.iter().map(|r| r.code).max_by_key(|c| badness(*c)).unwrap_or(0);
+    if rows.is_empty() {
+        println!("the queue is empty: nothing is queued, interrupted or stale");
+    } else {
+        println!("--- queue run --all: {} entr{} in {:.1} s ---", rows.len(), if rows.len() == 1 { "y" } else { "ies" }, t0.elapsed().as_secs_f64());
+        // the train column only exists when a merge train handled an entry, so a drain without trains prints the plain table
+        let trains = rows.iter().any(|r| !r.train.is_empty());
+        println!("entry\ttask\tstatus\texit\tseconds\tnote{}", if trains { "\ttrain" } else { "" });
+        for r in &rows {
+            println!("{}\t{}\t{}\t{}\t{:.1}\t{}{}", r.id, r.task, r.status, r.code, r.secs, r.note, if trains { format!("\t{}", if r.train.is_empty() { "-" } else { r.train.as_str() }) } else { String::new() });
+        }
+        if !stopped.is_empty() {
+            eprintln!("broadsword: queue run --all {stopped}");
+        }
+        println!("worst exit: {worst}");
+    }
+    ExitCode::from(worst)
+}
+
+/// A summary row read back from the entry's record (its final status and one-line reason).
+fn row_for(cfg: &Config, id: &str, code: u8, t: std::time::Instant) -> Row {
+    let e = load_entry(cfg, id).ok();
+    let get = |k: &str| e.as_ref().map(|e| e.get(k).to_string()).unwrap_or_default();
+    let mut note = get("reason");
+    if note.chars().count() > 120 {
+        note = note.chars().take(117).collect::<String>() + "...";
+    }
+    let train = match (get("train"), get("train_pos")) {
+        (t, p) if !t.is_empty() => format!("{t}#{p}"),
+        _ => String::new(),
+    };
+    Row { id: id.to_string(), task: get("task"), status: get("status"), code, secs: t.elapsed().as_secs_f64(), note, train }
 }
 
 struct Run<'a> {
@@ -627,11 +872,15 @@ struct Run<'a> {
     wt: PathBuf,
     /// Secret values (every `.env` value, secret-named variables): redacted from the prompt and from everything stored.
     secrets: reviewer::Secrets,
+    /// Merge train mode: the entry's own check is deferred to its train (`s_defer_check`), and its review PASS ends it `approved`.
+    defer_check: bool,
+    /// The claims of the entry's task (what a train compares: entries whose claims overlap never share a train).
+    claims: Vec<String>,
 }
 
 impl<'a> Run<'a> {
     fn new(cfg: &'a Config, e: Record, dir: PathBuf) -> Run<'a> {
-        Run { cfg, e, dir, wt: PathBuf::new(), secrets: process_secrets(cfg) }
+        Run { cfg, e, dir, wt: PathBuf::new(), secrets: process_secrets(cfg), defer_check: false, claims: Vec::new() }
     }
 
     fn branch(&self) -> String {
@@ -722,8 +971,20 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// The step to start from: the recorded one (a resumed run), else the first.
+    fn start_step(&self) -> usize {
+        STEPS.iter().position(|s| *s == self.e.get("step")).unwrap_or(0)
+    }
+
     fn pipeline(&mut self) -> R<ExitCode> {
-        let start = STEPS.iter().position(|s| *s == self.e.get("step")).unwrap_or(0);
+        let start = self.start_step();
+        self.until_review(start)?;
+        self.review_phase(start)?;
+        self.merge_phase(start)
+    }
+
+    /// Steps 1 to 3: preconditions, rebase, check (each only when `start` is at or before it).
+    fn until_review(&mut self, start: usize) -> R<()> {
         if start < STEP_MERGE {
             self.s_preconditions(start)?;
         }
@@ -731,18 +992,290 @@ impl<'a> Run<'a> {
             self.s_rebase()?;
         }
         if start <= 2 {
-            self.s_check()?;
+            self.check_step()?;
         }
+        Ok(())
+    }
+
+    /// The check step: the real check, or (merge train mode) the deferral that leaves the check to the train.
+    fn check_step(&mut self) -> R<()> {
+        if self.defer_check {
+            self.s_defer_check()
+        } else {
+            self.s_check()
+        }
+    }
+
+    /// Step 4, review.
+    fn review_phase(&mut self, start: usize) -> R<()> {
         if start <= 3 {
             self.s_review()?;
         }
+        Ok(())
+    }
+
+    /// Steps 5 to 7: merge, main check, done. An entry whose check was deferred to a merge train that never checked it (a train that
+    /// died, or `queue run` of an `approved` entry on its own) is checked alone first: nothing unchecked ever merges.
+    fn merge_phase(&mut self, start: usize) -> R<ExitCode> {
         if start <= STEP_MERGE {
+            if self.e.get("check_deferred") == "yes" && self.e.get("train_checked") != self.e.get("reviewed_tip") {
+                self.log("merge", "this entry's check was deferred to a merge train that has not checked this commit: it is checked on its own before it can merge")?;
+                self.s_check()?;
+            }
             self.s_merge()?;
         }
         if start <= 5 {
             self.s_main_check()?;
         }
         self.s_done()
+    }
+
+    // -- merge train (see `run_train`) ------------------------------------------------------
+
+    /// MERGE TRAIN, check step: the entry's own check is NOT run. The commit that is reviewed is recorded as `checked_tip` (review and
+    /// merge are bound to it as always); `check_deferred = yes` says that no check has run on it, and the review prompt says so too.
+    /// The build and tests run once, on the whole train; a deferred commit never merges before a check of it has passed (`merge_phase`).
+    fn s_defer_check(&mut self) -> R<()> {
+        self.set_step("check")?;
+        let (dir, branch) = (self.dir.clone(), self.branch());
+        let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
+        self.e.set("check_job", "");
+        self.e.set("check_exit", "");
+        self.e.set("check_summary", "NOT RUN for this change alone: with a merge train the build and tests run once on the combined branches of every approved change, after the reviews, and nothing merges before that check passes. Judge the diff on its own merits.");
+        self.e.set("check_tail", "");
+        self.e.set("checked_tip", tip.clone());
+        self.e.set("check_deferred", "yes");
+        self.e.set("train_checked", "");
+        self.save()?;
+        self.log("check", &format!("deferred to the merge train: commit {} is reviewed without a check of its own", short(&tip)))
+    }
+
+    /// The claims of this entry's task, as a train compares them. A task that cannot be read claims everything (`*`), so it never
+    /// shares a train.
+    fn load_claims(&mut self) {
+        self.claims = match task::load_task(self.cfg, self.e.get("task")) {
+            Ok(t) => task::claims_of(&t),
+            Err(_) => vec!["*".to_string()],
+        };
+    }
+
+    /// MERGE TRAIN: the gating review PASSed. The entry stops here as `approved`: nothing is merged, the task stays running, the
+    /// worktree is untouched. `run_train` merges it with the other approved entries of its project.
+    fn approve(&mut self) -> R<ExitCode> {
+        self.load_claims();
+        let base = self.e.get("base_head").to_string();
+        self.e.set("train_up", base);
+        self.e.set("status", APPROVED);
+        self.e.set("reason", "the review PASSed; it waits for a merge train (nothing is merged yet)");
+        println!("queue entry {}: approved (the review PASSed); it waits for a merge train", self.e.id());
+        self.log("review", "approved: the entry joins the next merge train of its project (claims that do not overlap, at most merge_train_max entries)")?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Before an approved entry joins a train: still exactly the reviewed commit, clean worktree, clean main on the same branch. A
+    /// chain rebase that a killed drain left half done is aborted first (the branch is then back at its `pre_rebase` tip).
+    fn train_ready(&mut self) -> R<()> {
+        self.locate()?;
+        self.abort_stale_rebase()?;
+        let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
+        let (reviewed, checked) = (self.e.get("reviewed_tip").to_string(), self.e.get("checked_tip").to_string());
+        if self.e.get("verdict") != "PASS" || reviewed.is_empty() || reviewed != checked {
+            return Err(self.leave_train(STALE, &format!("an approved entry without a recorded PASS for its checked commit (reviewed `{}`, checked `{}`) cannot join a merge train. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(&checked), self.e.id()), EXIT_RETRY));
+        }
+        if let Some(why) = self.test_hook_refusal() {
+            return Err(self.leave_train(BLOCKED, &why, EXIT_RETRY));
+        }
+        let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
+        if tip != reviewed {
+            return Err(self.leave_train(STALE, &format!("branch changed after the review: `{branch}` was reviewed at {} but is at {} now; nothing was merged. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(&tip), self.e.id()), EXIT_RETRY));
+        }
+        let wt_status = self.g(wtgit::status_porcelain_plain(&wt))?;
+        if !wt_status.is_empty() {
+            return Err(self.leave_train(BLOCKED, &format!("the task's worktree got changes after the review ({}); it cannot join a merge train; nothing merged", some(&wt_status)), EXIT_RETRY));
+        }
+        let main_branch = self.g(wtgit::current_branch(&dir))?;
+        if main_branch.as_deref() != Some(self.e.get("main_branch")) {
+            return Err(self.leave_train(BLOCKED, "the main checkout is not on the branch this entry was reviewed against; nothing merged", EXIT_RETRY));
+        }
+        let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
+        if !dirty.is_empty() {
+            return Err(self.leave_train(BLOCKED, &format!("the main checkout has uncommitted or untracked changes ({}); commit or discard them, then run again; nothing merged", some(&dirty)), EXIT_RETRY));
+        }
+        if self.e.get("alone_tip").is_empty() {
+            self.e.set("alone_tip", reviewed);
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Put this entry's own commits (everything after `train_up`) on top of `onto`, the previous entry of the chain (or main's HEAD
+    /// for the first). `Some(new tip)`; `None` when the entry cannot ride in this train and went back to `queued`: git could not apply
+    /// its commits (its branch exactly as it was), or the rebased commits are not the same patches as the reviewed ones. The old tip is
+    /// saved under refs/broadsword/queue/ first, as for every rebase.
+    ///
+    /// THE REVIEW BINDS ITS COMMITS: the review and the merge follow the entry to its new commit only when `git patch-id --stable` of
+    /// the rebased commits (`onto..new tip`) equals that of the commits that were reviewed (`base_head..reviewed_orig_tip`), commit for
+    /// commit. Anything else (a hunk whose context the entries before it changed) sends the entry back to `queued` ("patch changed by
+    /// the train rebase"): it is reviewed again and never merges on the old verdict.
+    fn train_link(&mut self, onto: &str, train_id: &str) -> R<Option<String>> {
+        let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
+        let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
+        let up = if self.e.get("train_up").is_empty() { self.e.get("base_head").to_string() } else { self.e.get("train_up").to_string() };
+        let orig = if self.e.get("reviewed_orig_tip").is_empty() { self.e.get("reviewed_tip").to_string() } else { self.e.get("reviewed_orig_tip").to_string() };
+        let base = self.e.get("base_head").to_string();
+        let reviewed_ids = self.g(wtgit::patch_ids(&dir, &format!("{base}..{orig}")))?;
+        self.e.set("train", train_id);
+        let r = self.keep_pre_rebase(&tip)?;
+        self.e.set("pre_rebase", tip.clone());
+        self.e.set("pre_rebase_ref", r.clone());
+        self.log("rebase", &format!("merge train {train_id}: chaining `{branch}` (tip {}) onto {}; its own commits start after {}; the old tip is saved in {r}", short(&tip), short(onto), short(&up)))?;
+        match self.g(wtgit::rebase_onto(&wt, onto, &up))? {
+            wtgit::Rebase::Done => {
+                let now = self.g(wtgit::branch_tip(&dir, &branch))?;
+                if !self.g(wtgit::is_ancestor(&dir, onto, &now))? {
+                    return Err(self.internal(&format!("the chain rebase reported success but `{branch}` ({}) does not contain {}; the old tip {} is saved in {r}", short(&now), short(onto), short(&tip))));
+                }
+                if self.g(wtgit::rev_count(&dir, &format!("{onto}..{now}")))? == 0 {
+                    self.e.set("train_up", onto);
+                    return Err(self.leave_train(BLOCKED, &format!("after chaining onto the train `{branch}` has no commit left (its changes are already in the train); the old tip {} is saved in {r}", short(&tip)), EXIT_RETRY));
+                }
+                let now_ids = self.g(wtgit::patch_ids(&dir, &format!("{onto}..{now}")))?;
+                if now_ids != reviewed_ids {
+                    self.e.set("train_up", onto);
+                    self.e.set("rebased_tip", now.clone());
+                    self.requeue(&format!("patch changed by the train rebase: merge train {train_id} chained `{branch}` onto the entries before it, and its rebased commits {} are not the same patches (git patch-id --stable) as the reviewed commits {}..{}; the old verdict does not cover them, so the entry goes back to `queued` and is reviewed again (the pre-train tip is saved in {r})", short(&now), short(&base), short(&orig)));
+                    return Ok(None);
+                }
+                if self.e.get("reviewed_orig_tip").is_empty() {
+                    self.e.set("reviewed_orig_tip", orig.clone());
+                }
+                self.e.set("train_up", onto);
+                self.e.set("rebased_tip", now.clone());
+                self.e.set("checked_tip", now.clone());
+                self.e.set("reviewed_tip", now.clone());
+                self.e.set("check_deferred", "yes");
+                self.e.set("train_checked", "");
+                self.save()?;
+                self.log("rebase", &format!("chained: tip {} -> {}; the same {} patch(es) as reviewed (git patch-id --stable)", short(&tip), short(&now), now_ids.len()))?;
+                Ok(Some(now))
+            }
+            wtgit::Rebase::Conflict(files) => {
+                let now = self.g(wtgit::branch_tip(&dir, &branch))?;
+                if now != tip {
+                    return Err(self.internal(&format!("the chain rebase conflicted and was aborted, but `{branch}` is at {} instead of {}: the old tip is saved in {r}", short(&now), short(&tip))));
+                }
+                self.requeue(&format!("merge train {train_id}: chaining `{branch}` onto the entries before it conflicts in: {}. The rebase was aborted and the branch is exactly as before; the entry goes back to `queued` and is reviewed again on its own", files.join(", ")));
+                Ok(None)
+            }
+            wtgit::Rebase::Failed(m) => {
+                let now = self.g(wtgit::branch_tip(&dir, &branch))?;
+                if now != tip {
+                    return Err(self.internal(&format!("{m}; and `{branch}` is at {} instead of {}: the old tip is saved in {r}", short(&now), short(&tip))));
+                }
+                self.requeue(&format!("merge train {train_id}: `{branch}` could not be chained onto the entries before it: {m}. The branch is unchanged; the entry goes back to `queued`"));
+                Ok(None)
+            }
+        }
+    }
+
+    /// LEFT-TRAIN RULE for a run outside a train (`s_preconditions`, `s_merge`): an entry whose branch is still chained on other
+    /// entries' commits that are not on main is never reviewed or merged on that diff; it ends `blocked` (`leave_train`). Once the
+    /// branch no longer carries that commit (the coder rebased, or those entries reached main) the record forgets it and the run goes on.
+    fn refuse_chained(&mut self, step: &str) -> R<()> {
+        let base = chain_base_of(&self.e);
+        if base.is_empty() {
+            return Ok(());
+        }
+        let (dir, branch) = (self.dir.clone(), self.branch());
+        if self.g(chained_onto(&dir, &branch, &base))? {
+            return Err(self.leave_train(BLOCKED, "it was run while its branch still carries those entries' commits; nothing was reviewed or merged", EXIT_RETRY));
+        }
+        if !self.e.get("left_train_base").is_empty() {
+            self.e.set("left_train_base", "");
+            self.log(step, &format!("the branch no longer carries {}, the commit a merge train chained it on that is not on main: it runs as it is", short(&base)))?;
+        }
+        Ok(())
+    }
+
+    /// An entry a train cannot take goes back to `queued` with the reason; the next `queue run` checks and reviews it afresh. Unless
+    /// its branch is chained on other entries (see `leave_train`): then it ends `blocked`.
+    /// Both outcomes are exit 3 (the caller records that); a record that cannot be written has printed its own error.
+    fn requeue(&mut self, reason: &str) {
+        let _ = self.leave_train(QUEUED, reason, EXIT_RETRY);
+    }
+
+    /// LEFT-TRAIN RULE, the ONE place it is applied: every way an entry leaves a merge train without merging (back to queued,
+    /// check_failed, conflict, stale, blocked) ends here, and so does a solo run of an entry still chained (`s_preconditions`,
+    /// `s_merge`). An entry whose branch still carries commits of other entries that are not on main (`chained_onto`) never goes on to
+    /// a review or merge of that chained diff: it ends `blocked` ("left a train: ..."), and `left_train_base` keeps the commit it is
+    /// chained on across attempts, so a later `queue run` or `queue add` refuses it too until the coder has rebased its own commits
+    /// onto main (or those entries reached main). Otherwise the entry gets `status` as asked. A git error counts as chained.
+    fn leave_train(&mut self, status: &str, reason: &str, code: u8) -> ExitCode {
+        let (dir, branch, base) = (self.dir.clone(), self.branch(), chain_base_of(&self.e));
+        let chained = chained_onto(&dir, &branch, &base).unwrap_or(true);
+        if !chained {
+            if status == QUEUED {
+                let reason = self.secrets.redact(reason);
+                self.e.set("status", QUEUED);
+                self.e.set("reason", reason.clone());
+                let _ = self.log("train", &format!("back to queued: {reason}"));
+                eprintln!("broadsword: queue entry {} goes back to `queued`: {reason}", self.e.id());
+                return ExitCode::from(EXIT_RETRY);
+            }
+            return self.end(status, reason, code);
+        }
+        let main = if self.e.get("main_branch").is_empty() { wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into()) } else { self.e.get("main_branch").to_string() };
+        self.e.set("left_train_base", base.clone());
+        let text = left_train_text(&main, &branch, &base);
+        self.blocked(&format!("{text}. Why it left (it would have been `{status}`): {reason}"))
+    }
+
+    /// NB-18 PLUG-IN POINT 1 of 2. Check `commit` of this entry's project: the build and tests, as `check <project>` runs them.
+    /// Interim implementation (nb-18 is not merged): the check runs in this entry's task worktree (`check <project> --task <id>`), and
+    /// only for a commit that worktree has checked out right now. nb-18 (check from a clean checkout of the exact commit) replaces the
+    /// body with "check `commit` in a clean checkout", and then `check_alone` no longer needs to move the worktree.
+    fn check_commit(&mut self, commit: &str, what: &str) -> TrainCheck {
+        let (project, task_id) = (self.e.get("project").to_string(), self.e.get("task").to_string());
+        if let Some(code) = tools::guard_refusal(self.cfg, &project, Some(&task_id)) {
+            return TrainCheck::Blocked(format!("the check was refused before it started (exit {code}; the reason is printed above, e.g. Broadsword paused or an interrupted run to recover)"));
+        }
+        let head = match wtgit::head_commit(&self.wt) {
+            Ok(h) => h,
+            Err(m) => return TrainCheck::Blocked(m),
+        };
+        if head != commit {
+            return TrainCheck::Blocked(format!("the worktree of task {task_id} is at {} instead of {}: the interim check can only check a commit its worktree has checked out", short(&head), short(commit)));
+        }
+        println!("queue entry {}: check {project} --task {task_id} ({what}; commit {})", self.e.id(), short(commit));
+        let mut info = JobInfo::default();
+        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
+        let summary = info.summary.join("\n");
+        let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
+        let job_id = info.id.clone().unwrap_or_default();
+        match code {
+            0 => TrainCheck::Pass { job: job_id, summary, tail },
+            1 if !info.summary.is_empty() => TrainCheck::Fail { job: job_id, summary, tail },
+            c => TrainCheck::Blocked(format!("the check could not run to a verdict (exit {c}; job {})", if job_id.is_empty() { "none" } else { job_id.as_str() })),
+        }
+    }
+
+    /// NB-18 PLUG-IN POINT 2 of 2. Check this entry's OWN commit (`alone_tip`: the reviewed commit on main as it was, before a train
+    /// chained it) without the entries before it. Interim: the worktree is put on that commit (detached, no branch moves), checked, and
+    /// put back on its branch. With nb-18 this is simply `check_commit(alone_tip)` in a clean checkout.
+    fn check_alone(&mut self) -> TrainCheck {
+        let alone = self.e.get("alone_tip").to_string();
+        if alone.is_empty() {
+            return TrainCheck::Blocked("no alone commit is recorded for this entry".into());
+        }
+        let (wt, branch) = (self.wt.clone(), self.branch());
+        if let Err(m) = wtgit::checkout_detach(&wt, &alone) {
+            return TrainCheck::Blocked(format!("cannot put the worktree on the entry's own commit {}: {m}", short(&alone)));
+        }
+        let res = self.check_commit(&alone, "alone: the entry's own commit without the entries before it");
+        if let Err(m) = wtgit::checkout_branch(&wt, &branch) {
+            return TrainCheck::Blocked(format!("the worktree could NOT be put back on `{branch}` ({m}); do it by hand: git -C {} checkout {branch}", wt.display()));
+        }
+        res
     }
 
     // -- step 1: preconditions --------------------------------------------------------------
@@ -796,6 +1329,7 @@ impl<'a> Run<'a> {
         if !wt_status.is_empty() {
             return Err(self.blocked(&format!("the task's worktree is not clean ({}); commit or remove those changes, then run again (ignored files do not matter here)", some(&wt_status))));
         }
+        self.refuse_chained("preconditions")?;
         let coder = self.e.get("coder").to_string();
         let (model, why) = match gating_model(self.cfg, self.e.get("risk"), &coder) {
             Ok((m, why)) => (m.to_string(), if why.is_empty() { String::new() } else { format!(" ({why})") }),
@@ -908,6 +1442,7 @@ impl<'a> Run<'a> {
                     return Err(self.end(STALE, &format!("branch changed during the check: `{branch}` was at {} when the check started and is at {} now; nothing was reviewed or merged. Run `queue run --entry {}` to check it again", short(&tip_before), short(&tip_after), self.e.id()), EXIT_RETRY));
                 }
                 self.e.set("checked_tip", tip_before.clone());
+                self.e.set("check_deferred", "");
                 self.save()?;
                 self.log("check", &format!("passed on commit {} ({})", short(&tip_before), info.summary.join("; ")))
             }
@@ -1161,14 +1696,11 @@ verdict: {} (answer followed the format: {})
         if reviewed.is_empty() || base.is_empty() || self.e.get("checked_tip") != reviewed {
             return Err(self.end(STALE, &format!("the merge step was reached without a recorded PASS for the checked commit (reviewed `{}`, checked `{}`, base `{}`); nothing was merged. Run `queue run --entry {}` to check and review it again", short(&reviewed), short(self.e.get("checked_tip")), short(&base), self.e.id()), EXIT_RETRY));
         }
-        // A stand-in reviewer (a scratch test hook) may only merge into a project that itself lives in scratch.
         let cli_path = self.e.get("reviewer_cli").to_string();
-        if self.e.get("test_hook") == "true" {
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if !canon(&dir).starts_with(canon(&self.cfg.scratch_dir)) {
-                return Err(self.blocked(&format!("the review was made by a TEST HOOK reviewer ({cli_path}), not a real one, and project folder {} is outside scratch_dir; a stand-in review never merges into a real project; nothing merged", dir.display())));
-            }
+        if let Some(why) = self.test_hook_refusal() {
+            return Err(self.blocked(&why));
         }
+        self.refuse_chained("merge")?;
         println!("queue entry {}: merging after a {} review through reviewer CLI {}", self.e.id(), if self.e.get("test_hook") == "true" { "TEST HOOK" } else { "real" }, if cli_path.is_empty() { "(none recorded)" } else { &cli_path });
         let main_branch = self.g(wtgit::current_branch(&dir))?;
         if main_branch.as_deref() != Some(self.e.get("main_branch")) {
@@ -1211,6 +1743,19 @@ verdict: {} (answer followed the format: {})
         self.e.set("main_sha", after.clone());
         let note = format!("fast-forwarded `{}` from {} to {}; reviewed through CLI {} (test_hook: {})", self.e.get("main_branch"), short(&head), short(&after), if cli_path.is_empty() { "(none recorded)" } else { &cli_path }, self.e.get("test_hook"));
         self.log("merge", &note)
+    }
+
+    /// A stand-in reviewer (a scratch test hook) may only merge into a project that itself lives in scratch. The ONE place this rule
+    /// is decided: the single-entry merge (`s_merge`) and the merge train (`train_ready`, before any chaining) both ask it.
+    fn test_hook_refusal(&self) -> Option<String> {
+        if self.e.get("test_hook") != "true" {
+            return None;
+        }
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if canon(&self.dir).starts_with(canon(&self.cfg.scratch_dir)) {
+            return None;
+        }
+        Some(format!("the review was made by a TEST HOOK reviewer ({}), not a real one, and project folder {} is outside scratch_dir; a stand-in review never merges into a real project; nothing merged", self.e.get("reviewer_cli"), self.dir.display()))
     }
 
     // -- step 6: main check -----------------------------------------------------------------
@@ -1261,6 +1806,502 @@ verdict: {} (answer followed the format: {})
     }
 }
 
+// ---- merge train ----------------------------------------------------------------------------
+
+/// The result of one check of a commit (see `Run::check_commit`).
+enum TrainCheck {
+    Pass { job: String, summary: String, tail: String },
+    Fail { job: String, summary: String, tail: String },
+    /// The check could not run to a verdict (refused, paused, wrong checkout, job could not start): no conclusion about the code.
+    Blocked(String),
+}
+
+/// What a check recorded: the job id, its summary lines and the end of its output.
+#[derive(Default, Clone)]
+struct PassInfo {
+    job: String,
+    summary: String,
+    tail: String,
+}
+
+/// What a `check_alone` said about the culprit of a failed train.
+enum Alone {
+    /// It fails on its own commit too: the entry itself is bad.
+    Bad(PassInfo),
+    /// It passes on its own commit: the failure only shows when it is combined with the entries before it.
+    Fine,
+    Unknown(String),
+}
+
+/// The entries the next train takes out of `items` (one `(project, claims)` per approved entry, oldest first), as indices into
+/// `items`. Entries of one project only; an entry whose claims overlap an entry already taken is left out (it waits for a later
+/// train); at most `max` entries. A train is ready when it is full, or when `flush` is set (nothing else is coming) and it holds at
+/// least one entry. Empty when no project has a ready train.
+fn pick_train(items: &[(String, Vec<String>)], max: usize, flush: bool) -> Vec<usize> {
+    let mut seen: Vec<&str> = Vec::new();
+    for (first, (project, _)) in items.iter().enumerate() {
+        if seen.contains(&project.as_str()) {
+            continue;
+        }
+        seen.push(project.as_str());
+        let mut group: Vec<usize> = Vec::new();
+        for (i, (p, claims)) in items.iter().enumerate().skip(first) {
+            if p != project || group.len() >= max {
+                continue;
+            }
+            let clash = group.iter().any(|g| items[*g].1.iter().any(|a| claims.iter().any(|b| task::overlaps(a, b))));
+            if !clash {
+                group.push(i);
+            }
+        }
+        if group.len() >= max || (flush && !group.is_empty()) {
+            return group;
+        }
+    }
+    Vec::new()
+}
+
+/// The commit a merge train chained this entry's branch onto: `left_train_base` (recorded when it left a train, kept across attempts),
+/// else `train_up` (the base of its own commits while it rides a train). Empty for an entry no train ever chained.
+fn chain_base_of(e: &Record) -> String {
+    if e.get("left_train_base").is_empty() { e.get("train_up").to_string() } else { e.get("left_train_base").to_string() }
+}
+
+/// LEFT-TRAIN RULE, the test: does `branch` still carry `base` (a commit a merge train chained it onto) while main's HEAD does not?
+/// Then the branch holds commits of OTHER entries that are not on main, and a review or merge of it would take their code as this
+/// entry's. An empty `base` is never chained; a base that main already holds (those entries merged) is not either.
+fn chained_onto(dir: &Path, branch: &str, base: &str) -> Result<bool, String> {
+    if base.is_empty() {
+        return Ok(false);
+    }
+    let head = wtgit::head_commit(dir)?;
+    let tip = wtgit::branch_tip(dir, branch)?;
+    Ok(wtgit::is_ancestor(dir, base, &tip)? && !wtgit::is_ancestor(dir, base, &head)?)
+}
+
+/// The reason an entry with a chained branch gets (see `Run::leave_train`), with the coder's way out.
+fn left_train_text(main: &str, branch: &str, base: &str) -> String {
+    format!("left a train: rebase your own commits onto main and queue again. `{branch}` is chained on {}, a commit of other entries of a merge train that is not on `{main}`, so a review or merge of it now would take their code as this entry's. In the task's worktree run `git rebase --onto {main} {base} {branch}`, then run the entry again (`queue run --entry <id>`, or `queue cancel` it and `queue add` the task). If those entries reach `{main}` first, the branch needs nothing and runs as it is", short(base))
+}
+
+/// Take the next train out of `approved` (see `pick_train`), in queue order; the others stay.
+fn take_group<'a>(approved: &mut Vec<(Run<'a>, std::time::Instant)>, max: usize, flush: bool) -> Option<Vec<(Run<'a>, std::time::Instant)>> {
+    let items: Vec<(String, Vec<String>)> = approved.iter().map(|(r, _)| (r.e.get("project").to_string(), r.claims.clone())).collect();
+    let idx = pick_train(&items, max, flush);
+    if idx.is_empty() {
+        return None;
+    }
+    let mut group = Vec::new();
+    for i in idx.iter().rev() {
+        group.push(approved.remove(*i));
+    }
+    group.reverse();
+    Some(group)
+}
+
+/// Entries an earlier `queue run --all` approved and never merged (it died, or stopped): claimed by this process (their pid), oldest
+/// first. Under entries.lock; their status stays `approved`.
+fn claim_approved(cfg: &Config) -> Result<Vec<Record>, ExitCode> {
+    let _l = entries_lock(cfg)?;
+    let all = load_entries(cfg).map_err(|m| fail(EXIT_ERROR, m))?;
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for mut e in all.into_iter().filter(|x| x.status() == APPROVED) {
+        e.set("pid", me.to_string());
+        e.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
+        e.save().map_err(|err| fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display())))?;
+        out.push(e);
+    }
+    Ok(out)
+}
+
+fn train_stop_note(code: u8) -> String {
+    if code == EXIT_MERGED_BAD {
+        "stopped by a merge train (exit 6): main holds the train's commits and the main check failed; a human decides before anything else merges".into()
+    } else {
+        "stopped by a merge train (exit 1): an internal error or a check that could not run to a verdict; the entries it was working on are `approved` (or `running`), and the next `queue run --all` takes them again".into()
+    }
+}
+
+/// One entry of a train is finished (merged, rejected, back to queued, ...): its summary row, and the train's worst outcome so far.
+fn finish_member(cfg: &Config, r: Run<'_>, code: u8, t: std::time::Instant, rows: &mut Vec<Row>, worst: &mut u8) {
+    let id = r.e.id().to_string();
+    rows.push(row_for(cfg, &id, code, t));
+    if badness(code) > badness(*worst) {
+        *worst = code;
+    }
+}
+
+/// The entries stay `approved` (the reason says why), and the next drain takes them again.
+fn leave_approved(cfg: &Config, members: Vec<(Run<'_>, std::time::Instant)>, why: &str, rows: &mut Vec<Row>, worst: &mut u8) {
+    for (mut r, t) in members {
+        r.e.set("reason", format!("approved, not merged: {why}"));
+        let _ = r.log("train", why);
+        finish_member(cfg, r, EXIT_RETRY, t, rows, worst);
+    }
+}
+
+/// An internal error that hits every member (git or the record could not be used): each stays as it is, with the message.
+fn fail_members(cfg: &Config, members: Vec<(Run<'_>, std::time::Instant)>, msg: &str, rows: &mut Vec<Row>, worst: &mut u8) -> u8 {
+    for (mut r, t) in members {
+        let c = r.internal(msg);
+        finish_member(cfg, r, code_num(c), t, rows, worst);
+    }
+    EXIT_ERROR
+}
+
+/// Entries still `approved` when the drain ends early (it stopped) or no train took them: a row each; the next drain takes them.
+fn settle_approved(cfg: &Config, approved: &mut Vec<(Run<'_>, std::time::Instant)>, rows: &mut Vec<Row>) {
+    for (r, t) in approved.drain(..) {
+        let id = r.e.id().to_string();
+        rows.push(row_for(cfg, &id, 0, t));
+    }
+}
+
+/// Run trains while `approved` holds a ready one (`flush`: any entry is ready). Returns 0, or EXIT_ERROR / EXIT_MERGED_BAD when the
+/// drain must stop.
+fn run_trains<'a>(cfg: &'a Config, approved: &mut Vec<(Run<'a>, std::time::Instant)>, flush: bool, rows: &mut Vec<Row>) -> u8 {
+    let max = cfg.merge_train_max as usize;
+    let mut hard = 0u8;
+    while hard == 0 {
+        let Some(group) = take_group(approved, max, flush) else { break };
+        hard = run_train(cfg, group, rows);
+    }
+    hard
+}
+
+/// The commit a chain entry's own check proves (its tip in the chain), for the 1-based position `i`.
+fn chain_tip(chain: &[(Run<'_>, std::time::Instant)], i: usize) -> String {
+    chain[i - 1].0.e.get("checked_tip").to_string()
+}
+
+/// ONE MERGE TRAIN. `group` are approved entries of one project with claims that do not overlap (`pick_train`).
+///
+/// 1. Each entry is checked to still be exactly its reviewed commit (`train_ready`).
+/// 2. CHAIN: each entry's own commits are rebased onto the previous entry's tip, the first onto main's HEAD (`train_link`). The result
+///    is one straight line `main <- e1 <- e2 <- ... <- en`, every entry's branch tip is on it, and the tip of entry i contains the
+///    entries before it. An entry that cannot be chained (a textual conflict), or whose rebased commits are not the same patches as
+///    the reviewed ones, goes back to `queued`; the rest go on.
+/// 3. ONE CHECK of the chain tip (`Run::check_commit`).
+/// 4. PASS: ONE fast-forward of main to the tip (every entry's commits as they are, in order, no squash), ONE main check (`s_main_check`,
+///    run by the last entry), then every entry is `merged` (`task done`), recording train id, position and the shared check job.
+/// 5. FAIL: BISECT. The check of entry i's tip is a check of the first i entries, so a binary search over the prefixes finds the first
+///    entry k whose prefix fails (about log2(n) checks; the prefix before it passed). The culprit is then checked on its own commit
+///    (`check_alone`): if it fails alone it is `check_failed` with that check's log, the proven-good entries before it merge as a
+///    smaller train, and the entries after it start a new round on the new main. If it passes alone the failure only shows when it is
+///    combined with the entries before it: the culprit AND every entry before it in the chain (the partner is not searched for) are
+///    `conflict` with the combined failure's log, and NOTHING is merged for them. Every round removes at least one entry, so it ends.
+/// 6. A main check that fails after the fast-forward: every entry of the merge is `merged_check_failed` (exit 6), main is NOT reset, the
+///    drain stops. A check that cannot run to a verdict leaves all its entries `approved` and stops the drain.
+///
+/// Returns 0, EXIT_ERROR or EXIT_MERGED_BAD (the drain stops on the last two).
+fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, rows: &mut Vec<Row>) -> u8 {
+    static TRAIN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    let train_id = format!("tr-{}-{}", job::file_stamp(now_secs()), TRAIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let started = std::time::Instant::now();
+    let size = group.len();
+    println!("merge train {train_id}: {size} approved entr{} (merge_train_max = {})", if size == 1 { "y" } else { "ies" }, cfg.merge_train_max);
+    let mut worst = 0u8;
+    let mut hard = 0u8;
+    let mut checks = 0u32;
+    let mut todo: Vec<(Run<'a>, std::time::Instant)> = Vec::new();
+    for (mut r, t) in group {
+        match r.train_ready() {
+            Ok(()) => todo.push((r, t)),
+            Err(c) => {
+                let code = code_num(c);
+                finish_member(cfg, r, code, t, rows, &mut worst);
+            }
+        }
+    }
+    let mut round = 0u32;
+    while !todo.is_empty() && hard == 0 {
+        round += 1;
+        let dir = todo[0].0.dir.clone();
+        let head = match wtgit::head_commit(&dir) {
+            Ok(h) => h,
+            Err(m) => {
+                hard = fail_members(cfg, std::mem::take(&mut todo), &m, rows, &mut worst);
+                break;
+            }
+        };
+        // ---- chain
+        let mut chain: Vec<(Run<'a>, std::time::Instant)> = Vec::new();
+        let mut prev = head.clone();
+        let mut pending: std::collections::VecDeque<(Run<'a>, std::time::Instant)> = std::mem::take(&mut todo).into();
+        while let Some((mut r, t)) = pending.pop_front() {
+            match r.train_link(&prev, &train_id) {
+                Ok(Some(tip)) => {
+                    prev = tip;
+                    chain.push((r, t));
+                }
+                Ok(None) => finish_member(cfg, r, EXIT_RETRY, t, rows, &mut worst),
+                Err(c) => {
+                    let code = code_num(c);
+                    finish_member(cfg, r, code, t, rows, &mut worst);
+                    if code == EXIT_ERROR {
+                        hard = EXIT_ERROR;
+                        break;
+                    }
+                }
+            }
+        }
+        if hard != 0 {
+            let rest: Vec<(Run<'a>, std::time::Instant)> = chain.into_iter().chain(pending).collect();
+            leave_approved(cfg, rest, "the merge train stopped on an internal error of an earlier entry", rows, &mut worst);
+            break;
+        }
+        if chain.is_empty() {
+            continue;
+        }
+        let m = chain.len();
+        for (i, (r, _)) in chain.iter_mut().enumerate() {
+            r.e.set("train", train_id.clone());
+            r.e.set("train_pos", (i + 1).to_string());
+            let _ = r.save();
+        }
+        // ---- one check of the whole chain, then a bisect if it fails
+        let mut lo = 0usize; // the first `lo` entries are proven good by a check that passed (their tip's)
+        let mut hi = m; // the check of the first `hi` entries failed
+        let mut good = PassInfo::default();
+        let mut bad = PassInfo::default();
+        let mut blocked: Option<String> = None;
+        let mut bisect_checks = 0u32;
+        let mut bisect_secs = 0f64;
+        let tip = chain_tip(&chain, m);
+        let first = chain[m - 1].0.check_commit(&tip, &format!("merge train {train_id}: all {m} entries combined"));
+        checks += 1;
+        match first {
+            TrainCheck::Pass { job, summary, tail } => {
+                lo = m;
+                good = PassInfo { job, summary, tail };
+            }
+            TrainCheck::Fail { job, summary, tail } => bad = PassInfo { job, summary, tail },
+            TrainCheck::Blocked(msg) => blocked = Some(msg),
+        }
+        while blocked.is_none() && hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            let tip_mid = chain_tip(&chain, mid);
+            let tb = std::time::Instant::now();
+            let res = chain[mid - 1].0.check_commit(&tip_mid, &format!("bisect of merge train {train_id}: the first {mid} entries"));
+            bisect_checks += 1;
+            checks += 1;
+            bisect_secs += tb.elapsed().as_secs_f64();
+            match res {
+                TrainCheck::Pass { job, summary, tail } => {
+                    lo = mid;
+                    good = PassInfo { job, summary, tail };
+                }
+                TrainCheck::Fail { job, summary, tail } => {
+                    hi = mid;
+                    bad = PassInfo { job, summary, tail };
+                }
+                TrainCheck::Blocked(msg) => blocked = Some(msg),
+            }
+        }
+        if bisect_checks > 0 {
+            println!("merge train {train_id}: bisect: {bisect_checks} extra check(s) in {bisect_secs:.1} s; the first {lo} entr{} pass, entry {hi} makes it fail", if lo == 1 { "y" } else { "ies" });
+        }
+        let stats = format!("round {round}: {} check(s) of the chain, {bisect_checks} of them bisect, {bisect_secs:.1} s of bisect", 1 + bisect_checks);
+        for (r, _) in chain.iter_mut() {
+            r.e.set("train_bisect", stats.clone());
+        }
+        if let Some(msg) = blocked {
+            println!("merge train {train_id}: the check could not give a verdict ({msg}); the {m} entries stay approved");
+            leave_approved(cfg, chain, &format!("the merge train's check could not run to a verdict: {msg}"), rows, &mut worst);
+            hard = EXIT_ERROR;
+            break;
+        }
+        if lo == m {
+            // ---- the whole chain passed
+            let c = merge_members(cfg, &train_id, chain, &tip, &head, &good, rows, &mut worst);
+            if c != 0 {
+                hard = c;
+            }
+            continue;
+        }
+        // ---- entry `hi` (1-based) is the first whose prefix fails
+        let k = hi;
+        let after: Vec<(Run<'a>, std::time::Instant)> = chain.split_off(k);
+        let Some((mut culprit, ct)) = chain.pop() else {
+            hard = EXIT_ERROR;
+            break;
+        };
+        let alone = if k == 1 {
+            Alone::Bad(bad.clone()) // its tip IS its own commit on main: the check that failed was already the check on its own
+        } else {
+            checks += 1;
+            match culprit.check_alone() {
+                TrainCheck::Fail { job, summary, tail } => Alone::Bad(PassInfo { job, summary, tail }),
+                TrainCheck::Pass { job, summary, .. } => {
+                    let _ = culprit.log("train", &format!("checked on its own commit: passes (job {job}: {summary}); so the failure only shows when it is combined with the entries before it"));
+                    Alone::Fine
+                }
+                TrainCheck::Blocked(msg) => Alone::Unknown(msg),
+            }
+        };
+        let culprit_id = culprit.e.id().to_string();
+        match alone {
+            Alone::Unknown(msg) => {
+                println!("merge train {train_id}: entry {culprit_id} could not be checked on its own ({msg}); every entry stays approved");
+                let mut all = chain;
+                all.push((culprit, ct));
+                all.extend(after);
+                leave_approved(cfg, all, &format!("the merge train's check of {culprit_id} on its own could not run to a verdict: {msg}"), rows, &mut worst);
+                hard = EXIT_ERROR;
+                break;
+            }
+            Alone::Bad(info) => {
+                println!("merge train {train_id}: entry {culprit_id} fails on its own (job {}): check_failed; the {} entr{} before it merge", info.job, lo, if lo == 1 { "y" } else { "ies" });
+                culprit.e.set("check_job", info.job.clone());
+                culprit.e.set("check_exit", "1");
+                culprit.e.set("check_summary", info.summary.clone());
+                culprit.e.set("check_tail", info.tail.clone());
+                // the proven-good entries before it merge FIRST: then a culprit chained only on them sits on main and ends a plain
+                // `check_failed`; if they could not merge, its branch still carries them and it ends `blocked` (`leave_train`)
+                if lo > 0 {
+                    let tip_good = chain_tip(&chain, lo);
+                    let c = merge_members(cfg, &train_id, chain, &tip_good, &head, &good, rows, &mut worst);
+                    if c != 0 {
+                        hard = c;
+                    }
+                }
+                let c = culprit.leave_train(CHECK_FAILED, &format!("build or tests failed on this entry on its own (job {}): {}. Found by the bisect of merge train {train_id}; nothing of it was merged. Fix it, commit, and queue the task again with `queue add`", if info.job.is_empty() { "?" } else { info.job.as_str() }, info.summary.replace('\n', "; ")), EXIT_REJECTED);
+                finish_member(cfg, culprit, code_num(c), ct, rows, &mut worst);
+                if hard != 0 {
+                    leave_approved(cfg, after, "the merge train stopped before this entry's turn", rows, &mut worst);
+                    break;
+                }
+                todo = after;
+            }
+            Alone::Fine => {
+                println!("merge train {train_id}: entry {culprit_id} passes on its own, but fails combined with the entries before it: conflict for it and for those {lo} entr{}; nothing of them is merged", if lo == 1 { "y" } else { "ies" });
+                let mut held = chain;
+                held.push((culprit, ct));
+                let ids: Vec<String> = held.iter().map(|(r, _)| r.e.id().to_string()).collect();
+                for (mut r, t) in held {
+                    r.e.set("check_job", bad.job.clone());
+                    r.e.set("check_exit", "1");
+                    r.e.set("check_summary", bad.summary.clone());
+                    r.e.set("check_tail", bad.tail.clone());
+                    let reason = format!("the combined check of merge train {train_id} failed (job {}) although each of these entries passes on its own: {}. They only fail together, so none of them was merged (main is unchanged). The entry's check summary and tail are the combined failure's. Rebase or fix them yourself, commit, and queue them again with `queue add`", if bad.job.is_empty() { "?" } else { bad.job.as_str() }, ids.join(", "));
+                    let c = r.leave_train(CONFLICT, &reason, EXIT_RETRY);
+                    finish_member(cfg, r, code_num(c), t, rows, &mut worst);
+                }
+                todo = after;
+            }
+        }
+    }
+    println!("merge train {train_id}: finished in {:.1} s; {size} entr{} taken, {checks} check(s) of the train, worst exit {worst}", started.elapsed().as_secs_f64(), if size == 1 { "y" } else { "ies" });
+    hard
+}
+
+/// Fast-forward main to `tip` (the last of `members`, a chain whose tip passed its check), run ONE main check, mark every member
+/// merged. Returns 0, EXIT_ERROR (internal), or EXIT_MERGED_BAD (the main check failed after the fast-forward: loud, main not reset).
+#[allow(clippy::too_many_arguments)]
+fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time::Instant)>, tip: &str, head: &str, pass: &PassInfo, rows: &mut Vec<Row>, worst: &mut u8) -> u8 {
+    let n = members.len();
+    if n == 0 {
+        return 0;
+    }
+    let dir = members[0].0.dir.clone();
+    let now = match wtgit::head_commit(&dir) {
+        Ok(h) => h,
+        Err(m) => return fail_members(cfg, members, &m, rows, worst),
+    };
+    if now != head {
+        for (mut r, t) in members {
+            let id = r.e.id().to_string();
+            let c = r.leave_train(STALE, &format!("main moved from {} to {} while merge train {train_id} was being checked; nothing was merged. Run `queue run --entry {id}` to rebase again", short(head), short(&now)), EXIT_RETRY);
+            finish_member(cfg, r, code_num(c), t, rows, worst);
+        }
+        return 0;
+    }
+    let dirty = match wtgit::status_porcelain_plain(&dir) {
+        Ok(d) => d,
+        Err(m) => return fail_members(cfg, members, &m, rows, worst),
+    };
+    if !dirty.is_empty() {
+        for (mut r, t) in members {
+            let c = r.leave_train(BLOCKED, &format!("the main checkout got uncommitted or untracked changes while merge train {train_id} was checked ({}); nothing merged", some(&dirty)), EXIT_RETRY);
+            finish_member(cfg, r, code_num(c), t, rows, worst);
+        }
+        return 0;
+    }
+    if let Err(m) = wtgit::merge_ff_only(&dir, tip) {
+        let after = wtgit::head_commit(&dir).unwrap_or_default();
+        for (mut r, t) in members {
+            let id = r.e.id().to_string();
+            let c = if after != head {
+                r.leave_train(STALE, &format!("main moved from {} to {} during the merge of train {train_id}; nothing was merged by this run. Run `queue run --entry {id}` to rebase again", short(head), short(&after)), EXIT_RETRY)
+            } else {
+                r.leave_train(BLOCKED, &format!("git refused the fast-forward of train {train_id}: {m}. Main is unchanged"), EXIT_RETRY)
+            };
+            finish_member(cfg, r, code_num(c), t, rows, worst);
+        }
+        return 0;
+    }
+    let after = match wtgit::head_commit(&dir) {
+        Ok(h) => h,
+        Err(m) => return fail_members(cfg, members, &m, rows, worst),
+    };
+    if after != tip {
+        let msg = format!("after `git merge --ff-only` main's HEAD is {} but the train tip is {}; main was {} before; look at the project", short(&after), short(tip), short(head));
+        return fail_members(cfg, members, &msg, rows, worst);
+    }
+    let mut members = members;
+    let last = n - 1;
+    let last_id = members[last].0.e.id().to_string();
+    for (i, (r, _)) in members.iter_mut().enumerate() {
+        let own = r.e.get("reviewed_tip").to_string();
+        let cli = r.e.get("reviewer_cli").to_string();
+        r.e.set("main_sha", own);
+        r.e.set("train", train_id);
+        r.e.set("train_pos", (i + 1).to_string());
+        r.e.set("train_job", pass.job.clone());
+        r.e.set("check_job", pass.job.clone());
+        r.e.set("check_exit", "0");
+        r.e.set("check_summary", pass.summary.clone());
+        r.e.set("check_tail", pass.tail.clone());
+        r.e.set("check_deferred", "");
+        r.e.set("train_checked", tip);
+        r.e.set("main_check", if i == last { format!("full check of the train tip {} on main, run by this entry for the whole merge train {train_id}", short(tip)) } else { format!("one main check for the whole merge train {train_id}, run by its last entry {last_id}") });
+        r.e.set("step", "merge");
+        let _ = r.log("merge", &format!("merge train {train_id}, position {} of {n}: main fast-forwarded {} -> {} (the train tip, checked by job {}); reviewed through CLI {}", i + 1, short(head), short(tip), if pass.job.is_empty() { "?" } else { pass.job.as_str() }, if cli.is_empty() { "(none recorded)" } else { cli.as_str() }));
+    }
+    println!("merge train {train_id}: main fast-forwarded {} -> {} ({n} entr{}, one check, one fast-forward)", short(head), short(tip), if n == 1 { "y" } else { "ies" });
+    // TP2 SEAM: tp2 (main == checked commit -> only a build on main) is not merged at this base, so this ONE main check is the full
+    // `check` of main, run by the last entry (its commit is the tip); the others record that it covers them.
+    if let Err(c) = members[last].0.s_main_check() {
+        let code = code_num(c);
+        let reason = members[last].0.e.get("reason").to_string();
+        for (i, (mut r, t)) in members.into_iter().enumerate() {
+            if i == last {
+                finish_member(cfg, r, code, t, rows, worst);
+                continue;
+            }
+            let c2 = if code == EXIT_MERGED_BAD { r.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD) } else { r.internal(&format!("the main check of merge train {train_id} did not complete: {reason}")) };
+            finish_member(cfg, r, code_num(c2), t, rows, worst);
+        }
+        return code;
+    }
+    let mut hard = 0u8;
+    for (i, (mut r, t)) in members.into_iter().enumerate() {
+        if i != last {
+            r.e.set("step", "main_check");
+            let _ = r.log("main_check", &format!("covered by the one main check of merge train {train_id} (run by entry {last_id}), which passed"));
+        }
+        let code = code_num(match r.s_done() {
+            Ok(c) | Err(c) => c,
+        });
+        if code == EXIT_ERROR {
+            hard = EXIT_ERROR;
+        }
+        finish_member(cfg, r, code, t, rows, worst);
+    }
+    hard
+}
+
 /// The last `max` bytes of a file as text (empty if it cannot be read). Cut at a line start when it cut anything.
 fn read_tail(path: &Path, max: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
@@ -1308,6 +2349,47 @@ mod tests {
     fn steps_are_in_the_documented_order() {
         assert_eq!(STEPS, ["preconditions", "rebase", "check", "review", "merge", "main_check", "done"]);
         assert_eq!(STEPS[STEP_MERGE], "merge");
+        assert!(is_open(APPROVED), "an approved entry is open: its task cannot be queued again");
         assert!(is_open(QUEUED) && is_open(RUNNING) && is_open(BLOCKED) && is_open(STALE) && !is_open(MERGED) && !is_open(CANCELLED) && !is_open(REJECTED) && !is_open(CHECK_FAILED) && !is_open(CONFLICT));
+    }
+
+    fn item(project: &str, claims: &[&str]) -> (String, Vec<String>) {
+        (project.to_string(), claims.iter().map(|c| c.to_string()).collect())
+    }
+
+    #[test]
+    fn a_train_takes_only_entries_with_claims_that_do_not_overlap_and_only_from_one_project() {
+        let items = vec![item("p", &["src/a.rs"]), item("p", &["src"]), item("q", &["src/a.rs"]), item("p", &["docs"]), item("p", &["src/b.rs"])];
+        // `src` overlaps `src/a.rs` (and `src/b.rs`), so the second entry is left out; the other project's entry never joins
+        assert_eq!(pick_train(&items, 3, false), vec![0, 3, 4], "full train: a, docs, b");
+        assert_eq!(pick_train(&items, 4, false), Vec::<usize>::new(), "only 3 compatible entries: not full, so not ready without flush");
+        assert_eq!(pick_train(&items, 4, true), vec![0, 3, 4], "flush takes what there is");
+        // a task that could not be read claims everything and rides alone
+        let items = vec![item("p", &["*"]), item("p", &["src/a.rs"])];
+        assert_eq!(pick_train(&items, 2, false), Vec::<usize>::new());
+        assert_eq!(pick_train(&items, 2, true), vec![0]);
+        // two projects: the first project with a ready train goes first
+        let items = vec![item("p", &["a"]), item("q", &["a"]), item("q", &["b"])];
+        assert_eq!(pick_train(&items, 2, false), vec![1, 2]);
+        assert_eq!(pick_train(&[], 2, true), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_train_never_exceeds_merge_train_max() {
+        let items: Vec<(String, Vec<String>)> = (0..6)
+            .map(|i| {
+                let f = format!("f{i}");
+                item("p", &[f.as_str()])
+            })
+            .collect();
+        assert_eq!(pick_train(&items, 4, false), vec![0, 1, 2, 3]);
+        assert_eq!(pick_train(&items, 1, false), vec![0], "1 = every entry on its own");
+    }
+
+    #[test]
+    fn run_all_badness_orders_exit_codes_worst_first() {
+        let mut codes = vec![0u8, 4, 2, 3, 5, 1, 6];
+        codes.sort_by_key(|c| std::cmp::Reverse(badness(*c)));
+        assert_eq!(codes, vec![6, 1, 5, 3, 2, 4, 0]);
     }
 }

@@ -300,7 +300,50 @@ pub enum Rebase {
 /// `onto`. On ANY failure it then runs `git rebase --abort` (a rebase that stopped is never left behind), so the branch is
 /// back where it started; the caller still verifies the tip. Why: the merge into main must be a pure fast-forward.
 pub fn rebase(worktree: &Path, onto: &str) -> Result<Rebase, String> {
-    let o = run(worktree, &["rebase", onto])?;
+    rebase_with(worktree, &["rebase", onto], onto)
+}
+
+/// `git rebase --onto <onto> <upstream>` in the task's worktree: replay the commits between `upstream` and the branch tip on top of
+/// `onto`, and abort on any failure exactly as `rebase` does. Why: the merge train chains entries one after another, and when an
+/// entry drops out of a chain the entries after it must be lifted off its commits (`upstream` = the commit just before their own).
+pub fn rebase_onto(worktree: &Path, onto: &str, upstream: &str) -> Result<Rebase, String> {
+    rebase_with(worktree, &["rebase", "--onto", onto, upstream], onto)
+}
+
+/// `git checkout --detach <commit>` in a task's worktree (clean, checked by the caller): put its HEAD on `commit` without moving any
+/// branch. Why: the merge train must check an entry's own earlier commit; the branch still holds every commit and is put back by
+/// `checkout_branch`.
+pub fn checkout_detach(worktree: &Path, commit: &str) -> Result<(), String> {
+    ok(worktree, &["checkout", "--detach", commit]).map(|_| ())
+}
+
+/// `git checkout <branch>` in a task's worktree: put the worktree back on its branch after `checkout_detach`. Why: a task's
+/// worktree must always end on its own branch.
+pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<(), String> {
+    ok(worktree, &["checkout", branch]).map(|_| ())
+}
+
+/// `git log --patch --reverse <range>` piped into `git patch-id --stable`: one patch id per commit of `range` that has a diff, oldest
+/// first. A patch id hashes the diff itself (line numbers and whitespace ignored), so two lists are equal exactly when the commits
+/// make the same changes. Why: the merge train rebases an entry's commits after their review; the review only stands when the
+/// rebased commits are the same patches that were reviewed.
+pub fn patch_ids(dir: &Path, range: &str) -> Result<Vec<String>, String> {
+    let log = run(dir, &["log", "--patch", "--reverse", "--no-color", "--no-ext-diff", "--no-textconv", range])?;
+    if log.code != 0 {
+        return Err(format!("git log --patch {range} failed: {}", log.stderr));
+    }
+    if log.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let o = run_with(dir, &["patch-id", "--stable"], Some(log.stdout + "\n"))?;
+    if o.code != 0 {
+        return Err(format!("git patch-id --stable failed: {}", o.stderr));
+    }
+    Ok(o.stdout.lines().filter_map(|l| l.split_whitespace().next().map(str::to_string)).collect())
+}
+
+fn rebase_with(worktree: &Path, args: &[&str], onto: &str) -> Result<Rebase, String> {
+    let o = run(worktree, args)?;
     if o.code == 0 {
         return Ok(Rebase::Done);
     }

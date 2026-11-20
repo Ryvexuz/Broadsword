@@ -1546,3 +1546,429 @@ fn a_shadow_script_outside_scratch_is_refused_not_run() {
     assert_eq!(r.field(&entry, "shadow verdict"), "ERROR");
     assert!(r.field(&entry, "shadow reason").contains("inside scratch_dir"), "{}", r.field(&entry, "shadow reason"));
 }
+
+// ---- queue run --all and the merge train (merge_train_max > 1) --------------------------------------------------------
+//
+// The fake reviewer PASSes everything but the planted bug; the checks are REAL (`check` of the tiny cargo project p), so a failing
+// test in a commit really fails the train's check. Entries are made with claims that never overlap (the board would refuse
+// otherwise); a claim string is only a name, so it need not be the file the commit touches.
+//
+// TP4 SEAM: tp4 (t-20261118-095351) brings its own `queued_one`, `main_subjects` and `Root::set_setting`; these `train_*` helpers do
+// the same and can be replaced by tp4's when it is ported onto this.
+
+/// Set one key of a test root's broadsword.toml (the line `key = ...`, which support::config always writes).
+fn train_set(r: &Root, key: &str, value: &str) {
+    let path = r.dir.join("broadsword.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.lines().any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == key)), "{key} is in the test config");
+    let out: Vec<String> = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = {value}") } else { l.to_string() }).collect();
+    fs::write(&path, out.join("\n") + "\n").unwrap();
+}
+
+/// A root with the merge train set to `max` entries per train (1 = off).
+fn train_root(name: &str, max: u64) -> Root {
+    let r = Root::new(name, 30);
+    train_set(&r, "merge_train_max", &max.to_string());
+    r
+}
+
+/// A started task that commits `file` (its own claim) with `content` as `task: <file>`, queued. Returns (task, entry).
+fn train_one(r: &Root, file: &str, content: &str) -> (String, String) {
+    let id = r.started(file);
+    r.commit(&r.wt(&id), file, content, &format!("task: {file}"));
+    let e = r.add(&id, "low", "sonnet");
+    (id, e)
+}
+
+/// A started task with claim `claim` that commits `content` to `file` as `subject`, queued. Returns (task, entry).
+fn queued_claim(r: &Root, claim: &str, file: &str, content: &str, subject: &str) -> (String, String) {
+    let id = r.started(claim);
+    r.commit(&r.wt(&id), file, content, subject);
+    let e = r.add(&id, "low", "sonnet");
+    (id, e)
+}
+
+/// The subjects of main's commits, oldest first.
+fn train_subjects(r: &Root) -> Vec<String> {
+    git(&r.p(), &["log", "--reverse", "--format=%s"]).lines().map(String::from).collect()
+}
+
+/// How many job records of `kind` (`check`, `build`) the root has: every check or build that really ran.
+fn jobs_of(r: &Root, kind: &str) -> usize {
+    let want = format!("kind = {kind}");
+    fs::read_dir(r.dir.join("state/jobs")).into_iter().flatten().flatten().filter(|e| fs::read_to_string(e.path()).unwrap_or_default().lines().any(|l| l == want)).count()
+}
+
+/// Set fields of a task record by hand (to give two running tasks claims that overlap: the board itself never allows it).
+fn edit_task(r: &Root, id: &str, set: &[(&str, &str)]) {
+    let path = r.dir.join("state/tasks").join(format!("{id}.task"));
+    let text = fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    for (k, v) in set {
+        let prefix = format!("{k} = ");
+        match lines.iter_mut().find(|l| l.starts_with(&prefix)) {
+            Some(l) => *l = format!("{prefix}{v}"),
+            None => lines.push(format!("{prefix}{v}")),
+        }
+    }
+    fs::write(&path, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn run_all_refuses_entry_and_all_together_and_runs_nothing() {
+    let r = train_root("allbad", 4);
+    let (_, e1) = train_one(&r, "src/a.txt", "x\n");
+    let o = r.run(&["queue", "run", "--all", "--entry", &e1]);
+    assert_eq!(o.code, 2, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e1), "queued", "nothing ran");
+}
+
+#[test]
+fn three_approved_entries_with_disjoint_claims_merge_as_one_train_with_one_check_and_one_main_check() {
+    let r = train_root("train3", 4);
+    let before = r.head();
+    let es: Vec<(String, String)> = ["src/a.txt", "src/b.txt", "src/c.txt"].iter().map(|f| train_one(&r, f, "x\n")).collect();
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for (id, e) in &es {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+        assert_eq!(r.task_status(id), "done");
+        assert!(!r.wt(id).exists(), "the worktree is removed: every entry's branch is on main");
+    }
+    assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt", "task: src/c.txt"], "the commits are on main in queue order, as they are (no squash)");
+    assert!(git(&r.p(), &["rev-list", "--merges", "HEAD"]).is_empty(), "a fast-forward, never a merge commit");
+    assert_eq!(git(&r.p(), &["rev-list", "--count", &format!("{before}..HEAD")]), "3");
+    // ONE check of the chain tip and ONE main check (a full check on main at this base): two check jobs, no build job.
+    // Without the train: three checks of their own and three main checks.
+    assert_eq!((jobs_of(&r, "check"), jobs_of(&r, "build")), (2, 0), "{}", o.stdout);
+    assert_eq!(r.calls(), 3, "every entry is still reviewed on its own");
+    let train = r.field(&es[0].1, "merge train");
+    assert!(train.starts_with("tr-"), "{train}");
+    let jobs: Vec<String> = es.iter().map(|(_, e)| r.field(e, "train check job (shared by the whole train)")).collect();
+    for (i, (_, e)) in es.iter().enumerate() {
+        assert_eq!(r.field(e, "merge train"), train, "one train for all three");
+        assert_eq!(r.field(e, "position in the train"), (i + 1).to_string());
+        assert!(!jobs[i].is_empty() && jobs[i] == jobs[0], "the shared check job: {jobs:?}");
+        assert!(r.field(e, "check deferred to the train").is_empty(), "the deferral is cleared once the train checked it");
+    }
+    assert_eq!(r.field(&es[2].1, "main commit"), r.head());
+    assert!(r.field(&es[2].1, "main check").contains("full check of the train tip"), "{}", r.field(&es[2].1, "main check"));
+    assert!(r.field(&es[0].1, "main check").contains("one main check for the whole merge train"), "{}", r.field(&es[0].1, "main check"));
+    // the table shows the train
+    assert!(o.stdout.contains("\ttrain") && o.stdout.contains(&format!("{train}#2")), "{}", o.stdout);
+    // the review prompt said the entry's own check was not run
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(stdin.contains("NOT RUN for this change alone"), "{stdin}");
+}
+
+#[test]
+fn entries_with_overlapping_claims_never_share_a_train() {
+    let r = train_root("trainclash", 4);
+    let (_, e1) = train_one(&r, "src/a.txt", "x\n");
+    let (t2, e2) = train_one(&r, "src/b.txt", "x\n");
+    edit_task(&r, &t2, &[("claims", "src")]); // `src` overlaps `src/a.txt`
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    let (a, b) = (r.field(&e1, "merge train"), r.field(&e2, "merge train"));
+    assert!(a.starts_with("tr-") && b.starts_with("tr-") && a != b, "two trains: {a} / {b}");
+    assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt"]);
+}
+
+#[test]
+fn merge_train_max_1_is_off_and_run_all_merges_every_entry_on_its_own() {
+    let r = train_root("trainoff", 1);
+    let es: Vec<(String, String)> = ["src/a.txt", "src/b.txt", "src/c.txt"].iter().map(|f| train_one(&r, f, "x\n")).collect();
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for (id, e) in &es {
+        assert_eq!(r.status(e), "merged");
+        assert_eq!(r.task_status(id), "done");
+        assert!(r.field(e, "merge train").is_empty(), "no train");
+        assert!(o.stdout.lines().any(|l| l.starts_with(&format!("{e}\t")) && l.contains("\tmerged\t0\t")), "a summary row for {e}: {}", o.stdout);
+    }
+    assert!(!o.stdout.contains("merge train") && o.stdout.contains("entry\ttask\tstatus\texit\tseconds\tnote\n") && o.stdout.contains("worst exit: 0"), "{}", o.stdout);
+    // every entry checked on its own, then checked on main (no train): six check jobs
+    assert_eq!((jobs_of(&r, "check"), jobs_of(&r, "build")), (6, 0));
+    assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt", "task: src/c.txt"]);
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(!stdin.contains("NOT RUN for this change alone") && stdin.contains("test: ok"), "{stdin}");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0);
+    assert!(o.stdout.contains("the queue is empty"), "{}", o.stdout);
+}
+
+#[test]
+fn a_train_never_holds_more_than_merge_train_max_entries() {
+    let r = train_root("trainmax2", 2);
+    let es: Vec<(String, String)> = ["src/a.txt", "src/b.txt", "src/c.txt"].iter().map(|f| train_one(&r, f, "x\n")).collect();
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    let trains: Vec<String> = es.iter().map(|(_, e)| r.field(e, "merge train")).collect();
+    assert_eq!(trains[0], trains[1], "the first two share a train");
+    assert_ne!(trains[1], trains[2], "the third rides in the next one: {trains:?}");
+    assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt", "task: src/c.txt"]);
+}
+
+#[test]
+fn a_rejected_entry_never_joins_a_train_and_the_approved_ones_still_merge_together() {
+    let r = train_root("trainrej", 4);
+    let (_, e1) = train_one(&r, "src/a.txt", "x\n");
+    let (t2, e2) = train_one(&r, "src/b.txt", "PLANTED_BUG\n");
+    let (_, e3) = train_one(&r, "src/c.txt", "x\n");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "rejected");
+    assert_eq!(r.task_status(&t2), "running");
+    for e in [&e1, &e3] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(r.field(&e1, "merge train"), r.field(&e3, "merge train"));
+    assert!(r.field(&e2, "merge train").is_empty());
+    assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/c.txt"]);
+}
+
+#[test]
+fn a_textual_conflict_inside_a_train_drops_that_entry_back_to_queued_and_the_rest_merge() {
+    let r = train_root("trainconf", 4);
+    let (_, e1) = queued_claim(&r, "src/x1", "src/lib.rs", &LIB_BASE.replace("a + b", "b + a"), "task: e1 swaps the operands");
+    let (t2, e2) = queued_claim(&r, "src/x2", "src/lib.rs", &LIB_BASE.replace("a + b", "a.wrapping_add(b)"), "task: e2 wraps the add");
+    let (_, e3) = queued_claim(&r, "src/x3", "src/c.txt", "x\n", "task: e3 adds a file");
+    let e2_tip = r.branch_tip(&t2);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e3] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(r.status(&e2), "queued", "back to queued, not lost");
+    assert!(r.field(&e2, "reason").contains("conflicts in: src/lib.rs"), "{}", r.field(&e2, "reason"));
+    assert_eq!(r.branch_tip(&t2), e2_tip, "its branch is exactly as it was");
+    assert_eq!(r.task_status(&t2), "running");
+    assert_eq!(train_subjects(&r)[1..], ["task: e1 swaps the operands", "task: e3 adds a file"]);
+}
+
+#[test]
+fn a_train_rebase_that_changes_an_entrys_patch_sends_it_back_to_review_and_never_merges_it_on_the_old_verdict() {
+    let r = train_root("trainpatch", 4);
+    // e1 adds a line at the top; e2 changes the line just below it. They merge cleanly, but e2's rebased hunk now has e1's line as
+    // context, so its patch id is not the reviewed one.
+    let (_, e1) = queued_claim(&r, "src/y1", "src/lib.rs", &format!("// e1 was here\n{LIB_BASE}"), "task: e1 adds a comment");
+    let (t2, e2) = queued_claim(&r, "src/y2", "src/lib.rs", &LIB_BASE.replace("a + b", "b + a"), "task: e2 swaps the operands");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e1), "merged", "reason = {}", r.field(&e1, "reason"));
+    // e2 left the train chained on e1, which was not on main yet: blocked (the left-train rule), with the patch-id reason kept
+    assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
+    let why = r.field(&e2, "reason");
+    assert!(why.starts_with("left a train: rebase your own commits onto main and queue again") && why.contains("patch changed by the train rebase"), "{why}");
+    assert_eq!(train_subjects(&r)[1..], ["task: e1 adds a comment"], "e2 never merged on its old verdict");
+    assert_eq!(r.task_status(&t2), "running");
+    assert_eq!(r.calls(), 2);
+    // a blocked entry is not drained again
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "blocked");
+    assert_eq!(r.calls(), 2);
+    // e1 (the commit e2 is chained on) is on main now, so e2 runs as it is: reviewed again (a new reviewer call), then merged
+    let o = r.run(&["queue", "run", "--entry", &e2]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "merged", "reason = {}", r.field(&e2, "reason"));
+    assert!(r.show(&e2).contains("the branch no longer carries"), "{}", r.show(&e2));
+    assert_eq!(r.calls(), 3, "e2 was reviewed a second time");
+    assert_eq!(train_subjects(&r)[1..], ["task: e1 adds a comment", "task: e2 swaps the operands"]);
+    assert_eq!(fs::read_to_string(r.p().join("src/lib.rs")).unwrap(), format!("// e1 was here\n{}", LIB_BASE.replace("a + b", "b + a")));
+}
+
+#[test]
+fn one_bad_entry_in_a_train_of_four_is_found_by_bisection_and_the_other_three_merge() {
+    let r = train_root("trainbad", 4);
+    let bad = lib_with("\n#[cfg(test)]\nmod bad {\n    #[test]\n    fn fails() {\n        assert!(false, \"planted failure\");\n    }\n}\n");
+    let (_, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (t2, e2) = queued_claim(&r, "src/lib.rs", "src/lib.rs", &bad, "task: bad");
+    let (_, e3) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let (_, e4) = queued_claim(&r, "src/c.txt", "src/c.txt", "x\n", "task: c");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e3, &e4] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(r.status(&e2), "check_failed", "reason = {}", r.field(&e2, "reason"));
+    assert!(r.field(&e2, "reason").contains("on its own"), "{}", r.field(&e2, "reason"));
+    assert!(r.show(&e2).contains("FAILED"), "its own failing check's summary is in the entry: {}", r.show(&e2));
+    assert_eq!(r.task_status(&t2), "running", "the bad entry's task stays running");
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b", "task: c"], "the bad one never reached main");
+    assert!(r.field(&e1, "train bisect").contains("2 of them bisect"), "{}", r.field(&e1, "train bisect"));
+    assert!(r.field(&e3, "train bisect").starts_with("round 2:"), "{}", r.field(&e3, "train bisect"));
+    assert!(o.stdout.contains("fails on its own") && o.stdout.contains("bisect: 2 extra check(s)"), "{}", o.stdout);
+}
+
+#[test]
+fn a_pair_that_fails_only_when_combined_keeps_both_out_and_main_unchanged() {
+    let r = train_root("trainpair", 4);
+    let before = r.head();
+    // each adds `dup`: one at the top, one at the end (no textual conflict); each builds alone, together they do not
+    let (t1, e1) = queued_claim(&r, "src/p1", "src/lib.rs", &format!("pub fn dup() {{}}\n{LIB_BASE}"), "task: dup at the top");
+    let (t2, e2) = queued_claim(&r, "src/p2", "src/lib.rs", &lib_with("\npub fn dup() {}\n"), "task: dup at the end");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert!(r.field(e, "reason").contains("only fail together"), "{}", r.field(e, "reason"));
+        assert!(r.show(e).contains("check summary"), "the combined failure's log is in the entry");
+    }
+    // e1 sits on main's HEAD: a plain conflict. e2 is chained on e1, which is not on main: blocked by the left-train rule
+    assert_eq!(r.status(&e1), "conflict", "reason = {}", r.field(&e1, "reason"));
+    assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
+    assert!(r.field(&e2, "reason").starts_with("left a train:"), "{}", r.field(&e2, "reason"));
+    assert_eq!(r.head(), before, "main is unchanged");
+    assert_eq!((r.task_status(&t1), r.task_status(&t2)), ("running".to_string(), "running".to_string()));
+    assert!(git(&r.p(), &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn an_entry_that_leaves_a_train_on_a_chained_branch_is_blocked_and_never_reviewed_on_the_chained_diff() {
+    let r = train_root("trainleft", 4);
+    let before = r.head();
+    // as in the pair test: each builds alone, together they do not; e2 is chained on e1 and e1 never merges
+    let (t1, e1) = queued_claim(&r, "src/l1", "src/lib.rs", &format!("pub fn dup() {{}}\n{LIB_BASE}"), "task: dup at the top");
+    let (t2, e2) = queued_claim(&r, "src/l2", "src/lib.rs", &lib_with("\npub fn dup() {}\n"), "task: dup at the end");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e1), "conflict", "reason = {}", r.field(&e1, "reason"));
+    assert_eq!(r.status(&e2), "blocked", "reason = {}", r.field(&e2, "reason"));
+    let why = r.field(&e2, "reason");
+    assert!(why.starts_with("left a train: rebase your own commits onto main and queue again") && why.contains("git rebase --onto main"), "{why}");
+    let chained_on = r.field(&e2, "left a train chained on");
+    assert_eq!(chained_on, r.branch_tip(&t1), "it is chained on e1's tip");
+    assert_eq!(r.calls(), 2);
+    // run on its own while still chained: refused before any review
+    let o = r.run(&["queue", "run", "--entry", &e2]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2), "blocked");
+    assert!(r.field(&e2, "reason").starts_with("left a train:"), "{}", r.field(&e2, "reason"));
+    assert_eq!(r.calls(), 2, "never re-reviewed on the chained diff");
+    assert_eq!(r.head(), before);
+    // cancelled and queued again while still chained: `queue add` refuses
+    assert_eq!(r.run(&["queue", "cancel", &e2]).code, 0);
+    let o = r.run(&["queue", "add", &t2, "--risk", "low", "--coder", "sonnet"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("left a train") && o.stderr.contains(&e2), "{}", o.stderr);
+    // the coder's way out: put its own commits back on main, then queue again; reviewed on its own diff only, and merged
+    git(&r.wt(&t2), &["rebase", "-q", "--onto", "main", &chained_on, &format!("task/{t2}")]);
+    assert_eq!(git(&r.p(), &["rev-list", "--count", &format!("main..task/{t2}")]), "1");
+    let e2b = r.add(&t2, "low", "sonnet");
+    let o = r.run(&["queue", "run", "--entry", &e2b]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e2b), "merged", "reason = {}", r.field(&e2b, "reason"));
+    assert_eq!(r.calls(), 3);
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert_eq!(stdin.matches("+pub fn dup() {}").count(), 1, "the review saw e2's own change only: {stdin}");
+    assert_eq!(train_subjects(&r)[1..], ["task: dup at the end"], "nothing of e1 reached main");
+    assert_eq!(r.task_status(&t1), "running");
+}
+
+#[test]
+fn a_test_hook_review_never_merges_into_a_project_outside_scratch_through_a_merge_train_either() {
+    let r = Root::with_projects("trainhook", 30, "projects");
+    train_set(&r, "merge_train_max", "4");
+    let (t1, e1) = train_one(&r, "src/a.txt", "x\n");
+    let (t2, e2) = train_one(&r, "src/b.txt", "x\n");
+    let (tip1, tip2, main_head) = (r.branch_tip(&t1), r.branch_tip(&t2), r.head());
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "blocked", "{e}: reason = {}", r.field(e, "reason"));
+        let why = r.field(e, "reason");
+        assert!(why.contains("TEST HOOK") && why.contains("outside scratch_dir"), "{why}");
+        assert_eq!(r.field(e, "test hook"), "true");
+        assert!(r.field(e, "position in the train").is_empty(), "refused before it was chained");
+    }
+    assert_eq!(r.calls(), 2, "both were reviewed (by the test hook) and approved before the train refused them");
+    assert_eq!(r.head(), main_head, "nothing merged");
+    assert_eq!((r.branch_tip(&t1), r.branch_tip(&t2)), (tip1, tip2), "no branch was chained");
+    assert_eq!(jobs_of(&r, "check"), 0, "the train refused them before its check");
+    assert!(!r.p().join("src/a.txt").exists() && !r.p().join("src/b.txt").exists());
+    assert_eq!((r.task_status(&t1), r.task_status(&t2)), ("running".to_string(), "running".to_string()));
+}
+
+#[test]
+fn a_main_check_failure_after_a_train_is_loud_exit_6_for_every_entry_and_the_queue_stops() {
+    let r = train_root("trainmain", 2);
+    // passes in a worktree, fails in the main checkout: the "impossible" case, made on purpose (as in the single-entry test)
+    let only_here = LIB_BASE.to_string() + "\n#[cfg(test)]\nmod only_here {\n    #[test]\n    fn not_in_main() {\n        assert!(!env!(\"CARGO_MANIFEST_DIR\").replace('\\\\', \"/\").contains(\"/projects/p\"));\n    }\n}\n";
+    let (_, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (t2, e2) = queued_claim(&r, "src/lib.rs", "src/lib.rs", &only_here, "task: a test that only passes outside main");
+    let (_, e3) = queued_claim(&r, "src/c.txt", "src/c.txt", "x\n", "task: c");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    for e in [&e1, &e2] {
+        assert_eq!(r.status(e), "merged_check_failed", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert!(o.stderr.contains("LOUD") && o.stderr.contains("NOT reset"), "{}", o.stderr);
+    assert_eq!(r.head(), r.branch_tip(&t2), "main keeps the train: it is NOT reset");
+    assert_eq!(r.status(&e3), "queued", "the queue stopped: the entry after the train was not run");
+    assert_eq!(r.task_status(&t2), "running", "nothing of the train was marked done");
+}
+
+/// A drain killed while a train's check runs (the check of the last entry hangs while `train-hang.flag` exists), with three entries
+/// approved. Returns the root, the three entries and main's HEAD before.
+fn killed_train(name: &str) -> (Root, [String; 3], String) {
+    let r = train_root(name, 4);
+    let hang = "\n#[cfg(test)]\nmod hang {\n    #[test]\n    fn waits_while_the_flag_exists() {\n        let flag = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"../../../train-hang.flag\");\n        for _ in 0..600 {\n            if !flag.exists() {\n                break;\n            }\n            std::thread::sleep(std::time::Duration::from_millis(100));\n        }\n    }\n}\n";
+    let (_, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (_, e2) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let (_, e3) = queued_claim(&r, "src/lib.rs", "src/lib.rs", &lib_with(hang), "task: c with a hanging test");
+    let before = r.head();
+    let flag = r.dir.join("train-hang.flag");
+    fs::write(&flag, "1").unwrap();
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    wait_for("the train to be chained", 180, || !r.field(&e3, "position in the train").is_empty());
+    kill_tree(&mut child);
+    fs::remove_file(&flag).unwrap();
+    (r, [e1, e2, e3], before)
+}
+
+#[test]
+fn a_train_killed_mid_check_leaves_main_unmoved_and_the_next_drain_merges_all_three() {
+    let (r, es, before) = killed_train("trainkill");
+    assert_eq!(r.head(), before, "main never moved past an unchecked commit");
+    for e in &es {
+        assert_eq!(r.status(e), "approved", "{e}");
+    }
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for e in &es {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b", "task: c with a hanging test"]);
+    assert!(git(&r.p(), &["rev-list", "--merges", "HEAD"]).is_empty());
+}
+
+#[test]
+fn an_approved_entry_run_on_its_own_is_checked_first_and_never_merges_unchecked() {
+    let (r, es, before) = killed_train("trainsolo");
+    assert_eq!(r.head(), before);
+    let checks = jobs_of(&r, "check");
+    let o = r.run(&["queue", "run", "--entry", &es[0]]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&es[0]), "merged", "reason = {}", r.field(&es[0], "reason"));
+    assert!(jobs_of(&r, "check") >= checks + 2, "its own check ran before the merge, then the main check");
+    assert!(r.show(&es[0]).contains("deferred to a merge train that has not checked this commit"), "{}", r.show(&es[0]));
+    // the next one was chained on top of the first: main moved, so it is stale (it was never merged unchecked)
+    let o = r.run(&["queue", "run", "--entry", &es[1]]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&es[1]), "stale", "reason = {}", r.field(&es[1], "reason"));
+}
+
+#[test]
+fn an_approved_entry_can_be_cancelled_and_blocks_a_second_queue_add_for_its_task() {
+    let (r, es, _) = killed_train("traincancel");
+    let task = r.field(&es[0], "task");
+    let o = r.run(&["queue", "add", &task, "--risk", "low", "--coder", "sonnet"]);
+    assert_eq!(o.code, 3, "an approved entry is open: {}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("approved"), "{}", o.stderr);
+    assert_eq!(r.run(&["queue", "cancel", &es[0]]).code, 0);
+    assert_eq!(r.status(&es[0]), "cancelled");
+    assert_eq!(r.task_status(&task), "running", "cancelling touches nothing else");
+}

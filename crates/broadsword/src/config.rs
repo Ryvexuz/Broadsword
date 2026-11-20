@@ -111,6 +111,9 @@ pub struct Config {
     pub queue_lock_wait_seconds: u64,
     /// The most reviewer calls (real model calls, resumes and re-runs included) one queue entry may make; at the cap it is `blocked`.
     pub reviewer_max_calls_per_entry: u64,
+    /// `queue run --all` merge train: the most review-PASSed entries (one project, claims that do not overlap) merged by one check, one
+    /// fast-forward and one main check. 1 = off: every entry is checked, merged and main-checked on its own.
+    pub merge_train_max: u64,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -248,6 +251,7 @@ impl Config {
             reviewer_check_tail_kb: positive("reviewer_check_tail_kb")?,
             queue_lock_wait_seconds: positive("queue_lock_wait_seconds")?,
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
+            merge_train_max: positive("merge_train_max")?,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -377,6 +381,7 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+merge_train_max = 4
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
@@ -410,7 +415,7 @@ install_dir=\"build/bin\"\n";
         assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
         for key in [
             "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_model_high_fallback", "reviewer_effort_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
-            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms",
+            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms", "merge_train_max",
         ] {
             let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
 ");
@@ -432,6 +437,8 @@ install_dir=\"build/bin\"\n";
         assert_eq!(c.max_queued, 30, "the shipped max_queued");
         assert!(Config::from_text(&with("queue_entry_read_wait_ms", "queue_entry_read_wait_ms = 0"), Path::new("p")).is_err(), "0 would never wait for an entry being written");
         assert_eq!(c.queue_entry_read_wait_ms, 2000, "the shipped queue_entry_read_wait_ms");
+        assert!(Config::from_text(&with("merge_train_max", "merge_train_max = 0"), Path::new("p")).is_err(), "0 would merge nothing: 1 means off");
+        assert_eq!(c.merge_train_max, 4, "shipped 4 for the trial (Lazlo 2026-11-19); 1 turns the train off");
         assert!(valid_model_name("claude-haiku-4-5") && valid_model_name("opus[1m]") && !valid_model_name("") && !valid_model_name("-x"));
     }
 
@@ -461,6 +468,7 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+merge_train_max = 4
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
@@ -502,6 +510,7 @@ sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
+merge_train_max = 4
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
