@@ -97,7 +97,8 @@ def secret_name(name: str) -> bool:
 #   macro_rules! name { () => { "<literal>" }; }                       defined exactly once in the file, its body ONE literal.
 # A <literal> is a plain Rust string literal: no raw strings (r"..."), no byte strings, and only the escapes \n \t \r \0 \\ \" \'.
 # Other escapes (\x.., \u{..}, a backslash before a line break) are refused, not guessed. CRLF in the file reads as LF, as rustc
-# reads it; a bare CR is refused.
+# reads it; a bare CR is refused. `const SYSTEM_PROMPT` and each `macro_rules! name` it uses must appear exactly once in the WHOLE
+# file, and that once in code: any copy in a line comment, a (nested) block comment or a string refuses the file (code_states).
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
 
 
@@ -127,12 +128,80 @@ def rust_literal(text: str, at: int, path: Path) -> tuple:
     raise PromptParseError(f"unterminated string literal at offset {at} of {path}")
 
 
-def prompt_macro(text: str, name: str, path: Path) -> str:
-    """The literal body of `macro_rules! name { () => { "..." }; }`, which must be defined exactly once."""
-    heads = list(re.finditer(rf"macro_rules!\s+{re.escape(name)}\b", text))
-    if len(heads) != 1:
-        raise PromptParseError(f"macro {name}! is defined {len(heads)} times in {path}; exactly one definition is allowed")
-    m = re.compile(r"\s*\{\s*\(\s*\)\s*=>\s*\{\s*").match(text, heads[0].end())
+CODE, COMMENT, STRING = "c", "/", '"'
+
+
+def code_states(text: str, path: Path) -> str:
+    """One character per character of `text`: CODE, COMMENT (line `//...`, block `/* */`, nested as Rust allows) or STRING (a
+    string, raw string, byte string or char literal, quotes included). It tracks nothing else. An unterminated block comment,
+    string or raw string raises PromptParseError."""
+    out, i, n = [], 0, len(text)
+    ident = re.compile(r"[A-Za-z0-9_]")
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            out.append(COMMENT * (end - i))
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            if depth:
+                raise PromptParseError(f"unterminated block comment at offset {i} of {path}")
+            out.append(COMMENT * (j - i))
+            i = j
+        elif (raw := re.compile(r"b?r(#*)\"").match(text, i)) and (i == 0 or not ident.match(text[i - 1])):
+            close = '"' + raw.group(1)
+            end = text.find(close, raw.end())
+            if end < 0:
+                raise PromptParseError(f"unterminated raw string at offset {i} of {path}")
+            end += len(close)
+            out.append(STRING * (end - i))
+            i = end
+        elif c == '"' or (c == "b" and text.startswith('b"', i) and (i == 0 or not ident.match(text[i - 1]))):
+            j = i + (2 if c == "b" else 1)
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise PromptParseError(f"unterminated string literal at offset {i} of {path}")
+            out.append(STRING * (j + 1 - i))
+            i = j + 1
+        elif c == "'":
+            ch = re.compile(r"'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]{1,6}\}|.)|[^\\'\n])'").match(text, i)
+            if ch:  # a char literal such as '"'; otherwise a lifetime such as 'a, which is code
+                out.append(STRING * (ch.end() - i))
+                i = ch.end()
+            else:
+                out.append(CODE)
+                i += 1
+        else:
+            out.append(CODE)
+            i += 1
+    return "".join(out)
+
+
+def only_in_code(text: str, states: str, token: str, what: str, path: Path) -> re.Match:
+    """The one match of `token`. Refused unless it appears exactly once in the WHOLE file, comments and strings included, and that
+    one is code: a commented-out or quoted copy is never read, and its presence alone refuses the file."""
+    hits = list(re.finditer(token, text))
+    if len(hits) != 1:
+        raise PromptParseError(f"{what} appears {len(hits)} times in {path} (comments and strings included); exactly one is allowed")
+    if states[hits[0].start()] != CODE:
+        raise PromptParseError(f"{what} in {path} is inside a comment or a string, not code")
+    return hits[0]
+
+
+def prompt_macro(text: str, states: str, name: str, path: Path) -> str:
+    """The literal body of `macro_rules! name { () => { "..." }; }`, which must be defined exactly once, in code."""
+    head = only_in_code(text, states, rf"macro_rules!\s*{re.escape(name)}\b", f"`macro_rules! {name}`", path)
+    m = re.compile(r"\s*\{\s*\(\s*\)\s*=>\s*\{\s*").match(text, head.end())
     if not m:
         raise PromptParseError(f"macro {name}! in {path} is not of the form `{{ () => {{ \"...\" }}; }}`")
     value, end = rust_literal(text, m.end(), path)
@@ -146,10 +215,15 @@ def queue_system_prompt(path: Path) -> str:
     text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")  # bytes: read_text would also turn a bare CR into LF
     if "\r" in text:
         raise PromptParseError(f"{path} holds a bare CR")
-    heads = list(re.finditer(r"(?m)^pub const SYSTEM_PROMPT\s*:\s*&str\s*=\s*", text))
-    if len(heads) != 1:
-        raise PromptParseError(f"`pub const SYSTEM_PROMPT: &str =` appears {len(heads)} times in {path}; exactly one is allowed")
-    i = heads[0].end()
+    states = code_states(text, path)
+    head = only_in_code(text, states, r"\bconst\s+SYSTEM_PROMPT\b", "`const SYSTEM_PROMPT`", path)
+    pub = re.search(r"(?:^|(?<=[\s;}]))pub[ \t]+$", text[: head.start()])  # `pub` on the same line, itself code
+    if not pub or set(states[pub.start():head.start()]) != {CODE}:
+        raise PromptParseError(f"`const SYSTEM_PROMPT` in {path} is not `pub const SYSTEM_PROMPT`")
+    m = re.compile(r"\s*:\s*&str\s*=\s*").match(text, head.end())
+    if not m:
+        raise PromptParseError(f"SYSTEM_PROMPT in {path} is not `pub const SYSTEM_PROMPT: &str = ...`")
+    i = m.end()
     if text.startswith('"', i):
         prompt, i = rust_literal(text, i, path)
     else:
@@ -168,7 +242,7 @@ def queue_system_prompt(path: Path) -> str:
                 pm = piece.match(text, i)
                 if not pm:
                     raise PromptParseError(f"concat! piece at offset {i} of {path} is not a string literal or a name!() macro")
-                value, i = prompt_macro(text, pm.group(1), path), pm.end()
+                value, i = prompt_macro(text, states, pm.group(1), path), pm.end()
             pieces.append(value)
             i = re.compile(r"\s*").match(text, i).end()
             if text.startswith(",", i):

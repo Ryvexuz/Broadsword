@@ -165,7 +165,34 @@ UNKNOWN_FORMS = {
     "two definitions": 'pub const SYSTEM_PROMPT: &str = "a";\npub const SYSTEM_PROMPT: &str = "b";\n',
     "no definition": 'pub const SYSTEM_PROMPT_GATE: &str = "a";\n',
     "bare CR": 'pub const SYSTEM_PROMPT: &str = "a\rb";\n',
+    # Copies in comments and strings (review q-20261120-212639): refused, never read in place of the real definition.
+    "reviewer's example: block-commented column-zero copy, indented real one":
+        '/*\npub const SYSTEM_PROMPT: &str = "old prompt";\n*/\n    pub const SYSTEM_PROMPT: &str = "real prompt";\n',
+    "line-commented duplicate": '// pub const SYSTEM_PROMPT: &str = "old";\npub const SYSTEM_PROMPT: &str = "real";\n',
+    "only a line-commented definition": '// pub const SYSTEM_PROMPT: &str = "old";\n',
+    "only a doc-commented definition": '/// pub const SYSTEM_PROMPT: &str = "old";\n',
+    "nested block comment, the copy after the inner close": '/* outer /* inner */ pub const SYSTEM_PROMPT: &str = "old"; */\n',
+    "nested block comment and a real one": '/* a /* b */ pub const SYSTEM_PROMPT: &str = "old"; */\npub const SYSTEM_PROMPT: &str = "real";\n',
+    "definition text inside a string": 'pub const OTHER: &str = "pub const SYSTEM_PROMPT: &str = \\"old\\";";\n',
+    "definition text inside a string and a real one":
+        'pub const OTHER: &str = "pub const SYSTEM_PROMPT: &str = \\"old\\";";\npub const SYSTEM_PROMPT: &str = "real";\n',
+    "definition text inside a raw string": 'pub const OTHER: &str = r#"pub const SYSTEM_PROMPT: &str = "old";"#;\n',
+    "pub only in a comment": '// pub\nconst SYSTEM_PROMPT: &str = "a";\n',
+    "unterminated block comment": '/* open\npub const SYSTEM_PROMPT: &str = "a";\n',
+    "macro also in a line comment": '// macro_rules! h { () => { "old" }; }\n' + MACRO_H + 'pub const SYSTEM_PROMPT: &str = concat!(h!());\n',
+    "macro only in a block comment": '/*\n' + MACRO_H + '*/\npub const SYSTEM_PROMPT: &str = concat!(h!());\n',
+    "macro only in a string": 'pub const OTHER: &str = "macro_rules! h { () => { \\"old\\" }; }";\npub const SYSTEM_PROMPT: &str = concat!(h!());\n',
 }
+
+# Comments, char literals and lifetimes AROUND the one real definition are fine: only the definition tokens themselves are counted.
+NOISY_BUT_FINE = (
+    "// The prompt is SYSTEM_PROMPT; see `macro_rules!` below. /* not a block: this is a line comment\n"
+    "/* outer /* nested */ still a comment with \" and ' in it */\n"
+    "fn f<'a>(s: &'a str) -> char { let _ = s; '\"' }\n"
+    'const QUOTE: char = \'"\';\n'
+    + MACRO_H +
+    'pub const SYSTEM_PROMPT: &str = concat!(h!(), "\\n// not a comment, /* not a block */");\n'
+)
 
 
 def bench_system_prompt() -> str:
@@ -199,6 +226,9 @@ class PromptParseTests(unittest.TestCase):
     def test_a_fixture_parses_to_the_pieces_rustc_joins(self):
         self.assertIn("\r\n", FIXTURE)
         self.assertEqual(self.parse(FIXTURE), HEAD + "\n\n" + TAIL)
+
+    def test_comments_char_literals_and_lifetimes_around_the_definition_are_fine(self):
+        self.assertEqual(self.parse(NOISY_BUT_FINE), "head\n// not a comment, /* not a block */")
 
     def test_the_plain_literal_form_still_parses(self):
         self.assertEqual(self.parse(REVIEWER_RS), "be a reviewer")
