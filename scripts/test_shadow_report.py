@@ -145,8 +145,69 @@ class OpenTests(Base):
         code, out, _ = self.report("--open")
         self.assertEqual(code, 3)
         self.assertIn("2 open shadow-only finding(s)", out)
-        self.assertIn("a.py:10#the loop never ends here", out)
-        self.assertIn("a.py:10#a second different bug appears", out)
+        self.assertIn(sr.finding_id("a.py:10 - the loop never ends here"), out)
+        self.assertIn(sr.finding_id("a.py:10 - a second, different bug appears"), out)
+
+    REVIEWER_PAIR = ("a.py:10 - the lock is not released on error path in retry",
+                     "a.py:10 - the lock is not released on error path in the cache")
+
+    def test_reviewer_example_same_first_eight_words_stays_two_open_findings(self):
+        # rejection q-20261120-031413-2: the first eight normalised words are equal, the findings are not
+        self.put("q-A", entry("merged", "PASS", "", "\\n".join(self.REVIEWER_PAIR)))
+        code, out, _ = self.report("--open")
+        self.assertEqual(code, 3)
+        self.assertIn("2 open shadow-only finding(s)", out)
+        self.assertIn("in retry", out)
+        self.assertIn("in the cache", out)
+        k1, k2 = (sr.finding_id(t) for t in self.REVIEWER_PAIR)
+        self.assertNotEqual(k1, k2)
+        s = sr.summarize(sr.shadow_only(sr.load_entries(self.root)), sr.load_verdicts(self.root))["gpt-x"]
+        self.assertEqual(s["findings"], 2)
+        # each closes by its own key; judging one leaves the other open, and both real count two gating misses
+        self.assertEqual(self.add("q-A", k1, "real", "--evidence", "e", "--judge", "m")[0], 0)
+        code, out, _ = self.report("--open")
+        self.assertEqual(code, 3)
+        self.assertIn("1 open shadow-only finding(s)", out)
+        self.assertIn("in the cache", out)
+        self.assertEqual(self.add("q-A", k2, "real", "--evidence", "e", "--judge", "m")[0], 0)
+        self.assertEqual(self.report("--open")[0], 0)
+        s = sr.summarize(sr.shadow_only(sr.load_entries(self.root)), sr.load_verdicts(self.root))["gpt-x"]
+        self.assertEqual((s["real"], s["misses"]), (2, 2))
+
+    def test_reviewer_example_with_gating_finding_one_leaves_the_other_open(self):
+        self.put("q-A", entry("failed", "FAIL", self.REVIEWER_PAIR[0], "\\n".join(self.REVIEWER_PAIR)))
+        code, out, _ = self.report("--open")
+        self.assertEqual(code, 3)
+        self.assertIn("1 open shadow-only finding(s)", out)
+        self.assertIn("in the cache", out)
+        self.assertNotIn("in retry", out)
+
+    def test_identical_full_text_twice_is_one_finding(self):
+        self.put("q-A", entry("merged", "PASS", "", "a.py:10 - Same bug.\\n- a.py:10 - same   bug"))
+        code, out, _ = self.report("--open")
+        self.assertEqual(code, 3)
+        self.assertIn("1 open shadow-only finding(s)", out)
+        # and when the gating review has it, neither copy stays open
+        self.put("q-A", entry("failed", "FAIL", "a.py:10 - same bug", "a.py:10 - Same bug.\\n- a.py:10 - same   bug"))
+        self.assertEqual(self.report("--open")[0], 0)
+
+    def test_drive_letter_and_backslash_paths_match_their_forward_slash_twin(self):
+        for a, b in ((r"C:\src\a.rs:12 - x", "C:/src/a.rs:12 - y"), (r"c:\src\a.rs:~12", "C:/SRC/a.rs:12"),
+                     (r"src\a.rs:12 - x", "src/a.rs:12 - y"), (r"- D:\w\b.py:3 - x", "d:/w/b.py:3")):
+            self.assertEqual(sr.finding_key(a), sr.finding_key(b), (a, b))
+        self.assertEqual(sr.finding_key(r"C:\src\a.rs:12 - x"), "c:/src/a.rs:12")
+        self.assertEqual(sr.finding_id(r"C:\src\a.rs:12 - same bug"), sr.finding_id("C:/src/a.rs:12 - same bug"))
+        # the gating review wrote the forward-slash form, the shadow the drive-letter backslash form: one finding, not open
+        self.put("q-A", entry("failed", "FAIL", "C:/src/a.rs:12 - lock leak", r"C:\\src\\a.rs:12 - lock leak"))
+        self.assertEqual(self.report("--open")[0], 0)
+        # a lone drive-letter finding is closed by a bare-location verdict given in either form
+        self.put("q-B", entry("merged", "PASS", "", r"C:\\src\\b.rs:7 - overflow"))
+        code, out, _ = self.report("--open")
+        self.assertEqual(code, 3)
+        self.assertIn("c:/src/b.rs:7#", out)
+        self.assertEqual(self.add("q-B", r"C:\src\b.rs:7", "real", "--evidence", "e", "--judge", "m")[0], 0)
+        self.assertEqual(self.report("--open")[0], 0)
+        self.assertIn("\tc:/src/b.rs:7\treal\t", self.verdicts_text())
 
     def test_bare_location_verdict_closes_none_when_several_and_says_why(self):
         self.two_at_one_line()
@@ -163,13 +224,13 @@ class OpenTests(Base):
 
     def test_full_key_verdict_closes_exactly_one(self):
         self.two_at_one_line()
-        self.hand_row("a.py:10#the loop never ends here")
+        self.hand_row(sr.finding_id("a.py:10 - the loop never ends here"))
         code, out, _ = self.report("--open")
         self.assertEqual(code, 3)
         self.assertIn("1 open shadow-only finding(s)", out)
         self.assertIn("a second, different bug", out)
-        self.assertNotIn("the loop never ends\t", out)
-        self.assertEqual(self.add("q-A", "a.py:10#a second different bug appears", "false", "--evidence", "e", "--judge", "m")[0], 0)
+        self.assertNotIn("the loop never ends", out)
+        self.assertEqual(self.add("q-A", sr.finding_id("a.py:10 - a second, different bug appears"), "false", "--evidence", "e", "--judge", "m")[0], 0)
         self.assertEqual(self.report("--open")[0], 0)
 
     def test_bare_location_verdict_closes_a_lone_finding(self):

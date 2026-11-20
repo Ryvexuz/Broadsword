@@ -17,6 +17,7 @@ import sys
 sys.dont_write_bytecode = True  # never write .pyc files into the repo
 
 import argparse
+import hashlib
 import re
 from pathlib import Path
 
@@ -38,53 +39,60 @@ def parse_entry(text: str) -> dict:
 BULLET = re.compile(r"^(\s*)(?:[-*]|\d+[.)])\s+")
 
 
-def finding_key(line: str) -> str:
-    """`src/a.rs:12 - text` (or `src/a.rs:~12`) is identified by its file:line; a finding without one by its normalised text.
-    A leading bullet (`-`, `*`, `1.`) is not part of the finding."""
-    line = BULLET.sub("", line, count=1)
-    m = re.match(r"\s*([\w./\\-]+:~?\d+)", line)
-    return m.group(1).replace("~", "").lower() if m else re.sub(r"\W+", " ", line).strip().lower()
+# `path:line` at the start of a finding: an optional drive letter (`C:\` or `C:/`), then a path with `/` or `\`, then `:N` or `:~N`
+HEAD = re.compile(r"(?:[A-Za-z]:[\\/])?[\w./\\-]+:~?\d+")
 
 
-def findings(rec: dict, key: str) -> dict:
-    return {finding_key(l): l.strip() for l in rec.get(key, "").splitlines() if l.strip()}
+def norm_loc(loc: str) -> str:
+    """One form for a location: lower case, `\\` as `/`, no `~` before the line (`C:\\src\\a.rs:~12` -> `c:/src/a.rs:12`)."""
+    return re.sub(r":~(\d)", r":\1", loc.strip().lower()).replace("\\", "/")
 
 
-def fingerprint(text: str) -> str:
-    """The first 8 normalised words of a finding's text after its `path:line` (empty for a text-only finding)."""
+def norm_text(text: str) -> str:
+    return " ".join(re.sub(r"\W+", " ", text).lower().split())
+
+
+def split_finding(text: str):
+    """(normalised location or None, the rest of the text). A leading bullet (`-`, `*`, `1.`) is not part of the finding."""
     body = BULLET.sub("", text, count=1).strip()
-    m = re.match(r"[\w./\\-]+:~?\d+", body)
-    if not m:
-        return ""
-    return " ".join(re.sub(r"\W+", " ", body[m.end():]).lower().split()[:8])
+    m = HEAD.match(body)
+    return (norm_loc(m.group(0)), body[m.end():]) if m else (None, body)
 
 
-def finding_id(loc: str, text: str) -> str:
-    """`path:line#first eight words` for a located finding, so two findings at one line stay apart; text-only: the text key."""
-    fp = fingerprint(text)
-    return f"{loc}#{fp}" if fp else loc
+def finding_key(text: str) -> str:
+    """The location of a finding: its normalised `path:line`, or for a finding without one its whole normalised text."""
+    loc, rest = split_finding(text)
+    return loc if loc else norm_text(rest)
+
+
+def finding_id(text: str) -> str:
+    """The one identity of a finding. Located: `path:line#<12 hex of sha256 of the WHOLE normalised text after the location>`, so
+    two findings at one line are distinct unless their full normalised text is equal. Text-only: its whole normalised text."""
+    loc, rest = split_finding(text)
+    if not loc:
+        return norm_text(rest)
+    return f"{loc}#{hashlib.sha256(norm_text(rest).encode('utf-8')).hexdigest()[:12]}"
 
 
 def grouped_findings(rec: dict, key: str) -> list:
     """Like findings(), but a line that does not start a finding is the continuation of the finding before it (a reviewer quote
     that spans lines). A line starts a finding when it begins with `path:line` or is a bullet (`-`, `*`, `1.`) at the indent of
     the finding's own bullet or shallower; a text-only bullet is a finding of its own. A block with neither paths nor bullets is
-    one finding per line. Returns [(location key, text)] in order; two findings at one location are both kept."""
+    one finding per line. Returns [(finding_key of the whole text, text)] in order; two findings at one location are both kept."""
     lines = [l.rstrip() for l in rec.get(key, "").splitlines() if l.strip()]
-    head = re.compile(r"[\w./\\-]+:~?\d+")
     bodies = [BULLET.sub("", l, count=1).strip() for l in lines]
-    if not any(head.match(b) or BULLET.match(l) for l, b in zip(lines, bodies)):
+    if not any(HEAD.match(b) or BULLET.match(l) for l, b in zip(lines, bodies)):
         return [(finding_key(l), l.strip()) for l in lines]
-    out, last, last_indent = [], None, 0
+    out, last_indent = [], 0
     for l, b in zip(lines, bodies):
         m = BULLET.match(l)
         indent = len(l) - len(l.lstrip())
-        if last is None or head.match(b) or (m and indent <= last_indent):
-            last, last_indent = len(out), indent
-            out.append([finding_key(l), b])
+        if not out or HEAD.match(b) or (m and indent <= last_indent):
+            last_indent = indent
+            out.append(b)
         else:
-            out[last][1] += " " + l.strip()
-    return [(k, t) for k, t in out]
+            out[-1] += " " + l.strip()
+    return [(finding_key(t), t) for t in out]
 
 
 VERDICTS = ("real", "false", "known")
@@ -93,7 +101,8 @@ VERDICT_FILE = Path("state") / "shadow-verdicts.tsv"
 
 
 def norm_key(key: str) -> str:
-    return re.sub(r":~(\d)", r":\1", key.strip().lower())
+    """A key as typed or stored (bare `path:line`, `path:line#hex` or a text key) in the form finding_id/finding_key give."""
+    return norm_loc(key)
 
 
 def load_entries(root: Path) -> list:
@@ -110,35 +119,49 @@ def load_entries(root: Path) -> list:
     return out
 
 
-LOCATED = re.compile(r"[\w./\\-]+:\d+$")
-
-
 def words(text: str) -> set:
     """The normalised words of a finding's text after its `path:line`."""
-    body = BULLET.sub("", text, count=1).strip()
-    m = re.match(r"[\w./\\-]+:~?\d+", body)
-    return set(re.sub(r"\W+", " ", body[m.end():] if m else body).lower().split())
+    return set(norm_text(split_finding(text)[1]).split())
+
+
+def unique(found: list) -> list:
+    """found without repeats of one finding_id (the full normalised text at a location), first copy kept."""
+    seen, out = set(), []
+    for loc, text in found:
+        fid = finding_id(text)
+        if fid not in seen:
+            seen.add(fid)
+            out.append((loc, text))
+    return out
+
+
+def pair_findings(sb: list, gb: list) -> list:
+    """[(i, j)]: shadow finding sb[i] and gating finding gb[j] are the same finding; each finding is in at most one pair. Located
+    findings pair only at one location: a gating finding there accounts for ONE shadow finding, the one whose words overlap it most
+    (greedy, best pair first); a second, different shadow finding at that line stays unpaired. Text-only findings pair when their
+    whole normalised text is equal."""
+    cand = []
+    for i, (loc, text) in enumerate(sb):
+        for j, (gloc, gtext) in enumerate(gb):
+            if gloc != loc:
+                continue
+            if split_finding(text)[0] is None:
+                cand.append((2.0, -i, -j, i, j))  # equal text keys: an exact match, taken first
+            else:
+                a, b = words(text), words(gtext)
+                cand.append((len(a & b) / len(a | b) if a | b else 0.0, -i, -j, i, j))
+    used_s, used_g, out = set(), set(), []
+    for _, _, _, i, j in sorted(cand, reverse=True):
+        if i not in used_s and j not in used_g:
+            used_s.add(i)
+            used_g.add(j)
+            out.append((i, j))
+    return out
 
 
 def matched_by_gating(sb: list, gb: list) -> set:
-    """Indexes into sb of the shadow findings the gating review also found. A gating finding at path:line accounts for ONE shadow
-    finding at that line: the one whose words overlap it most (greedy, best pair first). A second, different shadow finding at the
-    same line is not accounted for and stays open. A text-only shadow finding is matched by its text key."""
-    gating_keys = {k for k, _ in gb}
-    done = {i for i, (loc, _) in enumerate(sb) if not LOCATED.match(norm_key(loc)) and loc in gating_keys}
-    pairs = []
-    for i, (loc, text) in enumerate(sb):
-        if LOCATED.match(norm_key(loc)):
-            for j, (gloc, gtext) in enumerate(gb):
-                if gloc == loc:
-                    a, b = words(text), words(gtext)
-                    pairs.append((len(a & b) / len(a | b) if a | b else 0.0, -i, -j, i, j))
-    used_g = set()
-    for _, _, _, i, j in sorted(pairs, reverse=True):
-        if i not in done and j not in used_g:
-            done.add(i)
-            used_g.add(j)
-    return done
+    """Indexes into sb of the shadow findings the gating review also found (see pair_findings)."""
+    return {i for i, _ in pair_findings(sb, gb)}
 
 
 def shadow_only(entries: list) -> list:
@@ -147,18 +170,14 @@ def shadow_only(entries: list) -> list:
     for eid, r in entries:
         if r["shadow_verdict"] in ("ERROR", "SKIPPED"):
             continue
-        gb, sb = grouped_findings(r, "blocking"), grouped_findings(r, "shadow_blocking")
+        gb, sb = unique(grouped_findings(r, "blocking")), unique(grouped_findings(r, "shadow_blocking"))
         merged = r.get("status") == "merged"
         commit = (r.get("main_sha") if merged else "") or r.get("checked_tip") or r.get("reviewed_tip") or r.get("rebased_tip") or "-"
         model = r.get("shadow_model_used") or r.get("shadow_model") or "unknown"
         known = matched_by_gating(sb, gb)
-        seen = {}
         for idx, (loc, line) in enumerate(sb):
-            fid = norm_key(finding_id(loc, line))
-            if idx in known or fid in seen:
-                continue
-            seen[fid] = {"entry": eid, "commit": commit, "key": fid, "loc": norm_key(loc), "line": line, "model": model, "merged": merged}
-            out.append(seen[fid])
+            if idx not in known:
+                out.append({"entry": eid, "commit": commit, "key": finding_id(line), "loc": loc, "line": line, "model": model, "merged": merged})
     return out
 
 
@@ -249,9 +268,10 @@ def main(argv=None) -> int:
         compared += real
         agree += real and g == s
         print(f"{eid}\t{r.get('status', '')}\t{g}\t{s}\t{same}\t{r.get('shadow_cost_usd') or '-'}\t{r.get('shadow_secs') or '-'}\t{r.get('shadow_model_used') or '-'}")
-        gb, sb = findings(r, "blocking"), findings(r, "shadow_blocking")
-        only_g = [v for k, v in gb.items() if k not in sb]
-        only_s = [v for k, v in sb.items() if k not in gb]
+        gb, sb = unique(grouped_findings(r, "blocking")), unique(grouped_findings(r, "shadow_blocking"))
+        pairs = pair_findings(sb, gb)
+        only_g = [t for j, (_, t) in enumerate(gb) if j not in {pj for _, pj in pairs}]
+        only_s = [t for i, (_, t) in enumerate(sb) if i not in {pi for pi, _ in pairs}]
         if only_g or only_s or s in ("ERROR", "SKIPPED"):
             details.append((eid, only_g, only_s, r.get("shadow_reason", "") if s in ("ERROR", "SKIPPED") else ""))
     for eid, only_g, only_s, why in details:
