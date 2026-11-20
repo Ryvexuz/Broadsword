@@ -307,6 +307,44 @@ class Cli(unittest.TestCase):
             self.assertEqual(nc.main(["9.9", "--root", str(self.root), "--list"], env={}), 2)
 
 
+class NamedNodes(unittest.TestCase):
+    def setUp(self):
+        SCRATCH.mkdir(exist_ok=True)
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="test-node-check-", dir=SCRATCH))
+        (self.root / "docs" / "nodes").mkdir(parents=True)
+        (self.root / "emit.py").write_text("print('hello')\n", encoding="utf-8")
+        for name in ("sandbox", "a1_b-c"):
+            (self.root / "docs" / "nodes" / f"{name}.md").write_text("# n\n" + block("one", "python -I emit.py", "last line == hello"), encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_cli(self, node, *args):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = nc.main([node, "--root", str(self.root), *args], env={})
+        return code, buf.getvalue()
+
+    def test_named_node_lists_and_runs(self):
+        for node in ("sandbox", "a1_b-c"):
+            code, out = self.run_cli(node, "--list")
+            self.assertEqual((code, "1 checks, 0 problems" in out), (0, True), out)
+        code, out = self.run_cli("sandbox", "--run", "one")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.root / "scratch" / "node-checks" / "sandbox" / "one.txt").is_file())
+
+    def test_unsafe_or_odd_names_are_refused_with_a_message(self):
+        for bad in ("../x", "..", "a/b", "a\\b", "a.b", "Sandbox", "1abc", "_x", "sand box", "sandbox\n", "con", "nul", "com1", "c:x"):
+            code, out = self.run_cli(bad, "--list")
+            self.assertEqual(code, 2, bad)
+            self.assertIn("node must be", out, bad)
+
+    def test_missing_named_plan_is_refused(self):
+        code, out = self.run_cli("nosuch", "--list")
+        self.assertEqual(code, 2)
+        self.assertIn("no plan at", out)
+
+
 class PipeEncoding(unittest.TestCase):
     def test_non_console_characters_survive_a_pipe_under_dash_I(self):
         """A check whose output holds an arrow must not crash the tool when stdout is a pipe (cp1252 by default)."""

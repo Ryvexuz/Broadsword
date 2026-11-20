@@ -1,6 +1,6 @@
 """List and run a roadmap node's done checks.
 
-  python -I scripts/node_check.py <node> --list
+  python -I scripts/node_check.py <node> --list     (<node> is N.M like 1.2, or a name like sandbox: [a-z][a-z0-9_-]*)
   python -I scripts/node_check.py <node> --run <id>
   python -I scripts/node_check.py <node> --run --all
   (add --root DIR to use another Broadsword root; default is the folder above scripts/)
@@ -42,7 +42,7 @@ import shlex
 import subprocess
 
 FENCE_RE = re.compile(r"^(\s*)(`{3,})\s*(.*?)\s*$")
-NODE_RE = re.compile(r"^\d+\.\d+$")
+NODE_RE = re.compile(r"\d+\.\d+|[a-z][a-z0-9_-]*")  # N.M, or a name; used with fullmatch
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 BAD_CHARS = set(";&|<`$()")
 RESERVED = {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
@@ -188,8 +188,8 @@ def main(argv=None, env=None):
     g.add_argument("--run", nargs="?", const="", metavar="ID")
     ap.add_argument("--all", action="store_true")
     args = ap.parse_args(argv)
-    if not NODE_RE.match(args.node):
-        print(f"node_check: node must look like 1.2, got {args.node!r}")
+    if not NODE_RE.fullmatch(args.node) or args.node.split(".")[0] in RESERVED:
+        print(f"node_check: node must be N.M (like 1.2) or a name matching [a-z][a-z0-9_-]* (not a Windows device name), got {args.node!r}")
         return 2
     root = pathlib.Path(args.root)
     doc = root / "docs" / "nodes" / f"{args.node}.md"
