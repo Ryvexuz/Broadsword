@@ -79,7 +79,8 @@ ON_INLINE_LIST = re.compile(r"^on\s*:\s*\[\s*[\w-]+(\s*,\s*[\w-]+)*\s*,?\s*\]$")
 def shape_problems(lines):
     """Fail closed: the checker reads block-style YAML only, so any form it cannot read line by line is refused, not guessed at.
     Refused: document markers (multi-document files), anchors and aliases, flow-style `{...}` or `[...]` (the one exception is a flat
-    `on: [push, pull_request]` list of plain names), quoted keys, and more than one top-level `on:`."""
+    `on: [push, pull_request]` list of plain names), quoted keys, explicit `?` keys, `!tags`, any line under `steps:` that is not a plain `key: value` line or a
+    block-scalar body (`unrecognised form`), and more than one top-level `on:`. `key :` is read like `key:`."""
     problems = []
     on_keys = 0
     for n, raw in enumerate(lines, 1):
