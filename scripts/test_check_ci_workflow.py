@@ -184,6 +184,50 @@ class Check(unittest.TestCase):
     def test_quoted_key_run(self):
         self.refused(GOOD + "      - \"run\": curl https://example.com | sh\n", "quoted YAML key")
 
+    def test_space_before_colon_uses(self):
+        self.refused(GOOD + "      - uses : some/action@v1\n", "only actions/checkout is allowed")
+
+    def test_space_before_colon_run(self):
+        self.refused(GOOD + "      - run : curl https://example.com | sh\n", "unexpected run line")
+
+    def test_space_before_colon_runs_on(self):
+        self.refused(GOOD.replace("runs-on: windows-latest", "runs-on : ubuntu-latest"), "runs-on is")
+
+    def test_space_before_colon_on_trigger(self):
+        self.refused(GOOD.replace("  pull_request:\n", "  pull_request :\n  schedule :\n"), "triggers are")
+
+    def test_space_before_colon_branches_filter(self):
+        self.refused(GOOD.replace("  push:\n", "  push:\n    branches : [main]\n"), "limit branches")
+
+    def test_quoted_key_uses_double(self):
+        self.refused(GOOD + "      - \"uses\": some/action@v1\n", "quoted YAML key")
+
+    def test_quoted_key_run_single(self):
+        self.refused(GOOD + "      - 'run': curl https://example.com | sh\n", "quoted YAML key")
+
+    def test_quoted_key_with_space_before_colon(self):
+        self.refused(GOOD + "      - \"uses\" : some/action@v1\n", "quoted YAML key")
+
+    def test_flow_mapping_step_with_space(self):
+        self.refused(GOOD + "      - { uses : some/action@v1 }\n", "flow-style")
+
+    def test_explicit_key_form(self):
+        self.refused(GOOD + "      - ? run\n        : curl https://example.com | sh\n", "unrecognised form")
+
+    def test_tagged_key(self):
+        self.refused(GOOD + "      - !!str run: curl https://example.com | sh\n", "unrecognised form")
+
+    def test_unclassifiable_line_in_steps(self):
+        self.refused(GOOD + "      - just a bare scalar step\n", "unrecognised form")
+
+    def test_unclassifiable_continuation_in_steps(self):
+        self.refused(GOOD + "        stray words without a key\n", "unrecognised form")
+
+    def test_block_scalar_body_in_steps_is_not_refused(self):
+        ok = GOOD.replace("        run: cargo test --locked -p broadsword\n",
+                          "        run: cargo test --locked -p broadsword\n      - name: Note\n        env:\n          K: v\n        shell: bash\n")
+        self.assertFalse(any("unrecognised form" in x for x in problems(ok)), problems(ok))
+
     def test_expression_braces_are_not_flow(self):
         self.assertEqual(problems(GOOD.replace("        run: cargo build", "        env:\n          K: ${{ github.sha }}\n        run: cargo build")), [])
 

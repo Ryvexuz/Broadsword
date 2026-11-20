@@ -44,7 +44,7 @@ def read_triggers(lines):
     """(triggers, limited): the keys directly under a top-level `on:` and whether any of them restricts branches or tags."""
     triggers, limited = [], []
     for i, raw in enumerate(lines):
-        if re.match(r"^on:\s*$", strip_comment(raw)):
+        if re.match(r"^on\s*:\s*$", strip_comment(raw)):
             child_indent = None
             current = None
             for raw2 in lines[i + 1:]:
@@ -57,14 +57,14 @@ def read_triggers(lines):
                 if child_indent is None:
                     child_indent = ind
                 if ind == child_indent:
-                    m = re.match(r"^\s*([\w-]+):", line)
+                    m = re.match(r"^\s*([\w-]+)\s*:", line)
                     if m:
                         current = m.group(1)
                         triggers.append(current)
                 elif ind > child_indent and re.match(r"^\s*(branches|branches-ignore|tags|tags-ignore|paths|paths-ignore)\s*:", line):
                     limited.append(current)
             return triggers, limited
-        m = re.match(r"^on:\s*(.+)$", strip_comment(raw))
+        m = re.match(r"^on\s*:\s*(.+)$", strip_comment(raw))
         if m:  # inline forms: `on: push` or `on: [push, pull_request]`
             return [t.strip() for t in m.group(1).strip("[]").split(",") if t.strip()], []
     return [], []
@@ -73,7 +73,7 @@ def read_triggers(lines):
 FLOW_START = re.compile(r"(^\s*(-\s+)?[{\[])|(:\s+[{\[])")  # a flow mapping or sequence as a line, list item or value
 ANCHOR_ALIAS = re.compile(r"(^|[\s,\[{])[&*][^\s,\]}]+")
 QUOTED_KEY = re.compile(r"^\s*(-\s+)?[\"'][^\"']*[\"']\s*:")
-ON_INLINE_LIST = re.compile(r"^on:\s*\[\s*[\w-]+(\s*,\s*[\w-]+)*\s*,?\s*\]$")
+ON_INLINE_LIST = re.compile(r"^on\s*:\s*\[\s*[\w-]+(\s*,\s*[\w-]+)*\s*,?\s*\]$")
 
 
 def shape_problems(lines):
@@ -96,13 +96,56 @@ def shape_problems(lines):
             problems.append(f"line {n}: quoted YAML key (refused; the checker reads plain keys only): {line.strip()}")
         if re.match(r"^(on|\"on\"|'on'|true)\s*:", line):
             on_keys += 1
-        if re.match(r"^on:\s*[{\[]", line):
+        if re.match(r"^on\s*:\s*[{\[]", line):
             if not ON_INLINE_LIST.match(line):
                 problems.append(f"line {n}: flow-style `on:` other than a flat `on: [push, pull_request]` list (refused): {line.strip()}")
         elif FLOW_START.search(line):
             problems.append(f"line {n}: flow-style YAML `{{...}}` or `[...]` (refused; write block style): {line.strip()}")
     if on_keys > 1:
         problems.append(f"{on_keys} top-level `on:` keys (refused)")
+    problems.extend(steps_problems(lines))
+    return problems
+
+
+EXPLICIT_KEY = re.compile(r"^\s*(-\s+)*\?(\s|$)")
+TAG = re.compile(r"(^\s*(-\s+)*|:\s+)!\S*")
+KEY_LINE = re.compile(r"^(\s*)((?:-\s+)*)[\w.-]+\s*:(\s|$)")
+BLOCK_SCALAR = re.compile(r":\s*[|>][+-]?\d*[+-]?$")
+
+
+def steps_problems(lines):
+    """Every line under a `steps:` key must be a plain `key: value` line (optionally after `- `) or the body of a `|` / `>` block
+    scalar; explicit `? key` entries and `!tag`s are refused anywhere. Anything else is `unrecognised form`: the checker cannot say
+    what it runs, so it fails instead of passing it."""
+    problems = []
+    steps_indent = None
+    body_above = None  # indent a line must exceed to be the body of the block scalar just opened
+    for n, raw in enumerate(lines, 1):
+        line = re.sub(r"\$\{\{.*?\}\}", "", strip_comment(raw))
+        if not line.strip():
+            continue
+        ind = indent_of(line)
+        if EXPLICIT_KEY.match(line) or TAG.search(line):
+            problems.append(f"line {n}: unrecognised form (explicit `?` key or `!tag`; refused): {line.strip()}")
+        if steps_indent is not None and ind <= steps_indent:
+            steps_indent = None
+            body_above = None
+        if steps_indent is None:
+            if re.match(r"^\s*(-\s+)*steps\s*:\s*$", line):
+                steps_indent = ind
+                body_above = None
+            continue
+        if body_above is not None and ind > body_above:
+            continue  # inside a block scalar body
+        body_above = None
+        m = KEY_LINE.match(line)
+        if not m:
+            problems.append(f"line {n}: unrecognised form inside steps (not a plain `key: value` line): {line.strip()}")
+            continue
+        if BLOCK_SCALAR.search(line):
+            body_above = len(m.group(1)) + 2 * m.group(2).count("-")  # the key's own column, so any deeper line is the body
+            if m.group(2):
+                body_above = len(m.group(1)) + len(m.group(2)) - 1
     return problems
 
 
@@ -118,7 +161,7 @@ def check(workflow_text, contract):
     if limited:
         problems.append(f"trigger(s) {', '.join(sorted(set(limited)))} limit branches, tags or paths; CI must run on every push and PR")
 
-    runners = [m.group(1).strip().strip("'\"") for m in (re.match(r"^\s*-?\s*runs-on:\s*(.+)$", strip_comment(l)) for l in lines) if m]
+    runners = [m.group(1).strip().strip("'\"") for m in (re.match(r"^\s*-?\s*runs-on\s*:\s*(.+)$", strip_comment(l)) for l in lines) if m]
     if not runners:
         problems.append("no runs-on line")
     for r in runners:
@@ -127,7 +170,7 @@ def check(workflow_text, contract):
 
     runs = []
     for l in lines:
-        m = re.match(r"^\s*-?\s*run:\s*(.*)$", strip_comment(l))
+        m = re.match(r"^\s*-?\s*run\s*:\s*(.*)$", strip_comment(l))
         if m:
             runs.append(m.group(1).strip().strip("'\""))
     if contract["build"] not in runs:
@@ -139,7 +182,7 @@ def check(workflow_text, contract):
             problems.append(f"unexpected run line (only the documented build and test commands are allowed): {r}")
 
     for l in lines:
-        m = re.match(r"^\s*-?\s*uses:\s*(.+)$", strip_comment(l))
+        m = re.match(r"^\s*-?\s*uses\s*:\s*(.+)$", strip_comment(l))
         if m:
             ref = m.group(1).strip().strip("'\"")
             name, _, rev = ref.partition("@")
@@ -147,7 +190,7 @@ def check(workflow_text, contract):
                 problems.append(f"uses {ref}: only actions/checkout is allowed")
             elif not SHA.match(rev):
                 problems.append(f"uses {ref}: actions/checkout must be pinned to a full 40-character commit SHA")
-    if not any(re.match(r"^\s*-?\s*uses:\s*actions/checkout@", l) for l in lines):
+    if not any(re.match(r"^\s*-?\s*uses\s*:\s*actions/checkout@", l) for l in lines):
         problems.append("no actions/checkout step")
 
     for l in lines:
