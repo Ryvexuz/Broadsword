@@ -192,11 +192,14 @@ pub mod planted {
         d
     }
 
-    /// `out` is a child's environment dump: it must list PATH (so the dump is real) and nothing planted.
+    /// `out` is a child's environment dump: it must list PATH (so the dump is real) and nothing planted. A failure names only
+    /// variables, never the dump's values, so a broken scrub cannot write this machine's real secrets into a test log.
     pub fn assert_clean(what: &str, out: &str) {
-        assert!(out.to_uppercase().contains("PATH="), "{what}: the child's environment dump has no PATH, so it proves nothing:\n{out}");
+        let names: Vec<&str> = out.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k.trim())).collect();
+        assert!(names.iter().any(|k| k.eq_ignore_ascii_case("PATH")), "{what}: the child's environment dump lists no PATH, so it proves nothing ({} lines)", out.lines().count());
         for bad in [API_NAME, API_VALUE, COPY_NAME, DOTENV_VALUE] {
-            assert!(!out.contains(bad), "{what}: the child saw `{bad}`:\n{out}");
+            let holders: Vec<&str> = out.lines().filter(|l| l.contains(bad)).filter_map(|l| l.split_once('=').map(|(k, _)| k.trim())).collect();
+            assert!(!out.contains(bad), "{what}: the child saw `{bad}` (in the variable(s) {holders:?}); its variables: {names:?}");
         }
     }
 
@@ -256,7 +259,7 @@ mod tests {
     fn command_in_fails_closed_without_a_config() {
         let nowhere = std::env::temp_dir().join(format!("bs-scrub-no-config-{}", std::process::id())).join("x");
         assert!(find_config_dir(&nowhere).is_none(), "test premise: no {CONFIG_FILE} above {}", nowhere.display());
-        let e = command_in(&nowhere, "git").err().expect("must refuse");
+        let e = command_in(&nowhere, "git").expect_err("must refuse");
         assert!(e.contains("refusing to start it") && e.contains(CONFIG_FILE), "{e}");
     }
 
@@ -266,7 +269,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(CONFIG_FILE), "root = \".\"\n").unwrap();
-        let e = command_in(&d, "git").err().expect("must refuse");
+        let e = command_in(&d, "git").expect_err("must refuse");
         assert!(e.contains("refusing to start `git`"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
