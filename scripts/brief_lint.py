@@ -17,6 +17,13 @@ Rules, each printed as `PASS` or `FAIL` per brief:
   donecheck a Done check section exists, has at least one item, and every item holds a
             backtick span that is a command (first word: broadsword, python, cargo, git, ...)
 
+A brief with more than one Done check section fails the donecheck rule ("more than one Done
+check section").
+
+Threat model: this lint is ADVISORY. Its inputs are our own agents' briefs, not an adversary's.
+It catches honest mistakes and drift; making it bypass-proof is NOT a goal, and a deliberately
+hand-crafted brief that defeats it is a known limit, not a defect.
+
 A brief with no Claims line or no Done check section fails (fail closed).
 Exit codes: 0 every brief passes, 1 some rule failed, 2 usage error or unreadable file.
 """
@@ -166,6 +173,8 @@ def lint(text, max_lines, max_bullets, max_files, max_done_lines):
 
     if not done:
         results.append(("donecheck", False, "no Done check section found"))
+    elif len(done) > 1:
+        results.append(("donecheck", False, "more than one Done check section"))
     else:
         _, a, b = done[0]
         head = section_of(lines[a])[1]

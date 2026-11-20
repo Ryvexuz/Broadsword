@@ -232,6 +232,15 @@ class HiddenBullets(unittest.TestCase):
         self.assertFalse(res["bullets"][0], res["bullets"][1])
 
 
+class SecondDoneCheck(unittest.TestCase):
+    def test_more_than_one_done_check_section_is_an_error(self):
+        many = "".join(f"- req {i}\n" for i in range(20))
+        text = "Requirements:\n- one\nClaims: a.py\nDone check: `python t.py`\nDone check:\n" + many
+        res = lint(text)
+        self.assertFalse(res["donecheck"][0], res["donecheck"][1])
+        self.assertIn("more than one Done check section", res["donecheck"][1])
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_"))
