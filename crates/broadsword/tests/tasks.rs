@@ -880,14 +880,28 @@ fn a_ram_hook_file_outside_scratch_is_ignored() {
 #[test]
 fn an_unreadable_tasks_folder_is_an_error_never_an_empty_board() {
     let r = Root::new("unreadable-board");
-    // a FILE where the tasks folder should be: read_dir fails with something other than NotFound
-    fs::create_dir_all(r.dir.join("state")).unwrap();
-    fs::write(r.dir.join("state").join("tasks"), "not a folder").unwrap();
+    // a REAL task, then the tasks folder replaced by a FILE: read_dir fails with something other than NotFound
+    let id = r.add("p", "real task", &["src"]);
+    let tasks = r.dir.join("state").join("tasks");
+    fs::remove_dir_all(&tasks).unwrap();
+    fs::write(&tasks, "not a folder").unwrap();
     let o = r.run(&["task", "list"]);
     assert_ne!(o.code, 0, "list must not succeed on an unreadable board: {}", o.stdout);
     assert!(o.stderr.contains("cannot read"), "stderr: {}", o.stderr);
-    let o = r.start("t-nonexistent", "someone");
+    // `start` is refused at the board LOCK step (its lock file lives inside the tasks folder), before load_tasks is reached, so the
+    // message is the lock's folder error: `cannot create <root>/state/tasks: Cannot create a file when that file already exists.`
+    let o = r.start(&id, "someone");
     assert_ne!(o.code, 0, "start must not succeed on an unreadable board: {}", o.stdout);
+    let norm = o.stderr.replace('\\', "/");
+    assert!(o.stderr.contains("cannot create") && norm.contains("state/tasks"), "stderr must give the folder error and path: {}", o.stderr);
+    assert!(!o.stderr.contains("no task with the exact id"), "must not be the missing-id error: {}", o.stderr);
+    // control: on a READABLE board the same start of an id that does not exist gives the missing-id message instead, so the
+    // assertions above can only pass because of the unreadable board.
+    fs::remove_file(&tasks).unwrap();
+    fs::create_dir_all(&tasks).unwrap();
+    let c = r.start("t-nonexistent", "someone");
+    assert_ne!(c.code, 0);
+    assert!(c.stderr.contains("no task with the exact id") && !c.stderr.contains("cannot create"), "control stderr: {}", c.stderr);
     assert!(!o.stdout.contains("running"), "nothing may be marked running: {}", o.stdout);
 }
 
