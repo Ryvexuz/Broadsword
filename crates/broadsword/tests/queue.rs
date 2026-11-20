@@ -536,6 +536,120 @@ fn a_dirty_main_checkout_blocks_the_entry_and_changes_nothing_then_it_can_be_run
     assert_eq!(r.field(&e, "attempt"), "2");
 }
 
+// ---- the trunk: the queue merges into `main` or `master`, never into what is checked out ---------------------------------
+
+/// Which branch the project's main checkout has checked out.
+fn checked_out(r: &Root) -> String {
+    git(&r.p(), &["symbolic-ref", "--short", "HEAD"])
+}
+
+fn tip_of(r: &Root, branch: &str) -> String {
+    git(&r.p(), &["rev-parse", &format!("refs/heads/{branch}")])
+}
+
+fn contains(r: &Root, branch: &str, commit: &str) -> bool {
+    git_out(&r.p(), &["merge-base", "--is-ancestor", commit, &format!("refs/heads/{branch}")]).code == 0
+}
+
+/// Check out a new branch `feature` in the project with a commit of its own. Returns its tip.
+fn feature_checked_out(r: &Root) -> String {
+    git(&r.p(), &["switch", "-q", "-c", "feature"]);
+    r.commit(&r.p(), "FEATURE.txt", "feature work\n", "feature: own work")
+}
+
+/// The entry ended blocked because `feature` is checked out instead of `trunk`, and nothing moved: the checkout, the feature
+/// branch, the trunk, the task branch; no reviewer was asked.
+fn assert_refused_on_feature(r: &Root, e: &str, trunk: &str, trunk_before: &str, feature_tip: &str, task_tip: &str, task: &str) {
+    assert_eq!(r.status(e), "blocked", "reason = {}", r.field(e, "reason"));
+    let reason = r.field(e, "reason");
+    assert!(reason.contains("`feature`") && reason.contains(&format!("trunk `{trunk}`")), "the reason names HEAD and the trunk: {reason}");
+    assert_eq!(checked_out(r), "feature", "the checkout is untouched");
+    assert_eq!(tip_of(r, "feature"), feature_tip, "the feature branch is never moved or merged into");
+    assert_eq!(tip_of(r, trunk), trunk_before, "nothing merged into the trunk");
+    assert_eq!(r.branch_tip(task), task_tip, "the task branch is not rebased onto the feature branch");
+    assert!(git(&r.p(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(r.calls(), 0, "no review of a diff against the wrong branch");
+}
+
+#[test]
+fn a_feature_branch_checked_out_in_the_project_is_never_merged_into_and_the_entry_is_refused_until_the_trunk_is_checked_out() {
+    let r = Root::new("featco", 30);
+    let id = r.started("src");
+    let task_tip = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let main_before = tip_of(&r, "main");
+    let feature_tip = feature_checked_out(&r);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_refused_on_feature(&r, &e, "main", &main_before, &feature_tip, &task_tip, &id);
+    // with the trunk checked out again it merges into main, and the feature branch stays as it was
+    git(&r.p(), &["switch", "-q", "main"]);
+    let o = r.run(&["queue", "run", "--entry", &e]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged", "reason = {}", r.field(&e, "reason"));
+    assert_eq!(r.field(&e, "main branch"), "main");
+    assert_eq!(git(&r.p(), &["log", "-1", "--format=%s", "refs/heads/main"]), "task: new file");
+    assert_eq!(r.field(&e, "main commit"), tip_of(&r, "main"));
+    assert_eq!(tip_of(&r, "feature"), feature_tip);
+    assert!(!contains(&r, "main", &feature_tip), "the feature branch's commit never reaches main");
+    assert_eq!(checked_out(&r), "main");
+}
+
+#[test]
+fn a_merge_train_never_merges_into_a_checked_out_feature_branch() {
+    let r = train_root("feattrain", 4);
+    let (a, ea) = train_one(&r, "src/a.txt", "x\n");
+    let (b, eb) = train_one(&r, "src/b.txt", "y\n");
+    let (ta, tb) = (r.branch_tip(&a), r.branch_tip(&b));
+    let main_before = tip_of(&r, "main");
+    let feature_tip = feature_checked_out(&r);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_refused_on_feature(&r, &ea, "main", &main_before, &feature_tip, &ta, &a);
+    assert_refused_on_feature(&r, &eb, "main", &main_before, &feature_tip, &tb, &b);
+}
+
+#[test]
+fn a_project_whose_trunk_is_master_merges_into_master_and_never_into_a_checked_out_feature_branch() {
+    let r = Root::new("master", 30);
+    git(&r.p(), &["branch", "-m", "main", "master"]);
+    let id = r.started("src");
+    let task_tip = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let master_before = tip_of(&r, "master");
+    let feature_tip = feature_checked_out(&r);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_refused_on_feature(&r, &e, "master", &master_before, &feature_tip, &task_tip, &id);
+    git(&r.p(), &["switch", "-q", "master"]);
+    let o = r.run(&["queue", "run", "--entry", &e]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged", "reason = {}", r.field(&e, "reason"));
+    assert_eq!(r.field(&e, "main branch"), "master");
+    assert_eq!(git(&r.p(), &["log", "-1", "--format=%s", "refs/heads/master"]), "task: new file");
+    assert_eq!(r.field(&e, "main commit"), tip_of(&r, "master"));
+    assert!(r.show(&e).contains("fast-forwarded `master`"), "{}", r.show(&e));
+    assert_eq!(tip_of(&r, "feature"), feature_tip);
+    assert!(git_out(&r.p(), &["rev-parse", "--verify", "-q", "refs/heads/main"]).code != 0, "no `main` was made");
+}
+
+#[test]
+fn a_project_with_both_main_and_master_blocks_the_entry_with_the_trunk_error_and_merges_nothing() {
+    let r = Root::new("bothtrunks", 30);
+    let id = r.started("src");
+    let task_tip = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let main_before = tip_of(&r, "main");
+    git(&r.p(), &["branch", "master", "main"]);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "blocked");
+    let reason = r.field(&e, "reason");
+    assert!(reason.contains("both `main` and `master`"), "{reason}");
+    assert_eq!((tip_of(&r, "main"), tip_of(&r, "master"), r.branch_tip(&id)), (main_before.clone(), main_before, task_tip));
+    assert_eq!(r.calls(), 0);
+}
+
 #[test]
 fn a_reviewer_model_equal_to_the_coder_blocks_the_entry_before_anything_runs() {
     let r = Root::new("samemodel", 30);

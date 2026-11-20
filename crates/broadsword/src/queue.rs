@@ -10,7 +10,7 @@
 //!   approved             MERGE TRAIN only (merge_train_max > 1, `queue run --all`): the review PASSed, nothing is merged, the task stays
 //!                        running; the entry waits for a train (see MERGE TRAIN). An open entry (it blocks `queue add` for its task); `queue
 //!                        cancel` drops it; `queue run` on it alone resumes it (its deferred check is made first) [0]
-//!   merged              fast-forwarded into the main checkout, main's check passed, `task done` ran [0]
+//!   merged              fast-forwarded into the project's trunk (see TRUNK), main's check passed, `task done` ran [0]
 //!   blocked              a precondition failed or a step could not run (dirty main, task not running, dirty worktree, reviewer
 //!                        model = coder model, diff too big, check could not run, reviewer unreachable or timed out); nothing
 //!                        was merged and nothing was changed except what the entry says; fix the cause, `queue run --entry` [3]
@@ -100,9 +100,15 @@
 //! called only while the branch tip still equals it, and `merge --ff-only` merges exactly that commit. A tip that moved at any
 //! point makes the entry `stale`; an unchecked commit is never reviewed or merged.
 //!
-//! SAFETY. The only commands that move history are `git rebase <main HEAD>` in the task's worktree (aborted on any failure, the tip
-//! verified) and `git merge --ff-only <reviewed commit>` in the main checkout (so the commit merged is exactly the one reviewed;
-//! never a merge commit). Never `--force`, `-D`, `reset --hard` or `push`. Before a rebase the pre-rebase tip is saved in the entry
+//! TRUNK. "Main" in this file is the project's TRUNK (`wtgit::trunk_branch`: the one of `main`/`master` that exists; both or
+//! neither ends the entry `blocked` with that error), recorded as the entry's `main_branch` when it starts, and "main's HEAD" is
+//! `refs/heads/<trunk>`. Every "is it on main" test reads that ref, never HEAD (`trunk_tip`). The rebase base, every fast-forward and
+//! the main check also need the main checkout to have the trunk checked out (`trunk_checkout`): a feature branch or a detached HEAD
+//! there ends the entry `blocked` naming both, and that branch and the checkout are never moved, merged into or switched.
+//!
+//! SAFETY. The only commands that move history are `git rebase <trunk tip>` in the task's worktree (aborted on any failure, the tip
+//! verified) and `git merge --ff-only <reviewed commit>` in the main checkout while it has the trunk checked out (so the commit
+//! merged is exactly the one reviewed, into the trunk only; never a merge commit). Never `--force`, `-D`, `reset --hard` or `push`. Before a rebase the pre-rebase tip is saved in the entry
 //! and, create-only, under `refs/broadsword/queue/<entry id>/pre-rebase` (a later attempt: `pre-rebase-<N>`). All git commands are
 //! in wtgit.rs.
 
@@ -521,7 +527,7 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
         match chained_base(&dir, &branch, x) {
             Ok(None) => {}
             Ok(Some(chained_on)) => {
-                let main = wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into());
+                let main = trunk_name(&dir);
                 return refuse(format!("its earlier queue entry {} {}", x.id(), left_train_text(&main, &branch, &chained_on)));
             }
             Err(e) => return refuse(e),
@@ -663,7 +669,7 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
 
 /// CANCEL RULE, the ONE place: an entry whose commits may already be on main is never cancelled (it would leave main holding code
 /// whose main check and `task done` never ran). Refused: a half-finished train merge (`half_merged`), and any entry whose reviewed
-/// commit (or recorded main commit) is an ancestor of the project's main HEAD. When that cannot be decided (git or the project
+/// commit (or recorded main commit) is an ancestor of the project's trunk (`refs/heads/<trunk>`, never HEAD). When that cannot be decided (git or the project
 /// fails), the cancel is refused too: fail closed. `None` = may be cancelled.
 fn cancel_refusal(cfg: &Config, e: &Record) -> Option<String> {
     let id = e.id();
@@ -677,7 +683,7 @@ fn cancel_refusal(cfg: &Config, e: &Record) -> Option<String> {
     }
     let on_main = (|| -> Result<Option<String>, String> {
         let dir = job::resolve_project(&cfg.root, &cfg.projects_dir, e.get("project"))?;
-        let head = wtgit::head_commit(&dir)?;
+        let (_, head) = wtgit::trunk_commit(&dir)?;
         for c in &commits {
             if wtgit::is_ancestor(&dir, c, &head)? {
                 return Ok(Some(c.to_string()));
@@ -1259,15 +1265,27 @@ impl<'a> Run<'a> {
         self.s_done()
     }
 
-    /// Is the reviewed commit already on the main checkout's HEAD (equal to it or an ancestor of it)? False when none is recorded.
+    /// Is the reviewed commit already on the trunk (`refs/heads/<trunk>`: equal to it or an ancestor of it)? False when none is
+    /// recorded. A trunk that cannot be told ends the entry `blocked` (`trunk_tip`).
     fn reviewed_on_main(&mut self) -> R<bool> {
         let reviewed = self.e.get("reviewed_tip").to_string();
         if reviewed.is_empty() {
             return Ok(false);
         }
         let dir = self.dir.clone();
-        let head = self.g(wtgit::head_commit(&dir))?;
+        let head = match trunk_tip(&dir, self.e.get("main_branch")) {
+            Ok((_, tip)) => tip,
+            Err(m) => return Err(self.blocked(&format!("{m}; nothing merged"))),
+        };
         self.g(wtgit::is_ancestor(&dir, &reviewed, &head))
+    }
+
+    /// `trunk_checkout` for this entry (its recorded trunk): the trunk's tip, or the entry ends `blocked` with the reason.
+    fn on_trunk(&mut self) -> R<String> {
+        match trunk_checkout(&self.dir, self.e.get("main_branch")) {
+            Ok((_, tip)) => Ok(tip),
+            Err(m) => Err(self.blocked(&format!("{m}; nothing merged"))),
+        }
     }
 
     // -- merge train (see `run_train`) ------------------------------------------------------
@@ -1350,9 +1368,8 @@ impl<'a> Run<'a> {
         if !wt_status.is_empty() {
             return Err(self.leave_train(BLOCKED, &format!("the task's worktree got changes after the review ({}); it cannot join a merge train; nothing merged", some(&wt_status)), EXIT_RETRY));
         }
-        let main_branch = self.g(wtgit::current_branch(&dir))?;
-        if main_branch.as_deref() != Some(self.e.get("main_branch")) {
-            return Err(self.leave_train(BLOCKED, "the main checkout is not on the branch this entry was reviewed against; nothing merged", EXIT_RETRY));
+        if let Err(m) = trunk_checkout(&dir, self.e.get("main_branch")) {
+            return Err(self.leave_train(BLOCKED, &format!("{m}; nothing merged"), EXIT_RETRY));
         }
         let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
         if !dirty.is_empty() {
@@ -1493,7 +1510,7 @@ impl<'a> Run<'a> {
             }
             return self.end(status, reason, code);
         };
-        let main = if self.e.get("main_branch").is_empty() { wtgit::current_branch(&dir).ok().flatten().unwrap_or_else(|| "<main branch>".into()) } else { self.e.get("main_branch").to_string() };
+        let main = if self.e.get("main_branch").is_empty() { trunk_name(&dir) } else { self.e.get("main_branch").to_string() };
         self.e.set("left_train_base", base.clone());
         let text = left_train_text(&main, &branch, &base);
         self.blocked(&format!("{text}. Why it left (it would have been `{status}`): {reason}"))
@@ -1660,16 +1677,13 @@ impl<'a> Run<'a> {
         if !git::is_repo(&dir) {
             return Err(self.blocked(&format!("project `{}` is not a Git repo", self.e.get("project"))));
         }
-        let main_branch = match self.g(wtgit::current_branch(&dir))? {
-            Some(b) => b,
-            None => return Err(self.blocked("the main checkout is on a detached HEAD; check out a branch first")),
+        // the entry's `main branch` is the project's TRUNK (never what HEAD happens to be), and it must be what is checked out
+        let recorded = if start == 0 { String::new() } else { self.e.get("main_branch").to_string() };
+        let (main_branch, trunk_at) = match trunk_checkout(&dir, &recorded) {
+            Ok(t) => t,
+            Err(m) => return Err(self.blocked(&format!("{m}; nothing merged"))),
         };
-        if start == 0 || self.e.get("main_branch").is_empty() {
-            self.e.set("main_branch", main_branch.clone());
-        } else if self.e.get("main_branch") != main_branch {
-            let was = self.e.get("main_branch").to_string();
-            return Err(self.blocked(&format!("the main checkout is on `{main_branch}` but this entry started on `{was}`")));
-        }
+        self.e.set("main_branch", main_branch.clone());
         let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
         if !dirty.is_empty() {
             return Err(self.blocked(&format!("the main checkout has uncommitted or untracked changes ({}); commit or discard them, then run again", some(&dirty))));
@@ -1692,7 +1706,7 @@ impl<'a> Run<'a> {
             Ok(g) => (g.model, if g.why.is_empty() { String::new() } else { format!(" ({})", g.why) }),
             Err(msg) => return Err(self.blocked(&msg)),
         };
-        let ahead = self.g(wtgit::rev_count(&dir, &format!("HEAD..{branch}")))?;
+        let ahead = self.g(wtgit::rev_count(&dir, &format!("{trunk_at}..{branch}")))?;
         if ahead == 0 {
             return Err(self.blocked(&format!("nothing to merge: `{branch}` has no commit that `{main_branch}` lacks")));
         }
@@ -1747,7 +1761,7 @@ impl<'a> Run<'a> {
     fn s_rebase(&mut self) -> R<()> {
         self.set_step("rebase")?;
         let (dir, wt, branch) = (self.dir.clone(), self.wt.clone(), self.branch());
-        let head = self.g(wtgit::head_commit(&dir))?;
+        let head = self.on_trunk()?;
         self.e.set("base_head", head.clone());
         let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
         if self.g(wtgit::is_ancestor(&dir, &head, &tip))? {
@@ -2160,13 +2174,8 @@ verdict: {} (answer followed the format: {})
         }
         self.refuse_chained("merge")?;
         println!("queue entry {}: merging after a {} review through reviewer CLI {}", self.e.id(), if self.e.get("test_hook") == "true" { "TEST HOOK" } else { "real" }, if cli_path.is_empty() { "(none recorded)" } else { &cli_path });
-        let main_branch = self.g(wtgit::current_branch(&dir))?;
-        if main_branch.as_deref() != Some(self.e.get("main_branch")) {
-            let now = main_branch.unwrap_or_else(|| "a detached HEAD".into());
-            let was = self.e.get("main_branch").to_string();
-            return Err(self.blocked(&format!("the main checkout is on {now}, but this entry was reviewed against `{was}`; nothing merged")));
-        }
-        let head = self.g(wtgit::head_commit(&dir))?;
+        // the trunk (`refs/heads/<trunk>`), checked out in the main checkout, is what is fast-forwarded: never another branch
+        let head = self.on_trunk()?;
         if head == reviewed || self.g(wtgit::is_ancestor(&dir, &reviewed, &head))? {
             // an earlier run already fast-forwarded main to this commit (a merge train: to a later commit that contains it) and died
             // before recording it
@@ -2191,16 +2200,21 @@ verdict: {} (answer followed the format: {})
         if !wt_status.is_empty() {
             return Err(self.blocked(&format!("the task's worktree got changes after the review ({}); nothing merged", some(&wt_status))));
         }
+        // the last look before the fast-forward: still the trunk checked out, still at `head`
+        if self.on_trunk()? != head {
+            return Err(self.end(STALE, &format!("main moved from {} just before the merge; nothing was merged. Run `queue run --entry {}` to rebase again", short(&head), self.e.id()), EXIT_RETRY));
+        }
         if let Err(m) = wtgit::merge_ff_only(&dir, &reviewed) {
-            let now = self.g(wtgit::head_commit(&dir))?;
+            let now = self.g(trunk_tip(&dir, "").map(|(_, tip)| tip))?;
             if now != head {
                 return Err(self.end(STALE, &format!("main moved from {} to {} during the merge; nothing was merged by this run. Run `queue run --entry {}` to rebase again", short(&head), short(&now), self.e.id()), EXIT_RETRY));
             }
             return Err(self.blocked(&format!("git refused the fast-forward: {m}. Main is unchanged")));
         }
-        let after = self.g(wtgit::head_commit(&dir))?;
+        let mb = self.e.get("main_branch").to_string();
+        let after = self.g(trunk_checkout(&dir, &mb).map(|(_, tip)| tip))?;
         if after != reviewed {
-            return Err(self.internal(&format!("after `git merge --ff-only` main's HEAD is {} but the reviewed commit is {}; main was {} before; look at the project", short(&after), short(&reviewed), short(&head))));
+            return Err(self.internal(&format!("after `git merge --ff-only` the trunk `{mb}` is at {} but the reviewed commit is {}; it was {} before; look at the project", short(&after), short(&reviewed), short(&head))));
         }
         self.e.set("main_sha", after.clone());
         let note = format!("fast-forwarded `{}` from {} to {}; reviewed through CLI {} (test_hook: {})", self.e.get("main_branch"), short(&head), short(&after), if cli_path.is_empty() { "(none recorded)" } else { &cli_path }, self.e.get("test_hook"));
@@ -2230,10 +2244,19 @@ verdict: {} (answer followed the format: {})
         let loud = |code: String, extra: &str| {
             format!("commit {sha} is ALREADY on `{mb}` of project `{project}`, and `check {project}` there did not pass ({code}){extra}. Main was NOT reset or reverted. A human decides: fix forward, or `git revert` the commit. The task was NOT marked done and its worktree is kept")
         };
+        // The main check runs in the main checkout, on its files: only while that checkout is the trunk and holds the merged
+        // commit is it a check of the trunk. Otherwise it is refused, loudly (`trunk_checkout`); never run on another branch.
+        let on_trunk = trunk_checkout(&self.dir, &mb).and_then(|(trunk, tip)| match wtgit::is_ancestor(&self.dir, &sha, &tip)? {
+            true => Ok(()),
+            false => Err(format!("the trunk `{trunk}` (at {}) does not hold commit {}", short(&tip), short(&sha))),
+        });
+        if let Err(m) = on_trunk {
+            return Err(self.end(MERGED_CHECK_FAILED, &loud("the check was refused before it started".into(), &format!(": {m}")), EXIT_MERGED_BAD));
+        }
         if let Some(code) = tools::guard_refusal(self.cfg, &project, None) {
             return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("the check was refused before it started, exit {code}"), ""), EXIT_MERGED_BAD));
         }
-        println!("queue entry {}: check {project} (the main checkout)", self.e.id());
+        println!("queue entry {}: check {project} (the main checkout, on its trunk `{mb}`)", self.e.id());
         let mut info = JobInfo::default();
         let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
         if code != 0 {
@@ -2373,9 +2396,43 @@ fn chained_onto(dir: &Path, branch: &str, base: &str) -> Result<bool, String> {
     if base.is_empty() {
         return Ok(false);
     }
-    let head = wtgit::head_commit(dir)?;
+    let (_, head) = wtgit::trunk_commit(dir)?;
     let tip = wtgit::branch_tip(dir, branch)?;
     Ok(wtgit::is_ancestor(dir, base, &tip)? && !wtgit::is_ancestor(dir, base, &head)?)
+}
+
+/// TRUNK RULE of the merge queue, part 1 (the ONE place every step asks; part 2 is `trunk_checkout`): the project's trunk
+/// (`wtgit::trunk_branch`: the one of `main`/`master` that exists) and the commit at `refs/heads/<trunk>`. `recorded` is the trunk
+/// the entry started on (`main_branch`; empty before it is recorded): a different trunk now is refused. Every "is it on main" test
+/// asks this, never HEAD. Any error (both or neither trunk, git failing) is returned and the caller fails closed.
+fn trunk_tip(dir: &Path, recorded: &str) -> Result<(String, String), String> {
+    let (trunk, tip) = wtgit::trunk_commit(dir)?;
+    if !recorded.is_empty() && recorded != trunk {
+        return Err(format!("the project's trunk is `{trunk}` now, but this entry started on `{recorded}`"));
+    }
+    Ok((trunk, tip))
+}
+
+/// TRUNK RULE of the merge queue, part 2: `trunk_tip`, and the project's main checkout has exactly that trunk checked out.
+/// DECISION (t-20261120-134432): a checkout on any other branch (or a detached HEAD) is REFUSED, never worked around. The queue
+/// moves the trunk only with `git merge --ff-only` in that checkout (which fast-forwards whatever is checked out) and runs the main
+/// check on that checkout's files, so both are only right while the trunk is what is checked out. It never updates a branch ref
+/// behind a checkout's back and never moves, merges into or switches the checked-out branch. Called before the rebase (its base),
+/// before every fast-forward, right after it, and before the main check.
+fn trunk_checkout(dir: &Path, recorded: &str) -> Result<(String, String), String> {
+    let (trunk, tip) = trunk_tip(dir, recorded)?;
+    match wtgit::current_branch(dir)? {
+        Some(b) if b == trunk => Ok((trunk, tip)),
+        other => {
+            let on = other.map(|b| format!("`{b}`")).unwrap_or_else(|| "a detached HEAD".into());
+            Err(format!("the project's main checkout ({}) has {on} checked out, not its trunk `{trunk}`. The merge queue merges only into the trunk, by fast-forwarding it in that checkout, and never moves or merges into any other branch; the checkout was not touched. Check out `{trunk}` there (`git switch {trunk}`), then run the entry again", dir.display()))
+        }
+    }
+}
+
+/// The trunk's name for a message (`<the trunk>` when it cannot be told).
+fn trunk_name(dir: &Path) -> String {
+    wtgit::trunk_branch(dir).unwrap_or_else(|_| "<the trunk>".into())
 }
 
 /// The reason an entry with a chained branch gets (see `Run::leave_train`), with the coder's way out.
@@ -2615,10 +2672,14 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
     while !todo.is_empty() && hard == 0 {
         round += 1;
         let dir = todo[0].0.dir.clone();
-        let head = match wtgit::head_commit(&dir) {
-            Ok(h) => h,
+        // the chain's base is the trunk's tip, and the trunk must be what the main checkout has checked out (`trunk_checkout`)
+        let head = match trunk_checkout(&dir, todo[0].0.e.get("main_branch")) {
+            Ok((_, h)) => h,
             Err(m) => {
-                hard = fail_members(cfg, std::mem::take(&mut todo), &m, rows, &mut worst);
+                for (mut r, t) in std::mem::take(&mut todo) {
+                    let c = r.leave_train(BLOCKED, &format!("{m}; nothing merged"), EXIT_RETRY);
+                    finish_member(cfg, r, code_num(c), t, rows, &mut worst);
+                }
                 break;
             }
         };
@@ -2828,9 +2889,17 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
         return 0;
     }
     let dir = members[0].0.dir.clone();
-    let now = match wtgit::head_commit(&dir) {
-        Ok(h) => h,
-        Err(m) => return fail_members(cfg, members, &m, rows, worst),
+    let trunk = members[0].0.e.get("main_branch").to_string();
+    // the trunk, checked out in the main checkout, is what is fast-forwarded (`trunk_checkout`); anything else merges nothing
+    let now = match trunk_checkout(&dir, &trunk) {
+        Ok((_, h)) => h,
+        Err(m) => {
+            for (mut r, t) in members {
+                let c = r.leave_train(BLOCKED, &format!("{m}; merge train {train_id} merged nothing"), EXIT_RETRY);
+                finish_member(cfg, r, code_num(c), t, rows, worst);
+            }
+            return 0;
+        }
     };
     if now != head {
         for (mut r, t) in members {
@@ -2862,7 +2931,7 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
         }
     }
     if let Err(m) = wtgit::merge_ff_only(&dir, tip) {
-        let after = wtgit::head_commit(&dir).unwrap_or_default();
+        let after = trunk_tip(&dir, "").map(|(_, t)| t).unwrap_or_default();
         for (mut r, t) in members {
             let id = r.e.id().to_string();
             let c = if after != head {
@@ -2874,12 +2943,12 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
         }
         return 0;
     }
-    let after = match wtgit::head_commit(&dir) {
-        Ok(h) => h,
+    let after = match trunk_checkout(&dir, &trunk) {
+        Ok((_, h)) => h,
         Err(m) => return fail_members(cfg, members, &m, rows, worst),
     };
     if after != tip {
-        let msg = format!("after `git merge --ff-only` main's HEAD is {} but the train tip is {}; main was {} before; look at the project", short(&after), short(tip), short(head));
+        let msg = format!("after `git merge --ff-only` the trunk `{trunk}` is at {} but the train tip is {}; it was {} before; look at the project", short(&after), short(tip), short(head));
         return fail_members(cfg, members, &msg, rows, worst);
     }
     let last = n - 1;
