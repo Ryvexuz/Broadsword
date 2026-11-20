@@ -19,11 +19,17 @@
 //! interrupted `run` jobs, with the command to roll each back; it changes no project file. The automatic recovery before
 //! a job (`Mode::Auto`) likewise kills orphans and resumes read-only jobs but never rolls back, and
 //! `blocked_by_interrupted_run` then stops new jobs in that run's own source folder until it is recovered.
-//! A lock file (`state/recover.lock`) keeps two recovers from working at the same time.
+//! The automatic recovery acts only on jobs of the CALLER's own project and task (`Mode::Auto` carries them, so it cannot
+//! run without them): an interrupted job of another project or task (task-less and tasked never match) is reported on one
+//! line and left exactly as it is, for an explicit `broadsword recover` or a call of that same task. Several agents run
+//! jobs at once, and one agent's call must never resume (and so run, and print the results of) another agent's job.
+//! A lock file (`state/recover.lock`) keeps two recovers from working at the same time. Each record a recover changes is
+//! also worked on only under its own lock (`state/recover-locks/<id>.lock`), re-read once that lock is held; `--abandon`
+//! takes only that record lock, so it never waits for a recover busy with other jobs, and can never race one on its job.
 
 use crate::config::Config;
 use crate::git;
-use crate::job::{self, JobSpec};
+use crate::job::{self, JobInfo, JobSpec};
 use crate::lock::{self, Lock};
 use crate::pause;
 use crate::record::{self, Record};
@@ -32,13 +38,25 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub enum Mode<'a> {
     /// `broadsword recover --all`: does everything, including rolling back EVERY interrupted `run` job.
     All,
     /// `broadsword recover`: the automatic part, then lists interrupted `run` jobs; never rolls back.
     List,
-    /// Before a job starts: never rolls anything back, prints no list.
-    Auto,
+    /// Before a job of `project` for `task` (`None` = the main checkout) starts: never rolls anything back, prints no list,
+    /// and touches only interrupted jobs of exactly that project and task (see `is_callers`).
+    Auto { project: &'a str, task: Option<&'a str> },
+}
+
+/// Is record `r` a job of the automatic recovery's caller: the same project (records store the canonical name) and exactly
+/// the same task, where a task-less job matches only a task-less caller. The ONE place this is decided.
+fn is_callers(cfg: &Config, r: &Record, project: &str, task: Option<&str>) -> bool {
+    let canon = job::canonical_project(&cfg.projects_dir, project).unwrap_or_else(|_| project.to_string());
+    r.get("project") == canon && r.get("task") == task.unwrap_or("")
+}
+
+fn task_text(task: &str) -> String {
+    if task.is_empty() { "no task".to_string() } else { format!("task {task}") }
 }
 
 pub fn cmd_list(cfg: &Config) -> ExitCode {
@@ -116,12 +134,32 @@ fn acquire(cfg: &Config, wait: Duration) -> Result<Lock, String> {
     })
 }
 
+/// Take the lock of the one job record `id` (`state/recover-locks/<id>.lock`, an OS file lock like `acquire`). Whoever
+/// changes an interrupted record (a recover resuming, rolling back or failing it, or an abandon) holds it, and re-reads the
+/// record once it has it. `id` must be a sanitized record id (it names the file).
+fn acquire_record(cfg: &Config, id: &str) -> Result<Lock, String> {
+    let path = cfg.state_dir.join("recover-locks").join(format!("{id}.lock"));
+    lock::acquire(&path, Duration::from_secs(cfg.recover_lock_wait_seconds), &|owner| match owner {
+        Some(pid) => format!("job {id} is being recovered by another process (pid {pid}); try again when it has finished"),
+        None => format!("job {id} is being recovered by another process; try again when it has finished"),
+    })
+}
+
+/// Re-read record `id` from disk (after its lock is taken): `Ok` only if it is still `running` with a dead broadsword.
+fn reread_interrupted(cfg: &Config, id: &str) -> Result<Record, String> {
+    match record::load(&record::jobs_dir(cfg).join(format!("{id}.rec"))) {
+        Ok(r) if r.id() == id && r.status() == record::RUNNING && !broadsword_alive(&r) => Ok(r),
+        Ok(r) if r.id() == id => Err(format!("job {id} changed while waiting for its lock (now `{}`); left alone", r.status())),
+        _ => Err(format!("job {id}: its record can no longer be read; left alone")),
+    }
+}
+
 /// Recover every dead running job. Returns non-zero if any job needs attention or a resumed job failed.
 pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
     let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
         Ok(l) => l,
         Err(e) => {
-            if mode == Mode::Auto {
+            if matches!(mode, Mode::Auto { .. }) {
                 eprintln!("broadsword: warning: automatic recovery skipped: {e}");
                 return ExitCode::SUCCESS;
             }
@@ -133,16 +171,49 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
     let mut attention: Vec<String> = Vec::new();
     let mut any = false;
     let mut listed: Vec<String> = Vec::new();
-    for mut r in record::load_all(&record::jobs_dir(cfg)) {
-        if r.status() != record::RUNNING {
+    for seen in record::load_all(&record::jobs_dir(cfg)) {
+        if seen.status() != record::RUNNING {
             continue;
         }
         any = true;
-        let id = r.id().to_string();
-        if broadsword_alive(&r) {
-            println!("job {id}: still running (broadsword pid {}), left alone", r.get("pid"));
+        let id = seen.id().to_string();
+        if broadsword_alive(&seen) {
+            println!("job {id}: still running (broadsword pid {}), left alone", seen.get("pid"));
             continue;
         }
+        if let Mode::Auto { project, task } = mode {
+            if !is_callers(cfg, &seen, project, task) {
+                // Not this call's job: one line, and nothing is touched (no orphan kill, no resume, no record change).
+                let t = seen.get("task");
+                println!(
+                    "job {id}: {} {} ({}) was interrupted (broadsword pid {} is gone); left alone, as it is not a job of this call's project and task: `broadsword recover` or a call for {} deals with it",
+                    seen.get("kind"),
+                    seen.get("project"),
+                    task_text(t),
+                    seen.get("pid"),
+                    if t.is_empty() { format!("`{}` without --task", seen.get("project")) } else { format!("--task {t}") }
+                );
+                continue;
+            }
+        }
+        // From here this record may be changed: only under its own lock, and as it is on disk now.
+        let _record_lock = match acquire_record(cfg, &id) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("{e}; it is interrupted but was skipped this time");
+                if !matches!(mode, Mode::Auto { .. }) {
+                    attention.push(id); // still unresolved: exit non-zero
+                }
+                continue;
+            }
+        };
+        let mut r = match reread_interrupted(cfg, &id) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{e}"); // someone else resolved it meanwhile
+                continue;
+            }
+        };
         println!("recovering job {id}: {} {} was interrupted (broadsword pid {} is gone)", r.get("kind"), r.get("project"), r.get("pid"));
         kill_orphan(&r);
         let kind = r.get("kind").to_string();
@@ -193,9 +264,15 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
             let steps = job::steps_for(&kind);
             let first = steps.iter().position(|s| *s == r.get("step")).unwrap_or(0);
             println!("  read-only job: resuming `{kind} {project}` from step `{}`", steps[first]);
-            let c = job::run_job(cfg, JobSpec { kind, name: project, command: None, first_step: first, resumed_from: Some(id), resume_count: count + 1, task });
-            if c != ExitCode::SUCCESS {
+            let mut info = JobInfo::default();
+            let c = job::run_job_info(cfg, JobSpec { kind: kind.clone(), name: project.clone(), command: None, first_step: first, resumed_from: Some(id.clone()), resume_count: count + 1, task }, &mut info);
+            if c != 0 {
                 resumed_failed = true;
+            }
+            if matches!(mode, Mode::Auto { .. }) {
+                // The caller asked for its own job, not this one: say where the resumed job's output ends.
+                let new = info.id.as_deref().unwrap_or("(no record)");
+                println!("broadsword: the output above belongs to resumed job {new} (`{kind} {project}`, resuming interrupted job {id}, exit {c}), not to this call's own job, which starts now");
             }
         }
     }
@@ -228,6 +305,13 @@ pub fn recover_one(cfg: &Config, id: &str) -> ExitCode {
         return refuse("not a job id (see `broadsword jobs`)".into());
     }
     let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("broadsword: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let _record_lock = match acquire_record(cfg, id) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("broadsword: {e}");
@@ -346,18 +430,20 @@ fn rollback_run(cfg: &Config, r: &mut Record, project: &str) -> Result<(), Strin
 
 /// `broadsword recover --abandon <id>`: give up on an interrupted job without touching any file.
 /// The record becomes `abandoned` (which lifts the per-folder refusal); the record and every ref stay.
+/// It takes only this record's lock, not `state/recover.lock`: a recover busy with other jobs does not hold it up, and
+/// every recover changes a record only under that record's lock and after re-reading it, so the two never race on it.
 pub fn abandon(cfg: &Config, id: &str) -> ExitCode {
-    let _lock = match acquire(cfg, Duration::from_secs(cfg.recover_lock_wait_seconds)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("broadsword: {e}");
-            return ExitCode::from(1);
-        }
-    };
     if id.is_empty() || record::sanitize(id) != id {
         eprintln!("broadsword: `{id}` is not a job id (see `broadsword jobs`)");
         return ExitCode::from(1);
     }
+    let _record_lock = match acquire_record(cfg, id) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("broadsword: {e}; nothing was changed");
+            return ExitCode::from(1);
+        }
+    };
     let path = record::jobs_dir(cfg).join(format!("{id}.rec"));
     let mut r = match record::load(&path) {
         Ok(r) if r.id() == id => r,

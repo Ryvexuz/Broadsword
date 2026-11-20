@@ -700,3 +700,106 @@ fn a_check_job_that_panics_ends_failed_and_its_child_is_gone() {
     // a failed record blocks nothing, and recover has nothing to do for it
     assert!(text(&r.run(&["recover"]).stdout).contains("nothing to do"));
 }
+
+// ---- t-20261120-152958: automatic recovery never hijacks another task's call ------------------------------------------
+
+impl Root {
+    /// A task of project `p` started with its own worktree. Returns the id.
+    fn task(&self, claim: &str) -> String {
+        let o = self.run(&["task", "add", "p", "--title", "t", "--claim", claim]);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+        let id = text(&o.stdout).trim().to_string();
+        let o = self.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
+        assert_eq!(o.status.code(), Some(0), "{}{}", text(&o.stdout), text(&o.stderr));
+        id
+    }
+
+    fn record(&self, id: &str) -> String {
+        fs::read_to_string(self.dir.join(format!("state/jobs/{id}.rec"))).unwrap()
+    }
+
+    /// Hold the per-record recover lock of job `id`, as a recover working on that record would.
+    fn hold_record_lock(&self, id: &str) -> fs::File {
+        let dir = self.dir.join("state/recover-locks");
+        fs::create_dir_all(&dir).unwrap();
+        let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(format!("{id}.lock"))).unwrap();
+        f.lock().unwrap();
+        f
+    }
+}
+
+/// Task A's interrupted check job exists. A `run --task B` (and a task-less run) neither resumes nor runs it: it is reported
+/// on one line and left `running`. Only a call of task A itself resumes it, and says the output above was that job's.
+#[test]
+fn a_call_for_another_task_never_resumes_an_interrupted_job() {
+    let r = Root::new("othertask");
+    r.project("", true);
+    let (a, b) = (r.task("a.txt"), r.task("b.txt"));
+    let dead = dead_pid().to_string();
+    let old = "20260101-000001-p-check";
+    r.fake_record(old, &[("project", "p"), ("kind", "check"), ("status", "running"), ("pid", &dead), ("step", "build"), ("task", &a), ("resume_count", "0")]);
+    for args in [vec!["run", "p", "--task", &b, "--", "echo from-b"], vec!["run", "p", "--", "echo from-main"]] {
+        let out = r.run(&args);
+        let (so, se) = (text(&out.stdout), text(&out.stderr));
+        println!("{args:?}\n{so}{se}");
+        assert_eq!(out.status.code(), Some(0), "{so}{se}");
+        assert!(!so.contains("resuming") && !so.contains("recovering job"), "another task's job must not be resumed in this call: {so}");
+        assert_eq!(so.lines().filter(|l| l.contains(old)).count(), 1, "the interrupted job is reported on exactly one line: {so}");
+        assert!(so.lines().any(|l| l.contains(old) && l.contains(&format!("task {a}")) && l.contains("left alone")), "{so}");
+        assert!(so.contains(if args.len() == 6 { "from-b" } else { "from-main" }), "the caller's own command ran: {so}");
+        let rec = r.record(old);
+        assert_eq!(Root::field(&rec, "status"), "running", "{rec}");
+        assert_eq!(Root::field(&rec, "resumed_as"), "", "{rec}");
+        assert!(r.records().iter().all(|(_, t)| Root::field(t, "kind") == "run" || Root::field(t, "id") == old), "no job of another task was started: {:?}", r.records());
+    }
+    // task A's own call does resume it, and marks where the resumed job's output ends
+    let out = r.run(&["run", "p", "--task", &a, "--", "echo from-a"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    println!("{so}{se}");
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    assert!(so.contains("resuming `check p` from step `build`"), "{so}");
+    let rec = r.record(old);
+    assert_eq!(Root::field(&rec, "status"), "resumed", "{rec}");
+    let new = Root::field(&rec, "resumed_as");
+    assert!(so.contains(&format!("the output above belongs to resumed job {new}")), "{so}");
+    let (mark, mine) = (so.find("the output above belongs").unwrap(), so.find("from-a").unwrap());
+    assert!(mark < mine, "the marker comes before the caller's own job: {so}");
+    assert_eq!(Root::field(&r.record(&new), "task"), a);
+}
+
+/// `recover --abandon <id>` of a dead job is not refused by an unrelated recover holding `state/recover.lock`; it is
+/// refused (record unchanged) while a recover works on THAT record, and a recover skips a record an abandon holds.
+#[test]
+fn abandon_does_not_wait_for_an_unrelated_recover_but_never_races_one_on_the_same_record() {
+    let r = Root::new("abandonlock");
+    r.project("", false);
+    let dead = dead_pid().to_string();
+    let (one, two) = ("20260101-000001-p-run", "20260101-000002-p-check");
+    r.fake_record(one, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("checkpoint", "pending")]);
+    r.fake_record(two, &[("project", "p"), ("kind", "check"), ("status", "running"), ("pid", &dead), ("step", "build"), ("resume_count", "0")]);
+    fs::create_dir_all(r.dir.join("state")).unwrap();
+    let global = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(r.dir.join("state/recover.lock")).unwrap();
+    global.lock().unwrap();
+    let out = r.run(&["recover", "--abandon", one]);
+    assert_eq!(out.status.code(), Some(0), "an unrelated recover must not block the abandon: {}{}", text(&out.stdout), text(&out.stderr));
+    assert_eq!(Root::field(&r.record(one), "status"), "abandoned");
+    drop(global);
+
+    // a recover working on `two` (its record lock held): abandon is refused and changes nothing
+    let held = r.hold_record_lock(two);
+    let out = r.run(&["recover", "--abandon", two]);
+    assert_eq!(out.status.code(), Some(1), "{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(text(&out.stderr).contains("being recovered"), "{}", text(&out.stderr));
+    assert_eq!(Root::field(&r.record(two), "status"), "running");
+    // and a recover skips a record whose lock another process holds (as an abandon would): nothing is resumed
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{so}{}", text(&out.stderr));
+    assert!(!so.contains("resuming") && so.contains("being recovered"), "{so}");
+    assert_eq!(Root::field(&r.record(two), "status"), "running");
+    assert_eq!(r.records().len(), 2, "no new job was started: {:?}", r.records());
+    drop(held);
+    let out = r.run(&["recover", "--abandon", two]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+    assert_eq!(Root::field(&r.record(two), "status"), "abandoned");
+}

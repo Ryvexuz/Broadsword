@@ -1413,9 +1413,10 @@ fn guarded(cfg: &Config, project: &str, task: Option<&str>, job: impl FnOnce() -
 
 /// The recovery step every job starts with (also used by the merge queue before its check jobs): `Some(exit code)` when the
 /// job must be refused, with the reason already printed. `task` is the job's `--task` (`None` = the project's main checkout):
-/// an interrupted run blocks only jobs in its own source folder (see `recover::blocked_by_interrupted_run`).
+/// the automatic recovery touches only interrupted jobs of exactly this project and task (others are reported, one line
+/// each, and left alone), and an interrupted run blocks only jobs in its own source folder (see `recover::blocked_by_interrupted_run`).
 pub fn guard_refusal(cfg: &Config, project: &str, task: Option<&str>) -> Option<u8> {
-    let _ = recover::recover(cfg, recover::Mode::Auto); // kills orphans, resumes read-only jobs; never rolls back
+    let _ = recover::recover(cfg, recover::Mode::Auto { project, task }); // this call's own jobs only: kills their orphans, resumes read-only ones; never rolls back
     if let Some((id, source)) = recover::blocked_by_interrupted_run(cfg, project, task) {
         eprintln!("broadsword: refusing to start: job {id} (run {project}, source folder {source}) was interrupted and may have changed files in that folder; run `broadsword recover {id}` first to roll it back (only if nobody is still working in that folder), or `broadsword recover --abandon {id}` to give up on it");
         return Some(job::EXIT_REFUSED);
