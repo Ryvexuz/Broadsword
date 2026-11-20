@@ -79,8 +79,17 @@ macro_rules! gate_block {
 /// The reviewer's fixed system prompt: the one the reviewer benchmark (bench/reviewer/run.py) measured. The shadow reviewer uses it.
 pub const SYSTEM_PROMPT: &str = concat!(prompt_head!(), "\n\n", prompt_tail!());
 
-/// The gating reviewer's prompt: `SYSTEM_PROMPT` with the rules block inserted before the answer format.
+/// `SYSTEM_PROMPT` with the rules block inserted before the answer format: for LOW-risk gating calls only (the block was replayed on Haiku).
 pub const SYSTEM_PROMPT_GATE: &str = concat!(prompt_head!(), "\n\n", gate_block!(), "\n\n", prompt_tail!());
+
+/// The system prompt for a gating call, chosen by risk (not by model name): `low` gets the block, `high` keeps `SYSTEM_PROMPT`.
+pub fn gate_system_prompt(risk: &str) -> &'static str {
+    if risk == "high" {
+        SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT_GATE
+    }
+}
 
 // ---- the prompt -------------------------------------------------------------------------------
 
@@ -350,7 +359,7 @@ pub trait ReviewBackend {
     fn name(&self) -> &'static str;
     /// Work out which program a call would run, and refuse a forbidden one, WITHOUT calling it.
     fn prepare(&self, cfg: &Config) -> Result<Cli, String>;
-    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, prompt: &str) -> Result<Review, CallError>;
+    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, system_prompt: &str, prompt: &str) -> Result<Review, CallError>;
 }
 
 /// The backend `reviewer_backend` names (config validation already refused anything but `claude`).
@@ -433,10 +442,10 @@ impl ReviewBackend for ClaudeCli {
         resolve_cli(cfg)
     }
 
-    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, prompt: &str) -> Result<Review, CallError> {
+    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, system_prompt: &str, prompt: &str) -> Result<Review, CallError> {
         let cwd = cfg.scratch_dir.join("review-cwd");
         std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
-        let mut args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT_GATE, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
+        let mut args: Vec<String> = ["-p", "--system-prompt", system_prompt, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
         if !effort.is_empty() {
             args.extend(["--effort".to_string(), effort.to_string()]);
         }
@@ -645,6 +654,14 @@ mod tests {
         let expect = format!("{}{}\n\n{}", &SYSTEM_PROMPT[..at], gate_block!(), &SYSTEM_PROMPT[at..]);
         assert_eq!(SYSTEM_PROMPT_GATE, expect);
         assert!(SYSTEM_PROMPT_GATE.contains("Be specific: name the file and line (from the diff) and the concrete scenario that fails.\n\nRules for BLOCKING lines:"));
+    }
+
+    #[test]
+    fn gate_prompt_is_chosen_by_risk() {
+        assert!(gate_system_prompt("low").contains("Rules for BLOCKING lines:"));
+        assert!(!gate_system_prompt("high").contains("Rules for BLOCKING lines:"));
+        assert_eq!(gate_system_prompt("high"), SYSTEM_PROMPT);
+        assert_eq!(gate_system_prompt("low"), SYSTEM_PROMPT_GATE);
     }
 
     #[test]
