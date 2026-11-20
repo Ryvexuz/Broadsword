@@ -20,11 +20,45 @@ mod sys;
 /// its creation time must equal the recorded `child_start` exactly (`sys::exact_match`). A record without a start
 /// time, or a pid that now belongs to another process, is never killed.
 fn kill_recorded_if_same(rec: &str) {
-    let (pid, start) = (Root::field(rec, "child_pid"), Root::field(rec, "child_start"));
-    let Ok(pid) = pid.parse::<u32>() else { return };
-    if sys::exact_match(start.parse::<u64>().ok(), sys::process_state(pid)) {
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+    let Some(p) = Proc::recorded(rec) else { return };
+    if p.alive() {
+        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &p.pid.to_string()]).output();
     }
+}
+
+/// One process, named by its pid AND its creation time. Windows hands a freed pid to a new process within seconds, so
+/// every "is it still running?" / "is it gone?" check in these tests asks about this pair, never about a bare pid: a bare
+/// pid check (`tasklist /FI "PID eq N"`) failed at the old recovery.rs:296 when, after `recover` had killed the orphan,
+/// a sibling test's `git.exe` got the same pid (t-20261120-002351). This is the only liveness check in this file.
+#[derive(Clone, Copy, Debug)]
+struct Proc {
+    pid: u32,
+    start: Option<u64>,
+}
+
+impl Proc {
+    /// The child a job record names (`child_pid` + `child_start`); `None` when the record names no child.
+    fn recorded(rec: &str) -> Option<Proc> {
+        let pid = Root::field(rec, "child_pid").parse().ok()?;
+        Some(Proc { pid, start: Root::field(rec, "child_start").parse().ok() })
+    }
+
+    /// The process that has `pid` right now (its creation time read now). Only for a pid this test keeps open (a
+    /// `Child` it holds, so the pid cannot be reused) or one it has just learned; a pid already gone has no start.
+    fn now(pid: u32) -> Proc {
+        Proc { pid, start: sys::start_time(pid) }
+    }
+
+    /// Is this exact process running? The product's strict identity rule (`sys::exact_match`): the live process with
+    /// this pid must have this creation time. A pid that now belongs to another process, or no known start, is not it.
+    fn alive(&self) -> bool {
+        sys::exact_match(self.start, sys::process_state(self.pid))
+    }
+}
+
+/// The child a record names, which the test then watches; panics (naming the record) when there is none.
+fn recorded_child(rec: &str) -> Proc {
+    Proc::recorded(rec).unwrap_or_else(|| panic!("the record names no child process:\n{rec}"))
 }
 
 struct Root {
@@ -49,11 +83,6 @@ fn sleepy_change() -> &'static str {
     } else {
         "echo changed > tracked.txt; echo partial > new.txt; sleep 30"
     }
-}
-
-fn pid_alive(pid: &str) -> bool {
-    let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().expect("tasklist");
-    text(&out.stdout).split_whitespace().any(|w| w == pid)
 }
 
 fn kill_hard(pid: u32) {
@@ -219,11 +248,11 @@ fn kill_mid_run_job_then_recover_rolls_back_and_keeps_partial_work() {
     });
     let rec = r.only_record();
     assert_eq!(Root::field(&rec, "status"), "running");
-    let (id, child) = (Root::field(&rec, "id"), Root::field(&rec, "child_pid"));
+    let (id, child) = (Root::field(&rec, "id"), recorded_child(&rec));
     assert_eq!(Root::field(&rec, "pid"), bs_pid.to_string());
 
     kill_hard(bs_pid);
-    assert!(pid_alive(&child), "the orphaned command should still be running after the crash");
+    assert!(child.alive(), "the orphaned command should still be running after the crash: {child:?}");
 
     // plain `recover` only lists the interrupted run (and kills its verified orphan): no file changes, exit 1
     let listed = r.run(&["recover"]);
@@ -241,7 +270,7 @@ fn kill_mid_run_job_then_recover_rolls_back_and_keeps_partial_work() {
     assert_eq!(out.status.code(), Some(0), "{so}");
     assert!(so.contains("rolled back"), "{so}");
     assert!(so.contains("git -C"), "tells how to see the partial work: {so}");
-    wait_until("orphan to die", 10, || !pid_alive(&child)); // killed by the plain recover above
+    wait_until("orphan to die", 10, || !child.alive()); // killed by the plain recover above
 
     // working tree is back at the checkpoint state; HEAD and the index are untouched
     assert_eq!(fs::read_to_string(p.join("tracked.txt")).unwrap(), "original\n");
@@ -281,9 +310,9 @@ fn kill_mid_check_job_then_recover_resumes_and_completes() {
             && fs::read_to_string(Root::field(&recs[0].1, "log")).map(|l| l.contains("running 1 test")).unwrap_or(false)
     });
     let rec = r.only_record();
-    let (old_id, child) = (Root::field(&rec, "id"), Root::field(&rec, "child_pid"));
+    let (old_id, child) = (Root::field(&rec, "id"), recorded_child(&rec));
     kill_hard(bs_pid);
-    assert!(pid_alive(&child), "orphaned cargo test should still be running");
+    assert!(child.alive(), "orphaned cargo test should still be running: {child:?}");
     fs::remove_file(p.join("sleep.flag")).unwrap();
 
     let out = r.run(&["recover"]);
@@ -293,7 +322,7 @@ fn kill_mid_check_job_then_recover_resumes_and_completes() {
     assert!(so.contains("killing orphaned process tree"), "{so}");
     assert!(so.contains("resuming `check p` from step `test`"), "{so}");
     assert!(so.contains("test: ok"), "{so}");
-    assert!(!pid_alive(&child));
+    assert!(!child.alive(), "recover must have killed the orphan: {child:?}");
 
     let recs = r.records();
     assert_eq!(recs.len(), 2, "{recs:?}");
@@ -320,7 +349,7 @@ fn recover_leaves_a_live_job_alone() {
     assert!(so.contains("still running") && so.contains("left alone"), "{so}");
     assert_eq!(r.only_record(), before, "record untouched");
     assert!(p.join("new.txt").exists(), "working tree untouched");
-    assert!(pid_alive(&Root::field(&before, "child_pid")));
+    assert!(recorded_child(&before).alive());
     let _ = bs_pid;
 }
 
@@ -487,7 +516,7 @@ fn auto_recover_does_not_roll_back_and_refuses_new_jobs_on_that_project() {
     let p = r.project_dir();
     let bs_pid = r.spawn(&["run", "p", "--", sleepy_change()]);
     wait_until("partial changes", 60, || r.records().len() == 1 && !Root::field(&r.records()[0].1, "child_pid").is_empty() && p.join("new.txt").exists());
-    let child = Root::field(&r.only_record(), "child_pid");
+    let child = recorded_child(&r.only_record());
     kill_hard(bs_pid);
     let out = r.run(&["run", "p", "--", "echo hi"]);
     let se = text(&out.stderr);
@@ -495,7 +524,7 @@ fn auto_recover_does_not_roll_back_and_refuses_new_jobs_on_that_project() {
     assert!(se.contains("broadsword recover"), "{se}");
     assert!(p.join("new.txt").exists(), "auto-recover must not touch the working tree");
     assert_eq!(Root::field(&r.only_record(), "status"), "running");
-    wait_until("orphan to be killed by auto-recover", 10, || !pid_alive(&child));
+    wait_until("orphan to be killed by auto-recover", 10, || !child.alive());
     let id = Root::field(&r.only_record(), "id");
     assert!(se.contains(&format!("broadsword recover {id}")), "the refusal names the exact command: {se}");
     let out = r.run(&["recover", &id]);
@@ -523,6 +552,22 @@ fn recover_lock_blocks_a_second_recover_and_stale_locks_are_taken_over() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 }
 
+/// t-20261120-002351: the tests' liveness check is not fooled by pid reuse. A live process stands in for "the new owner
+/// of a reused pid": the recorded process had the same pid but an earlier creation time, so it is gone, although a
+/// process with that pid is running (which is what made the old bare-pid check fail after a correct `recover`).
+#[test]
+fn a_reused_pid_is_not_taken_for_the_recorded_process() {
+    let mut r = Root::new("reuse");
+    let pid = r.sleeper();
+    let owner = Proc::now(pid);
+    assert!(owner.alive(), "the running process itself is alive: {owner:?}");
+    let start = owner.start.expect("a live process has a creation time");
+    let rec = format!("child_pid = {pid}\nchild_start = {}\n", start - 1);
+    let recorded = recorded_child(&rec);
+    assert!(!recorded.alive(), "pid {pid} is running, but as another process than the recorded one: {recorded:?}");
+    assert!(Proc::now(pid).alive(), "and the new owner is untouched");
+}
+
 /// Item 5: an orphan is killed only when its creation time matches exactly.
 #[test]
 fn unverifiable_child_pids_are_not_killed() {
@@ -537,7 +582,7 @@ fn unverifiable_child_pids_are_not_killed() {
     let so = text(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "the two interrupted runs are listed, not rolled back: {so}{}", text(&out.stderr));
     assert!(so.contains("NOT killed"), "{so}");
-    assert!(pid_alive(&a.to_string()) && pid_alive(&b.to_string()), "neither process may be killed");
+    assert!(Proc::now(a).alive() && Proc::now(b).alive(), "neither process may be killed"); // the test holds both Child handles, so neither pid can be reused
 }
 
 /// Item 6: a failed rollback leaves the record running, keeps everything, and exits non-zero.
@@ -638,8 +683,12 @@ fn a_check_job_that_panics_ends_failed_and_its_child_is_gone() {
     let (so, se) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(1), "{so}{se}");
     assert!(se.contains("TEST HOOK ACTIVE") && se.contains("PANIC in job"), "{se}");
-    let pid = so.split("killing orphaned process tree (pid ").nth(1).and_then(|t| t.split(')').next()).unwrap_or_else(|| panic!("the child must have been killed: {so}")).to_string();
-    wait_until("the child to be gone", 10, || !pid_alive(&pid));
+    let pid = so.split("killing orphaned process tree (pid ").nth(1).and_then(|t| t.split(')').next()).unwrap_or_else(|| panic!("the child must have been killed: {so}"));
+    // The record no longer names the child (a failed job clears it), so its creation time is read now: the kill has
+    // already returned, so this is normally `Gone` (no start, not alive); a pid already reused here would make the wait
+    // fail loudly, never pass by mistake.
+    let child = Proc::now(pid.parse().expect("a pid"));
+    wait_until("the child to be gone", 10, || !child.alive());
     // the ungated `run` above left its own record; this test is about the check job's
     let recs = r.records();
     let checks: Vec<&String> = recs.iter().map(|(_, t)| t).filter(|t| Root::field(t, "kind") == "check").collect();
