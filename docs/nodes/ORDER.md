@@ -203,3 +203,88 @@ These are later parts of a node, not its first briefs, so they are listed here a
 
 - 0.4: `CAPABILITY_ROADMAP.md:372` says "Needs: 0.1, 0.3"; ADR 0004's table says "Depends on nothing else" (`docs/adr/0004-roadmap-repo-map.md:78`). Graph A uses the roadmap.
 - 1.5 is mapped to stage 1 (`ROADMAP.md:24`) but needs 1.4, mapped to stage 4 (`ROADMAP.md:23`); `DEVELOPMENT_PLAN.md:24` and `:27` build stage 1 before stage 4. Section 5 lists every edge of this kind.
+
+## 3. Longest path
+
+**Method.** Each node counts 1; a path's length is its number of nodes. For every node, its level is 1 if it has no prerequisite, otherwise 1 + the highest level among its prerequisites (a memoised depth-first walk over the edges of section 2; no cycle was found). The longest path is the chain behind the highest level; ties are all listed. Brief counts are not used as weights, because only nine nodes have plans with briefs. The levels are in section 4.
+
+**Graph A (roadmap as written): 14 nodes, three ties.**
+
+- 0.1 -> 0.2 -> 0.3 -> 0.4 -> 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.7 -> 2.1 -> 2.2 -> 3.7 -> 4.3
+- 0.1 -> 0.2 -> 0.3 -> 0.4 -> 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.7 -> 2.1 -> 2.2 -> 3.8 -> 4.3
+- 0.1 -> 0.2 -> 0.3 -> 0.4 -> 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.7 -> 2.1 -> 2.2 -> 3.8 -> 4.4
+
+What makes it long is Tier 1 as a single file: 1.1 needs 0.1 to 0.4 (line 422), then 1.2 needs 1.1 (430), 1.3 needs 1.2 (438), 1.4 needs 1.3 (446), 1.5 needs 1.4 (454), 1.7 needs 1.5 (470), and 2.1 needs 1.7 (512). Counted in the plans' own brief rounds (section 4c, unlimited slots), the Tier 1 part of this chain alone, 1.1 to 1.5 then 1.7, is 6 + 6 + 5 + 7 + 7 + 5 = 36 rounds done one node after another.
+
+**Graph B (every Tier 1 waiver in section 2b accepted): 9 nodes, three ties.**
+
+- 0.1 -> 0.2 -> 0.3 -> 0.4 -> 2.8 -> 2.9 -> 3.11 -> 3.12 -> 4.5
+- 0.1 -> 0.2 -> 0.3 -> 0.4 -> 2.8 -> 3.10 -> 3.11 -> 3.12 -> 4.5
+- 0.1 -> 0.2 -> 0.3 -> 0.5 -> 0.6 -> 2.3 -> 3.19 -> 3.21 -> 4.8
+
+In graph B the Tier 1 chain is gone and the long paths run through Tier 0 and then numerics (2.8) into CAD, or through serialization and undo (0.5, 0.6) into the mesh kernel and simulation. 1.7 is on graph A's longest path; 2.8 is on two of graph B's. Section 5 uses both facts.
+
+**Not counted, because the Needs line names no node.** 5.1 ("at least two studios from Tier 4", line 894), 5.3 ("as each app comes online", line 910) and 5.4 ("the studios built so far", line 918). If 5.1 waited for the two studios at the top of graph A (4.3 and 4.4, level 14), graph A's longest path would end 4.3 -> 5.1 -> 5.2: 16 nodes. Which studios count is not stated.
+
+## 4. Lanes that can run side by side
+
+### 4a. Waves of graph A
+
+Every node in a wave has all its prerequisites in earlier waves, so all nodes of one wave can run side by side once the waves before it are done. ("Done" here means the dependency is met; `ROADMAP.md:5` says "Nothing is `done` yet", and the plans treat 0.1 as usable now, for example "Already usable" in `1.2.md:154`.)
+
+| Wave | Nodes | Width |
+| --- | --- | --- |
+| 1 | 0.1 | 1 |
+| 2 | 0.2, 0.7, 0.9 | 3 |
+| 3 | 0.3 | 1 |
+| 4 | 0.4, 0.5 | 2 |
+| 5 | 0.6, 1.1, 1.6, 1.9, 1.10, 2.8, 5.1 | 7 |
+| 6 | 0.8, 1.2, 2.3, 2.4, 3.1, 3.3, 3.10, 3.20, 5.2 | 9 |
+| 7 | 1.3, 1.11, 2.5, 3.2, 3.4, 3.13, 3.19, 5.3 | 8 |
+| 8 | 1.4, 2.9, 3.5, 3.21, 3.23, 3.24 | 6 |
+| 9 | 1.5, 3.11, 3.14, 4.11 | 4 |
+| 10 | 1.7, 1.8, 2.10, 3.12, 4.10, 5.4 | 6 |
+| 11 | 2.1, 2.6, 2.7, 3.6, 3.16, 3.17, 3.22, 3.25, 3.26, 4.5 | 10 |
+| 12 | 2.2, 3.9, 3.15, 3.18, 4.1, 4.8, 4.9 | 7 |
+| 13 | 3.7, 3.8, 4.2, 4.6, 4.7 | 5 |
+| 14 | 4.3, 4.4 | 2 |
+
+5.1 sits in wave 5 only because its studios are not named (section 3).
+
+### 4b. Waves of graph B
+
+| Wave | Nodes | Width |
+| --- | --- | --- |
+| 1 | 0.1, 1.7 | 2 |
+| 2 | 0.2, 0.7, 0.9, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8 | 10 |
+| 3 | 0.3, 1.11, 2.10, 5.4 | 4 |
+| 4 | 0.4, 0.5, 2.1, 3.24, 3.25, 3.26 | 6 |
+| 5 | 0.6, 1.9, 1.10, 2.2, 2.4, 2.8, 3.15, 4.9, 4.11, 5.1 | 10 |
+| 6 | 0.8, 2.3, 2.5, 2.6, 2.7, 2.9, 3.1, 3.3, 3.10, 3.16, 3.20, 3.22, 5.2 | 13 |
+| 7 | 3.2, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.11, 3.13, 3.14, 3.17, 3.18, 3.19, 3.23, 4.1, 5.3 | 16 |
+| 8 | 3.12, 3.21, 4.2, 4.3, 4.4, 4.6, 4.7, 4.10 | 8 |
+| 9 | 4.5, 4.8 | 2 |
+
+Graph B is only as true as the waivers: a wave-2 Tier 1 node whose waiver Lazlo refuses moves back to its graph A place. The later parts in section 2c (1.3's GPU backend, the 1.7 panel, the 1.8 widget on screen, the sandbox) are outside both tables.
+
+### 4c. The lanes that can start now: the nine plans
+
+These are the only nodes with first briefs written. Each plan creates its own new repo (ADR 0001 option a: "no Cargo dependency (path or git) on another repo", for example `1.7.md:227`), so their claims never overlap and the nine lanes can run side by side, subject to the gate in the last column. "Rounds" counts brief waves from each plan's Depends-on column with unlimited slots; "peak" is the most briefs that column lets run at once.
+
+| Lane | Repo | Briefs | Rounds | Peak | Order stated in the plan | Gate before the first brief |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.1 | `projects/window-input` | W1 to W10 | 6 ("five or six rounds", `1.1.md:295`) | 3 | `1.1.md:295` | new repo, a step for Lazlo to approve (`1.1.md:284`); waiver (`1.1.md:223`) |
+| 1.2 | `projects/gpu` | G1 to G10 | 6 by the Dep column (`1.2.md:205-214`); the prose at `1.2.md:201` puts G3 beside G2, but G3's Dep is G2 | 3 | `1.2.md:216` | decisions D1 (G1) and D2, D3 (G2) (`1.2.md:201`) |
+| 1.3 | `projects/vector2d` | V1 to V10 | 5 by the Dep column; "about six rounds" with three slots (`1.3.md:275`) | 5 | `1.3.md:275` | new repo, Lazlo approves (`1.3.md:264`); V10 also needs Lazlo's suite and licence choice (`1.3.md:273`) |
+| 1.4 | `projects/text` | X1 to X10 | 7 | 2 | `1.4.md:260`, `1.4.md:275` | D1 (X1); D2 to D4 (X2) (`1.4.md:260`) |
+| 1.5 | `projects/shell` (project name, `1.5.md:408`) | S1 to S10, P1 to P3 | 7 ("seven rounds", `1.5.md:424`) | 3 | `1.5.md:424` | new repo, Lazlo approves (`1.5.md:408`); waiver and the undo-stack question (`1.5.md:324`); the 0.7 overlap (`1.5.md:322`) |
+| 1.6 | `projects/reflect` | R1 to R10 | 5 by the Dep column (R9 needs R3 to R6 only); the prose orders R9 after R7 and R8, which makes 6 (`1.6.md:240`) | 4 | `1.6.md:240` | D1 (`1.6.md:229`) |
+| 1.7 | `projects/nodegraph` | N1 to N10 | 5 ("Five waves, at most four briefs at once", `1.7.md:365`) | 4 | `1.7.md:365` | D1 (`1.7.md:354`); waiver (`1.7.md:273`) |
+| 1.8 | `projects/timeline` | TL1 to TL10 | 4 ("four rounds", `1.8.md:363`) | 5 | `1.8.md:363` | new repo, Lazlo approves (`1.8.md:350`); waiver (`1.8.md:290`) |
+| sandbox | the 1.5 shell repo (edits P2's files) and `broadsword.toml` (X0) | X0 to X6 | 6 ("six rounds", `sandbox.md:380`) | 2 | `sandbox.md:380` | 1.5's P3 merged (`sandbox.md:283`); Lazlo's values (X0) and OK (X1) (`sandbox.md:372-373`) |
+
+**What this gives the board.** Round 1 is eight skeleton briefs (W1, G1, V1, X1, S1, R1, N1, TL1), one per repo. Round 2 offers 3 + 3 + 5 + 2 + 2 + 1 + 2 + 5 = 23 briefs (1.1 W2 to W4; 1.2 G2, G5, G6; 1.3 V2 to V5 and V9; 1.4 X2, X6; 1.5 S2, S5; 1.6 R2; 1.7 N2, N5; 1.8 TL2, TL3, TL4, TL6, TL7), more than the 14 slots `broadsword.toml` sets today (`max_agents = 14`). With the waivers, all eight Tier 1 plans finish in 7 rounds at unlimited slots (the longest are 1.4 and 1.5); the sandbox follows 1.5's P3 (round 5 of 1.5) and ends about round 11. Without the waivers, the same plans run one node after another along graph A (36 rounds for 1.1 to 1.5 and 1.7, section 3).
+
+**Suggested lane order when slots are short** (the orchestrator's call, from the facts above, not from the plans): 1.7 and 1.8 first, since they are the two compounders in decision 1 and 1.7 has no prerequisite in graph B; then 1.5 and 1.4 (7 rounds each, the longest lanes, and the sandbox waits on 1.5); then 1.1, 1.2, 1.3, 1.6.
+
+**Tier 0 lane, beside the plans.** Graph B's longest paths all start 0.1 -> 0.2 -> 0.3 and then 0.4 or 0.5 (section 3), so Tier 0 work (now started in `projects/foundation`) is on the critical path in both graphs and should keep a slot of its own. No Tier 0 node other than 0.1 has a plan in `docs/nodes/`.
