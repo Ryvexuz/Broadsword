@@ -142,21 +142,31 @@ Moving shared memory to the GPU is a BIOS change Lazlo makes by hand, followed b
 lowers the RAM agents can use (`docs/MOVING.md`, steps 2 and 3). A memory note is not enough, so:
 
 - **Marking:** a plan or board task that needs the GPU more than the software adapter does (large textures, big
-  compute, local model) says `gpu-heavy` in its brief Board block.
-- **The check, run by the orchestrator before it starts a `gpu-heavy` task:** read the GPU memory the machine reports
-  and compare it with the number in a new required `broadsword.toml` key (proposed name `gpu_heavy_min_dedicated_gb`,
-  no default in code). Pass: the task starts. Fail: the task stays `open`, and the orchestrator writes one line in
-  `state/pc-inbox.md` asking Lazlo to change the split, then starts other work. It never changes BIOS or system
-  settings itself.
+  compute, local model) carries the key `gpu-heavy: yes` in its brief Board block. A brief key is all this is today.
+- **What exists today, said plainly:** no program reads that key and no program checks the GPU memory. The rule is a
+  **brief key that the orchestrator verifies by hand** before it starts a `gpu-heavy` task. The hand check is this
+  command (PowerShell), which prints the dedicated GPU memory in bytes:
+
+  ```
+  Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*" -Name HardwareInformation.qwMemorySize -ErrorAction SilentlyContinue | ForEach-Object { $_.'HardwareInformation.qwMemorySize' }
+  ```
+
+  Output it must show: one line holding the number of bytes for the Radeon 8060S, and the task starts only if that
+  number is at least the `gpu-heavy` task's stated need (for example 34359738368 for 32 GB). On this PC, read on
+  2026-11-19, the command printed `17179869184` (16 GiB), the current split. Fail: the task stays `open`, the
+  orchestrator writes one line in `state/pc-inbox.md` asking Lazlo to change the split, then starts other work. It never
+  changes BIOS or system settings itself. An empty output counts as a failure, not a pass.
 - **Batching:** because a split change reboots the PC, `gpu-heavy` tasks are started together after one change, and the
   split is changed back only when none is left.
-- **How the number is read** (the mechanism is a follow-up task, not decided here): candidates are the dedicated-memory
-  counter Windows keeps per adapter, or the adapter's reported limits from `wgpu`. The old WMI `AdapterRAM` field is
-  known to cap near 4 GB and must not be used. The follow-up chooses one and proves it on the EVO-X3 by showing the
-  value before and after a split change.
-- **Not yet in force:** neither the key nor the check exists. Until the follow-up task is merged this is a stated rule
-  with no mechanism, and the orchestrator checks by hand (Task Manager, Performance, GPU), as `docs/MOVING.md` already
-  describes. Per the playbook it must be labelled that way until it is enforced.
+- **Why not WMI:** `Win32_VideoController.AdapterRAM` is a 32-bit field, so it cannot show more than 4 GB. Measured on this
+  PC on 2026-11-19 it printed `4293918720` for the same Radeon 8060S that the registry value above reports as 16 GiB.
+  WMI `AdapterRAM` is therefore unreliable for this rule and must not be used. Task Manager, Performance, GPU
+  ("Dedicated GPU memory") is a second, manual cross-check, as `docs/MOVING.md` describes.
+- **Not yet in force:** this whole rule is labelled "not yet in force" as a program check. Proposed follow-up F1 (below)
+  turns it into code: a required `broadsword.toml` key (proposed name `gpu_heavy_min_dedicated_gb`, no default in code)
+  and a check that runs the command above (or reads the adapter limits from `wgpu`), proven on the EVO-X3 by showing the
+  value before and after a split change. Until F1 is merged, the hand check above is the only mechanism, and the
+  orchestrator's report names it as such.
 
 ## How vendoring would work (for options A2 and B2)
 
@@ -197,35 +207,45 @@ This is the mechanism the recommendation depends on; each point is a requirement
 
 ## What each option unblocks (every wrap-first and GPU node named)
 
-"Needs" is what the node cannot reach its roadmap done check without. Node numbers and wording are from
-CAPABILITY_ROADMAP.md.
+**Source of the node list:** `CAPABILITY_ROADMAP.md`, Tier 1 to Tier 4 tables (read 2026-11-19). The rule used to pick
+rows: (a) every node marked `\[wrap first\]` (1.9, 1.11, 2.7, 3.10, 3.24); (b) every node that needs the GPU in its own
+text (1.2, and 1.3 with "GPU paths"); (c) every node whose "Builds on" column lists a row already in the table, directly
+or through a chain (computed from the roadmap's tables: 26 rows from the seeds 1.2, 1.9, 1.11, 2.7, 3.10, 3.24, plus 1.3
+as the 27th). Dependents of 1.3 are not listed, because 1.3 starts as a CPU path (C1). Tier 5 nodes (5.1 to 5.4) build on
+"all studios" and inherit whatever the studios use. "none chosen yet" always has its reason in the same row.
 
-| Node | Needs | Option | Licence note | Without it |
+| Node | Library or GPU API | Option | Licence note | Without it |
 | --- | --- | --- | --- | --- |
-| 1.2 GPU abstraction | `wgpu` (crate), headless software adapter | A2 + C2 | MIT/Apache-2.0 | Done check ("same shader on two backends") cannot be met |
+| 1.2 GPU abstraction | `wgpu` (crate), headless software adapter | A2 + C2 | MIT/Apache-2.0 | Done check (same shader on two backends) cannot be met |
+| 1.3 2D vector renderer | none chosen yet: the roadmap says "GPU paths" but a CPU path can come first | C1 first, C2 later | none | CPU rasteriser only; GPU paths wait for 1.2 |
 | 1.9 Media I/O \[FFmpeg, OpenEXR\] | FFmpeg (LGPL, dynamic) and OpenEXR | B2 | FFmpeg LGPL-only build; OpenEXR BSD | Own PPM/WAV/PNG-level I/O only; "4K H.264 plays in real time" cannot be met |
 | 1.11 Color management \[OpenColorIO\] | OpenColorIO | B2 | BSD-3 | Own linear/sRGB maths only; "matches a reference across every app" cannot be met |
+| 2.1 Raster image engine | `wgpu` (via 1.2) and OpenColorIO (via 1.11) | C2 + B2 | MIT/Apache-2.0; BSD-3 | No GPU tiles or colour-managed layers; a CPU-only 16k image will not stay interactive |
+| 2.2 Brush engine | none chosen yet: no library of its own; inherits 2.1 (GPU) | C2 (via 2.1) | none | CPU dabs on a CPU image only |
+| 2.5 Real-time renderer | `wgpu` (via 1.2) | C2 | MIT/Apache-2.0 | Software rasteriser only; glTF reference match at real-time speed cannot be met |
 | 2.7 Audio DSP engine \[CLAP/VST3 SDK\] | CLAP first (C API); VST3 only if its licence allows | B2 | CLAP MIT; VST3 verify | Built-in effects only; "a third-party plugin loads" cannot be met |
+| 3.5 Path tracer | none chosen yet: the roadmap names no library; a CPU path tracer is possible first, a GPU one later via 1.2 | C1 first, C2 later | none | CPU tracer only |
+| 3.7 Sculpting | none chosen yet: no library of its own; GPU display through 2.2 and 2.5 | C2 (via 2.2) | none | CPU display only; 5M-polygon interactivity unlikely |
+| 3.8 Texture painting and material authoring | none chosen yet: no library of its own; GPU through 2.1 and 2.5 | C2 (via 2.1, 2.5) | none | CPU painting and baking only |
 | 3.10 B-rep CAD kernel \[OpenCASCADE\] | OpenCASCADE | B2 | LGPL with exception, dynamic | "Import a STEP file, fillet an edge, export a STEP" cannot be met |
+| 3.11 Parametric feature tree | OpenCASCADE (via 3.10) | B2 | as 3.10 | No solid history on top of a kernel |
+| 3.12 Assemblies and drawings | OpenCASCADE (via 3.11); DXF/DWG: none chosen yet, the DXF text format can be written by us (B1), DWG needs a library decision in its plan | B2 + B1 | as 3.10 | No solid assemblies |
+| 3.13 CAM | OpenCASCADE (via 3.10) | B2 | as 3.10 | No toolpaths from real solids |
+| 3.15 Compositor and colour grading | `wgpu` (via 2.1) and OpenColorIO (via 1.11) | C2 + B2 | MIT/Apache-2.0; BSD-3 | CPU node comp, no colour-managed grade |
+| 3.16 Nonlinear video editing | FFmpeg (via 1.9, LGPL, dynamic) | B2 | as 1.9 | "10-minute 4K piece with no dropped frames" cannot be met |
+| 3.18 DAW features | CLAP host (via 2.7) | B2 | CLAP MIT | No plugin routing in the DAW |
 | 3.24 GIS core \[PROJ, GDAL\] | PROJ and GDAL | B2 | MIT | Hand-written projections only; OSM/DEM loading limited to formats we write ourselves |
+| 4.1 Game runtime | `wgpu` (via 2.5) and CLAP host (via 2.7) | C2 + B2 | as 2.5, 2.7 | No GPU renderer or plugin audio in the game |
+| 4.2 Game editor | inherits 4.1 (builds on it) | as 4.1 | as 4.1 | as 4.1 |
+| 4.3 DCC Studio | inherits 2.5, 3.5, 3.7, 3.8 (GPU) | C2 | as 2.5 | CPU-only studio |
+| 4.4 Image and Texture Studio | inherits 2.1 (GPU + OpenColorIO) and 3.8 | C2 + B2 | as 2.1 | CPU-only studio |
+| 4.5 CAD Studio | OpenCASCADE (via 3.10 to 3.13) | B2 | as 3.10 | No STEP-capable studio |
+| 4.6 Media Studio | FFmpeg (via 3.16), OpenColorIO (via 3.15), CLAP (via 3.18) | B2 + C2 | as those nodes | No delivery of a finished video |
+| 4.7 Audio Studio | CLAP host (via 2.7, 3.18) | B2 | CLAP MIT | No plugin hosting in the studio |
+| 4.11 Geo Studio | PROJ and GDAL (via 3.24) | B2 | MIT | No real terrain input |
 
-Nodes that use the GPU but do not themselves wrap a library (they need C2 from node 1.2 and, where they depend on a
-wrap-first node, that node too):
-
-| Node | Why it needs the GPU or a wrapped node | Option |
-| --- | --- | --- |
-| 1.3 2D vector renderer | The roadmap says "GPU paths"; a CPU path is possible first (C1) | C1 first, C2 later |
-| 2.1 Raster image engine | Depends on 1.2 and 1.11 | C2 and B2 (OCIO) |
-| 2.5 Real-time renderer | Depends on 1.2 | C2 |
-| 3.15 Compositor and colour grading | Depends on 2.1 and 1.11 | C2 and B2 (OCIO) |
-| 3.16 Nonlinear video editing | Depends on 1.9 (FFmpeg) | B2 |
-| 3.11 to 3.13 CAD features, CAM | Depend on 3.10 (OpenCASCADE) | B2 |
-| 3.18 DAW features | Depends on 2.7 | B2 (CLAP) |
-| 4.1, 4.5, 4.6, 4.7, 4.11 (studios and game runtime) | Inherit the nodes above | whichever their parents use |
-
-Everything not named in either table stays on A1 and B1 unless its own plan proves otherwise and Lazlo agrees.
-(The second table is built from the dependency column of CAPABILITY_ROADMAP.md; the plans for each node, written in
-the `ra-<node>` tasks, confirm or correct it.)
+Everything not named in the table stays on A1 and B1 unless its own plan proves otherwise and Lazlo agrees. The plans
+for each node (the `ra-<node>` tasks) confirm or correct each row.
 
 ## What would make this recommendation wrong (triggers)
 
@@ -248,7 +268,7 @@ the `ra-<node>` tasks, confirm or correct it.)
 These are proposals for the orchestrator to board only after Lazlo accepts or changes this ADR. They are not part of
 this task and nothing here has been done.
 
-- F1: `broadsword.toml` keys `gpu_heavy_min_dedicated_gb` and one `native_<library>_dir` key per wrapped library
+- F1 (turns the EVO-X3 hand check into code; until then the rule is not yet in force as a program check): `broadsword.toml` keys `gpu_heavy_min_dedicated_gb` and one `native_<library>_dir` key per wrapped library
   (required, no defaults), plus the orchestrator check for `gpu-heavy` tasks (mechanism proved on the EVO-X3).
 - F2: the dependency manifest and `shared/` rebuild command, with the root source replacement and `--offline` proven from a
   fresh task worktree.
