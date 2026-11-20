@@ -377,6 +377,46 @@ fn project_names_are_canonical_whatever_the_case_or_trailing_dot() {
     assert_eq!(r.list(&["--project", "CRASH"]).len(), 3);
 }
 
+/// Rewrite the `project = ...` line of a stored task, as an older Broadsword or a hand edit could have left it.
+fn set_stored_project(r: &Root, id: &str, name: &str) {
+    let path = r.dir.join("state").join("tasks").join(format!("{id}.task"));
+    let text = fs::read_to_string(&path).unwrap();
+    let new: Vec<String> = text.lines().map(|l| if l.starts_with("project = ") { format!("project = {name}") } else { l.to_string() }).collect();
+    assert_ne!(new.join("\n"), text.trim_end_matches('\n'), "the project line must have changed");
+    fs::write(&path, new.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn a_stored_project_name_in_another_case_still_holds_its_claims() {
+    let r = Root::new("stored-case");
+    fs::create_dir_all(r.dir.join("projects/Crash-Sim")).unwrap();
+    fs::write(r.dir.join("projects/Crash-Sim/Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let a = r.add("crash-sim", "a", &["src"]);
+    let b = r.add("Crash-Sim", "b", &["src"]);
+    assert_eq!(r.start(&a, "one").code, 0);
+    // a record written before names were canonical (or edited by hand) says `crash-sim`, `CRASH-SIM` ...
+    set_stored_project(&r, &a, "crash-sim");
+    set_stored_project(&r, &b, "CRASH-SIM");
+    let o = r.start(&b, "two");
+    assert_eq!(o.code, 3, "`crash-sim` and `CRASH-SIM` are one project: {}", o.stderr);
+    assert!(o.stderr.contains(a.as_str()), "{}", o.stderr);
+    assert_eq!(r.status_of(&b), "open");
+    // ... and list --project finds both under the folder's name
+    assert_eq!(r.list(&["--project", "Crash-Sim"]).len(), 2);
+    assert_eq!(r.list(&["--project", "CRASH-SIM"]).len(), 2);
+}
+
+#[test]
+fn a_stored_name_with_no_project_folder_is_compared_case_folded() {
+    let r = Root::new("stored-gone");
+    let a = r.add("p", "a", &["src"]);
+    let b = r.add("p", "b", &["src"]);
+    set_stored_project(&r, &a, "Gone");
+    set_stored_project(&r, &b, "gone");
+    assert_eq!(r.start(&a, "one").code, 0);
+    assert_eq!(r.start(&b, "two").code, 3, "`Gone` and `gone` must not be two projects");
+}
+
 #[test]
 fn sixteen_gated_starts_with_a_garbage_lock_and_a_big_board_never_give_two_running() {
     // The reviewer's repro: a garbage lock file, 16 simultaneous starts all claiming `src`, and thousands of records so the

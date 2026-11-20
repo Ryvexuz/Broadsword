@@ -199,6 +199,21 @@ pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The ONE place a stored project name is normalised: the folder name `broadsword projects` lists (job::canonical_project,
+/// case-insensitive), or, when the name matches no project folder, the case-folded name (so `Gone` and `gone` still agree).
+/// Every task record passes through here when it is loaded, so claims, conflicts and `list --project` only ever see
+/// normalised names, whatever an old or hand-edited record says.
+pub fn project_key(cfg: &Config, name: &str) -> String {
+    job::canonical_project(&cfg.projects_dir, name).unwrap_or_else(|_| name.to_lowercase())
+}
+
+fn normalise_record(cfg: &Config, r: &mut Record) {
+    let key = project_key(cfg, r.get("project"));
+    if key != r.get("project") {
+        r.set("project", key);
+    }
+}
+
 /// Every task. A record that cannot be read is an error (never silently skipped: `start` decides on this list);
 /// an empty file, which only exists for an instant while `add` creates a task, is skipped.
 pub fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
@@ -231,7 +246,10 @@ pub fn load_tasks(cfg: &Config) -> Result<Vec<Record>, String> {
             }
         }
         match rec {
-            Some(r) if !r.id().is_empty() => v.push(r),
+            Some(mut r) if !r.id().is_empty() => {
+                normalise_record(cfg, &mut r);
+                v.push(r)
+            }
             Some(_) => {}
             None => return Err(last),
         }
@@ -247,7 +265,10 @@ pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     }
     let path = tasks_dir(cfg).join(format!("{id}.{EXT}"));
     match record::load(&path) {
-        Ok(r) if r.id() == id => Ok(r),
+        Ok(mut r) if r.id() == id => {
+            normalise_record(cfg, &mut r);
+            Ok(r)
+        }
         _ => Err(nope()),
     }
 }
@@ -626,7 +647,7 @@ pub fn cmd_list(cfg: &Config, status: Option<&str>, project: Option<&str>) -> Ex
         Err(e) => return fail(EXIT_ERROR, e),
     };
     // the filter is canonicalised like every project name; an unknown name just matches nothing
-    let project = project.map(|p| job::canonical_project(&cfg.projects_dir, p).unwrap_or_else(|_| p.to_string()));
+    let project = project.map(|p| project_key(cfg, p));
     let shown: Vec<&Record> = all.iter().filter(|t| status.is_none_or(|s| t.status() == s) && project.as_deref().is_none_or(|p| t.get("project") == p)).collect();
     if shown.is_empty() {
         println!("no tasks{}", if status.is_some() || project.is_some() { " match" } else { "" });
