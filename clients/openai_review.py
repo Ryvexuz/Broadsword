@@ -36,8 +36,8 @@ Two gates sit at the lowest level every GPT call passes through: the cap and led
    highest listed price (never 0). Calls running at the same moment can overshoot the cap by what they cost: the check is made
    before a call, not held across it. Cap 0 means no GPT call at all. `caller` comes from OPENAI_REVIEW_CALLER ("unlabelled" if absent).
 2. Codex canary (Lazlo 2026-11-19: re-run the shadow canary after any Codex update). Before any codex process other than
-   `codex --version` is started, the current version is compared with <checkout>/<state_dir>/canary/last-pass.json (written by
-   scripts/shadow_canary.py on a full PASS). Missing, unreadable or different: scripts/shadow_canary.py --offline-only runs as a child
+   `codex --version` is started, the current version is compared with <root>/<state_dir>/canary/last-pass.json (<root> is the main
+   Broadsword root, also from a worktree: there is one record; written by scripts/shadow_canary.py on a full PASS). Missing, unreadable or different: scripts/shadow_canary.py --offline-only runs as a child
    (no model call) with the codex child environment. It must exit 0 AND leave a last-pass.json naming this version, else no codex is
    started and the result is is_error with codex_error "canary_failed: <reason>". `codex --version` failing, or no codex found, is "codex_unavailable".
    Neither falls back to the API: the queue records the shadow as ERROR and goes on.
@@ -626,7 +626,10 @@ review_codex = metered("codex", review_codex)
 
 
 def canary_state_file(root: Path) -> Path:
-    return HERE.parent / state_dir_of(root) / "canary" / "last-pass.json"
+    """The ONE canary record: <root>/<state_dir>/canary/last-pass.json, where `root` is the main Broadsword root (oc.find_main_root,
+    the folder holding broadsword.toml that every other gate here uses). Never the checkout this file runs from: a worktree's own
+    state/ folder is not read, even if one exists there, so every checkout sees the same record that shadow_canary.py writes."""
+    return root / state_dir_of(root) / "canary" / "last-pass.json"
 
 
 def read_last_pass(path: Path):

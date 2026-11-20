@@ -499,6 +499,46 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((self.root / "scripts" / "canary-ran").exists(), "a recorded pass for this version: no canary run")
         self.assertTrue((self.codex_dir / "started").is_file())
 
+    def make_worktree(self, main_planted, wt_planted):
+        """A temp main ROOT (make_root) plus a linked "worktree" inside it, as Broadsword lays them out: ROOT/worktrees/broadsword/wt
+        with its own broadsword.toml, copies of the wrapper, the fake canary (set to FAIL) and a `.git` FILE pointing at
+        ROOT/.git/worktrees/wt. Returns (root, worktree). wt_planted puts a last-pass.json in the worktree's own state/ too."""
+        root = self.make_root(planted=main_planted)
+        gitdir = root / ".git" / "worktrees" / "wt"
+        gitdir.mkdir(parents=True)
+        wt = root / "worktrees" / "broadsword" / "wt"
+        (wt / "clients").mkdir(parents=True)
+        (wt / "scripts").mkdir()
+        for name in ("openai_review.py", "openai_mcp.py"):
+            shutil.copy(HERE / name, wt / "clients" / name)
+        (wt / "scripts" / "shadow_canary.py").write_text(FAKE_CANARY_PY, encoding="utf-8")
+        (wt / "broadsword.toml").write_text('state_dir = "state"\n', encoding="utf-8")
+        (wt / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        (wt / "canary_mode").write_text("fail", encoding="utf-8")
+        (wt / "canary_version").write_text(CODEX_VERSION, encoding="utf-8")
+        if wt_planted:
+            (wt / "state" / "canary").mkdir(parents=True)
+            (wt / "state" / "canary" / "last-pass.json").write_text(json.dumps({"codex_version": CODEX_VERSION}), encoding="utf-8")
+        return root, wt
+
+    def test_from_a_worktree_the_root_record_is_read(self):
+        root, wt = self.make_worktree(main_planted="match", wt_planted=False)
+        p = self.run_script(codex="ok", root=wt)
+        j = json.loads(p.stdout)
+        self.assertEqual((p.returncode, j["backend"], j["is_error"]), (0, "codex", False), j)
+        self.assertFalse((wt / "scripts" / "canary-ran").exists(), "the root's pass for this version counts: no canary run")
+        self.assertTrue((self.codex_dir / "started").is_file())
+        self.assertTrue(any((root / "state" / "gpt-spend").glob("*.tsv")), "the ledger is the root's too")
+
+    def test_from_a_worktree_its_own_record_is_never_read(self):
+        root, wt = self.make_worktree(main_planted="stale", wt_planted=True)
+        p = self.run_script(codex="ok", root=wt)
+        j = json.loads(p.stdout)
+        self.assertTrue(j["is_error"] and j["codex_error"].startswith("canary_failed"), j)
+        self.assertTrue((wt / "scripts" / "canary-ran").is_file(), "the root's record is stale, so the canary had to run")
+        self.assertFalse((self.codex_dir / "started").exists(), "a matching record in the worktree's own state/ is not a pass")
+        self.assertEqual(Fake.seen, [])
+
     def test_codex_version_failing_is_codex_unavailable_with_no_canary(self):
         p = self.run_script(codex="ok", version="FAIL", planted="stale")
         j = json.loads(p.stdout)

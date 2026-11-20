@@ -25,7 +25,8 @@ Exit codes:
      wrapper reported tool use (it then discards the answer, so the canary must assume the worst).
   2  INCONCLUSIVE: codex did not run or did not answer, or the setup failed; nothing was proven.
 
-On a full PASS (exit 0: leg A, and leg B when it ran) it writes <checkout>/<state_dir>/canary/last-pass.json atomically:
+On a full PASS (exit 0: leg A, and leg B when it ran) it writes <root>/<state_dir>/canary/last-pass.json atomically (<root> is the
+main Broadsword root, oc.find_main_root, also when the canary runs from a worktree; there is no per-worktree record):
 {"codex_version", "utc", "legs", "model"}. Never on a FAIL. clients/openai_review.py compares codex_version with `codex --version`
 before it starts codex and runs `shadow_canary.py --offline-only` itself when they differ (an --offline-only pass is recorded with
 legs ["A"] and model null). If `codex --version` fails the legs cannot be recorded and the exit code is 2.
@@ -39,7 +40,8 @@ provider; system-level codex config (%ProgramData%\\OpenAI\\Codex\\requirements.
 It tests the wrapper NEXT TO THIS SCRIPT (<checkout>/clients/openai_review.py). The queue runs <root>/clients/openai_review.py, so
 after a merge run the canary from the main checkout. Settings come from broadsword.toml at the main root: scratch_dir,
 shadow_reviewer_model (unless --model is given) and shadow_reviewer_timeout_seconds. The system prompt is read from
-crates/broadsword/src/reviewer.rs of this checkout.
+crates/broadsword/src/reviewer.rs of this checkout by queue_system_prompt (an allow-listed parse; any other form is INCONCLUSIVE).
+--show-prompt prints the parsed prompt's first 80 characters and its length and exits (no codex, no model, nothing recorded).
 """
 
 import sys
@@ -87,13 +89,97 @@ def secret_name(name: str) -> bool:
     )
 
 
-def queue_system_prompt(path: Path) -> str:
-    """reviewer.rs SYSTEM_PROMPT, the exact text the queue sends."""
-    text = path.read_text(encoding="utf-8")
-    m = re.search(r'pub const SYSTEM_PROMPT: &str = "((?:[^"\\]|\\.)*)";', text, re.S)
+# Leg B needs the exact text the queue sends. reviewer.rs builds it at compile time, so this is a small, allow-listed evaluator of
+# the only forms it accepts; anything else raises PromptParseError (the canary is then INCONCLUSIVE, never a pass):
+#   pub const SYSTEM_PROMPT: &str = "<literal>";
+#   pub const SYSTEM_PROMPT: &str = concat!(<piece>, <piece>, ...);    a piece is "<literal>" or name!() with no arguments,
+#   macro_rules! name { () => { "<literal>" }; }                       defined exactly once in the file, its body ONE literal.
+# A <literal> is a plain Rust string literal: no raw strings (r"..."), no byte strings, and only the escapes \n \t \r \0 \\ \" \'.
+# Other escapes (\x.., \u{..}, a backslash before a line break) are refused, not guessed. CRLF in the file reads as LF, as rustc
+# reads it; a bare CR is refused.
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+
+
+class PromptParseError(ValueError):
+    """reviewer.rs does not build SYSTEM_PROMPT in a form this parser allows."""
+
+
+def rust_literal(text: str, at: int, path: Path) -> tuple:
+    """(value, index after the closing quote) of the plain string literal that starts at text[at]."""
+    if at >= len(text) or text[at] != '"':
+        raise PromptParseError(f"expected a string literal at offset {at} of {path}")
+    out, i = [], at + 1
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            return "".join(out), i + 1
+        if c == "\\":
+            e = text[i + 1] if i + 1 < len(text) else ""
+            if e not in ESCAPES:
+                shown = repr(chr(92) + e)  # chr(92) is the backslash
+                raise PromptParseError(f"unsupported escape {shown} in a string literal at offset {i} of {path}")
+            out.append(ESCAPES[e])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    raise PromptParseError(f"unterminated string literal at offset {at} of {path}")
+
+
+def prompt_macro(text: str, name: str, path: Path) -> str:
+    """The literal body of `macro_rules! name { () => { "..." }; }`, which must be defined exactly once."""
+    heads = list(re.finditer(rf"macro_rules!\s+{re.escape(name)}\b", text))
+    if len(heads) != 1:
+        raise PromptParseError(f"macro {name}! is defined {len(heads)} times in {path}; exactly one definition is allowed")
+    m = re.compile(r"\s*\{\s*\(\s*\)\s*=>\s*\{\s*").match(text, heads[0].end())
     if not m:
-        raise ValueError(f"SYSTEM_PROMPT not found in {path}")
-    return re.sub(r"\\(.)", lambda e: {"n": "\n", "t": "\t"}.get(e.group(1), e.group(1)), m.group(1))
+        raise PromptParseError(f"macro {name}! in {path} is not of the form `{{ () => {{ \"...\" }}; }}`")
+    value, end = rust_literal(text, m.end(), path)
+    if not re.compile(r"\s*\}\s*;?\s*\}").match(text, end):
+        raise PromptParseError(f"macro {name}! in {path} holds more than one string literal")
+    return value
+
+
+def queue_system_prompt(path: Path) -> str:
+    """reviewer.rs SYSTEM_PROMPT, the exact text the queue sends (see the grammar above). Raises PromptParseError otherwise."""
+    text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")  # bytes: read_text would also turn a bare CR into LF
+    if "\r" in text:
+        raise PromptParseError(f"{path} holds a bare CR")
+    heads = list(re.finditer(r"(?m)^pub const SYSTEM_PROMPT\s*:\s*&str\s*=\s*", text))
+    if len(heads) != 1:
+        raise PromptParseError(f"`pub const SYSTEM_PROMPT: &str =` appears {len(heads)} times in {path}; exactly one is allowed")
+    i = heads[0].end()
+    if text.startswith('"', i):
+        prompt, i = rust_literal(text, i, path)
+    else:
+        m = re.compile(r"concat!\s*\(").match(text, i)
+        if not m:
+            raise PromptParseError(f"SYSTEM_PROMPT in {path} is neither a string literal nor concat!(...)")
+        i, pieces, piece = m.end(), [], re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)!\s*\(\s*\)")
+        while True:
+            i = re.compile(r"\s*").match(text, i).end()
+            if text.startswith(")", i) and pieces:
+                i += 1
+                break
+            if text.startswith('"', i):
+                value, i = rust_literal(text, i, path)
+            else:
+                pm = piece.match(text, i)
+                if not pm:
+                    raise PromptParseError(f"concat! piece at offset {i} of {path} is not a string literal or a name!() macro")
+                value, i = prompt_macro(text, pm.group(1), path), pm.end()
+            pieces.append(value)
+            i = re.compile(r"\s*").match(text, i).end()
+            if text.startswith(",", i):
+                i += 1
+            elif not text.startswith(")", i):
+                raise PromptParseError(f"expected `,` or `)` at offset {i} of {path} in concat!(...)")
+        prompt = "".join(pieces)
+    if not re.compile(r"\s*;").match(text, i):
+        raise PromptParseError(f"SYSTEM_PROMPT in {path} does not end with `;` after its value")
+    if not prompt.strip():
+        raise PromptParseError(f"SYSTEM_PROMPT in {path} is empty")
+    return prompt
 
 
 def required(cfg: dict, key: str, kind):
@@ -374,10 +460,12 @@ def codex_version(timeout: float = 20.0):
     return out if code == 0 and out else None
 
 
-def write_last_pass(state_dir: str, version: str, legs: list, model) -> Path:
-    """state/canary/last-pass.json of THIS checkout, written atomically (temp file, then replace). Only ever called on a full PASS.
-    openai_review.py reads it before it starts codex and re-runs this canary when the codex version differs."""
-    folder = CHECKOUT / state_dir / "canary"
+def write_last_pass(root: Path, state_dir: str, version: str, legs: list, model) -> Path:
+    """<root>/<state_dir>/canary/last-pass.json, written atomically (temp file, then replace). Only ever called on a full PASS.
+    `root` is the main Broadsword root (oc.find_main_root), never the checkout this script runs from: a worktree has no record of
+    its own, so there is exactly one record, the one openai_review.canary_state_file reads before it starts codex (it re-runs this
+    canary when the codex version differs)."""
+    folder = root / state_dir / "canary"
     folder.mkdir(parents=True, exist_ok=True)
     final = folder / "last-pass.json"
     tmp = folder / f"last-pass.json.{os.getpid()}.tmp"
@@ -390,14 +478,14 @@ def write_last_pass(state_dir: str, version: str, legs: list, model) -> Path:
     return final
 
 
-def record_pass(state_dir: str, legs: list, model) -> int:
+def record_pass(root: Path, state_dir: str, legs: list, model) -> int:
     """REFUSED when the pass was recorded; INCONCLUSIVE when it could not be (no codex version): a pass nobody can find is not a pass."""
     version = codex_version()
     if version is None:
         print("INCONCLUSIVE: the legs passed but `codex --version` failed, so no pass was recorded")
         return INCONCLUSIVE
     try:
-        path = write_last_pass(state_dir, version, legs, model)
+        path = write_last_pass(root, state_dir, version, legs, model)
     except OSError as e:
         print(f"INCONCLUSIVE: the legs passed but last-pass.json could not be written: {type(e).__name__}")
         return INCONCLUSIVE
@@ -409,7 +497,18 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Shadow-reviewer canary: exit 0 only if codex is offered no tool and cannot read a planted file.")
     ap.add_argument("--model", help="override broadsword.toml shadow_reviewer_model")
     ap.add_argument("--offline-only", action="store_true", help="run leg A only (no model call)")
+    ap.add_argument("--show-prompt", action="store_true",
+                    help="print the first 80 characters and the length of the SYSTEM_PROMPT parsed from reviewer.rs, then exit "
+                         "(no codex, no model, nothing recorded; exit 2 if it cannot be parsed)")
     args = ap.parse_args(argv)
+    if args.show_prompt:
+        try:
+            prompt = queue_system_prompt(REVIEWER_RS)
+        except Exception as e:
+            print(f"INCONCLUSIVE: SYSTEM_PROMPT not parsed: {type(e).__name__}: {e}")
+            return INCONCLUSIVE
+        print(f"SYSTEM_PROMPT from {REVIEWER_RS}: {len(prompt)} characters; first 80: {prompt[:80]!r}")
+        return 0  # a listing, not a canary result: nothing is recorded, and openai_review never passes --show-prompt
     try:
         root = oc.find_main_root(CHECKOUT)
         cfg = tomllib.loads((root / "broadsword.toml").read_text(encoding="utf-8"))
@@ -436,9 +535,9 @@ def main(argv=None) -> int:
         return a
     if args.offline_only:
         print("canary: leg B skipped (--offline-only)")
-        return record_pass(state_dir, ["A"], None)
+        return record_pass(root, state_dir, ["A"], None)
     b = leg_real(canary_dir, cwd, model, timeout, system_prompt)
-    return record_pass(state_dir, ["A", "B"], model) if b == REFUSED else b
+    return record_pass(root, state_dir, ["A", "B"], model) if b == REFUSED else b
 
 
 if __name__ == "__main__":
