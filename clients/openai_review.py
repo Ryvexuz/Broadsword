@@ -406,7 +406,9 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
 
 # TEMPORARY: Lazlo's cap of $20 a day (2026-11-19), in this ONE named place until broadsword.toml has the key `gpt_daily_cap_usd`
 # (follow-up once the toml is free to edit). If the toml already has that key it wins over this constant. 0 = no GPT calls.
-GPT_DAILY_CAP_USD = 20.0
+# Raised to 60 on 2026-11-20 (Lazlo 19:19Z: "it has 13% usage for the week left feel free to keep usingit unti i tell you",
+# "if they are actually helpingthat is"). The estimate counts unpriced models at UNPRICED_USD_PER_MTOK, so it runs high.
+GPT_DAILY_CAP_USD = 60.0
 # USD per million tokens, used only when bench/models.json lists NO price for any model (it holds none today). Deliberately high.
 UNPRICED_USD_PER_MTOK = {"input": 30.0, "output": 120.0}
 LEDGER_COLUMNS = ("utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits", "call_type")

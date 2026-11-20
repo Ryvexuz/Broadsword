@@ -527,11 +527,11 @@ class ReviewTests(unittest.TestCase):
 
     def test_cap_reached_refuses_before_any_call_and_writes_the_note_once(self):
         root = self.make_root()
-        self.plant_ledger(root, 20.0)  # the built-in cap is 20
+        self.plant_ledger(root, 60.0)  # the built-in cap is 60
         for _ in range(2):
             j = json.loads(self.run_script(codex="ok", root=root).stdout)
             self.assertTrue(j["is_error"], j)
-            self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+            self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
             self.assertFalse((self.codex_dir / "started").exists(), "no codex process")
             self.assertEqual(Fake.seen, [], "no API call")
         self.assertFalse((root / "scripts" / "canary-ran").exists())
@@ -541,7 +541,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_just_under_the_cap_still_calls(self):
         root = self.make_root()
-        self.plant_ledger(root, 19.99)
+        self.plant_ledger(root, 59.99)
         j = json.loads(self.run_script(codex="ok", root=root).stdout)
         self.assertEqual(j["backend"], "codex", j)
 
@@ -556,7 +556,7 @@ class ReviewTests(unittest.TestCase):
         root = self.make_root(cap="5")
         self.plant_ledger(root, 5.0)
         j = json.loads(self.run_script(codex="ok", root=root).stdout)
-        self.assertEqual(j["codex_error"], "daily_cap_reached: 5.0000 of 5", "a lower cap in the toml wins over the built-in 20")
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 5.0000 of 5", "a lower cap in the toml wins over the built-in 60")
 
     def test_a_bad_cap_in_the_toml_is_an_error_and_no_call(self):
         p = self.run_script(codex="ok", cap='"lots"')
@@ -596,23 +596,23 @@ class ReviewTests(unittest.TestCase):
 
     def test_an_old_seven_column_file_gives_the_same_cap_sum_and_is_not_rewritten(self):
         root = self.make_root()
-        old = self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t19.99\tcodex-plan\n"
+        old = self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t59.99\tcodex-plan\n"
         self.plant_raw(root, old)
         j = json.loads(self.run_script(codex="ok", root=root).stdout)
         self.assertEqual(j["backend"], "codex", j)
         text = (root / "state" / "gpt-spend" / f"{self.today()}.tsv").read_text(encoding="utf-8")
         self.assertTrue(text.startswith(old), "the old header and row are untouched; the new row is only appended")
         root2 = self.make_root()
-        self.plant_raw(root2, self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t20.0\tcodex-plan\n")
+        self.plant_raw(root2, self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t60.0\tcodex-plan\n")
         j = json.loads(self.run_script(codex="ok", root=root2).stdout)
-        self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
 
     def test_a_mixed_file_sums_old_and_new_rows(self):
         root = self.make_root()
-        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\told\tgpt-5.6-sol\t1\t1\t12.5\tcodex-plan\n"
+        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\told\tgpt-5.6-sol\t1\t1\t52.5\tcodex-plan\n"
                        "2026-01-01T00:00:01Z\tnew\tgpt-5.6-sol\t1\t1\t7.5\tapi-credits\tshadow\n")
         j = json.loads(self.run_script(codex="ok", root=root).stdout)
-        self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
         self.assertFalse((self.codex_dir / "started").exists())
         self.assertEqual(Fake.seen, [])
 
