@@ -185,6 +185,13 @@ class CodexCliClient:
 TEST_LINE = re.compile(r"^test (hidden_step_(\d{2})) \.\.\. (ok|FAILED|ignored)", re.M)
 
 
+def grader_crate_name(folder_name):
+    """A Cargo package name from the grader folder name: lower case, only [a-z0-9_] ("." and "-" become "_"), starting
+    with a letter (a `g_` prefix when it does not). The folder keeps its own name; only the package name is changed."""
+    name = re.sub(r"[^a-z0-9_]", "_", folder_name.lower())
+    return name if name[:1].isalpha() else "g_" + name
+
+
 class CargoGrader:
     """Grades through Broadsword (never plain cargo): a grader crate <workdir>-grader next to the work crate, depending on it
     by path, gets tests/hidden.rs with the hidden tests of steps 1..k, then `broadsword test <grader project>` runs it.
@@ -202,7 +209,7 @@ class CargoGrader:
         (self.dir / "src").mkdir()
         (self.dir / "src" / "lib.rs").write_text("//! Hidden-test grader for a drift run.\n", encoding="utf-8")
         (self.dir / "Cargo.toml").write_text(
-            f'[package]\nname = "{self.dir.name.replace("-", "_")}"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            f'[package]\nname = "{grader_crate_name(self.dir.name)}"\nversion = "0.1.0"\nedition = "2021"\n\n'
             f'[dependencies]\n{task.CRATE} = {{ path = "../{self.workdir.name}" }}\n', encoding="utf-8")
 
     def grade(self, workdir, upto, out_dir):

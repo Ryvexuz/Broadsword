@@ -311,6 +311,14 @@ class Parsers(unittest.TestCase):
         self.assertEqual([e["kind"] for e in r["events"]], ["edit", "command"])
         self.assertTrue(clients.parse_codex_stream(json.dumps({"type": "turn.failed", "error": {"message": "x"}}))["error"])
 
+    def test_grader_crate_name_is_a_valid_cargo_name_for_a_dotted_model(self):
+        wd = pathlib.Path("projects") / "drift-20261120-010203-codex-gpt-6.2-astra-ab12"
+        g = clients.CargoGrader("bs", wd, 1)
+        self.assertEqual(g.dir.name, wd.name + "-grader")  # the folder (the Broadsword project name) is unchanged
+        name = clients.grader_crate_name(g.dir.name)
+        self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
+        self.assertEqual(clients.grader_crate_name("20261120-x"), "g_20261120_x")  # must start with a letter
+
     def test_cargo_grader_parse(self):
         g = clients.CargoGrader("bs", pathlib.Path("projects") / "drift-x", 1)
         self.assertEqual(g.dir.name, "drift-x-grader")
