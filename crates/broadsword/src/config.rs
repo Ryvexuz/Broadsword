@@ -159,6 +159,9 @@ pub struct Config {
     pub python_tests: Vec<(String, Vec<String>)>,
     /// The test step runs up to this many copied test executables (and Python test scripts) at once; 1 = one after another.
     pub test_parallel_binaries: u64,
+    /// Side by side, a test child that has exited has its output pipes waited for at most this many seconds (a process it
+    /// started may hold them open); then its output is printed as far as it got, marked TRUNCATED. Never blocks the pool.
+    pub test_output_wait_seconds: u64,
 }
 
 /// Parse the `python_tests` setting: `"<project>: <script> <script> ...; <project>: ..."`, or `""` when no project has Python
@@ -349,6 +352,7 @@ impl Config {
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
             test_parallel_binaries: positive("test_parallel_binaries")?,
+            test_output_wait_seconds: positive("test_output_wait_seconds")?,
             recover_lock_wait_seconds: positive("recover_lock_wait_seconds")?,
             sweep_older_than_days: positive("sweep_older_than_days")?,
             redact_min_chars: positive("redact_min_chars")?,
@@ -547,6 +551,7 @@ perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
 test_parallel_binaries = 1
+test_output_wait_seconds = 10
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -663,6 +668,9 @@ install_dir=\"build/bin\"\n";
         assert!(e.contains("test_parallel_binaries") && e.contains("missing"), "{e}");
         let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "test_parallel_binaries") { "test_parallel_binaries = 0" } else { l }).collect::<Vec<_>>().join("\n");
         assert!(Config::from_text(&zero, Path::new("p")).is_err(), "0 would run no test");
+        assert!(Config::from_text(text, Path::new("p")).unwrap().test_output_wait_seconds >= 1);
+        let e = Config::from_text(&without_key(text, "test_output_wait_seconds"), Path::new("p")).unwrap_err();
+        assert!(e.contains("test_output_wait_seconds") && e.contains("missing"), "{e}");
     }
 
     #[test]
@@ -707,6 +715,7 @@ perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
 test_parallel_binaries = 1
+test_output_wait_seconds = 10
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -755,6 +764,7 @@ perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
 test_parallel_binaries = 1
+test_output_wait_seconds = 10
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

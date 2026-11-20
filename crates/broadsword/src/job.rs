@@ -24,7 +24,9 @@
 //! A failing executable fails the step with exit 101 as before; a failing script fails it as `test: FAILED (python ...)` (the
 //! first failing script in the declared order is named). The disk floor is polled for the whole pool and a drop kills every
 //! running child's tree. The record names every running child: `child_pid`/`child_start` the first, `child_pids` all of them
-//! (`pid:start|...`). At 1, everything runs one after another and streams, exactly as before (the first failure stops the rest).
+//! (`pid:start|...`); recovery kills each one whose creation time matches. A child's exit never makes the pool wait on its output
+//! pipes: a process it started that still holds one after `test_output_wait_seconds` gets that child's output cut there, marked
+//! TRUNCATED in the log. At 1, everything runs one after another and streams, exactly as before (the first failure stops the rest).
 //!
 //! PYTHON TESTS (SCALING F9). When cargo's tests pass, the test step (of `test` and `check`) runs the scripts the required setting
 //! `python_tests` declares for the project, in order, each as `python -I -B <script>` in the project folder (the task's worktree
@@ -915,6 +917,10 @@ impl TestStep<'_> {
     /// so the output reads like a serial run. `counts` items add their stdout to `kept`. After a failure nothing new starts; the
     /// running ones finish and are printed. The disk floor is polled every `poll` and a drop kills every running child's tree;
     /// the record names every running child (`on_live`). A start or wait error kills every running child.
+    /// A child that has exited never makes the pool wait on its readers: it moves to `draining`, checked without blocking each
+    /// round, and frees its slot at once. When its readers end (its pipes closed) its output is complete; if a process it started
+    /// still holds a pipe after `test_output_wait_seconds`, its output is taken as far as it got and marked TRUNCATED (the
+    /// reader threads are left to end on their own). The disk poll and the other children go on meanwhile.
     fn run_pool(&mut self, items: Vec<PoolItem>, kept: &mut String) -> Result<PoolEnd, String> {
         struct Live {
             idx: usize,
@@ -923,6 +929,14 @@ impl TestStep<'_> {
             err: Arc<Mutex<Vec<u8>>>,
             readers: Vec<std::thread::JoinHandle<()>>,
             from: f64,
+        }
+        /// An exited child whose output may still be arriving.
+        struct Draining {
+            idx: usize,
+            out: Arc<Mutex<Vec<u8>>>,
+            err: Arc<Mutex<Vec<u8>>>,
+            readers: Vec<std::thread::JoinHandle<()>>,
+            exited: Instant,
         }
         fn reader(mut src: impl Read + Send + 'static, into: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
@@ -950,6 +964,8 @@ impl TestStep<'_> {
         let mut items: Vec<Option<PoolItem>> = items.into_iter().map(Some).collect();
         let mut lines: Vec<(String, FailLine, bool)> = Vec::with_capacity(n);
         let mut live: Vec<Live> = Vec::new();
+        let mut draining: Vec<Draining> = Vec::new();
+        let wait = Duration::from_secs(self.cfg.test_output_wait_seconds);
         let mut finished: Vec<Option<Finished>> = (0..n).map(|_| None).collect();
         let mut outputs: Vec<Option<(String, String)>> = (0..n).map(|_| None).collect();
         let (mut next, mut printed, mut failed) = (0usize, 0usize, false);
@@ -990,16 +1006,39 @@ impl TestStep<'_> {
                     i += 1;
                     continue;
                 };
-                let mut l = live.swap_remove(i);
-                for r in l.readers.drain(..) {
-                    let _ = r.join(); // it ended: its pipes close (as in `cargo test`, a grandchild holding one is waited for)
-                }
-                let text = |b: &Arc<Mutex<Vec<u8>>>| self.secrets.redact(&String::from_utf8_lossy(&b.lock().map(|v| v.clone()).unwrap_or_default()));
-                outputs[l.idx] = Some((text(&l.out), text(&l.err)));
+                let l = live.swap_remove(i);
                 let code = status.code();
                 failed |= code != Some(0);
                 finished[l.idx] = Some(Finished { code, from: l.from, to: start.elapsed().as_secs_f64() });
+                draining.push(Draining { idx: l.idx, out: l.out, err: l.err, readers: l.readers, exited: Instant::now() });
                 changed = true;
+            }
+            // collect the output of exited children, never blocking: complete once its readers ended, else cut at the wait
+            let mut i = 0;
+            while i < draining.len() {
+                let done = draining[i].readers.iter().all(|r| r.is_finished());
+                if !done && draining[i].exited.elapsed() < wait {
+                    i += 1;
+                    continue;
+                }
+                let d = draining.swap_remove(i);
+                if done {
+                    for r in d.readers {
+                        let _ = r.join(); // already finished: returns at once
+                    }
+                }
+                let text = |b: &Arc<Mutex<Vec<u8>>>| self.secrets.redact(&String::from_utf8_lossy(&b.lock().map(|v| v.clone()).unwrap_or_default()));
+                let (out, mut err) = (text(&d.out), text(&d.err));
+                if !done {
+                    if !err.is_empty() && !err.ends_with('\n') {
+                        err.push('\n');
+                    }
+                    err.push_str(&format!(
+                        "broadsword: TRUNCATED: this test child exited, but a process it started still held its output open {} s later (test_output_wait_seconds); its output above is as far as it got, and the rest is not read\n",
+                        wait.as_secs()
+                    ));
+                }
+                outputs[d.idx] = Some((out, err));
             }
             if changed {
                 let pids: Vec<u32> = live.iter().map(|l| l.child.id()).collect();
@@ -1011,7 +1050,7 @@ impl TestStep<'_> {
                 self.print_one(&lines[printed], finished[printed].as_ref(), &out, &err, kept);
                 printed += 1;
             }
-            if live.is_empty() && (failed || next >= n) {
+            if live.is_empty() && draining.is_empty() && (failed || next >= n) {
                 break;
             }
             if Instant::now() >= next_poll {

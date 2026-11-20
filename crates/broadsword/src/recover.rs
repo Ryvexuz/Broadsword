@@ -105,15 +105,49 @@ fn blocks_source(recorded: &str, mine: Option<&str>) -> bool {
     recorded.is_empty() || mine.is_none_or(|m| m == recorded)
 }
 
-/// Kill the recorded child tree if, and only if, it is verifiably the same process.
+/// Every child a job record names, as (pid, recorded creation time): each `pid:start` pair of `child_pids` (the test step's
+/// side-by-side pool records them all), then `child_pid`/`child_start` if `child_pids` does not already list it (a record with
+/// only `child_pid`, as every record before `child_pids` existed, names its one child). A malformed pair is reported and skipped:
+/// it is never guessed at, so nothing is killed on it.
+pub fn recorded_children(r: &Record) -> Vec<(u32, Option<u64>)> {
+    let mut v: Vec<(u32, Option<u64>)> = Vec::new();
+    for pair in r.get("child_pids").split('|').map(str::trim).filter(|p| !p.is_empty()) {
+        let parsed = pair.split_once(':').and_then(|(p, s)| {
+            let pid = p.trim().parse::<u32>().ok()?;
+            let s = s.trim();
+            let start = if s.is_empty() { None } else { Some(s.parse::<u64>().ok()?) };
+            Some((pid, start))
+        });
+        match parsed {
+            Some(c) if !v.iter().any(|(p, _)| *p == c.0) => v.push(c),
+            Some(_) => {}
+            None => println!("  child_pids entry `{pair}` is not `pid:start`, so it is NOT acted on; check it by hand"),
+        }
+    }
+    if let Some(pid) = r.get_num("child_pid") {
+        if !v.iter().any(|(p, _)| u64::from(*p) == pid) {
+            if let Ok(pid) = u32::try_from(pid) {
+                v.push((pid, r.get_num("child_start")));
+            }
+        }
+    }
+    v
+}
+
+/// Kill every recorded child tree (`recorded_children`) that is verifiably the same process: its creation time must equal the
+/// recorded one, so a reused pid is never killed.
 pub fn kill_orphan(r: &Record) {
-    let Some(pid) = r.get_num("child_pid") else { return };
-    let recorded = r.get_num("child_start");
-    match sys::process_state(pid as u32) {
+    for (pid, recorded) in recorded_children(r) {
+        kill_one(pid, recorded);
+    }
+}
+
+fn kill_one(pid: u32, recorded: Option<u64>) {
+    match sys::process_state(pid) {
         sys::ProcState::Gone => {}
         state if sys::exact_match(recorded, state) => {
             println!("  killing orphaned process tree (pid {pid})");
-            sys::kill_tree(pid as u32);
+            sys::kill_tree(pid);
         }
         sys::ProcState::Alive { start: Some(_) } if recorded.is_some() => {} // same pid, different process: not ours
         _ => println!("  pid {pid} is running but cannot be verified as this job's child (no exact creation time), so it is NOT killed; check it by hand"),

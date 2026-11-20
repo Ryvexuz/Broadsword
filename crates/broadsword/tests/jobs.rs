@@ -987,6 +987,40 @@ fn NAME() {
 }
 
 #[test]
+fn a_grandchild_holding_a_test_executables_output_open_never_blocks_the_pool() {
+    let r = Root::new("sidepipe", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    let gpid = r.dir.join("scratch/grandchild.pid");
+    // a starts a process that inherits (and so holds open) a's stdout for 40 s, then a passes and exits at once
+    let a = r#"
+#[test]
+fn a() {
+    let c = if cfg!(windows) { std::process::Command::new("ping").args(["-n", "40", "127.0.0.1"]).spawn() } else { std::process::Command::new("sleep").arg("40").spawn() };
+    let c = c.unwrap();
+    std::fs::write(r"GPID", c.id().to_string()).unwrap();
+    std::io::Write::write_all(&mut std::io::stdout(), b"a started a grandchild\n").unwrap();
+}
+"#
+    .replace("GPID", &gpid.display().to_string());
+    bin_project(&r, "sidepipe", "0.1.0", "pub fn f() {}\n", &[("a.rs", &a), ("b.rs", "#[test] fn b() {}\n")]);
+    // broadsword's own output goes to files: a pipe would be held open by the grandchild too, and this test times broadsword alone
+    let (so_f, se_f) = (r.dir.join("scratch/so.txt"), r.dir.join("scratch/se.txt"));
+    let start = Instant::now();
+    let status = r.cmd(&["test", "sidepipe"]).stdout(fs::File::create(&so_f).unwrap()).stderr(fs::File::create(&se_f).unwrap()).status().unwrap();
+    let took = start.elapsed();
+    let (so, se) = (fs::read_to_string(&so_f).unwrap(), fs::read_to_string(&se_f).unwrap());
+    if let Ok(p) = fs::read_to_string(&gpid) {
+        let p = p.trim().to_string();
+        let _ = if cfg!(windows) { Command::new("taskkill").args(["/F", "/PID", &p]).output() } else { Command::new("kill").arg(&p).output() };
+    }
+    assert_eq!(status.code(), Some(0), "{so}{se}");
+    assert!(took < Duration::from_secs(25), "the pool waited {took:?} on a pipe a grandchild held (test_output_wait_seconds = 2): {so}{se}");
+    assert!(so.contains("test: ok — 3 passed, 0 failed"), "a's result was read before the wait ran out: {so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("TRUNCATED") && log.contains("a started a grandchild"), "the cut is said, never silent, and what was read is kept: {log}");
+}
+
+#[test]
 fn a_failing_python_test_beside_others_fails_the_job_and_is_named() {
     let r = Root::new("sidepy", 1, 0);
     r.set("test_parallel_binaries", "4");

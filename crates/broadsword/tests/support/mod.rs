@@ -68,6 +68,7 @@ const BASE: &[(&str, &str)] = &[
     ("python_tests", "\"\""),
     // one after another unless a test sets it: the serial path keeps its streamed output and first-failure-stops order
     ("test_parallel_binaries", "1"),
+    ("test_output_wait_seconds", "2"),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),

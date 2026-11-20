@@ -367,11 +367,17 @@ fn recover_with_nothing_to_do_is_a_no_op() {
 // ---- regression tests for the review findings ------------------------------------------------
 
 impl Root {
-    /// Write a record by hand, as if left behind by a crashed broadsword.
+    /// Write a record by hand, as if left behind by a crashed broadsword. A record naming a `pid` without a `pid_start` gets
+    /// `pid_start = 1` (a creation time no live process can have): the `dead_pid()` it names may be reused by any new process
+    /// under load, and recover's lenient liveness check (kept for old records) would then take the record's job as still
+    /// running. With a creation time that cannot match, the record's broadsword reads as gone whoever holds the pid now.
     fn fake_record(&self, id: &str, fields: &[(&str, &str)]) {
         let dir = self.dir.join("state/jobs");
         fs::create_dir_all(&dir).unwrap();
-        let body: String = fields.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+        let mut body: String = fields.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+        if fields.iter().any(|(k, _)| *k == "pid") && !fields.iter().any(|(k, _)| *k == "pid_start") {
+            body.push_str("pid_start = 1\n");
+        }
         fs::write(dir.join(format!("{id}.rec")), format!("id = {id}\n{body}")).unwrap();
     }
 
@@ -583,6 +589,65 @@ fn unverifiable_child_pids_are_not_killed() {
     assert_eq!(out.status.code(), Some(1), "the two interrupted runs are listed, not rolled back: {so}{}", text(&out.stderr));
     assert!(so.contains("NOT killed"), "{so}");
     assert!(Proc::now(a).alive() && Proc::now(b).alive(), "neither process may be killed"); // the test holds both Child handles, so neither pid can be reused
+}
+
+/// t-20261120-174501: a job that crashed while its test step ran children side by side names them all in `child_pids`; recovery
+/// kills every one whose creation time matches, and never one whose recorded time differs (a reused pid). `child_pid` names the
+/// first, as the job writes it.
+#[test]
+fn recovery_kills_every_side_by_side_child_the_record_names() {
+    let mut r = Root::new("killall");
+    r.project("", true);
+    let (a, b, c) = (r.sleeper(), r.sleeper(), r.sleeper());
+    let start = |p: u32| Proc::now(p).start.expect("a live process has a creation time");
+    let (sa, sb, sc) = (start(a), start(b), start(c));
+    let pids = format!("{a}:{sa}|{b}:{sb}|{c}:{}", sc - 1); // c's recorded time is not its own: it stands for a reused pid
+    let dead = dead_pid().to_string();
+    r.fake_record(
+        "20260101-000001-p-run",
+        &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("child_pid", &a.to_string()), ("child_start", &sa.to_string()), ("child_pids", &pids), ("checkpoint", "pending")],
+    );
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    let t = Instant::now();
+    while Proc::now(a).alive() || Proc::now(b).alive() {
+        assert!(t.elapsed() < Duration::from_secs(10), "both recorded children are killed: a alive {}, b alive {}: {so}{}", Proc::now(a).alive(), Proc::now(b).alive(), text(&out.stderr));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(so.contains(&format!("pid {a}")) && so.contains(&format!("pid {b}")), "{so}");
+    assert!(Proc::now(c).alive(), "a pid whose creation time differs from the recorded one is never killed: {so}");
+}
+
+/// The pid-reuse race in the fake records cannot flip a result: a record whose `pid` is held by a live process right now (this
+/// test's own, the worst case of reuse) is still read as interrupted, because `fake_record` gives it a creation time that
+/// cannot match. Here it is a check job at the resume cap, so recover marks it failed instead of leaving it alone.
+#[test]
+fn a_fake_record_whose_pid_a_live_process_holds_is_still_taken_as_interrupted() {
+    let r = Root::new("reusedpid");
+    r.project("", false);
+    let me = std::process::id().to_string();
+    r.fake_record("20260101-000001-p-check", &[("project", "p"), ("kind", "check"), ("status", "running"), ("pid", &me), ("step", "build"), ("resume_count", "3")]);
+    let out = r.run(&["recover"]);
+    let so = text(&out.stdout);
+    assert!(!so.contains("still running"), "a live process holding the recorded pid is not taken for the job: {so}");
+    assert_eq!(Root::field(&r.only_record(), "status"), "failed", "{so}{}", text(&out.stderr));
+}
+
+/// An old record names its one child in `child_pid` only (no `child_pids`): it is still killed.
+#[test]
+fn a_record_with_only_child_pid_still_has_its_child_killed() {
+    let mut r = Root::new("killone");
+    r.project("", true);
+    let a = r.sleeper();
+    let sa = Proc::now(a).start.expect("a live process has a creation time").to_string();
+    let dead = dead_pid().to_string();
+    r.fake_record("20260101-000001-p-run", &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("child_pid", &a.to_string()), ("child_start", &sa), ("checkpoint", "pending")]);
+    let out = r.run(&["recover"]);
+    let t = Instant::now();
+    while Proc::now(a).alive() {
+        assert!(t.elapsed() < Duration::from_secs(10), "the child_pid child is killed: {}", text(&out.stdout));
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Item 6: a failed rollback leaves the record running, keeps everything, and exits non-zero.
