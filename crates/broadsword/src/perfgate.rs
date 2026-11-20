@@ -1,36 +1,70 @@
-//! The merge queue's PERF GATE: after the check of a commit passes, the project's timing bench runs on that same commit and a case
-//! whose median got slower than its baseline allows fails the entry (`perf_failed`).
+//! The merge queue's PERF GATE: after the check of a commit passes, the project's timing bench runs on that commit AND on the
+//! project's trunk tip in the same run (A/B), and a case where the entry is slower than main by more than the case allows fails the
+//! entry (`perf_failed`).
 //!
 //! WHICH PROJECTS. A queue entry touches exactly one project: the one it was queued for (its branch lives in that project's repo).
 //! The gate looks only at that project's baseline, `<state_dir>/perf/<project>-baseline.json`. A project with no such file is
 //! SKIPPED, and the skip is printed and logged in the entry; no bench runs for it, and no other project's bench ever runs.
 //!
+//! WHY A/B. A stored baseline goes stale and moves with machine load (crash-sim main's box case went 1.566 -> 2.220 ms, +42%, on
+//! load alone), so the gate times main and the entry in the same window instead: load slows both alike, and only their RATIO is
+//! judged. The baseline file now supplies only the cases, each case's `threshold_pct` and `runs_per_case`; its `median_ms` values
+//! are still checked (a broken file fails closed) and kept as a record, but nothing is judged against them.
+//!
+//! NOT JUDGED. When the entry's commit differs from the trunk tip only in documentation (`git diff --name-only --no-renames` of the
+//! two commits: every changed path is under `docs/` or ends in `.md`, and none is under `src/`, `examples/` or `benches/`), the
+//! gate is SKIPPED as "not judged: no benched source changed" and nothing is built or benched. This is an ALLOW-LIST of what cannot
+//! change the bench, not a list of what can: the crash sim's bench also reads `scenarios/` at run time, so every path that is not
+//! documentation (scenarios, Cargo.toml, Cargo.lock, build.rs, `.cargo/`, anything new) is judged. Limit: a Rust file that
+//! `include_str!`s a `.md` outside `src/`, `examples/` and `benches/` is not seen.
+//!
 //! FAIL CLOSED. A baseline file that exists but cannot be read, is not valid JSON, or lacks a field the gate needs is a FAILURE
-//! (`perf_failed`), never a pass and never a skip. So is a bench that exits non-zero, prints no case line, prints a line that is not
-//! a valid case, or leaves out a case the baseline has. A bench job that never ran (refused by the disk guard, the build lock or a
-//! pause) gives NO verdict: the entry is `blocked` (or, in a train, every entry stays `approved`), so it is never merged either.
+//! (`perf_failed`), never a pass and never a skip. So is a bench that cannot be built or exits non-zero (on main or on the entry),
+//! prints no case line, prints a line that is not a valid case, or leaves out a case the baseline has, and a case whose main median
+//! is 0 ms. A bench job that never ran (refused by the disk guard, the build lock or a pause), and a state the gate cannot trust
+//! (the main checkout not on the trunk tip or not clean, a checkout that moved during the gate, the build folder rebuilt by another
+//! job before the bench was copied out, git failing) gives NO verdict: the entry is `blocked` (or, in a train, every entry stays
+//! `approved`), so it is never merged either.
 //!
-//! THE BENCH. `cargo run --release --offline --example bench -- --runs <runs_per_case>` (the documented command of the crash sim's
-//! docs/BENCH.md), run `perf_runs` times as `broadsword run <project> --task <task>`: in the task's worktree, on the commit the check
-//! just passed, holding the build lock for the whole run, with the job's disk guard, scrubbed environment and log. `runs_per_case`
-//! comes from the baseline, so the timings are taken the way the baseline's were. The bench prints one JSON line per case
-//! (`{"name":"box","runs":10,"median_ms":1.9,...}`); the gate reads those lines from the job's log.
+//! THE BENCH, A and B. A is the project's MAIN CHECKOUT, which must have the trunk tip checked out and be clean (the queue's own
+//! precondition for merging); B is the task's worktree, at the commit the check just passed. Each side is BUILT ONCE by a `run` job
+//! (`broadsword run <project> [--task <task>]`: disk guard, scrubbed environment, log, the buildsrc stale-package clean) with
+//! `cargo build --release --offline --locked --example bench --message-format=json-render-diagnostics` (`--locked`: the build never
+//! rewrites the main checkout's Cargo.lock), the same binary `cargo run --release --offline --example bench -- --runs` runs (the
+//! documented command of the crash sim's docs/BENCH.md). Right after its build job, holding the build lock, the gate checks that the
+//! package's build-source note still names that side's folder (buildsrc.rs: anyone who built the package from another folder since
+//! would have changed it first) and copies the bench executable to `<scratch_dir>/perf-bins/<job id>/<side>/`. So two builds of
+//! one crate from different commits in the shared build folder never hand each other a stale binary, and the A copy is safe from
+//! B's build, which cleans A's artifacts. The copies are removed when the gate ends.
 //!
-//! THE VERDICT. For every case of the baseline: `now` is the median of the `perf_runs` medians; the change is
-//! `(now - baseline) / baseline * 100`; the case FAILS when the change is above the case's own `threshold_pct` from the baseline file
-//! (no global threshold: each case's noise differs). The reason lists every case: baseline, now and the change in %. A case the bench
-//! prints but the baseline lacks is listed as not judged. The first line says whether the baseline is LOADED (`loaded: true`: it was
-//! recorded while the machine was busy, so its thresholds are wide) or quiet.
+//! THE RUNS. Holding the build lock from B's copy to the last run (so no compile starts between an A run and its B run, and both
+//! see the same machine), after the job's own disk and pause guard, the gate runs `<copy> --runs <runs_per_case>` alternating A B A B
+//! ... for `perf_runs` rounds, each in its own checkout folder (the bench reads files relative to it, as under `cargo run`), with
+//! the scrubbed environment, the job's disk poll and redaction (`job::run_child`), all output in one log
+//! `<scratch_dir>/logs/perf/<time>-<project>-perf.log`. The bench prints one JSON line per case
+//! (`{"name":"box","runs":10,"median_ms":1.9,...}`).
 //!
-//! The settings are `perf_gate` (`"on"` or `"off"`) and `perf_runs` (how many times the bench runs).
+//! THE VERDICT. For every case of the baseline: `main` and `entry` are the medians of each side's `perf_runs` medians; the case
+//! FAILS when `entry` is above `main * (1 + threshold_pct / 100)`, with the case's own `threshold_pct` from the baseline file (no
+//! global threshold: each case's noise differs). The reason lists every case: both medians, the ratio entry/main and the change in
+//! %. A case the entry's bench prints but the baseline lacks is listed as not judged. The first line says whether the baseline is
+//! LOADED (`loaded: true`: it was recorded while the machine was busy, so its thresholds are wide) or quiet.
+//!
+//! The settings are `perf_gate` (`"on"` or `"off"`) and `perf_runs` (how many A/B rounds).
 
+use crate::buildsrc;
 use crate::config::Config;
-use crate::job::{self, JobInfo, JobSpec};
+use crate::job::{self, JobInfo, JobSpec, Outcome};
 use crate::json::{self, J};
+use crate::lock::Lock;
+use crate::{pause, scrub, wtgit};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-/// The bench command, without its `--runs` value (appended from the baseline's `runs_per_case`).
-pub const BENCH_COMMAND: &str = "cargo run --release --offline --example bench -- --runs";
+/// The build command of each side. Its `bench` example is the binary `cargo run --release --offline --example bench` runs.
+pub const BUILD_COMMAND: &str =
+    "cargo build --release --offline --locked --example bench --message-format=json-render-diagnostics";
 
 /// The most timed runs per case a baseline may ask for (a typo such as 1000000 would hold the build lock for hours).
 const MAX_RUNS_PER_CASE: u64 = 1000;
@@ -258,61 +292,386 @@ pub fn header(cfg: &Config, project: &str, base: &Baseline) -> String {
     }
 }
 
-/// Judge `runs` (each run's case lines, from `parse_bench`) against `base`. Returns (passed, one line per case). A baseline case
-/// missing from any run fails.
-pub fn judge(base: &Baseline, runs: &[Vec<(String, f64)>]) -> (bool, Vec<String>) {
-    let mut ok = !runs.is_empty();
+/// One bench run's case lines (`parse_bench`): (case, median_ms).
+type Run = Vec<(String, f64)>;
+
+/// Every run's value of case `name`, or the (1-based) runs that lack it.
+fn case_values(runs: &[Run], name: &str) -> Result<Vec<f64>, Vec<usize>> {
+    let mut got = Vec::new();
+    let mut missing = Vec::new();
+    for (i, r) in runs.iter().enumerate() {
+        match r.iter().find(|(n, _)| n == name) {
+            Some((_, m)) => got.push(*m),
+            None => missing.push(i + 1),
+        }
+    }
+    if missing.is_empty() && !got.is_empty() {
+        Ok(got)
+    } else {
+        Err(missing)
+    }
+}
+
+/// Judge the entry's runs `b` against main's runs `a` (each run's case lines, from `parse_bench`), case by case with the baseline's
+/// thresholds. Returns (passed, one line per case). A baseline case missing from any run of either side fails, so does a case
+/// whose main median is not above 0 (no ratio can be taken), and so does an empty side.
+pub fn judge(
+    base: &Baseline,
+    a: &[Vec<(String, f64)>],
+    b: &[Vec<(String, f64)>],
+) -> (bool, Vec<String>) {
+    let mut ok = !a.is_empty() && !b.is_empty();
     let mut lines = Vec::new();
-    if runs.is_empty() {
-        lines.push("no bench run to judge".to_string());
+    if !ok {
+        lines.push(format!(
+            "no bench run to judge (main {} run(s), entry {} run(s))",
+            a.len(),
+            b.len()
+        ));
     }
     for c in &base.cases {
-        let mut got: Vec<f64> = Vec::new();
-        let mut missing: Vec<usize> = Vec::new();
-        for (i, r) in runs.iter().enumerate() {
-            match r.iter().find(|(n, _)| *n == c.name) {
-                Some((_, m)) => got.push(*m),
-                None => missing.push(i + 1),
+        let (va, vb) = (case_values(a, &c.name), case_values(b, &c.name));
+        let (mut va, mut vb) = match (va, vb) {
+            (Ok(x), Ok(y)) => (x, y),
+            (ra, rb) => {
+                ok = false;
+                let side = |r: &Result<Vec<f64>, Vec<usize>>| match r {
+                    Ok(_) => "printed".to_string(),
+                    Err(m) => format!("MISSING in run(s) {m:?}"),
+                };
+                lines.push(format!(
+                    "{}: main {}, entry {}: FAIL (the bench did not print this case)",
+                    c.name,
+                    side(&ra),
+                    side(&rb)
+                ));
+                continue;
             }
-        }
-        if !missing.is_empty() || got.is_empty() {
-            ok = false;
-            lines.push(format!("{}: baseline {:.3} ms, now MISSING (the bench did not print this case in run(s) {:?}): FAIL", c.name, c.median_ms, missing));
-            continue;
-        }
-        let now = median(&mut got);
-        let change = (now - c.median_ms) / c.median_ms * 100.0;
-        // compared as a limit in ms, not as the % change: (1.1 - 1.0) / 1.0 * 100 is 10.000000000000009, so a case exactly at its
-        // threshold would fail on rounding
-        let limit = c.median_ms * (1.0 + c.threshold_pct / 100.0);
-        let slow = !change.is_finite() || !limit.is_finite() || now > limit;
+        };
+        let (ma, mb) = (median(&mut va), median(&mut vb));
+        let limit = ma * (1.0 + c.threshold_pct / 100.0);
+        // `!(mb <= limit)` is also true for NaN; a main median of 0 has no ratio
+        let slow = !(ma > 0.0 && ma.is_finite() && limit.is_finite() && mb <= limit);
         if slow {
             ok = false;
         }
+        let ratio = if ma > 0.0 { mb / ma } else { f64::INFINITY };
         lines.push(format!(
-            "{}: baseline {:.3} ms, now {now:.3} ms, change {change:+.1}% (threshold {}%): {}",
+            "{}: main {ma:.3} ms, entry {mb:.3} ms, ratio {ratio:.3} ({:+.1}%, threshold {}%): {}",
             c.name,
-            c.median_ms,
+            (ratio - 1.0) * 100.0,
             c.threshold_pct,
-            if slow {
-                "FAIL, slower than allowed"
+            if ma <= 0.0 {
+                "FAIL, main's median is 0 ms so no ratio can be judged"
+            } else if slow {
+                "FAIL, slower than main by more than allowed"
             } else {
                 "ok"
             }
         ));
     }
-    for r in runs.iter().take(1) {
+    for r in b.iter().take(1) {
         for (n, m) in r {
             if !base.cases.iter().any(|c| c.name == *n) {
-                lines.push(format!("{n}: now {m:.3} ms, no baseline: not judged"));
+                lines.push(format!(
+                    "{n}: entry {m:.3} ms, no baseline case: not judged"
+                ));
             }
         }
     }
     (ok, lines)
 }
 
+/// Can a change of this repo-relative path (`/`-separated, as git prints it) change what the bench measures? Everything is
+/// benched except documentation: a path under `docs/` or ending in `.md`, unless it is under `src/`, `examples/` or `benches/`
+/// (the folders the build reads). An allow-list of what cannot matter (see "NOT JUDGED" in the module doc). Compared without case,
+/// as Windows resolves folder names.
+pub fn is_benched_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    if ["src/", "examples/", "benches/"]
+        .iter()
+        .any(|d| p.starts_with(d))
+    {
+        return true;
+    }
+    !(p.starts_with("docs/") || p.ends_with(".md"))
+}
+
+/// `git diff --name-only --no-renames -z <from> <to>` in `dir` (two commits, so no working-tree file and no filter is involved;
+/// `--no-ext-diff` so no configured diff program runs): every path that differs, a rename as both of its paths.
+fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<String>, String> {
+    let args = [
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "-z",
+        from,
+        to,
+    ];
+    let o = scrub::command_in(dir, "git")?
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot start git: {e}"))?;
+    if !o.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ));
+    }
+    // a path that is not UTF-8 is kept lossily: it cannot end in `.md` by accident, so it stays benched
+    Ok(o.stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(10)]
+}
+
+/// The one `bench` example executable a `--message-format=json*` build printed (`compiler-artifact`, target kind `example`, name
+/// `bench`), with the Cargo.toml of its package. None, or two different ones, is an error.
+pub fn bench_artifact(log: &str) -> Result<(PathBuf, PathBuf), String> {
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for l in log
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("{\"reason\":\"compiler-artifact\""))
+    {
+        let j =
+            json::parse(l).map_err(|e| format!("cannot read cargo's JSON output ({e}): {l}"))?;
+        let Some(t) = j.get("target") else { continue };
+        let example = matches!(t.get("kind"), Some(J::Arr(k)) if k.iter().any(|k| k.str() == Some("example")));
+        if !example || t.get("name").and_then(J::str) != Some("bench") {
+            continue;
+        }
+        let (Some(exe), Some(manifest)) = (
+            j.get("executable").and_then(J::str),
+            j.get("manifest_path").and_then(J::str),
+        ) else {
+            continue;
+        };
+        let art = (PathBuf::from(manifest), PathBuf::from(exe));
+        if !found.contains(&art) {
+            found.push(art);
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(
+            "the build printed no `bench` example executable (is there an examples/bench.rs?)"
+                .into(),
+        ),
+        n => Err(format!(
+            "the build printed {n} different `bench` example executables"
+        )),
+    }
+}
+
+/// The copied bench executables of one gate, in `<scratch_dir>/perf-bins/<id>`; removed when the gate ends.
+struct Copies(PathBuf);
+
+impl Drop for Copies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One side of the A/B: main (the project's main checkout at the trunk tip) or the entry (the task's worktree).
+struct Side {
+    /// `main` or `entry`, as the report names it.
+    label: &'static str,
+    /// The checkout the bench is built and run in.
+    dir: PathBuf,
+    /// `--task` of its jobs: None for the main checkout.
+    task: Option<String>,
+    /// The commit `dir` must have checked out for the whole gate.
+    commit: String,
+}
+
+/// Why a step of the gate stopped it.
+enum Stop {
+    Fail(String),
+    NoVerdict(String),
+}
+
+impl Side {
+    /// The commit check: the checkout still holds `commit`, and (main only, where the queue merges) nothing uncommitted.
+    fn still_there(&self) -> Result<(), Stop> {
+        let head = wtgit::head_commit(&self.dir).map_err(Stop::NoVerdict)?;
+        if head != self.commit {
+            return Err(Stop::NoVerdict(format!(
+                "the {} checkout {} moved from {} to {} during the gate",
+                self.label,
+                self.dir.display(),
+                short(&self.commit),
+                short(&head)
+            )));
+        }
+        match wtgit::status_porcelain_plain(&self.dir) {
+            Ok(s) if s.is_empty() => Ok(()),
+            Ok(s) => Err(Stop::NoVerdict(format!("the {} checkout {} has uncommitted or untracked changes ({}), so its bench would not be of commit {} alone", self.label, self.dir.display(), s.lines().take(5).collect::<Vec<_>>().join(", "), short(&self.commit)))),
+            Err(m) => Err(Stop::NoVerdict(m)),
+        }
+    }
+
+    /// Build this side's bench with a `run` job, then (holding the build lock, returned) check the build folder still holds THIS
+    /// folder's build and copy the executable to `<copies>/<label>/`. Returns (job id, the copy, the lock).
+    fn build(
+        &self,
+        cfg: &Config,
+        project: &str,
+        copies: &Path,
+    ) -> Result<(String, PathBuf, Lock), Stop> {
+        self.still_there()?;
+        println!(
+            "perf gate {project}: building the bench of {} ({}): {BUILD_COMMAND}",
+            self.label,
+            short(&self.commit)
+        );
+        let mut info = JobInfo::default();
+        let code = job::run_job_info(
+            cfg,
+            JobSpec {
+                kind: "run".into(),
+                name: project.to_string(),
+                command: Some(BUILD_COMMAND.to_string()),
+                first_step: 0,
+                resumed_from: None,
+                resume_count: 0,
+                task: self.task.clone(),
+            },
+            &mut info,
+        );
+        let id = info.id.clone().unwrap_or_else(|| "none".into());
+        if info.summary.is_empty() {
+            return Err(Stop::NoVerdict(format!("the bench build of {} could not run (exit {code}, job {id}; the reason is printed above, e.g. Broadsword paused, the disk guard or a busy build folder)", self.label)));
+        }
+        if code != 0 {
+            return Err(Stop::Fail(format!("the bench could not be built on {} ({}): job {id} exited {code} ({}); a bench that cannot be built fails the gate", self.label, short(&self.commit), info.summary.join("; "))));
+        }
+        let text = match info.log.as_deref().map(std::fs::read_to_string) {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
+                return Err(Stop::NoVerdict(format!(
+                    "the log of bench build job {id} could not be read: {e}"
+                )))
+            }
+            None => return Err(Stop::NoVerdict(format!("bench build job {id} has no log"))),
+        };
+        let (manifest, exe) = bench_artifact(&text).map_err(|m| {
+            Stop::Fail(format!(
+                "the bench build of {} (job {id}) cannot be used: {m}",
+                self.label
+            ))
+        })?;
+        let same = |a: &Path, b: &Path| matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
+        if !manifest.parent().is_some_and(|p| same(p, &self.dir)) {
+            return Err(Stop::Fail(format!("the `bench` example built for {} (job {id}) belongs to {}, not to the package at the root of {}", self.label, manifest.display(), self.dir.display())));
+        }
+        let package = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|t| buildsrc::package_name_in(&t));
+        let Some(package) = package else {
+            return Err(Stop::Fail(format!(
+                "cannot read the package name in {}",
+                manifest.display()
+            )));
+        };
+        let lock = buildsrc::lock(cfg).map_err(|(_, m)| Stop::NoVerdict(m))?;
+        // under the lock: whoever builds this package from another folder rewrites its note FIRST (buildsrc.rs), so a note that
+        // still names this folder means the executable in the build folder is this folder's
+        let source = buildsrc::rel_source(cfg, &self.dir).map_err(Stop::NoVerdict)?;
+        let want = format!("{}{source}", buildsrc::RUN_NOTE_PREFIX);
+        let note = buildsrc::read_note(cfg, &package);
+        if note.as_deref() != Some(want.as_str()) {
+            return Err(Stop::NoVerdict(format!("the shared build folder changed hands before the bench of {} could be copied out (package `{package}` is noted as {:?}, not {want:?}); run the entry again", self.label, note.unwrap_or_default())));
+        }
+        self.still_there()?;
+        let dest_dir = copies.join(self.label);
+        let dest = dest_dir.join(exe.file_name().unwrap_or_default());
+        std::fs::create_dir_all(&dest_dir)
+            .and_then(|_| std::fs::copy(&exe, &dest))
+            .map_err(|e| {
+                Stop::NoVerdict(format!(
+                    "cannot copy the bench {} to {}: {e}",
+                    exe.display(),
+                    dest.display()
+                ))
+            })?;
+        Ok((id, dest, lock))
+    }
+}
+
+/// Run one bench copy in its checkout folder: the case lines it printed.
+fn bench_once(
+    cfg: &Config,
+    side: &Side,
+    exe: &Path,
+    runs_per_case: u64,
+    log: &Arc<Mutex<std::fs::File>>,
+    what: &str,
+) -> Result<Vec<(String, f64)>, Stop> {
+    if let Ok(mut f) = log.lock() {
+        let _ = std::io::Write::write_all(
+            &mut *f,
+            format!(
+                "=== {what}: {} at {} in {} ===\n",
+                side.label,
+                short(&side.commit),
+                side.dir.display()
+            )
+            .as_bytes(),
+        );
+    }
+    let mut cmd = scrub::command(cfg, exe);
+    cmd.arg("--runs")
+        .arg(runs_per_case.to_string())
+        .current_dir(&side.dir);
+    let mut free = job::hooked_free_source(cfg);
+    let secrets = Arc::new(scrub::secrets(cfg));
+    let ran = job::run_child(
+        cfg,
+        cmd,
+        log,
+        &mut *free,
+        Duration::from_secs(cfg.job_disk_poll_seconds),
+        &mut |_| {},
+        &secrets,
+    )
+    .map_err(Stop::NoVerdict)?;
+    match ran.outcome {
+        Outcome::DiskDropped(f) => Err(Stop::NoVerdict(format!(
+            "{what} ({}) was stopped: free space fell to {} (below the floor)",
+            side.label,
+            pause::gb(f)
+        ))),
+        Outcome::Exited(Some(0)) => parse_bench(&ran.stdout).map_err(|m| {
+            Stop::Fail(format!(
+                "the output of {what} ({}) cannot be used: {m}",
+                side.label
+            ))
+        }),
+        Outcome::Exited(c) => Err(Stop::Fail(format!(
+            "the bench failed: {what} ({}) exited {}; a bench that cannot run fails the gate",
+            side.label,
+            c.map(|c| c.to_string())
+                .unwrap_or_else(|| "without a code".into())
+        ))),
+    }
+}
+
 /// THE GATE, the one place every queue path calls (the single-entry check step, a train's check of its tip, every bisect check and
-/// a culprit's own check): judge `project` at the commit its task's worktree holds now. `what` names the check in the output.
+/// a culprit's own check): judge `project` at the commit its task's worktree holds now against the project's trunk tip. `what`
+/// names the check in the output.
 pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
     if !cfg.perf_gate {
         return Gate::Skipped(format!(
@@ -328,83 +687,166 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
         }
         Found::Some(b) => b,
     };
+    let no_verdict = |m: String| Gate::NoVerdict(m);
+    // the two sides
+    let main_dir = match job::job_folder(cfg, project, None) {
+        Ok(d) => d,
+        Err((_, m)) => return no_verdict(m),
+    };
+    let wt = match job::job_folder(cfg, project, Some(task)) {
+        Ok(d) => d,
+        Err((_, m)) => return no_verdict(m),
+    };
+    let (trunk, tip) = match wtgit::trunk_commit(&main_dir) {
+        Ok(t) => t,
+        Err(m) => return no_verdict(m),
+    };
+    let entry = match wtgit::head_commit(&wt) {
+        Ok(h) => h,
+        Err(m) => return no_verdict(m),
+    };
+    // nothing benched changed: not judged, nothing built
+    let changed = match changed_paths(&wt, &tip, &entry) {
+        Ok(c) => c,
+        Err(m) => {
+            return no_verdict(format!(
+                "cannot list what the entry changes against main: {m}"
+            ))
+        }
+    };
+    if !changed.iter().any(|p| is_benched_path(p)) {
+        let list = if changed.is_empty() {
+            "no file differs".to_string()
+        } else {
+            format!(
+                "only documentation differs: {}",
+                changed
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Gate::Skipped(format!("perf gate {project}: not judged: no benched source changed against main {trunk} ({}; {list}); no bench was built or ran", short(&tip)));
+    }
+    let a = Side {
+        label: "main",
+        dir: main_dir,
+        task: None,
+        commit: tip.clone(),
+    };
+    let b = Side {
+        label: "entry",
+        dir: wt,
+        task: Some(task.to_string()),
+        commit: entry.clone(),
+    };
     let head = header(cfg, project, &base);
     println!("{head}");
-    let mut lines = vec![head];
-    let command = format!("{BENCH_COMMAND} {}", base.runs_per_case);
-    let mut runs: Vec<Vec<(String, f64)>> = Vec::new();
-    let mut jobs: Vec<String> = Vec::new();
-    for i in 1..=cfg.perf_runs {
-        println!(
-            "perf gate {project}: bench run {i} of {} ({what}): {command}",
-            cfg.perf_runs
-        );
-        let mut info = JobInfo::default();
-        let code = job::run_job_info(
-            cfg,
-            JobSpec {
-                kind: "run".into(),
-                name: project.to_string(),
-                command: Some(command.clone()),
-                first_step: 0,
-                resumed_from: None,
-                resume_count: 0,
-                task: Some(task.to_string()),
-            },
-            &mut info,
-        );
-        let id = info.id.clone().unwrap_or_else(|| "none".into());
-        jobs.push(id.clone());
-        if info.summary.is_empty() {
-            return Gate::NoVerdict(format!("bench run {i} of {} could not run (exit {code}, job {id}; the reason is printed above, e.g. Broadsword paused, the disk guard or a busy build folder)", cfg.perf_runs));
-        }
-        if code != 0 {
-            let reason = format!("the bench failed: run {i} of {} exited {code} (job {id}: {}); a bench that cannot run on this commit fails the gate", cfg.perf_runs, info.summary.join("; "));
-            lines.push(format!("FAILED: {reason}"));
-            return Gate::Fail(reason, lines);
-        }
-        let text = match info.log.as_deref().map(std::fs::read_to_string) {
-            Some(Ok(t)) => t,
-            Some(Err(e)) => {
-                return Gate::NoVerdict(format!(
-                    "the log of bench run {i} (job {id}) could not be read: {e}"
-                ))
+    let ab = format!("perf gate {project}: A/B ({what}): main {trunk} at {} (the project's main checkout) against the entry at {} (task {task}'s worktree); {} round(s) of main then entry, under one hold of the build lock", short(&tip), short(&entry), cfg.perf_runs);
+    println!("{ab}");
+    let mut lines = vec![head, ab];
+    let fail = |reason: String, mut lines: Vec<String>| {
+        lines.push(format!("FAILED: {reason}"));
+        println!("perf gate {project}: FAILED: {reason}");
+        Gate::Fail(reason, lines)
+    };
+    let stopped = |s: Stop, lines: Vec<String>| match s {
+        Stop::Fail(r) => fail(r, lines),
+        Stop::NoVerdict(m) => Gate::NoVerdict(m),
+    };
+    // build A, copy it out (its lock is dropped before B's build job needs the lock); build B, copy it out and KEEP the lock
+    let copies = Copies(cfg.scratch_dir.join("perf-bins").join(format!(
+        "{project}-{}-{}",
+        job::file_stamp(now_secs()),
+        std::process::id()
+    )));
+    let mut built: Vec<(String, PathBuf)> = Vec::new();
+    let mut hold: Option<Lock> = None;
+    for side in [&a, &b] {
+        drop(hold.take());
+        match side.build(cfg, project, &copies.0) {
+            Ok((id, exe, lock)) => {
+                built.push((id, exe));
+                hold = Some(lock);
             }
-            None => return Gate::NoVerdict(format!("bench run {i} (job {id}) has no log")),
-        };
-        match parse_bench(&text) {
-            Ok(r) => runs.push(r),
-            Err(m) => {
-                let reason = format!(
-                    "the output of bench run {i} of {} (job {id}) cannot be used: {m}",
-                    cfg.perf_runs
-                );
-                lines.push(format!("FAILED: {reason}"));
-                return Gate::Fail(reason, lines);
+            Err(s) => return stopped(s, lines),
+        }
+    }
+    // the runs, under the lock taken for B's copy
+    let mut free = job::hooked_free_source(cfg);
+    if let Err(why) = job::guard_decision(
+        pause::is_paused(&cfg.root),
+        free(),
+        cfg.reserve_bytes(),
+        cfg.floor_bytes(),
+    ) {
+        return no_verdict(format!("the bench runs were refused: {why}"));
+    }
+    if let Err(s) = a.still_there().and_then(|_| b.still_there()) {
+        return stopped(s, lines);
+    }
+    let log_dir = cfg.scratch_dir.join("logs").join("perf");
+    let (log_path, log) = match std::fs::create_dir_all(&log_dir).and_then(|_| {
+        job::create_log(
+            &log_dir,
+            &format!("{}-{project}-perf", job::file_stamp(now_secs())),
+        )
+    }) {
+        Ok((p, f)) => (p, Arc::new(Mutex::new(f))),
+        Err(e) => {
+            return no_verdict(format!(
+                "cannot create the bench log in {}: {e}",
+                log_dir.display()
+            ))
+        }
+    };
+    let (mut ra, mut rb): (Vec<Run>, Vec<Run>) = (Vec::new(), Vec::new());
+    for i in 1..=cfg.perf_runs {
+        for (side, (_, exe), out) in [(&a, &built[0], &mut ra), (&b, &built[1], &mut rb)] {
+            let run = format!("bench round {i} of {}", cfg.perf_runs);
+            println!(
+                "perf gate {project}: {run}: {} ({}): {} --runs {}",
+                side.label,
+                short(&side.commit),
+                exe.display(),
+                base.runs_per_case
+            );
+            match bench_once(cfg, side, exe, base.runs_per_case, &log, &run) {
+                Ok(r) => out.push(r),
+                Err(s) => {
+                    lines.push(format!("bench log: {}", shown(cfg, &log_path)));
+                    return stopped(s, lines);
+                }
             }
         }
     }
-    let (ok, case_lines) = judge(&base, &runs);
+    drop(hold);
+    drop(copies);
+    let (ok, case_lines) = judge(&base, &ra, &rb);
     for l in &case_lines {
         println!("perf gate {project}: {l}");
     }
     lines.extend(case_lines.iter().cloned());
-    lines.push(format!("bench jobs: {}", jobs.join(", ")));
+    lines.push(format!(
+        "bench build jobs: main {}, entry {}; bench log: {}",
+        built[0].0,
+        built[1].0,
+        shown(cfg, &log_path)
+    ));
     if ok {
         lines.push(format!(
-            "perf gate {project}: PASS ({} bench run(s))",
+            "perf gate {project}: PASS ({} A/B round(s))",
             cfg.perf_runs
         ));
         println!("perf gate {project}: PASS");
         Gate::Pass(lines)
     } else {
         let reason = format!(
-            "{} ({}): {}",
-            if base.loaded {
-                "slower than the LOADED baseline allows"
-            } else {
-                "slower than the baseline allows"
-            },
+            "slower than main {trunk} ({}) by more than the {} baseline's thresholds allow ({}): {}",
+            short(&tip),
+            if base.loaded { "LOADED" } else { "quiet" },
             shown(cfg, &baseline_path(cfg, project)),
             case_lines.join("; ")
         );
@@ -412,6 +854,13 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
         println!("perf gate {project}: FAIL");
         Gate::Fail(reason, lines)
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -554,44 +1003,144 @@ mod tests {
     }
 
     #[test]
-    fn each_case_is_judged_on_the_median_of_the_runs_against_its_own_threshold() {
-        let b = base(&[("box", 1.0, 10.0), ("cube", 1.0, 20.0)]);
-        // box: median of 1.05, 1.30, 1.08 = 1.08 (+8%, under 10%); cube: +15%, under 20%
+    fn each_case_is_judged_on_the_ratio_of_the_two_sides_medians_against_its_own_threshold() {
+        // the stored medians (9.0) are a record only: the verdict is entry against main
+        let b = base(&[("box", 9.0, 10.0), ("cube", 9.0, 20.0)]);
+        let main = [
+            run(&[("box", 2.0), ("cube", 1.0)]),
+            run(&[("box", 2.2), ("cube", 1.0)]),
+            run(&[("box", 1.8), ("cube", 1.0)]),
+        ];
+        // box: entry median of 2.1, 2.6, 2.16 = 2.16 against main 2.0: ratio 1.08 (+8%, under 10%); cube +15%, under 20%
         let (ok, lines) = judge(
             &b,
+            &main,
             &[
-                run(&[("box", 1.05), ("cube", 1.15)]),
-                run(&[("box", 1.30), ("cube", 1.15)]),
-                run(&[("box", 1.08), ("cube", 1.15)]),
+                run(&[("box", 2.1), ("cube", 1.15)]),
+                run(&[("box", 2.6), ("cube", 1.15)]),
+                run(&[("box", 2.16), ("cube", 1.15)]),
             ],
         );
         assert!(ok, "{lines:?}");
-        assert!(
-            lines[0].starts_with(
-                "box: baseline 1.000 ms, now 1.080 ms, change +8.0% (threshold 10%): ok"
-            ),
+        assert_eq!(
+            lines[0], "box: main 2.000 ms, entry 2.160 ms, ratio 1.080 (+8.0%, threshold 10%): ok",
             "{lines:?}"
         );
         // cube +15% is over box's 10% but under its own 20%; box +12% is over its 10%
-        let (ok, lines) = judge(&b, &[run(&[("box", 1.12), ("cube", 1.15)])]);
+        let (ok, lines) = judge(&b, &main, &[run(&[("box", 2.24), ("cube", 1.15)])]);
         assert!(!ok);
         assert!(
-            lines[0].contains("+12.0%") && lines[0].contains("FAIL"),
+            lines[0].contains("ratio 1.120 (+12.0%") && lines[0].contains("FAIL"),
             "{lines:?}"
         );
         assert!(lines[1].ends_with(": ok"), "{lines:?}");
         // exactly at the threshold passes; faster passes
-        assert!(judge(&b, &[run(&[("box", 1.1), ("cube", 0.5)])]).0);
+        assert!(
+            judge(
+                &b,
+                &[run(&[("box", 1.0), ("cube", 1.0)])],
+                &[run(&[("box", 1.1), ("cube", 0.5)])]
+            )
+            .0
+        );
     }
 
     #[test]
-    fn a_case_missing_from_a_run_fails_and_an_extra_case_is_not_judged() {
+    fn a_uniform_load_on_both_sides_does_not_fail_and_a_main_median_of_zero_fails_closed() {
         let b = base(&[("box", 1.0, 10.0)]);
-        let (ok, lines) = judge(&b, &[run(&[("box", 1.0)]), run(&[("other", 1.0)])]);
-        assert!(!ok && lines[0].contains("MISSING"), "{lines:?}");
-        let (ok, lines) = judge(&b, &[run(&[("box", 1.0), ("new", 9.0)])]);
+        // the whole machine 3x slower: both sides alike, ratio 1
+        assert!(judge(&b, &[run(&[("box", 3.0)])], &[run(&[("box", 3.0)])]).0);
+        let (ok, lines) = judge(&b, &[run(&[("box", 0.0)])], &[run(&[("box", 0.0)])]);
+        assert!(
+            !ok && lines[0].contains("main's median is 0 ms"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_case_missing_from_a_run_of_either_side_fails_and_an_extra_case_is_not_judged() {
+        let b = base(&[("box", 1.0, 10.0)]);
+        let one = [run(&[("box", 1.0)])];
+        let (ok, lines) = judge(&b, &one, &[run(&[("box", 1.0)]), run(&[("other", 1.0)])]);
+        assert!(
+            !ok && lines[0].contains("entry MISSING in run(s) [2]"),
+            "{lines:?}"
+        );
+        let (ok, lines) = judge(&b, &[run(&[("other", 1.0)])], &one);
+        assert!(
+            !ok && lines[0].contains("main MISSING in run(s) [1]"),
+            "{lines:?}"
+        );
+        let (ok, lines) = judge(&b, &one, &[run(&[("box", 1.0), ("new", 9.0)])]);
         assert!(ok && lines[1].contains("not judged"), "{lines:?}");
-        assert!(!judge(&b, &[]).0, "no run is no pass");
+        assert!(!judge(&b, &[], &one).0, "no main run is no pass");
+        assert!(!judge(&b, &one, &[]).0, "no entry run is no pass");
+    }
+
+    #[test]
+    fn only_documentation_is_not_benched() {
+        for p in [
+            "docs/STAGE6.md",
+            "README.md",
+            "notes/x.MD",
+            "docs/img/a.png",
+            "DOCS/x.txt",
+        ] {
+            assert!(!is_benched_path(p), "{p}");
+        }
+        for p in [
+            "src/lib.rs",
+            "src/README.md",
+            "examples/bench.rs",
+            "examples/notes.md",
+            "benches/a.md",
+            "SRC/x.md",
+            "Cargo.toml",
+            "Cargo.lock",
+            "scenarios/box.bsn",
+            "build.rs",
+            ".cargo/config.toml",
+            "scripts/x.py",
+            ".gitattributes",
+            "docsx/a.rs",
+        ] {
+            assert!(is_benched_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_bench_executable_is_read_from_cargos_json_and_must_be_exactly_one() {
+        let art = |kind: &str, name: &str, exe: &str| {
+            format!("{{\"reason\":\"compiler-artifact\",\"manifest_path\":\"C:\\\\p\\\\Cargo.toml\",\"target\":{{\"kind\":[\"{kind}\"],\"name\":\"{name}\"}},\"executable\":{exe}}}")
+        };
+        let log = format!(
+            "job: run p\n{}\n{}\n{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            art("lib", "p", "null"),
+            art(
+                "example",
+                "bench",
+                r#""C:\\b\\release\\examples\\bench.exe""#
+            ),
+            art("example", "energy", r#""C:\\b\\e.exe""#)
+        );
+        assert_eq!(
+            bench_artifact(&log).unwrap(),
+            (
+                PathBuf::from(r"C:\p\Cargo.toml"),
+                PathBuf::from(r"C:\b\release\examples\bench.exe")
+            )
+        );
+        assert!(bench_artifact("job: run p\n").is_err(), "none");
+        let two = format!(
+            "{}\n{}\n",
+            art("example", "bench", "\"a.exe\""),
+            art("example", "bench", "\"b.exe\"")
+        );
+        assert!(bench_artifact(&two).is_err(), "two");
+        assert!(
+            bench_artifact("{\"reason\":\"compiler-artifact\",oops}\n").is_err(),
+            "not JSON"
+        );
     }
 
     #[test]

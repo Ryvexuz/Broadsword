@@ -1,10 +1,13 @@
 //! End-to-end tests of the merge queue's PERF GATE (perfgate.rs): the real binary, real Git repos and a real tiny cargo project in
 //! throwaway Broadsword roots under the repo's `scratch/` folder.
 //!
-//! The bench is the tiny project's OWN `examples/bench.rs`, run by the real gate with the real command (`cargo run --release
-//! --offline --example bench -- --runs N`). It prints fixed JSON case lines, so no real timing is involved: a test picks the
-//! verdict through the baseline it writes to `state/perf/p-baseline.json` and the numbers the committed bench prints. There is no
-//! test hook in the binary for this. NO MODEL IS EVER CALLED: the reviewer is `fake_claude`, as in tests/queue.rs.
+//! The bench is the tiny project's OWN `examples/bench.rs`, built by the real gate on main (the project's main checkout) and on the
+//! entry (the task's worktree) and run A/B. It prints fixed JSON case lines times a LOAD factor read from the env var `PG_LOAD`
+//! (default 1), which a test sets for the whole `queue run`, so it applies to main and entry alike: a uniformly loaded machine. No
+//! real timing is involved: the verdict comes from the numbers each side's committed bench prints and the thresholds of the
+//! baseline in `state/perf/p-baseline.json`. Each bench run also appends its working folder to the file named by `PG_BENCH_LOG`,
+//! so a test sees which checkout each run was in, and in what order. There is no test hook in the binary for any of this. NO MODEL
+//! IS EVER CALLED: the reviewer is `fake_claude`, as in tests/queue.rs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,11 +20,24 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 const LIB: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n";
 
-/// A bench example that prints these (case, median_ms) lines, in the bench's own JSON format, whatever `--runs` it is given.
+/// The start of every test bench: `--runs` is accepted and ignored, the load factor is read, and the working folder is logged.
+const BENCH_HEAD: &str = r#"use std::io::Write;
+
+fn main() {
+    let _ = std::env::args().count();
+    let load: f64 = std::env::var("PG_LOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    if let Ok(p) = std::env::var("PG_BENCH_LOG") {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
+        writeln!(f, "{}", std::env::current_dir().unwrap().display()).unwrap();
+    }
+"#;
+
+/// A bench example that prints these (case, median_ms x the load factor) lines, in the bench's own JSON format, whatever `--runs`
+/// it is given.
 fn bench_src(cases: &[(&str, f64)]) -> String {
-    let mut s = String::from("fn main() {\n    let _ = std::env::args().count();\n");
+    let mut s = String::from(BENCH_HEAD);
     for (n, m) in cases {
-        s.push_str(&format!("    println!(\"{{{{\\\"name\\\":\\\"{n}\\\",\\\"runs\\\":3,\\\"median_ms\\\":{m:.3},\\\"min_ms\\\":{m:.3},\\\"max_ms\\\":{m:.3},\\\"mad_ms\\\":0.000}}}}\");\n"));
+        s.push_str(&format!("    println!(\"{{{{\\\"name\\\":\\\"{n}\\\",\\\"runs\\\":3,\\\"median_ms\\\":{{:.3}},\\\"mad_ms\\\":0.000}}}}\", {m:.3} * load);\n"));
     }
     s.push_str("}\n");
     s
@@ -129,10 +145,17 @@ impl Root {
     }
 
     fn run(&self, args: &[&str]) -> Out {
+        self.run_loaded(args, 1.0)
+    }
+
+    /// `run` on a machine `load` times slower: every bench, main's and the entry's, prints its times x `load`.
+    fn run_loaded(&self, args: &[&str], load: f64) -> Out {
         let o = Command::new(bin())
             .args(args)
             .current_dir(&self.dir)
             .stdin(Stdio::null())
+            .env("PG_LOAD", load.to_string())
+            .env("PG_BENCH_LOG", self.dir.join("bench-runs.log"))
             .env("BROADSWORD_REVIEWER_CLI", &self.fake)
             .env("FAKE_CLAUDE_OUT_DIR", &self.fake_out)
             .env("FAKE_CLAUDE_MODEL", "auto")
@@ -161,6 +184,7 @@ impl Root {
         let o = self.run(&["task", "start", &id, "--owner", "coder", "--worktree"]);
         assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
         let wt = self.wt(&id);
+        fs::create_dir_all(wt.join(file).parent().unwrap()).unwrap();
         fs::write(wt.join(file), content).unwrap();
         git(&wt, &["add", file]);
         git(
@@ -201,7 +225,26 @@ impl Root {
             .unwrap_or(0)
     }
 
-    /// How many `run` jobs (bench runs) were started in this root.
+    /// Every bench run so far, in order: `M` for one in the project's main checkout, `E` for one in a task's worktree.
+    fn bench_runs(&self) -> String {
+        let main = self.p();
+        fs::read_to_string(self.dir.join("bench-runs.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let p = PathBuf::from(l.trim());
+                if p.starts_with(self.dir.join("worktrees")) {
+                    'E'
+                } else if p == main {
+                    'M'
+                } else {
+                    panic!("a bench ran in {l}, neither the main checkout nor a worktree")
+                }
+            })
+            .collect()
+    }
+
+    /// How many `run` jobs (bench builds: one per side and gate) were started in this root.
     fn bench_jobs(&self) -> usize {
         fs::read_dir(self.dir.join("state/jobs"))
             .into_iter()
@@ -222,15 +265,20 @@ impl Root {
 }
 
 #[test]
-fn a_case_slower_than_its_threshold_fails_the_entry_perf_failed_before_any_review() {
-    // box +100% over its 10%; cube +20% is within its own 50%: each case is judged on its own threshold
-    let r = Root::new("slow", &[("box", 2.0), ("cube", 1.2)], 1);
+fn an_entry_2x_slower_than_main_fails_perf_failed_with_the_ratio_named_before_any_review() {
+    // (c) box twice as slow as main's, over its 10%; cube +20% is within its own 50%: each case is judged on its own threshold.
+    // The stored medians (5.0) are far from both sides: they are a record only.
+    let r = Root::new("slow", &[("box", 1.0), ("cube", 1.0)], 1);
     r.set_baseline(
         "p",
-        &baseline(true, &[("box", 1.0, 10.0), ("cube", 1.0, 50.0)]),
+        &baseline(true, &[("box", 5.0, 10.0), ("cube", 5.0, 50.0)]),
     );
     let main = r.head();
-    let (task, entry) = r.queued("src/lib.rs", "src/lib.rs", &format!("{LIB}// a change\n"));
+    let (task, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 2.0), ("cube", 1.2)]),
+    );
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
     assert_eq!(
@@ -241,12 +289,15 @@ fn a_case_slower_than_its_threshold_fails_the_entry_perf_failed_before_any_revie
     );
     let reason = r.field(&entry, "reason");
     assert!(
-        reason
-            .contains("box: baseline 1.000 ms, now 2.000 ms, change +100.0% (threshold 10%): FAIL"),
+        reason.contains(
+            "box: main 1.000 ms, entry 2.000 ms, ratio 2.000 (+100.0%, threshold 10%): FAIL"
+        ),
         "{reason}"
     );
     assert!(
-        reason.contains("cube: baseline 1.000 ms, now 1.200 ms, change +20.0% (threshold 50%): ok"),
+        reason.contains(
+            "cube: main 1.000 ms, entry 1.200 ms, ratio 1.200 (+20.0%, threshold 50%): ok"
+        ),
         "{reason}"
     );
     assert!(
@@ -259,7 +310,12 @@ fn a_case_slower_than_its_threshold_fails_the_entry_perf_failed_before_any_revie
         "{}",
         o.stdout
     );
-    assert_eq!(r.bench_jobs(), 2, "the bench ran perf_runs (2) times");
+    assert_eq!(r.bench_jobs(), 2, "one bench build job per side");
+    assert_eq!(
+        r.bench_runs(),
+        "MEME",
+        "perf_runs (2) rounds, main then entry, each in its own checkout"
+    );
     assert_eq!(r.calls(), 0, "no model was asked");
     assert_eq!(r.head(), main, "nothing merged");
     assert!(
@@ -272,20 +328,104 @@ fn a_case_slower_than_its_threshold_fails_the_entry_perf_failed_before_any_revie
         "the task stays running: {}",
         o.stdout
     );
+    assert!(
+        !r.dir
+            .join("scratch/perf-bins")
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
+        "the bench copies are removed"
+    );
+}
+
+#[test]
+fn a_uniformly_loaded_machine_does_not_fail_an_unchanged_entry_but_a_slower_entry_still_fails() {
+    // (a) the stored baseline (1.0) was taken on a quiet machine; the machine is now 3x slower for main and entry alike
+    let r = Root::new("load", &[("box", 1.0)], 1);
+    r.set_baseline("p", &baseline(false, &[("box", 1.0, 10.0)]));
+    let (_, entry) = r.queued(
+        "src/lib.rs",
+        "src/lib.rs",
+        &format!("{LIB}// a change that does not touch the bench\n"),
+    );
+    let o = r.run_loaded(&["queue", "run"], 3.0);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
+    assert!(
+        r.show(&entry)
+            .contains("box: main 3.000 ms, entry 3.000 ms, ratio 1.000 (+0.0%, threshold 10%): ok"),
+        "{}",
+        r.show(&entry)
+    );
+    assert_eq!(r.bench_runs(), "MEME");
+    // on the same loaded machine, an entry 1.5x slower than main fails
+    let before = r.head();
+    let (_, slow) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 1.5)]),
+    );
+    let o = r.run_loaded(&["queue", "run"], 3.0);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&slow, "status"), "perf_failed", "{}", r.show(&slow));
+    let reason = r.field(&slow, "reason");
+    assert!(
+        reason.contains(
+            "box: main 3.000 ms, entry 4.500 ms, ratio 1.500 (+50.0%, threshold 10%): FAIL"
+        ),
+        "{reason}"
+    );
+    assert_eq!(r.head(), before, "nothing merged");
+}
+
+#[test]
+fn a_docs_only_entry_is_not_judged_and_no_bench_is_built_or_run() {
+    // (b) the baseline would fail any bench by far: if a bench ran, the entry could not merge
+    let r = Root::new("docs", &[("box", 9.0)], 1);
+    r.set_baseline("p", &baseline(false, &[("box", 0.001, 1.0)]));
+    let (_, entry) = r.queued("docs", "docs/NOTES.md", "# notes\n");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
+    assert!(
+        o.stdout
+            .contains("perf gate p: not judged: no benched source changed against main main"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout
+            .contains("only documentation differs: docs/NOTES.md"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        r.show(&entry)
+            .contains("not judged: no benched source changed"),
+        "the skip is logged in the entry: {}",
+        r.show(&entry)
+    );
+    assert_eq!(r.bench_jobs(), 0, "no bench was built");
+    assert_eq!(r.bench_runs(), "", "no bench ran");
 }
 
 #[test]
 fn a_faster_bench_passes_the_gate_and_the_reviewer_sees_the_perf_report() {
-    let r = Root::new("fast", &[("box", 2.0)], 1);
+    let r = Root::new("fast", &[("box", 4.0)], 1);
     r.set_baseline("p", &baseline(true, &[("box", 4.0, 10.0)]));
-    let (_, entry) = r.queued("src/lib.rs", "src/lib.rs", &format!("{LIB}// a change\n"));
+    let (_, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 2.0)]),
+    );
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.field(&entry, "status"), "merged");
     let show = r.show(&entry);
     assert!(
-        show.contains("box: baseline 4.000 ms, now 2.000 ms, change -50.0% (threshold 10%): ok")
-            && show.contains("perf gate p: PASS"),
+        show.contains(
+            "box: main 4.000 ms, entry 2.000 ms, ratio 0.500 (-50.0%, threshold 10%): ok"
+        ) && show.contains("perf gate p: PASS"),
         "{show}"
     );
     assert_eq!(r.bench_jobs(), 2);
@@ -372,9 +512,9 @@ fn a_merge_train_runs_the_gate_on_its_tip_and_bisects_a_perf_failure_to_the_slow
     assert_eq!(r.field(&e2, "status"), "perf_failed", "{}", r.show(&e2));
     let reason = r.field(&e2, "reason");
     assert!(
-        reason
-            .contains("box: baseline 2.000 ms, now 3.000 ms, change +50.0% (threshold 10%): FAIL")
-            && reason.contains("bisect of merge train"),
+        reason.contains(
+            "box: main 2.000 ms, entry 3.000 ms, ratio 1.500 (+50.0%, threshold 10%): FAIL"
+        ) && reason.contains("bisect of merge train"),
         "{reason}"
     );
     assert!(
@@ -384,8 +524,9 @@ fn a_merge_train_runs_the_gate_on_its_tip_and_bisects_a_perf_failure_to_the_slow
         o.stdout
     );
     // the tip (both) failed, the bisect's first-entry check passed; entry 2 is the 2nd, so its tip was its own commit on the
-    // chain (k = 2 needs a check alone): 3 checks x 2 bench runs
+    // chain (k = 2 needs a check alone): 3 gates x 2 bench builds, 3 gates x 2 rounds of main then entry
     assert_eq!(r.bench_jobs(), 6, "{}", o.stdout);
+    assert_eq!(r.bench_runs(), "MEMEMEMEMEME", "{}", o.stdout);
     assert_eq!(
         git(&r.p(), &["rev-parse", "HEAD~1"]),
         main,
