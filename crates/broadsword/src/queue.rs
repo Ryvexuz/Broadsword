@@ -1837,7 +1837,10 @@ verdict: {} (answer followed the format: {})
             // an earlier run already fast-forwarded main to this commit (a merge train: to a later commit that contains it) and died
             // before recording it
             self.e.set("main_sha", reviewed.clone());
-            return self.log("merge", &format!("the reviewed commit {} is already on main (HEAD {}): recorded as merged", short(&reviewed), short(&head)));
+            if head == reviewed {
+                return self.log("merge", &format!("main's HEAD already is the reviewed commit {}: recorded as merged", short(&head)));
+            }
+            return self.log("merge", &format!("the reviewed commit {} is already on main (HEAD {} contains it): recorded as merged", short(&reviewed), short(&head)));
         }
         let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
         if !dirty.is_empty() {
