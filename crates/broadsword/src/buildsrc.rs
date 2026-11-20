@@ -40,10 +40,28 @@
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
 //! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
 //!
-//! Deleting: `cargo clean -p` is the ONLY deletion here. It is built in one function (`clean_command`) that always passes
+//! Main's binaries survive another folder's clean (found 2026-11-20: a worktree's bench build cleaned `crash-sim` and deleted
+//! `build/release/crash-sim.exe` that Lazlo had just built from projects/crash-sim; render's drive tests then found no
+//! binary). Before a job of a folder that is not its project's main checkout cleans a package, every exe of that package's bin
+//! targets whose note names the main checkout (plain or `run:`) is copied, per profile, to `<build_dir>/main.bins/<profile>/`
+//! with the note beside it (`<exe>.source`). After the clean, any job of that project puts the kept copy back in cargo's place
+//! if the clean removed it. The clean still removed cargo's fingerprint, so a cargo step that needs the target rebuilds it from
+//! the job's own source; one that does not (an example, a bench) leaves main's exe for people and other projects' tests. The
+//! kept copy itself is written only from an exe whose note names the main checkout, so a worktree's exe never lands there.
+//! Limits: the kept copy is refreshed only when another folder's job cleans the package, so right after a main build it can be
+//! older than the exe in cargo's place (which is then main's, and its bin note says so); and a worktree job whose cargo step
+//! builds the target itself leaves its own exe in cargo's place until the next job of that package (its bin note names the
+//! worktree; main's exe is still in `main.bins`). The package and bin notes stay conservative: after a restore they name the
+//! job's folder, so the next job of another folder cleans again and `install` still refuses. So a command of that worktree
+//! that runs the exe by its path WITHOUT cargo building it gets main's restored exe while the bin note names the worktree
+//! (cargo itself never mistakes it for the worktree's: its fingerprint is gone).
+//!
+//! Deleting: `cargo clean -p` is the ONLY deletion of build output here. It is built in one function (`clean_command`) that always passes
 //! `-p <package>` (a bare `cargo clean` would wipe the whole folder), always points cargo at `build_dir` through both
 //! `--target-dir` and `CARGO_TARGET_DIR`, and refuses if `build_dir` is not strictly inside root or the source folder is
-//! inside it. Cargo deletes only regenerable artifacts below the target directory it is given; it never touches sources.
+//! inside it. Cargo deletes only regenerable artifacts below the target directory it is given; it never touches sources. The
+//! kept copies replace their own older versions (a rename over the file, and the `.source` note removed before a new copy is
+//! written), inside `<build_dir>/main.bins` only, behind the same build-folder guard (`guard_build_dir`).
 
 use crate::config::Config;
 use crate::lock::{self, Lock};
@@ -278,8 +296,31 @@ pub enum Profile {
     Release,
 }
 
+impl Profile {
+    /// The folder of this profile's artifacts under `build_dir` (cargo's layout).
+    pub fn dir(self) -> &'static str {
+        match self {
+            Profile::Dev => "debug",
+            Profile::Release => "release",
+        }
+    }
+}
+
 /// Every profile a stale package is cleaned in, in this order. Limit: a custom `[profile.<name>]` is not cleaned.
 pub const CLEAN_PROFILES: [Profile; 2] = [Profile::Dev, Profile::Release];
+
+/// The checks every write or delete in the build folder passes first: `build_dir` strictly inside root, no `..`, and no
+/// symlink, junction or reparse point on the way to it. `what` starts the message ("refusing to clean", ...).
+fn guard_build_dir(cfg: &Config, what: &str) -> Result<(), String> {
+    let b = &cfg.build_dir;
+    if !b.starts_with(&cfg.root) || *b == cfg.root || !b.components().all(|c| !matches!(c, Component::ParentDir)) {
+        return Err(format!("{what}: the build folder {} is not strictly inside root", b.display()));
+    }
+    if let Some(l) = link_in_path(b) {
+        return Err(format!("{what}: {} is a symlink, junction or reparse point (on the way to the build folder {}), so cleaning could reach somewhere that is not ours", l.display(), b.display()));
+    }
+    Ok(())
+}
 
 /// The one and only place a `cargo clean` is made. Always `-p <package>`, always aimed at `build_dir`, for one `profile` (dev, or
 /// `--release`). Refuses (Err, nothing run) if the package name is not a plain cargo name, `build_dir` is not strictly inside
@@ -289,12 +330,7 @@ pub fn clean_command(cfg: &Config, dir: &Path, package: &str, profile: Profile) 
         return Err(format!("refusing to clean: `{package}` is not a plain package name"));
     }
     let b = &cfg.build_dir;
-    if !b.starts_with(&cfg.root) || *b == cfg.root || !b.components().all(|c| !matches!(c, Component::ParentDir)) {
-        return Err(format!("refusing to clean: the build folder {} is not strictly inside root", b.display()));
-    }
-    if let Some(l) = link_in_path(b) {
-        return Err(format!("refusing to clean: {} is a symlink, junction or reparse point (on the way to the build folder {}), so cleaning could reach somewhere that is not ours", l.display(), b.display()));
-    }
+    guard_build_dir(cfg, "refusing to clean")?;
     if dir.starts_with(b) {
         return Err(format!("refusing to clean: the source folder {} is inside the build folder {}", dir.display(), b.display()));
     }
@@ -315,6 +351,162 @@ pub const RUN_NOTE_PREFIX: &str = "run:";
 /// The folder a note names, with the `run:` prefix removed.
 pub fn note_folder(note: &str) -> &str {
     note.strip_prefix(RUN_NOTE_PREFIX).unwrap_or(note)
+}
+
+// ---- main's binaries survive another folder's clean -----------------------------------------
+
+/// The folder under `build_dir` that holds the KEPT copy of each binary the main checkout built: `<build_dir>/main.bins/<profile
+/// dir>/<bin><exe suffix>`, with `<that file>.source` holding the build-source note it was kept under. Cargo does not build
+/// there: a profile's folder carries the profile's name, and cargo allows only letters, digits, `-` and `_` in one, so no
+/// profile maps to a name with a `.`; `cargo clean -p` removes the named package's artifacts, which live in the profile folders.
+/// It stays inside the ONE shared build folder: only final executables are copied, never dependencies.
+pub const KEEP_DIR: &str = "main.bins";
+
+/// The kept copy of `bin` for `profile`.
+pub fn kept_exe(cfg: &Config, profile: Profile, bin: &str) -> PathBuf {
+    cfg.build_dir.join(KEEP_DIR).join(profile.dir()).join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The note file beside a kept copy.
+fn kept_note(exe: &Path) -> PathBuf {
+    let mut s = exe.as_os_str().to_os_string();
+    s.push(".source");
+    PathBuf::from(s)
+}
+
+/// The build-source note a kept copy of `bin` for `profile` was kept under (`projects/<p>`, `.`, or a `run:` note of one of
+/// those), `None` if there is no kept copy or no (readable) note beside it.
+pub fn read_kept_note(cfg: &Config, profile: Profile, bin: &str) -> Option<String> {
+    let exe = kept_exe(cfg, profile, bin);
+    if !exe.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(kept_note(&exe)).ok()?;
+    let line = text.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// The cargo output path of `bin` for `profile` (what a person or another project's test runs).
+fn built_exe(cfg: &Config, profile: Profile, bin: &str) -> PathBuf {
+    cfg.build_dir.join(profile.dir()).join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The main checkout of the project that `source` belongs to: `.` for `.` and for a worktree of Broadsword itself
+/// (`<worktrees>/broadsword/<id>`), `<projects>/<p>` for `<projects>/<p>` and for `<worktrees>/<p>/<id>`. `None` for any other
+/// folder (nothing is kept or restored for it). An exact allow-list of the two shapes job.rs builds sources from.
+pub fn main_folder(cfg: &Config, source: &str) -> Option<String> {
+    if source == MAIN_SOURCE {
+        return Some(MAIN_SOURCE.to_string());
+    }
+    let projects = rel_source(cfg, &cfg.projects_dir).ok().filter(|p| p != MAIN_SOURCE)?;
+    let worktrees = rel_source(cfg, &cfg.worktrees_dir).ok().filter(|p| p != MAIN_SOURCE)?;
+    let one = |s: &str| !s.is_empty() && !s.contains('/') && s != "." && s != "..";
+    if let Some(p) = source.strip_prefix(&format!("{projects}/")) {
+        return one(p).then(|| source.to_string());
+    }
+    let (p, id) = source.strip_prefix(&format!("{worktrees}/"))?.split_once('/')?;
+    if !one(p) || !one(id) {
+        return None;
+    }
+    Some(if p == crate::job::SELF_PROJECT { MAIN_SOURCE.to_string() } else { format!("{projects}/{p}") })
+}
+
+/// Copy `from` to `to` through a temp file beside `to` and a rename (a reader sees the old file or the new one). Cargo-built
+/// executables only, inside the build folder.
+fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(d) = to.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut tmp = to.as_os_str().to_os_string();
+    tmp.push(".bskeep.tmp");
+    let tmp = PathBuf::from(tmp);
+    // flushing needs a handle with write access on Windows (FlushFileBuffers); the copy must be the whole file before it replaces anything
+    let r = std::fs::copy(from, &tmp)
+        .and_then(|n| {
+            let want = std::fs::metadata(from)?.len();
+            if n != want || std::fs::metadata(&tmp)?.len() != want {
+                return Err(std::io::Error::other(format!("the copy has {n} bytes, the original {want}")));
+            }
+            std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()
+        })
+        .and_then(|_| std::fs::rename(&tmp, to));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// Before a job of ANOTHER folder cleans package `pkg` (whose binary targets are `bins`): every exe of those targets whose note
+/// (the bin note, else the package note for builds from before bin notes) names `main` (plain or `run:`) is copied to its kept
+/// place, with that note beside it. Nothing is cleaned until this succeeded (Err refuses the job, nothing deleted). An unchanged
+/// copy is not rewritten. The note beside the copy is removed first and written last, so a crash in between leaves a copy with no
+/// note, which is never restored.
+fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String]) -> Result<Vec<String>, String> {
+    guard_build_dir(cfg, "refusing to keep main's binaries")?;
+    let mut lines = Vec::new();
+    for b in bins {
+        let Some(note) = read_bin_note(cfg, b).or_else(|| read_note(cfg, pkg)) else { continue };
+        if note_folder(&note) != main {
+            continue;
+        }
+        for profile in CLEAN_PROFILES {
+            let (from, to) = (built_exe(cfg, profile, b), kept_exe(cfg, profile, b));
+            if !from.is_file() {
+                continue;
+            }
+            let same = read_kept_note(cfg, profile, b).as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
+            if !same {
+                let side = kept_note(&to);
+                let fail = |e: std::io::Error| format!("cannot keep main's `{b}` ({}) at {} before cleaning `{pkg}`: {e}\nnothing was built or cleaned. If a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
+                match std::fs::remove_file(&side) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail(e)),
+                    _ => {}
+                }
+                copy_atomic(&from, &to).map_err(fail)?;
+                write_atomic(&side, &note).map_err(fail)?;
+            }
+            lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
+        }
+    }
+    Ok(lines)
+}
+
+/// After `pkg` was cleaned: every binary target of it whose exe is gone gets main's kept copy back in its cargo place, when the
+/// copy was kept from `main` (the main checkout of the job's own project). Cargo's fingerprint for the target was removed by the
+/// clean, so any cargo step that needs the target still rebuilds it from the job's own source; one that does not (an example
+/// only, a bench) leaves main's binary in place for people and other projects' tests.
+fn restore_main_bins(cfg: &Config, main: &str, bins: &[String]) -> Result<Vec<String>, String> {
+    guard_build_dir(cfg, "refusing to restore main's binaries")?;
+    let mut lines = Vec::new();
+    for b in bins {
+        for profile in CLEAN_PROFILES {
+            let Some(note) = read_kept_note(cfg, profile, b) else { continue };
+            let (from, to) = (kept_exe(cfg, profile, b), built_exe(cfg, profile, b));
+            if note_folder(&note) != main || to.exists() {
+                continue;
+            }
+            copy_atomic(&from, &to).map_err(|e| format!("cannot put main's kept `{b}` back at {}: {e}", to.display()))?;
+            lines.push(format!("restored main's `{b}` ({}, built from {}) at {} from its kept copy", profile.dir(), note_folder(&note), to.display()));
+        }
+    }
+    Ok(lines)
+}
+
+/// Write `text` and a newline to `path` atomically (temp file, flushed, renamed).
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, format!("{text}\n").as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 /// What `prepare` did, one line each, for the job's output and log.
@@ -544,7 +736,13 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
+    // main's binaries: a job of ANOTHER folder keeps a copy of each exe the main checkout of its project built before cleaning
+    // it, and every job puts that copy back where the clean removed it (see `keep_main_bins`, `restore_main_bins`)
+    let main = main_folder(cfg, source);
     for (p, was) in &stale {
+        if let Some(m) = main.as_deref().filter(|m| *m != source) {
+            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p))?);
+        }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };
             let out = clean_command(cfg, dir, p, profile)?.output().map_err(|e| format!("cannot start `cargo clean -p {p}{flag}`: {e}"))?;
@@ -557,6 +755,10 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
                 ));
             }
         }
+        let restored = match main.as_deref() {
+            Some(m) => restore_main_bins(cfg, m, bins_of_pkg(p))?,
+            None => Vec::new(),
+        };
         write_note(cfg, p, &wanted)?;
         for b in bins_of_pkg(p) {
             write_bin_note(cfg, b, &wanted)?;
@@ -566,6 +768,7 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
             Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {}); its other packages and all dependencies were kept", note_folder(w)),
             None => format!("cleaned `{p}` in the shared build folder (no record of what built it); its dependencies were kept"),
         });
+        lines.extend(restored);
     }
     if marked {
         std::fs::remove_file(&marker).map_err(|e| format!("cannot remove the build-source marker {}: {e}", marker.display()))?;
@@ -713,6 +916,22 @@ mod tests {
         assert_eq!(rel_source(&cfg, &cfg.root.join("projects").join("sim")).unwrap(), "projects/sim");
         assert_eq!(rel_source(&cfg, &cfg.worktrees_dir.join("p").join("t-1")).unwrap(), "worktrees/p/t-1");
         assert!(rel_source(&cfg, Path::new("elsewhere")).is_err());
+    }
+
+    #[test]
+    fn the_main_folder_of_a_source_is_an_exact_allow_list() {
+        let cfg = cfg_at(Path::new("r"));
+        assert_eq!(main_folder(&cfg, ".").as_deref(), Some("."));
+        assert_eq!(main_folder(&cfg, "projects/crash-sim").as_deref(), Some("projects/crash-sim"));
+        assert_eq!(main_folder(&cfg, "worktrees/crash-sim/t-1").as_deref(), Some("projects/crash-sim"));
+        assert_eq!(main_folder(&cfg, "worktrees/broadsword/t-1").as_deref(), Some("."), "Broadsword's own main checkout is the root");
+        for bad in ["", "projects", "projects/", "projects/a/b", "projects/..", "worktrees/p", "worktrees/p/", "worktrees/p/t/x", "worktrees/../t", "scratch/x", "run:projects/p", "elsewhere/p/t"] {
+            assert_eq!(main_folder(&cfg, bad), None, "{bad}");
+        }
+        assert_eq!(Profile::Dev.dir(), "debug");
+        assert_eq!(Profile::Release.dir(), "release");
+        let k = kept_exe(&cfg, Profile::Release, "crash-sim");
+        assert!(k.starts_with(cfg.build_dir.join(KEEP_DIR).join("release")), "{}", k.display());
     }
 
     #[test]
