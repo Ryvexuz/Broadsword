@@ -63,6 +63,7 @@ const BASE: &[(&str, &str)] = &[
     ("merge_train_wait_minutes", "20"),
     ("perf_gate", "\"on\""),
     ("perf_runs", "2"),
+    ("queue_per_project", "\"off\""),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),

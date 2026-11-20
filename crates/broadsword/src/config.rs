@@ -127,6 +127,9 @@ pub struct Config {
     pub perf_gate: bool,
     /// How many times the perf gate runs the bench per checked commit; each case is judged on the median of these runs.
     pub perf_runs: u64,
+    /// `"on"`: every `queue run` holds its project's own lock, `<state_dir>/queue/<project>.queue.lock`, so drivers of different
+    /// projects run at once (and `queue run` needs `--project` or `--entry`); `"off"`: the one global `queue.lock`, as before.
+    pub queue_per_project: bool,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -271,6 +274,11 @@ impl Config {
             "off" => false,
             other => return Err(format!("perf_gate = \"{other}\": must be \"on\" or \"off\"")),
         };
+        let queue_per_project = match get_str(&m, "queue_per_project")?.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("queue_per_project = \"{other}\": must be \"on\" or \"off\"")),
+        };
         let shadow_reviewer = get_str(&m, "shadow_reviewer")?;
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
@@ -296,6 +304,7 @@ impl Config {
             merge_train_wait_minutes: positive("merge_train_wait_minutes")?,
             perf_gate,
             perf_runs: positive("perf_runs")?,
+            queue_per_project,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -494,6 +503,7 @@ max_queued = 50
 queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
+queue_per_project = \"off\"
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -589,6 +599,20 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn queue_per_project_is_required_shipped_off_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert!(!c.queue_per_project, "shipped off (SCALING F2): one global queue.lock, exactly as before");
+        let e = Config::from_text(&without_key(text, "queue_per_project"), Path::new("p")).unwrap_err();
+        assert!(e.contains("queue_per_project") && e.contains("missing"), "{e}");
+        let with = |line: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "queue_per_project") { line.to_string() } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&with("queue_per_project = \"on\""), Path::new("p")).unwrap().queue_per_project);
+        for bad in ["queue_per_project = true", "queue_per_project = \"yes\"", "queue_per_project = \"\"", "queue_per_project = 1"] {
+            assert!(Config::from_text(&with(bad), Path::new("p")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
@@ -605,6 +629,7 @@ max_queued = 50
 queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
+queue_per_project = \"off\"
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -650,6 +675,7 @@ max_queued = 50
 queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
+queue_per_project = \"off\"
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

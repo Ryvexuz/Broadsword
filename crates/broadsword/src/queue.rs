@@ -89,6 +89,12 @@
 //! `queue_lock_wait_seconds`, then exits 4. `entries.lock` is held for milliseconds, around "is this task already queued, create
 //! the entry" and around choosing the next entry. Order is always queue.lock then entries.lock. The TASK BOARD lock is never held
 //! during the rebase, check, review or merge: it is taken only by `task done` (inside `task::cmd_finish`), which is short.
+//! PER-PROJECT RUN LOCK (setting `queue_per_project`, SCALING F2, shipped "off"). Everything above that says queue.lock means THE RUN
+//! LOCK, taken in one place (`run_lock`). "off": it is the one global queue.lock. "on": it is `<state_dir>/queue/<project>.queue.lock`,
+//! one per project (the same OS lock), and a run only ever takes entries of its own project (`Lane::holds`), so "running while nobody
+//! holds the lock" stays exact per project and drivers of different projects run at once; `queue run` then needs `--project` or
+//! `--entry` (exit 2 otherwise). entries.lock stays global, merge trains stay per project. LIMIT: a run started under one value does
+//! not see the lock of a run started under the other, so the setting must not be switched while a `queue run` is going.
 //!
 //! ONE COMMIT. The check records `checked_tip`, the commit it ran on. The review diff is `<base>...<checked_tip>`, the reviewer is
 //! called only while the branch tip still equals it, and `merge --ff-only` merges exactly that commit. A tip that moved at any
@@ -209,6 +215,84 @@ fn take(cfg: &Config, file: &str, what: &str) -> Result<Lock, ExitCode> {
 
 fn queue_lock(cfg: &Config) -> Result<Lock, ExitCode> {
     take(cfg, "queue.lock", "another `queue run` (or a cancel of a running entry)")
+}
+
+/// A run LANE (SCALING F2): the entries one `queue run` may take, and the OS lock that proves no other run takes them. Holding it is
+/// what makes a `running` entry of the lane an interrupted one. `key` is a lowercase project name (`lane_key`), or None for every
+/// project. The lock is held as long as the Lane lives.
+struct Lane {
+    _lock: Lock,
+    key: Option<String>,
+}
+
+impl Lane {
+    /// Whether entry `e` is in this lane. Project names are matched without case, like `job::canonical_project` matches them (the
+    /// canonical name of a plain name is that name up to case), so this is exact without reading the projects folder.
+    fn holds(&self, e: &Record) -> bool {
+        self.key.as_ref().is_none_or(|k| e.get("project").to_lowercase() == *k)
+    }
+}
+
+/// The lane key of an entry's project: its name, lowercased. Err when it is not a plain project name (no lock file could carry it). A
+/// plain name that is no longer a project keys as itself, so its entries can still be resumed (to end `blocked`) or cancelled.
+fn lane_key(cfg: &Config, name: &str) -> Result<String, String> {
+    match job::canonical_project(&cfg.projects_dir, name) {
+        Ok(c) => Ok(c.to_lowercase()),
+        Err(m) if m.starts_with("unknown project") => Ok(name.to_lowercase()),
+        Err(m) => Err(m),
+    }
+}
+
+/// The lane key of a `--project` the caller typed: it must be a project (exit 2 otherwise, nothing run).
+fn project_key(cfg: &Config, name: &str) -> Result<String, ExitCode> {
+    job::canonical_project(&cfg.projects_dir, name).map(|c| c.to_lowercase()).map_err(|m| fail(EXIT_BAD_INPUT, format!("--project: {m}; nothing was run (see `broadsword projects`)")))
+}
+
+/// The run lock file of a lane key: `<project>.queue.lock` next to queue.lock. `sanitize` maps any other character to `_`, so two
+/// names can only ever share a lock (stricter), never escape the queue folder.
+fn lane_lock_file(key: &str) -> String {
+    format!("{}.queue.lock", record::sanitize(key))
+}
+
+/// THE ONE PLACE a run lock is taken: every `queue run` (one entry or `--all`) and the cancel of a running entry come through here,
+/// before the entries lock (order: run lock, then entries lock). `queue_per_project = "off"`: the one global queue.lock, exactly as
+/// before (a `key` then only narrows which entries the run takes). `"on"`: the lane's own `<project>.queue.lock` (same OS lock, same
+/// `queue_lock_wait_seconds`, exit 4 naming the project), so runs of different projects go at once; without a key it is refused (exit
+/// 2), because a run of no named project cannot tell another project's live `running` entries from interrupted ones. A lock that
+/// cannot be taken for any other reason fails closed (exit 1).
+fn run_lock(cfg: &Config, key: Option<String>) -> Result<Lane, ExitCode> {
+    if !cfg.queue_per_project {
+        return Ok(Lane { _lock: queue_lock(cfg)?, key });
+    }
+    let Some(k) = key else {
+        return Err(fail(EXIT_BAD_INPUT, "queue_per_project is on: every project has its own run lock, so name the project with `--project <p>` (or one entry with `--entry <id>`); nothing was run"));
+    };
+    let lock = take(cfg, &lane_lock_file(&k), &format!("another `queue run` of project `{k}` (or a cancel of one of its running entries)"))?;
+    Ok(Lane { _lock: lock, key: Some(k) })
+}
+
+/// The lane of `queue run [--entry <id>] [--project <p>]`. `--project` must name a project, and an `--entry` given with it must be
+/// of that project. With `--entry` alone and the setting on, the lane is the entry's own project (an entry's project never changes,
+/// so reading it before the lock is safe); with the setting off, `--entry` alone is exactly as before (no lane key).
+fn lane_for(cfg: &Config, entry: Option<&str>, project: Option<&str>) -> Result<Option<String>, ExitCode> {
+    let of_entry = |id: &str| -> Result<String, ExitCode> {
+        let e = load_entry(cfg, id).map_err(|m| fail(EXIT_BAD_INPUT, m))?;
+        lane_key(cfg, e.get("project")).map_err(|m| fail(EXIT_BAD_INPUT, format!("queue entry {id}: its project `{}` cannot have a run lock: {m}; nothing was run", e.get("project"))))
+    };
+    match (entry, project) {
+        (_, Some(p)) => {
+            let k = project_key(cfg, p)?;
+            if let Some(id) = entry {
+                let ek = of_entry(id)?;
+                if ek != k {
+                    return Err(fail(EXIT_BAD_INPUT, format!("queue entry {id} is of project `{ek}`, not `{k}`; nothing was run")));
+                }
+            }
+            Ok(Some(k))
+        }
+        (Some(id), None) if cfg.queue_per_project => Ok(Some(of_entry(id)?)),
+        _ => Ok(None),
+    }
 }
 
 fn entries_lock(cfg: &Config) -> Result<Lock, ExitCode> {
@@ -609,8 +693,8 @@ fn cancel_refusal(cfg: &Config, e: &Record) -> Option<String> {
 }
 
 pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
-    // A queued entry: only the entry changes, under the short lock.
-    {
+    // A queued entry: only the entry changes, under the short lock. A running one: its project, for its run lock below.
+    let project = {
         let _l = match entries_lock(cfg) {
             Ok(l) => l,
             Err(c) => return c,
@@ -638,12 +722,18 @@ pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
                 println!("queue entry {id} is cancelled; nothing else was touched (task {} stays as it was)", e.get("task"));
                 return ExitCode::SUCCESS;
             }
-            RUNNING => {} // below
+            RUNNING => e.get("project").to_string(), // below
             other => return fail(EXIT_RETRY, format!("queue entry {id} is `{other}` and cannot be cancelled (it is finished; `queue add` queues the task again if it needs another try)")),
         }
-    }
-    // A running entry can only be cancelled when nobody is running it: holding the queue lock proves that.
-    let _q = match queue_lock(cfg) {
+    };
+    // A running entry can only be cancelled when nobody is running it: holding its run lock (`run_lock`: the global queue.lock, or
+    // with queue_per_project its project's own) proves that. An entry's project never changes, so it was safe to read it first.
+    // (with the setting off the key is not needed: the global lock guards every entry, exactly as before)
+    let key = match cfg.queue_per_project.then(|| lane_key(cfg, &project)).transpose() {
+        Ok(k) => k,
+        Err(m) => return fail(EXIT_ERROR, format!("queue entry {id}: its project `{project}` cannot have a run lock ({m}); not cancelled")),
+    };
+    let _q = match run_lock(cfg, key) {
         Ok(l) => l,
         Err(c) => return c,
     };
@@ -694,25 +784,31 @@ pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
 
 // ---- run --------------------------------------------------------------------------------
 
-pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
-    let _q = match queue_lock(cfg) {
+/// `queue run [--entry <id>] [--project <p>]`: one entry. `project` limits the choice to that project's entries (see `run_lock` for
+/// the lock it takes).
+pub fn cmd_run(cfg: &Config, entry: Option<&str>, project: Option<&str>) -> ExitCode {
+    let lane = match lane_for(cfg, entry, project).and_then(|k| run_lock(cfg, k)) {
         Ok(l) => l,
         Err(c) => return c,
     };
-    // Choose and claim the entry under the short lock. Holding queue.lock already means no other run exists, so every
-    // `running` entry is an interrupted one.
+    // Choose and claim the entry under the short lock. Holding the lane's run lock already means no other run of the lane exists,
+    // so every `running` entry of the lane is an interrupted one.
     let chosen = claim(cfg, |all| match entry {
         Some(id) => match all.iter().find(|x| x.id() == id) {
+            Some(x) if !lane.holds(x) => Err(fail(EXIT_BAD_INPUT, format!("queue entry {id} is of project `{}`, outside this run's project; nothing was run", x.get("project")))),
             Some(x) if matches!(x.status(), QUEUED | RUNNING | STALE | BLOCKED | APPROVED) => Ok(Some(x.clone())),
             Some(x) => Err(not_runnable(x)),
             None => Err(fail(EXIT_BAD_INPUT, format!("no queue entry with the exact id `{id}` (see `broadsword queue list`)"))),
         },
-        None => Ok(all.iter().find(|x| resume_first(x)).or_else(|| all.iter().find(|x| matches!(x.status(), QUEUED | STALE))).or_else(|| all.iter().find(|x| x.status() == APPROVED)).cloned()),
+        None => {
+            let mine: Vec<&Record> = all.iter().filter(|x| lane.holds(x)).collect();
+            Ok(mine.iter().find(|x| resume_first(x)).or_else(|| mine.iter().find(|x| matches!(x.status(), QUEUED | STALE))).or_else(|| mine.iter().find(|x| x.status() == APPROVED)).map(|x| (*x).clone()))
+        }
     });
     let e = match chosen {
         Ok(Some(e)) => e,
         Ok(None) => {
-            println!("the queue is empty: nothing is queued, interrupted or stale");
+            println!("the queue is empty{}: nothing is queued, interrupted or stale", in_project(&lane));
             return ExitCode::SUCCESS;
         }
         Err(c) => return c,
@@ -721,6 +817,11 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
         Ok(mut run) => run.go(),
         Err((_, code)) => code,
     }
+}
+
+/// ` for project <p>` when the lane is one project, for the "queue is empty" line.
+fn in_project(lane: &Lane) -> String {
+    lane.key.as_ref().map(|k| format!(" for project `{k}`")).unwrap_or_default()
 }
 
 /// `queue run` refuses a finished entry: exit 2 with the way on.
@@ -813,8 +914,8 @@ fn badness(code: u8) -> u8 {
 /// (`taken`), so an entry that ends stale or blocked is not run again in a loop. An `approved` entry (review PASSed, not merged) is
 /// picked last, and only when the merge train is off (`train` false): with the train on, the drain itself collects the approved
 /// entries into trains (`take_group`).
-fn next_for_all(all: &[Record], taken: &[String], train: bool) -> Option<Record> {
-    let fresh = |x: &&Record| !taken.iter().any(|t| t == x.id());
+fn next_for_all(all: &[Record], taken: &[String], train: bool, lane: &Lane) -> Option<Record> {
+    let fresh = |x: &&Record| lane.holds(x) && !taken.iter().any(|t| t == x.id());
     all.iter()
         .filter(fresh)
         .find(|x| resume_first(x))
@@ -852,8 +953,11 @@ struct Row {
 /// entries are merged in trains (see `run_train`): whenever a full train is ready, whenever a project's short train is due
 /// (`short_train_why`: none of its entries left to run, or its oldest approved entry waited merge_train_wait_minutes), and at the
 /// end of the drain for whatever is left.
-pub fn cmd_run_all(cfg: &Config) -> ExitCode {
-    let _q = match queue_lock(cfg) {
+///
+/// `project` (`--project <p>`): only that project's entries are drained (with queue_per_project on it is required, and the run holds
+/// only that project's lock: see `run_lock`).
+pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
+    let lane = match lane_for(cfg, None, project).and_then(|k| run_lock(cfg, k)) {
         Ok(l) => l,
         Err(c) => return c,
     };
@@ -868,7 +972,7 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
     let mut approved: Vec<(Run, std::time::Instant)> = Vec::new();
     if train {
         // entries an earlier drain approved and then died before merging them: they join the trains first (they are the oldest)
-        let left: Vec<Record> = match claim_approved(cfg) {
+        let left: Vec<Record> = match claim_approved(cfg, &lane) {
             Ok(l) => l,
             Err(c) => return c,
         };
@@ -886,7 +990,7 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
         }
     }
     loop {
-        let e = match claim(cfg, |all| Ok(next_for_all(all, &taken, train))) {
+        let e = match claim(cfg, |all| Ok(next_for_all(all, &taken, train, &lane))) {
             Ok(Some(e)) => e,
             Ok(None) => {
                 // MERGE TRAIN: nothing else to run: every approved entry left (even a single one) goes into a last train
@@ -954,9 +1058,9 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
     }
     let worst = worst_exit(rows.iter().map(|r| r.code), stop_code);
     if rows.is_empty() {
-        println!("the queue is empty: nothing is queued, interrupted or stale");
+        println!("the queue is empty{}: nothing is queued, interrupted or stale", in_project(&lane));
     } else {
-        println!("--- queue run --all: {} entr{} in {:.1} s ---", rows.len(), if rows.len() == 1 { "y" } else { "ies" }, t0.elapsed().as_secs_f64());
+        println!("--- queue run --all{}: {} entr{} in {:.1} s ---", lane.key.as_ref().map(|k| format!(" --project {k}")).unwrap_or_default(), rows.len(), if rows.len() == 1 { "y" } else { "ies" }, t0.elapsed().as_secs_f64());
         // the train column only exists when a merge train handled an entry, so a drain without trains prints the plain table
         let trains = rows.iter().any(|r| !r.train.is_empty());
         println!("entry\ttask\tstatus\texit\tseconds\tnote{}", if trains { "\ttrain" } else { "" });
@@ -2296,9 +2400,9 @@ fn take_group<'a>(approved: &mut Vec<(Run<'a>, std::time::Instant)>, max: usize,
 
 /// Entries an earlier `queue run --all` approved and never merged (it died, or stopped): claimed by this process (their pid), oldest
 /// first. Under entries.lock; their status stays `approved`.
-fn claim_approved(cfg: &Config) -> Result<Vec<Record>, ExitCode> {
+fn claim_approved(cfg: &Config, lane: &Lane) -> Result<Vec<Record>, ExitCode> {
     let _l = entries_lock(cfg)?;
-    let all = load_entries(cfg).map_err(|m| fail(EXIT_ERROR, m))?;
+    let all: Vec<Record> = load_entries(cfg).map_err(|m| fail(EXIT_ERROR, m))?.into_iter().filter(|x| lane.holds(x)).collect();
     let me = std::process::id();
     let mut out = Vec::new();
     // a half-finished merge is not a train candidate: the drain resumes it on its own first (`resume_first`)
