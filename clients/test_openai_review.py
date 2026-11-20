@@ -62,8 +62,9 @@ for a in args:
     if a.startswith("model_catalog_json='") and a.endswith("'"):
         catalog = json.load(open(a[len("model_catalog_json='"):-1], encoding="utf-8"))
 json.dump({"args": args, "stdin": stdin, "cwd": os.getcwd(), "env": dict(os.environ), "catalog": catalog}, open(os.path.join(d, "seen.json"), "w", encoding="utf-8"))
-sys.stderr.write("unrelated MCP connection error\n")
-if mode == "fail":
+if mode != "silentfail":
+    sys.stderr.write("unrelated MCP connection error\n")
+if mode in ("fail", "silentfail"):
     sys.exit(1)
 if mode == "hang":
     import subprocess, time
@@ -78,7 +79,14 @@ open(out, "w", encoding="utf-8").write("" if mode == "empty" else "VERDICT: FAIL
 if mode == "garbage":
     print("this is not json")
     sys.exit(0)
-print(json.dumps({"type": "thread.started"}))
+if mode == "modelnamed":  # a codex that names the answering model on thread.started, and a different one on turn.completed
+    print(json.dumps({"type": "thread.started", "model": "gpt-answered-by"}))
+elif mode == "modeltwo":
+    print(json.dumps({"type": "thread.started", "model": "model-a"}))
+elif mode == "modelnoise":  # a "model" that is not a string, or on an item: must not count
+    print(json.dumps({"type": "thread.started", "model": {"x": 1}}))
+else:
+    print(json.dumps({"type": "thread.started"}))
 print(json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Falling back from WebSockets to HTTPS transport."}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "reasoning", "text": "thinking"}}))
 if mode == "mcplist":
@@ -98,7 +106,7 @@ if mode == "tool":
     print(json.dumps({"type": "item.started", "item": {"id": "item_2", "type": "command_execution", "command": "Get-Content ../planted-secret.txt"}}))
     open(out, "w", encoding="utf-8").write("CANARY: TOOLREAD-SECRET-42\nVERDICT: PASS")
 print(json.dumps({"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "VERDICT: FAIL"}}))
-print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 7, "reasoning_output_tokens": 3}}))
+print(json.dumps({"type": "turn.completed", **({"model": "model-b"} if mode == "modeltwo" else {}), "usage": {"input_tokens": 50, "cached_input_tokens": 10, "output_tokens": 7, "reasoning_output_tokens": 3}}))
 '''
 
 # Flags that must reach codex so the model has no tool that reads a file or runs a command (docs/SHADOW_SANDBOX.md). Written out
@@ -283,6 +291,35 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(cwd.exists(), "the temp working folder is deleted afterwards")
         self.assertTrue(str(cwd).startswith(str(Path(tempfile.gettempdir()).resolve())), "under the system temp folder")
         self.assertNotIn(FAKE_KEY, p.stdout + p.stderr)
+
+    def test_model_reported_false_when_no_event_names_the_model(self):
+        for mode in ("ok", "modelnoise"):
+            with self.subTest(mode=mode):
+                j = json.loads(self.run_script(codex=mode).stdout)
+                self.assertEqual(j["backend"], "codex", j)
+                self.assertIs(j["model_reported"], False)
+                self.assertEqual(j["model_used"], [])
+                self.assertEqual(list(j["modelUsage"]), ["gpt-5.6-sol"])
+
+    def test_model_named_by_a_codex_event_is_returned_and_keys_the_usage(self):
+        j = json.loads(self.run_script(codex="modelnamed").stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertIs(j["model_reported"], True)
+        self.assertEqual(j["model_used"], ["gpt-answered-by"])
+        self.assertEqual(list(j["modelUsage"]), ["gpt-answered-by"], "keyed by the model that answered, not the one asked for")
+
+    def test_two_different_reported_models_are_both_listed(self):
+        j = json.loads(self.run_script(codex="modeltwo").stdout)
+        self.assertIs(j["model_reported"], True)
+        self.assertEqual(j["model_used"], ["model-a", "model-b"])
+        self.assertEqual(list(j["modelUsage"]), ["gpt-5.6-sol"])
+
+    def test_codex_exit_with_no_output_names_the_model(self):
+        j = json.loads(self.run_script(codex="silentfail").stdout)
+        self.assertEqual(j["backend"], "api")
+        self.assertIn("codex exited 1 with no output (model may be unavailable: gpt-5.6-sol)", j["codex_error"])
+        j = json.loads(self.run_script(codex="fail").stdout)
+        self.assertIn("code 1: unrelated MCP connection error", j["codex_error"], "with stderr the old message stays")
 
     def test_codex_gets_the_no_file_access_settings(self):
         p = self.run_script(codex="ok")

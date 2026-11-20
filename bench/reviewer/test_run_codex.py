@@ -21,6 +21,9 @@ REVIEW = "VERDICT: FAIL\nBLOCKING: src/a.rs:1 - the run prints NaN and exits 0 s
 FAKE_CODEX = r'''
 import json, os, sys
 argv = sys.argv[1:]
+if argv == ["--version"]:
+    print("codex-cli 9.9.9-test")
+    sys.exit(0)
 stdin = sys.stdin.read()
 mode = os.environ.get("FAKE_CODEX_MODE", "ok")
 catalog = None
@@ -34,7 +37,7 @@ if mode == "fail":
     sys.stderr.write("boom")
     sys.exit(1)
 out = argv[argv.index("-o") + 1]
-events = [{"type": "thread.started", "thread_id": "t"}, {"type": "turn.started"}]
+events = [{"type": "thread.started", "thread_id": "t", **({"model": "gpt-answered-by"} if mode == "modelnamed" else {})}, {"type": "turn.started"}]
 if mode == "tool":
     events.append({"type": "item.completed", "item": {"type": "command_execution", "command": "cat .env"}})
 events.append({"type": "item.completed", "item": {"type": "agent_message", "text": "x"}})
@@ -60,6 +63,12 @@ class RunCodex(unittest.TestCase):
                      "bug": "b", "catch": "(?i)nan.{0,100}(exit|silent)", "known_false_positives": []}
         (self.here / "cases.json").write_text(json.dumps([self.case]), encoding="utf-8")
         (self.tmp / "root").mkdir()  # find_main_root answer: no .env in it
+        # the spend cap and canary gates sit under review_codex(): give them a temp root with the settings they read, a passed
+        # canary for the fake codex's version, and the ledger folder inside it (never the real state/)
+        (self.tmp / "root" / "broadsword.toml").write_text('state_dir = "state"' + chr(10), encoding="utf-8")
+        (self.tmp / "clients").mkdir()
+        (self.tmp / "state" / "canary").mkdir(parents=True)
+        (self.tmp / "state" / "canary" / "last-pass.json").write_text(json.dumps({"codex_version": "codex-cli 9.9.9-test"}), encoding="utf-8")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         (self.bin / "fake_codex.py").write_text(FAKE_CODEX, encoding="utf-8")
@@ -72,6 +81,7 @@ class RunCodex(unittest.TestCase):
         self.log = self.tmp / "log.json"
         self.out = self.tmp / "out"
         self.old_here, rc.HERE = rc.HERE, self.here
+        self.old_rhere, rc.review.HERE = rc.review.HERE, self.tmp / "clients"
         self.old_root, rc.oc.find_main_root = rc.oc.find_main_root, lambda start: self.tmp / "root"
         self.env = {k: v for k, v in os.environ.items() if k.upper() != "OPENAI_API_KEY"}
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
@@ -80,6 +90,7 @@ class RunCodex(unittest.TestCase):
 
     def tearDown(self):
         rc.HERE = self.old_here
+        rc.review.HERE = self.old_rhere
         rc.oc.find_main_root = self.old_root
         shutil.rmtree(self._tmp, ignore_errors=True)
 
@@ -102,6 +113,25 @@ class RunCodex(unittest.TestCase):
         self.assertEqual((r["usage"]["input_tokens"], r["usage"]["output_tokens"]), (1234, 56))
         self.assertEqual(r["codex_items"], ["agent_message"])
         self.assertTrue((self.out / "c1__gpt-fake__default.raw.json").is_file())
+
+    def test_record_says_whether_codex_named_the_model(self):
+        self.run_it()
+        r = self.record()
+        self.assertIs(r["model_reported"], False)
+        self.assertEqual(r["model_used"], [])
+        self.env["FAKE_CODEX_MODE"] = "modelnamed"
+        self.run_it()
+        r = self.record()
+        self.assertIs(r["model_reported"], True)
+        self.assertEqual(r["model_used"], ["gpt-answered-by"])
+        raw = json.loads((self.out / "c1__gpt-fake__default.raw.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(raw["modelUsage"]), ["gpt-answered-by"])
+
+    def test_failed_run_records_model_reported_false(self):
+        self.env["FAKE_CODEX_MODE"] = "fail"
+        self.run_it()
+        r = self.record()
+        self.assertEqual((r["is_error"], r["model_reported"], r["model_used"]), (True, False, []))
 
     def test_codex_is_offered_no_tools_and_gets_the_prompt_on_stdin(self):
         self.run_it()

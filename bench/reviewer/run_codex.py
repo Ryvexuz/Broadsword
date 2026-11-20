@@ -101,8 +101,8 @@ def main(argv=None, environ=None):
         usage = ro.normalize_usage((raw or {}).get("usage"))
         rec = {"case": c["id"], "model": args.model, "effort": "default", "wall_s": round(dt, 1),
                "exit": 1 if error else 0, "cost_usd": None, "usage": usage,
-               "result": (raw or {}).get("result") or "", "is_error": bool(error), "model_used": [],
-               "backend": "codex", "codex_items": (raw or {}).get("codex_items", [])}
+               "result": (raw or {}).get("result") or "", "is_error": bool(error), "model_used": (raw or {}).get("model_used", []),
+               "model_reported": bool((raw or {}).get("model_reported", False)), "backend": "codex", "codex_items": (raw or {}).get("codex_items", [])}
         if error:
             rec["error"] = oc.redact(error)
         (out / f"{tag}.raw.json").write_text(oc.redact(json.dumps(raw if raw is not None else {"error": rec.get("error")}, indent=1)), encoding="utf-8")

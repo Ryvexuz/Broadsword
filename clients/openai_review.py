@@ -11,7 +11,8 @@ discarded ("codex_items" lists what was seen).
 
 Path order: the Codex CLI first (ChatGPT plan, `codex exec ... --json -o <file> -`, prompt on stdin, fresh temp folder); if it is missing
 or fails, the API below answers and the output records "backend": "api" plus "codex_error". A codex answer has "backend": "codex",
-"model_reported": false (codex does not name the model) and a null cost. It needs USERPROFILE/HOME/APPDATA/PATH for its sign-in;
+"model_reported" (true only when a codex event names the answering model, see codex_model_used; on codex-cli 0.170.0 none does,
+so it is false) and "model_used" (the names reported, [] when none) and a null cost. It needs USERPROFILE/HOME/APPDATA/PATH for its sign-in;
 the queue's scrub drops only secret-named variables, so they survive.
 
 The key comes from the OPENAI_API_KEY environment variable, else the main root's `.env` (the loader in openai_mcp.py).
@@ -294,6 +295,23 @@ def codex_item_types(stdout: str) -> list:
     return sorted(seen)
 
 
+# Events that may carry the answering model as a top-level string "model". Checked on codex-cli 0.170.0 (a real codex run against a
+# local fake Responses server whose response.created and response.completed both named a model): thread.started holds only
+# thread_id, turn.started nothing, item.completed the item, turn.completed only usage. NO event names the model, so today
+# model_reported is false. This reads the field if a later codex adds it; the tests use a fake codex that emits it.
+MODEL_EVENTS = frozenset({"thread.started", "turn.started", "turn.completed"})
+
+
+def codex_model_used(stdout: str) -> list:
+    """Sorted distinct model names that codex events report (a non-empty string "model" on a MODEL_EVENTS event); [] when none."""
+    seen = set()
+    for ev in codex_events(stdout):
+        m = ev.get("model")
+        if ev.get("type") in MODEL_EVENTS and isinstance(m, str) and m.strip():
+            seen.add(m.strip())
+    return sorted(seen)
+
+
 def kill_tree(p) -> None:
     """Kill the process and everything it started. On Windows codex is a codex.cmd, so killing only the pid leaves the node
     grandchild alive, still holding the output pipes."""
@@ -353,6 +371,8 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
         if tools:
             raise oc.Fail(f"codex used a tool or printed an unexpected event ({', '.join(tools)}); its answer is discarded")
         if code != 0:
+            if not (stderr or "").strip() and not (stdout or "").strip():
+                raise oc.Fail(f"codex exited {code} with no output (model may be unavailable: {args.model})")
             raise oc.Fail(f"codex exited with code {code}: {(stderr or '').strip()[-200:]}")
         text = answer.read_text(encoding="utf-8", errors="replace") if answer.is_file() else ""
     if not text.strip():
@@ -364,14 +384,17 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
     if not usage:  # never report zero usage as real data
         raise oc.Fail("codex output has no parseable turn.completed event with usage")
     tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+    used = codex_model_used(stdout)
+    keyed = used[0] if len(used) == 1 else args.model  # several different names: keep the requested key, model_used lists them all
     return {
         "type": "result",
         "is_error": False,
         "result": oc.redact(text),
         "total_cost_usd": None,
         "usage": dict(usage),
-        "modelUsage": {args.model: {"inputTokens": tin, "outputTokens": tout}},
-        "model_reported": False,
+        "modelUsage": {keyed: {"inputTokens": tin, "outputTokens": tout}},
+        "model_reported": bool(used),
+        "model_used": used,
         "backend": "codex",
         "codex_items": items,
     }
