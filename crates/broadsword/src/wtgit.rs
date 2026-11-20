@@ -257,10 +257,156 @@ pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool,
     }
 }
 
-/// `git diff --no-color --no-ext-diff <base>...<tip>`: the changes on `tip` since it split from `base` (three dots = from
-/// their merge base), nothing excluded. Why: exactly what a merge would bring in is what the reviewer reads.
+/// How `diff_since` makes Git read `.gitattributes`: from the reviewed commit itself (`--attr-source`, Git 2.40+), or by diffing
+/// inside the task worktree that has that commit checked out (older Git).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AttrMode {
+    Auto,
+    AttrSource,
+    Worktree,
+}
+
+/// `git --version`, parsed to (major, minor). Why: `--attr-source` exists from 2.40. An unreadable version is an error, never a guess.
+fn git_version(dir: &Path) -> Result<(u32, u32), String> {
+    let v = ok(dir, &["--version"])?;
+    let word = v.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit())).unwrap_or("");
+    let nums: Vec<u32> = word.split('.').map_while(|p| p.parse().ok()).collect();
+    if nums.len() < 2 {
+        return Err(format!("cannot read the git version from `{v}`"));
+    }
+    Ok((nums[0], nums[1]))
+}
+
+/// `git rev-parse --verify <rev>^{commit}`: the full id of a commit. Why: the tip is compared with worktree HEADs by full id.
+fn full_commit(dir: &Path, rev: &str) -> Result<String, String> {
+    ok(dir, &["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+}
+
+/// `git worktree list --porcelain`: the checkout (main or a task worktree) whose HEAD is exactly `commit`. Why: before Git 2.40
+/// the reviewed commit's `.gitattributes` can only be read from a checkout of that commit.
+fn worktree_at(dir: &Path, commit: &str) -> Result<String, String> {
+    let list = ok(dir, &["worktree", "list", "--porcelain"])?;
+    let mut path = String::new();
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = p.to_string();
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            if h == commit && !path.is_empty() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!("no worktree has {commit} checked out, so its .gitattributes cannot be read without --attr-source (Git 2.40+): refusing to diff with another commit's attributes"))
+}
+
+/// One changed path whose content the diff text does not show.
+struct Hidden {
+    status: String,
+    path: String,
+    old_hash: String,
+    new_hash: String,
+}
+
+/// `git cat-file -s <hash>`: a blob's size in bytes; the all-zero id (the side that does not exist) is "-".
+fn size_label(dir: &Path, hash: &str) -> Result<String, String> {
+    if !hash.is_empty() && hash.bytes().all(|b| b == b'0') {
+        return Ok("-".to_string());
+    }
+    Ok(format!("{} bytes", ok(dir, &["cat-file", "-s", hash])?))
+}
+
+/// Git's stdout untrimmed (NUL-separated records must not lose a trailing byte); a non-zero exit is an error.
+fn raw(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let o = run(dir, args)?;
+    if o.code != 0 {
+        return Err(format!("git {} failed: {}", args.join(" "), without_force_hints(&o.stderr)));
+    }
+    Ok(o.stdout)
+}
+
+/// `git diff --no-renames --raw -z --no-abbrev` and `--numstat -z` over the same range: the paths git counts as binary (numstat
+/// shows `-` for both counts: binary content, a `-diff` attribute, or a file over core.bigFileThreshold) with status and blob ids.
+/// Why: the reviewer is told about every change it cannot read. A mismatch between the two listings is an error.
+fn hidden_files(dir: &Path, attr: &[String], range: &str) -> Result<Vec<Hidden>, String> {
+    let mut raw_args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
+    raw_args.extend(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "-z", "--no-abbrev"]);
+    let mut num_args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
+    num_args.extend(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z"]);
+    raw_args.push(range);
+    num_args.push(range);
+    let raw_out = raw(dir, &raw_args)?;
+    let num_out = raw(dir, &num_args)?;
+    let mut binary: Vec<String> = Vec::new();
+    for rec in num_out.split('\0').filter(|r| !r.is_empty()) {
+        let mut it = rec.splitn(3, '\t');
+        let (a, d, path) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+        if path.is_empty() || a.is_empty() || d.is_empty() {
+            return Err(format!("cannot parse git diff --numstat record `{rec}`"));
+        }
+        if a == "-" && d == "-" {
+            binary.push(path.to_string());
+        }
+    }
+    let mut hidden = Vec::new();
+    let mut fields = raw_out.split('\0').filter(|r| !r.is_empty());
+    while let Some(meta) = fields.next() {
+        let path = fields.next().ok_or_else(|| format!("git diff --raw: record `{meta}` has no path"))?;
+        let parts: Vec<&str> = meta.trim_start_matches(':').split_whitespace().collect();
+        if parts.len() != 5 {
+            return Err(format!("cannot parse git diff --raw record `{meta}`"));
+        }
+        if binary.iter().any(|b| b == path) {
+            hidden.push(Hidden { status: parts[4].to_string(), path: path.to_string(), old_hash: parts[2].to_string(), new_hash: parts[3].to_string() });
+        }
+    }
+    if hidden.len() != binary.len() {
+        return Err(format!("git diff --numstat names {} binary path(s) but --raw matched {}: the changed-file list cannot be trusted", binary.len(), hidden.len()));
+    }
+    Ok(hidden)
+}
+
+/// The review diff for `tip` since it split from `base` (`git diff --no-color --no-ext-diff <base>...<tip>`; three dots = from
+/// their merge base), nothing excluded, with a header block first that lists every changed path whose content the diff text does not
+/// show (binary, `-diff`, or over core.bigFileThreshold): status, old and new size, new blob id. The attributes are the reviewed
+/// commit's own: `--attr-source=<tip>` on Git 2.40+, else the diff runs inside the worktree that has `tip` checked out. Any git
+/// failure is an `Err`, never an empty diff. Why: what a merge would bring in is what the reviewer reads, and an unexplained binary
+/// change must be visible to it.
 pub fn diff_since(dir: &Path, base: &str, tip: &str) -> Result<String, String> {
-    ok(dir, &["diff", "--no-color", "--no-ext-diff", &format!("{base}...{tip}")])
+    diff_since_mode(dir, base, tip, AttrMode::Auto)
+}
+
+/// `diff_since` with the attribute route forced (tests run both on one Git).
+pub fn diff_since_mode(dir: &Path, base: &str, tip: &str, mode: AttrMode) -> Result<String, String> {
+    let tip_id = full_commit(dir, tip)?;
+    let mode = match mode {
+        AttrMode::Auto => {
+            if git_version(dir)? >= (2, 40) {
+                AttrMode::AttrSource
+            } else {
+                AttrMode::Worktree
+            }
+        }
+        m => m,
+    };
+    let (run_dir, attr): (std::path::PathBuf, Vec<String>) = match mode {
+        AttrMode::Worktree => (std::path::PathBuf::from(worktree_at(dir, &tip_id)?), Vec::new()),
+        _ => (dir.to_path_buf(), vec![format!("--attr-source={tip_id}")]),
+    };
+    let range = format!("{base}...{tip_id}");
+    // `--attr-source` is an option of `git` itself (before the subcommand), not of `git diff`
+    let mut args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
+    args.extend(["diff", "--no-color", "--no-ext-diff", &range]);
+    let text = raw(&run_dir, &args)?;
+    let hidden = hidden_files(&run_dir, &attr, &range)?;
+    if hidden.is_empty() {
+        return Ok(text.trim().to_string());
+    }
+    let mut head = String::from("=== Changed files whose content is NOT shown in the diff below (binary, -diff, or over core.bigFileThreshold). Name each one in your review. ===\n");
+    for h in &hidden {
+        head.push_str(&format!("{}  {}  old size {}  new size {}  new blob {}\n", h.status, h.path, size_label(&run_dir, &h.old_hash)?, size_label(&run_dir, &h.new_hash)?, h.new_hash));
+    }
+    head.push_str("=== end of list ===\n\n");
+    Ok(format!("{head}{}", text.trim()))
 }
 
 /// `git rev-parse --path-format=absolute --git-path rebase-merge` (and `rebase-apply`), then does that folder exist? Git
