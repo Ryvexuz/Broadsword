@@ -247,6 +247,27 @@ class Refusals(Base):
             self.assertIn("CARGO_TARGET_DIR", out)
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
 
+    def test_refused_in_a_worktree_whose_job_got_the_main_checkouts_shared_build_folder(self):
+        # job.rs gives a job in a worktree the MAIN root's build folder, not the worktree's own
+        n, t = doc("python -I check.py")
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        files = {n: t, "check.py": "print(1)\n", "broadsword.toml": "root = '.'\nbuild_dir = 'build'\n"}
+        for name, text in files.items():
+            (self.repo / name).write_text(text, encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "init")
+        wt = self.tmp / "wt"
+        git(self.repo, "worktree", "add", "-q", "-b", "task", str(wt))
+        (self.root / "broadsword.toml").write_text("root = '.'\nbuild_dir = 'other'\n", encoding="utf-8")
+        env = {"CARGO_TARGET_DIR": str(self.repo / "build")}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = fc.main(["--repo", str(wt), "--root", str(self.root)], env=env)
+        self.assertEqual(code, 2, buf.getvalue())
+        self.assertIn("shared build folder", buf.getvalue())
+        self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
     def test_not_refused_for_a_plain_shell_or_an_unrelated_target_dir_or_the_invented_marker(self):
         n, t = doc("python -I check.py")
         self.make_repo({n: t, "check.py": "print('ok')\n"})

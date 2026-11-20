@@ -17,7 +17,8 @@ Exit 0 PASS, 1 FAIL (command failed or timed out), 2 refused or could not run (n
 NEVER run this inside a Broadsword job (a nested run deadlocked builds for 15 minutes, PROGRESS.md). Broadsword
 sets no job marker variable. What job.rs does set in every job child is CARGO_TARGET_DIR = the shared build folder
 (build_dir in broadsword.toml, joined to the root). So the script refuses when CARGO_TARGET_DIR resolves to the
-build_dir of the --root, --repo or this checkout; a shell that sets CARGO_TARGET_DIR to some other folder is not refused.
+build_dir of the --root, --repo or this checkout, or of the main checkout
+the git common dir of any of them points to (a job in a worktree gets the main root's folder, not the worktree's); a shell that sets CARGO_TARGET_DIR to some other folder is not refused.
 The orchestrator runs it directly.
 No network (the clone is local), no model calls.
 """
@@ -58,12 +59,27 @@ def build_dir_of(root):
         return None
 
 
+def main_checkout_of(path):
+    """The main checkout of the repo `path` belongs to (the parent of `git rev-parse --git-common-dir`), or None.
+    A job started in a worktree gets the MAIN root's build folder, so a worktree must be mapped back to it."""
+    try:
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.decode("utf-8", "replace").strip()
+    if r.returncode or not out:
+        return None
+    common = pathlib.Path(out)
+    return common.parent if common.name == ".git" else None
+
+
 def in_job(env, roots):
     """The build folder a job gave this process (CARGO_TARGET_DIR), if it is the shared build folder of any of `roots`."""
     target = env.get("CARGO_TARGET_DIR")
     if not target:
         return None
-    for r in roots:
+    for r in list(roots) + [m for m in map(main_checkout_of, roots) if m]:
         b = build_dir_of(r)
         if b is not None and norm(b) == norm(target):
             return b
