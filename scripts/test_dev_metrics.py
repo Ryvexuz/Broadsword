@@ -137,6 +137,35 @@ class Completion(unittest.TestCase):
         self.assertRegex(out, r"total \$\s+0\.7600 / 0\.7600")  # 0.75 coder + 0.01 review
         self.assertRegex(out, r"review \$\s+0\.0100")
 
+    def test_cost_usd_column_read_from_the_runs_file_priced_and_unpriced_tasks(self):
+        # a real agent-runs.tsv with the optional cost_usd column: t1 is priced on two runs, t2 has an empty price
+        head = HEAD.rstrip("\n") + "\tcost_usd\n"
+        with scratch_tmp() as d:
+            old = dm.ROOT
+            root = pathlib.Path(d)
+            (root / "state").mkdir()
+            (root / "state" / "agent-runs.tsv").write_text(
+                head + "2026-11-19\tcoder\tsonnet\tt1\t100\t60\tdone\t\t0.40\n"
+                "2026-11-19\tfix\tsonnet\tt1\t50\t30\tdone\t\t0.10\n"
+                "2026-11-19\tcoder\tsonnet\tt2\t100\t60\tdone\t\t\n", encoding="utf-8")
+            dm.ROOT = root
+            try:
+                runs = dm.read_runs(None)
+            finally:
+                dm.ROOT = old
+        tasks = [task("t1"), task("t2")]
+        entries = [entry("q-0001", "t1"), entry("q-0002", "t2")]
+        by = {}
+        for e in entries:
+            by.setdefault(e["task"], []).append(e)
+        rows = {r["id"]: r for r in dm.task_costs(tasks, by, runs, [])}
+        self.assertEqual(rows["t1"]["coder_usd"], [0.5, 0])
+        self.assertEqual(rows["t2"]["coder_usd"], [0.0, 1])  # empty price: unknown (counted), never a silent $0
+        out = self.completion_text(tasks, entries, runs)
+        self.assertRegex(out, r"coder \$\s+0\.5000 / 0\.5000.*known for 1 of 2 done tasks.*unknown for 1")
+        self.assertRegex(out, r"coder \$[^\n]*\n\s+review \$\s+0\.0100 / 0\.0100")  # coder $ is printed right above review $
+        self.assertRegex(out, r"total \$\s+0\.5100 / 0\.5100.*only for the 1 of 2")  # t2 has no total
+
     def test_total_is_unknown_not_review_only_when_coder_dollars_are_missing(self):
         out = self.completion_text([task("t1")], [entry("q-0001", "t1")], [run("t1", "100")])
         self.assertRegex(out, r"coder \$\s+- / -.*known for 0 of 1 done tasks.*never counted as \$0")
