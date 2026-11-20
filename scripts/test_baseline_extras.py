@@ -3,7 +3,9 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -138,6 +140,72 @@ class RecordV2(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(bx.InputError):
                 bx.record_v2(pathlib.Path(d), "../evil", 0, 10, FakeBase)
+
+
+class Fail(unittest.TestCase):
+    """Fail closed: a missing measurement is a named error, and baseline.py's own InputError is exit 1, never a traceback."""
+
+    def test_v2_missing_unmerged_fails_closed(self):
+        for unmerged in ({}, {"coder_tokens_unmerged": None}):
+            metrics = {"coder_tokens_per_merged": 422877.0, **unmerged}
+            with self.assertRaises(bx.InputError) as cm:
+                bx.coder_tokens_v2(metrics, {"merged_with_coder_run": 2})
+            self.assertIn("coder_tokens_unmerged", str(cm.exception))
+
+    def test_record_v2_missing_unmerged_writes_nothing(self):
+        class NoUnmerged(FakeBase):
+            @staticmethod
+            def measure(root, since, until):
+                return ({"coder_tokens_per_merged": 422877.0}, {"merged_with_coder_run": 2}, {}, "abc123", [])
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "broadsword.toml").write_text('root = "."\n', encoding="utf-8")
+            with self.assertRaises(bx.InputError):
+                bx.record_v2(root, "x-v2", 0, 3600, NoUnmerged)
+            self.assertFalse((root / "state" / "baselines").exists() and any((root / "state" / "baselines").iterdir()))
+
+    def run_main(self, argv):
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = bx.main(argv)
+        return code, err.getvalue()
+
+    def test_measure_input_error_on_record_v2_path_exits_1(self):
+        class Raising(FakeBase):
+            class InputError(Exception):
+                pass
+
+            @staticmethod
+            def parse_time(text, flag):
+                return {"2026-01-01T00:00:00Z": 0, "2026-01-02T00:00:00Z": 86400}[text]
+
+            @staticmethod
+            def main_root():
+                return pathlib.Path(self.root)
+
+            @staticmethod
+            def measure(root, since, until):
+                raise Raising.InputError("measure refused")
+
+        self.root = tempfile.mkdtemp()
+        (pathlib.Path(self.root) / "broadsword.toml").write_text('root = "."\n', encoding="utf-8")
+        original = bx.load_baseline_module
+        bx.load_baseline_module = lambda: Raising
+        try:
+            code, err = self.run_main(["record-v2", "x", "--since", "2026-01-01T00:00:00Z", "--until", "2026-01-02T00:00:00Z"])
+        finally:
+            bx.load_baseline_module = original
+        self.assertEqual(code, 1)
+        self.assertIn("measure refused", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_base_input_error_outside_record_v2_exits_1(self):
+        # the real baseline.py: its parse_time raises its own InputError class, which main must catch through the loaded module
+        code, err = self.run_main(["shadow", "--since", "not-a-time", "--until", "2026-01-02T00:00:00Z"])
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":

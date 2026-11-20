@@ -186,7 +186,10 @@ def coder_tokens_v2(metrics, samples):
     n = samples.get("merged_with_coder_run")
     if v1 is None or not n:
         return None
-    unmerged = metrics.get("coder_tokens_unmerged") or 0
+    unmerged = metrics.get("coder_tokens_unmerged")
+    if unmerged is None:
+        raise InputError("baseline.py measured coder_tokens_per_merged but not coder_tokens_unmerged; "
+                         "v2 cannot be computed without it (fail closed)")
     return (round(v1 * n) - unmerged) / n
 
 
@@ -261,6 +264,11 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         base = load_baseline_module()
+    except InputError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    # baseline.py has its own InputError class: catch it through the module object that was loaded, not a name lookup.
+    try:
         since, until = base.parse_time(args.since, "--since"), base.parse_time(args.until, "--until")
         if until <= since:
             raise InputError("--until is not after --since")
@@ -280,7 +288,7 @@ def main(argv=None):
             lines = rounds_lines(rows, since, until)
         print("\n".join(lines))
         return 0
-    except (InputError, getattr(sys.modules.get("_extras_baseline"), "InputError", InputError)) as e:
+    except (InputError, base.InputError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
