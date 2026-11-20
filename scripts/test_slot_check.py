@@ -93,6 +93,16 @@ class SlotCheckTests(unittest.TestCase):
         lines = Board(5, [task("t0", "a.rs")], [task("o1", "b.rs")], [], ram=20.0, cpu=10.0).run()
         self.assertTrue(lines[1].startswith("FLAG: large headroom"), lines)
 
+    def test_loop_line_at_three_rejected_entries(self):
+        entries = [("t0", "rejected"), ("t0", "check_failed"), ("t0", "rejected")]
+        lines = Board(5, [task("t0", "a.rs")], [], entries).run()
+        self.assertTrue(any(l.startswith("LOOP: t0 has 3 failed queue rounds") for l in lines), lines)
+
+    def test_no_loop_line_at_two_rejected_entries(self):
+        entries = [("t0", "rejected"), ("t0", "rejected")]
+        lines = Board(5, [task("t0", "a.rs")], [], entries).run()
+        self.assertFalse(any(l.startswith("LOOP") for l in lines), lines)
+
     def test_missing_binary_fails_loudly(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(SystemExit):

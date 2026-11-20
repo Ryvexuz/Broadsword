@@ -17,6 +17,8 @@ import subprocess
 import sys
 
 WAITING_STATUSES = {"queued", "running"}
+FAILED_STATUSES = ("rejected", "check_failed", "merged_check_failed")
+LOOP_ROUNDS = 3
 
 
 def broadsword_cmd(root):
@@ -104,6 +106,16 @@ def main(argv):
     print(line)
     if flag:
         print(flag)
+    # Loop breaker (2026-11-20, Lazlo "not get stuck in a loop"): a running task with 3 or more rejected/check_failed
+    # queue entries is stuck. Stop retrying it as-is: adjudicate, then split or escalate once (state/priority.md).
+    fails = {}
+    for e in (root / "state" / "queue").glob("*.entry"):
+        kv = dict(re.findall(r"(?m)^(\w+) = (.*)$", e.read_text(encoding="utf-8")))
+        if kv.get("status") in FAILED_STATUSES and kv.get("task") in run_ids:
+            fails[kv["task"]] = fails.get(kv["task"], 0) + 1
+    for t, n in sorted(fails.items(), key=lambda x: -x[1]):
+        if n >= LOOP_ROUNDS:
+            print(f"LOOP: {t} has {n} failed queue rounds: adjudicate, then split or escalate once; no plain retry")
 
 
 if __name__ == "__main__":
