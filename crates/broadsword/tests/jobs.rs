@@ -931,6 +931,61 @@ fn b() {
     assert!(r.records().contains("status = failed"), "{}", r.records());
 }
 
+/// Is process `pid` still running?
+fn alive(pid: u32) -> bool {
+    if cfg!(windows) {
+        let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output().unwrap();
+        text(&out.stdout).contains(&format!("\"{pid}\""))
+    } else {
+        Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+}
+
+#[test]
+fn a_disk_drop_while_test_executables_run_side_by_side_kills_every_one() {
+    let r = Root::new("sidedrop", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    let (gate, hook) = (r.dir.join("scratch/gate"), r.dir.join("scratch/free.txt"));
+    fs::write(&hook, "99999999999999").unwrap();
+    // each writes its pid into GATE; once all three run, a turns the free-space hook to 0; then all would sleep a minute
+    let src = |name: &str| {
+        r#"
+#[test]
+fn NAME() {
+    let gate = std::path::Path::new(r"GATE");
+    std::fs::create_dir_all(gate).unwrap();
+    std::fs::write(gate.join("NAME"), std::process::id().to_string()).unwrap();
+    let t = std::time::Instant::now();
+    while std::fs::read_dir(gate).unwrap().count() < 3 {
+        assert!(t.elapsed().as_secs() < 60, "the others never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if "NAME" == "a" {
+        std::fs::write(r"HOOK", "0").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+"#
+        .replace("NAME", name)
+        .replace("GATE", &gate.display().to_string())
+        .replace("HOOK", &hook.display().to_string())
+    };
+    let (a, b, c) = (src("a"), src("b"), src("c"));
+    bin_project(&r, "sidedrop", "0.1.0", "pub fn f() {}\n", &[("a.rs", &a), ("b.rs", &b), ("c.rs", &c)]);
+    let start = Instant::now();
+    let out = r.cmd(&["test", "sidedrop"]).env(HOOK, &hook).output().unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(4), "{so}{se}");
+    assert!(start.elapsed() < Duration::from_secs(50), "the running executables were not killed early: {so}{se}");
+    assert!(se.contains("GB floor during `test sidedrop`; job killed"), "{se}");
+    let pids: Vec<u32> = ["a", "b", "c"].iter().map(|n| fs::read_to_string(gate.join(n)).unwrap().trim().parse().unwrap()).collect();
+    let t = Instant::now();
+    while pids.iter().any(|p| alive(*p)) {
+        assert!(t.elapsed() < Duration::from_secs(10), "a test executable outlived the disk-floor kill: {pids:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn a_failing_python_test_beside_others_fails_the_job_and_is_named() {
     let r = Root::new("sidepy", 1, 0);
