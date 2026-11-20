@@ -49,6 +49,11 @@ fn baseline(loaded: bool, cases: &[(&str, f64, f64)]) -> String {
     format!("{{\"crash_sim_sha\":\"abc\",\"runs\":3,\"runs_per_case\":3,\"loaded\":{loaded},\"cases\":{{{}}}}}\n", cs.join(","))
 }
 
+/// A baseline file whose single case `box` has this `budget_ms` text (written as is, so a test can give a bad value).
+fn budget_baseline(threshold_pct: f64, budget: &str) -> String {
+    format!("{{\"loaded\":false,\"runs_per_case\":3,\"cases\":{{\"box\":{{\"median_ms\":1.0,\"threshold_pct\":{threshold_pct},\"budget_ms\":{budget}}}}}}}\n")
+}
+
 struct Out {
     code: i32,
     stdout: String,
@@ -536,4 +541,129 @@ fn a_merge_train_runs_the_gate_on_its_tip_and_bisects_a_perf_failure_to_the_slow
     assert!(o.stdout.contains("status: done"), "{}", o.stdout);
     let o = r.run(&["task", "show", &t2]);
     assert!(o.stdout.contains("status: running"), "{}", o.stdout);
+}
+
+#[test]
+fn an_entry_over_its_budget_fails_even_within_its_ab_threshold_and_names_the_budget() {
+    // main 1.0 ms, entry 1.3 ms: +30% is within the 50% threshold, but above the 1.2 ms budget
+    let r = Root::new("overbudget", &[("box", 1.0)], 1);
+    r.set_baseline("p", &budget_baseline(50.0, "1.2"));
+    let main = r.head();
+    let (_, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 1.3)]),
+    );
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(
+        r.field(&entry, "status"),
+        "perf_failed",
+        "{}",
+        r.show(&entry)
+    );
+    let reason = r.field(&entry, "reason");
+    assert!(
+        reason.contains("over budget")
+            && reason.contains("1.300 ms")
+            && reason.contains("budget 1.2 ms")
+            && reason.contains("load not recorded"),
+        "{reason}"
+    );
+    assert_eq!(r.head(), main, "nothing merged");
+    assert_eq!(r.calls(), 0, "no model was asked");
+}
+
+#[test]
+fn an_entry_under_its_budget_passes() {
+    let r = Root::new("underbudget", &[("box", 1.0)], 1);
+    r.set_baseline("p", &budget_baseline(50.0, "1.2"));
+    let (_, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 1.1)]),
+    );
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
+    assert!(
+        o.stdout.contains("entry under budget") && !o.stdout.contains("main over budget"),
+        "{}",
+        o.stdout
+    );
+}
+
+#[test]
+fn when_main_is_already_over_budget_the_entry_passes_with_a_loud_main_over_budget_line() {
+    // main 2.0 ms is above the 1.5 ms budget; the entry (2.1 ms, +5%, within 50%) is not blamed for it
+    let r = Root::new("mainover", &[("box", 2.0)], 1);
+    r.set_baseline("p", &budget_baseline(50.0, "1.5"));
+    let (_, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 2.1)]),
+    );
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
+    assert!(
+        o.stdout.contains("box: main over budget: main 2.000 ms"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        r.show(&entry).contains("main over budget"),
+        "kept in the report"
+    );
+}
+
+#[test]
+fn a_main_over_budget_entry_is_still_failed_by_the_ab_rule() {
+    // main over budget does not switch the A/B rule off: entry 4.0 against main 2.0 is +100%, over 50%
+    let r = Root::new("mainoverslow", &[("box", 2.0)], 1);
+    r.set_baseline("p", &budget_baseline(50.0, "1.5"));
+    let (_, entry) = r.queued(
+        "examples/bench.rs",
+        "examples/bench.rs",
+        &bench_src(&[("box", 4.0)]),
+    );
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "perf_failed");
+}
+
+#[test]
+fn a_bad_budget_value_refuses_the_baseline_and_runs_no_bench() {
+    for (name, v) in [
+        ("zero", "0"),
+        ("negative", "-1.5"),
+        ("string", "\"2\""),
+        ("null", "null"),
+        ("infinite", "1e999"),
+    ] {
+        let r = Root::new(&format!("badbudget-{name}"), &[("box", 1.0)], 1);
+        r.set_baseline("p", &budget_baseline(50.0, v));
+        let (_, entry) = r.queued("src/lib.rs", "src/lib.rs", &format!("{LIB}// a change\n"));
+        let o = r.run(&["queue", "run"]);
+        assert_eq!(o.code, 5, "{name}: {}{}", o.stdout, o.stderr);
+        assert_eq!(r.field(&entry, "status"), "perf_failed", "{name}");
+        let reason = r.field(&entry, "reason");
+        assert!(
+            reason.contains("exists but cannot be used") && reason.contains("budget_ms"),
+            "{name}: {reason}"
+        );
+        assert_eq!(r.bench_jobs(), 0, "{name}: no bench ran");
+    }
+}
+
+#[test]
+fn a_docs_only_entry_is_still_skipped_when_a_budget_is_set_and_main_is_far_over_it() {
+    let r = Root::new("docsbudget", &[("box", 9.0)], 1);
+    r.set_baseline("p", &budget_baseline(1.0, "0.001"));
+    let (_, entry) = r.queued("docs", "docs/NOTES.md", "# notes\n");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
+    assert!(o.stdout.contains("not judged"), "{}", o.stdout);
+    assert_eq!(r.bench_jobs(), 0, "no bench was built");
 }

@@ -50,6 +50,23 @@
 //! %. A case the entry's bench prints but the baseline lacks is listed as not judged. The first line says whether the baseline is
 //! LOADED (`loaded: true`: it was recorded while the machine was busy, so its thresholds are wide) or quiet.
 //!
+//! BUDGETS. A case of the baseline file may also have `budget_ms`, an absolute ceiling for the entry's median (the A/B rule only
+//! sees a slowdown against main, so a creep across many small merges, each under its threshold, would never be caught). The shape,
+//! the one place a budget is set (no `broadsword.toml` key):
+//!
+//! ```json
+//! "cases": { "box": { "median_ms": 1.571, "threshold_pct": 50, "budget_ms": 2.36 } }
+//! ```
+//!
+//! `budget_ms` must be a finite number above 0; 0, a negative, a string, null, NaN and infinity make the whole file BAD (fail
+//! closed, like any other bad field). When a case has one, the entry FAILS if its median (the median of its `perf_runs` medians)
+//! is above `budget_ms`, even when it is within its A/B threshold; the reason line says "over budget" with both numbers. A case
+//! with no `budget_ms` is judged exactly as before. If MAIN is itself over the budget in the same run, the entry is not blamed for
+//! it: the budget rule passes the case (the A/B rule still applies) and a loud `main over budget` line is printed and kept in the
+//! report, so the orchestrator boards a fix. Budgets hold in quiet and loaded runs alike; the gate does not record the CPU load of
+//! a run, so a budget reason says "load not recorded". Budgets only change the verdict of an entry that is benched: a docs-only
+//! entry is skipped (NOT JUDGED) before any bench is built, so a budget never runs a bench for it.
+//!
 //! The settings are `perf_gate` (`"on"` or `"off"`) and `perf_runs` (how many A/B rounds).
 
 use crate::buildsrc;
@@ -75,6 +92,8 @@ pub struct Case {
     pub name: String,
     pub median_ms: f64,
     pub threshold_pct: f64,
+    /// Optional absolute ceiling for the entry's median, in ms (finite, above 0); see "BUDGETS" in the module doc.
+    pub budget_ms: Option<f64>,
 }
 
 /// A project's perf baseline: what the gate compares against.
@@ -154,7 +173,7 @@ fn valid_case_name(n: &str) -> bool {
 
 /// Parse a baseline file's text. Every field the gate uses is required and checked: `loaded` (true or false), `runs_per_case` (a
 /// whole number from 1 to MAX_RUNS_PER_CASE), `cases` (an object with at least one case, no name twice), and per case `median_ms`
-/// (finite, above 0) and `threshold_pct` (finite, 0 or more). Other fields are ignored.
+/// (finite, above 0), `threshold_pct` (finite, 0 or more) and, only if present, `budget_ms` (finite, above 0). Other fields are ignored.
 pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
     let v = json::parse(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("not valid JSON: {e}"))?;
@@ -208,10 +227,22 @@ pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
                 "`cases.{name}.threshold_pct` must be 0 or more, not {threshold_pct}"
             ));
         }
+        // optional, but when the key is there it must be a finite number above 0 (null, a string, 0, a negative are refused)
+        let budget_ms = match c.get("budget_ms") {
+            None => None,
+            Some(_) => {
+                let b = num(c.get("budget_ms"), &format!("`cases.{name}.budget_ms`"))?;
+                if b <= 0.0 {
+                    return Err(format!("`cases.{name}.budget_ms` must be above 0, not {b}"));
+                }
+                Some(b)
+            }
+        };
         cases.push(Case {
             name: name.clone(),
             median_ms,
             threshold_pct,
+            budget_ms,
         });
     }
     Ok(Baseline {
@@ -281,6 +312,10 @@ fn median(v: &mut [f64]) -> f64 {
         (v[n / 2 - 1] + v[n / 2]) / 2.0
     }
 }
+
+/// What a budget reason says about the machine's CPU load: the gate does not measure it (the baseline file records the load of
+/// its own recording only), so a budget failure on a loaded machine is told apart by the reader, not by the gate.
+const LOAD_NOTE: &str = "load not recorded";
 
 /// The header line of every report: which baseline, and whether it is LOADED.
 pub fn header(cfg: &Config, project: &str, base: &Baseline) -> String {
@@ -356,19 +391,46 @@ pub fn judge(
             ok = false;
         }
         let ratio = if ma > 0.0 { mb / ma } else { f64::INFINITY };
+        let mut status = if ma <= 0.0 {
+            "FAIL, main's median is 0 ms so no ratio can be judged".to_string()
+        } else if slow {
+            "FAIL, slower than main by more than allowed".to_string()
+        } else {
+            "ok".to_string()
+        };
+        // the absolute budget: only a case that has one is judged on it (every median here is finite: parse_bench refuses the rest)
+        let mut main_over: Option<String> = None;
+        if let Some(bg) = c.budget_ms {
+            if ma > bg {
+                // main is over its own budget: the entry is not blamed for that (the A/B rule above still applies)
+                main_over = Some(format!(
+                    "{}: main over budget: main {ma:.3} ms is above the budget {bg} ms; the entry is not blamed for it, board a fix",
+                    c.name
+                ));
+                status.push_str(&format!(" (budget {bg} ms: main over budget, not judged)"));
+            } else if mb > bg {
+                ok = false;
+                let why = format!(
+                    "over budget: entry {mb:.3} ms is above the budget {bg} ms (main {ma:.3} ms; {LOAD_NOTE})"
+                );
+                status = if status == "ok" {
+                    format!("FAIL, {why}")
+                } else {
+                    format!("{status}; {why}")
+                };
+            } else {
+                status.push_str(&format!(" (budget {bg} ms: entry under budget)"));
+            }
+        }
         lines.push(format!(
-            "{}: main {ma:.3} ms, entry {mb:.3} ms, ratio {ratio:.3} ({:+.1}%, threshold {}%): {}",
+            "{}: main {ma:.3} ms, entry {mb:.3} ms, ratio {ratio:.3} ({:+.1}%, threshold {}%): {status}",
             c.name,
             (ratio - 1.0) * 100.0,
             c.threshold_pct,
-            if ma <= 0.0 {
-                "FAIL, main's median is 0 ms so no ratio can be judged"
-            } else if slow {
-                "FAIL, slower than main by more than allowed"
-            } else {
-                "ok"
-            }
         ));
+        if let Some(l) = main_over {
+            lines.push(l);
+        }
     }
     for r in b.iter().take(1) {
         for (n, m) in r {
@@ -993,6 +1055,7 @@ mod tests {
                     name: n.to_string(),
                     median_ms: *m,
                     threshold_pct: *t,
+                    budget_ms: None,
                 })
                 .collect(),
         }
@@ -1075,6 +1138,72 @@ mod tests {
         assert!(ok && lines[1].contains("not judged"), "{lines:?}");
         assert!(!judge(&b, &[], &one).0, "no main run is no pass");
         assert!(!judge(&b, &one, &[]).0, "no entry run is no pass");
+    }
+
+    fn budgeted(budget: Option<f64>) -> Baseline {
+        let mut b = base(&[("box", 1.0, 50.0)]);
+        b.cases[0].budget_ms = budget;
+        b
+    }
+
+    #[test]
+    fn a_budget_fails_an_entry_within_its_threshold_and_a_case_without_one_is_judged_as_before() {
+        let main = [run(&[("box", 1.0)])];
+        let entry = [run(&[("box", 1.3)])];
+        // +30% is within 50%: no budget passes, exactly as before
+        let (ok, plain) = judge(&budgeted(None), &main, &entry);
+        assert!(ok);
+        assert_eq!(
+            plain[0],
+            "box: main 1.000 ms, entry 1.300 ms, ratio 1.300 (+30.0%, threshold 50%): ok"
+        );
+        // budget 1.2: the same numbers fail, and the line names the budget, both numbers and the load note
+        let (ok, lines) = judge(&budgeted(Some(1.2)), &main, &entry);
+        assert!(!ok, "{lines:?}");
+        assert!(
+            lines[0].contains("over budget")
+                && lines[0].contains("entry 1.300 ms is above the budget 1.2 ms")
+                && lines[0].contains("load not recorded"),
+            "{lines:?}"
+        );
+        // budget 1.4: under it passes
+        let (ok, lines) = judge(&budgeted(Some(1.4)), &main, &entry);
+        assert!(ok && lines[0].contains("entry under budget"), "{lines:?}");
+        // exactly at the budget passes
+        assert!(judge(&budgeted(Some(1.3)), &main, &entry).0);
+    }
+
+    #[test]
+    fn main_over_budget_is_not_blamed_on_the_entry_but_the_ab_rule_still_applies() {
+        let b = budgeted(Some(1.5));
+        let (ok, lines) = judge(&b, &[run(&[("box", 2.0)])], &[run(&[("box", 2.1)])]);
+        assert!(ok, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("box: main over budget: main 2.000 ms")),
+            "{lines:?}"
+        );
+        let (ok, _) = judge(&b, &[run(&[("box", 2.0)])], &[run(&[("box", 4.0)])]);
+        assert!(!ok, "+100% is over the 50% threshold");
+    }
+
+    #[test]
+    fn a_bad_budget_is_refused_and_a_good_one_is_read() {
+        let with = |v: &str| {
+            format!(
+                r#"{{"loaded":true,"runs_per_case":10,"cases":{{"box":{{"median_ms":1,"threshold_pct":1,"budget_ms":{v}}}}}}}"#
+            )
+        };
+        for v in ["0", "-1", "-0.0", "null", "\"2\"", "true", "1e999", "[]"] {
+            let e = parse_baseline(&with(v)).unwrap_err();
+            assert!(e.contains("budget_ms"), "{v}: {e}");
+        }
+        assert_eq!(
+            parse_baseline(&with("2.5")).unwrap().cases[0].budget_ms,
+            Some(2.5)
+        );
+        assert_eq!(parse_baseline(REAL).unwrap().cases[0].budget_ms, None);
     }
 
     #[test]
