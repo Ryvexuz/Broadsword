@@ -91,8 +91,11 @@ class Fixture(unittest.TestCase):
             return 2, str(e)
         return code, out.getvalue()
 
-    def approve(self):
-        put(self.approval, "APPROVED by Lazlo in chat 2026-11-20\n")
+    def approve(self, classes=cold_move.CLASSES, date=None):
+        put(self.approval, f"APPROVED {date or cold_move.utc_today()} {','.join(classes)}\n")
+
+    def used_approvals(self):
+        return sorted(p.name for p in self.approval.parent.iterdir() if ".used-" in p.name)
 
     YES = ("--yes", "--approval-file", "state/cold-move-approved.txt")
     ALL = ("--class", "build-cache", "--class", "evidence", "--class", "reference", "--class", "worktree")
@@ -283,8 +286,214 @@ class Safety(Fixture):
         code, out = self.go(*self.YES, "--class", "evidence")
         self.assertEqual(code, 0, out)
         self.assertFalse((self.root / "state" / cold_move.LOCK_NAME).exists())
+        self.approve()  # a new yes; the first approval was used up
         code, out = self.go(*self.YES, "--class", "reference")  # a second run is not blocked
         self.assertEqual(code, 0, out)
+
+    def test_worktree_board_change_after_planning_keeps_source(self):
+        self.approve()
+        real_plan = cold_move.build_plan
+
+        def plan_then_task_reopened(*a, **k):
+            items = real_plan(*a, **k)
+            put(self.board, "t-done\trunning\nt-run\trunning\n")
+            return items
+
+        with mock.patch.object(cold_move, "build_plan", plan_then_task_reopened):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("board status is now running", out)
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-done" / "README.md").is_file())
+        self.assertFalse((self.ext / "worktree").exists())
+
+    def test_worktree_dst_appearing_after_planning_keeps_both(self):
+        self.approve()
+        real_plan = cold_move.build_plan
+        dst = self.ext / "worktree" / "worktrees" / "proj" / "t-done"
+
+        def plan_then_dst_appears(*a, **k):
+            items = real_plan(*a, **k)
+            put(dst / "other.txt", "someone else's")
+            return items
+
+        with mock.patch.object(cold_move, "build_plan", plan_then_dst_appears):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("target appeared after planning", out)
+        self.assertEqual((dst / "other.txt").read_text(), "someone else's")
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-done" / "README.md").is_file())
+
+
+class ApprovalScope(Fixture):
+    """Finding 1: an approval names its classes and date, and is used up by one --yes run."""
+
+    def test_approval_for_one_class_does_not_cover_another(self):
+        self.approve(["evidence"])
+        before = self.snapshot()
+        code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 2, out)
+        self.assertIn("does not approve class worktree", out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(list(self.ext.iterdir()), [])
+        self.assertTrue(self.approval.is_file())  # a refused run uses nothing up
+
+    def test_approval_must_name_every_requested_class(self):
+        self.approve(["evidence"])
+        code, out = self.go(*self.YES, "--class", "evidence", "--class", "reference")
+        self.assertEqual(code, 2, out)
+        self.assertIn("reference", out)
+        self.assertTrue((self.root / "evidence" / "ev1").exists())
+
+    def test_approval_with_old_date_is_refused(self):
+        self.approve(date="2026-11-19" if cold_move.utc_today() != "2026-11-19" else "2026-11-18")
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 2, out)
+        self.assertIn("not today", out)
+        self.assertTrue((self.root / "evidence" / "ev1").exists())
+
+    def test_old_free_text_approval_is_refused(self):
+        put(self.approval, "APPROVED by Lazlo in chat\n")
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 2, out)
+        self.assertTrue((self.root / "evidence" / "ev1").exists())
+
+    def test_unknown_class_in_approval_is_refused(self):
+        put(self.approval, f"APPROVED {cold_move.utc_today()} evidence,everything\n")
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 2, out)
+        self.assertIn("unknown class", out)
+
+    def test_yes_run_uses_up_the_approval_and_the_next_run_is_refused(self):
+        self.approve(["evidence", "reference"])
+        text = self.approval.read_text()
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.approval.exists())
+        used = self.used_approvals()
+        self.assertEqual(len(used), 1, used)
+        self.assertEqual((self.approval.parent / used[0]).read_text(), text)  # renamed, not deleted
+        # a later first run of another class, even one the old file named, needs a new yes
+        code, out = self.go(*self.YES, "--class", "reference")
+        self.assertEqual(code, 2, out)
+        self.assertIn("does not exist", out)
+        self.assertTrue((self.root / "reference" / "ref1").exists())
+
+    def test_approval_rename_failure_moves_nothing(self):
+        self.approve()
+        real_rename = os.rename
+
+        def no_rename_for_approval(a, b, *r, **k):
+            if Path(a).name == self.approval.name:
+                raise OSError("rename blocked")
+            return real_rename(a, b, *r, **k)
+
+        before = self.snapshot()
+        with mock.patch.object(cold_move.os, "rename", no_rename_for_approval):
+            code, out = self.go(*self.YES, *self.ALL)
+        self.assertEqual(code, 2, out)
+        self.assertIn("use up", out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(list(self.ext.iterdir()), [])
+
+
+class RepoGuardTests(Fixture):
+    """Finding 2: a copy-class candidate that is, holds or sits in a repo or worktree never moves."""
+
+    def guard(self, with_wdir=True):
+        state = self.root / "state"
+        wdir = (self.root / "worktrees") if with_wdir else None
+        return cold_move.RepoGuard(self.root, state, wdir, cold_move.registered_worktrees(self.root))
+
+    def test_plain_untracked_folder_passes(self):
+        self.assertIsNone(cold_move.repo_guard(self.guard(), self.root / "evidence" / "ev1"))
+
+    def test_nested_git_folder_at_depth_is_refused(self):
+        put(self.root / "reference" / "clone" / "deep" / "er" / ".git" / "HEAD", "ref: x")
+        why = cold_move.repo_guard(self.guard(), self.root / "reference" / "clone")
+        self.assertIsNotNone(why)
+        self.assertIn(".git", why)
+
+    def test_nested_git_file_is_refused(self):
+        put(self.root / "reference" / "wt" / "sub" / ".git", "gitdir: elsewhere")
+        why = cold_move.repo_guard(self.guard(), self.root / "reference" / "wt")
+        self.assertIsNotNone(why)
+        self.assertIn(".git", why)
+
+    def test_registered_worktree_is_refused_even_without_worktrees_dir(self):
+        g = self.guard(with_wdir=False)
+        why = cold_move.repo_guard(g, self.root / "worktrees" / "proj" / "t-done")
+        self.assertIn("worktree", why)
+
+    def test_folder_holding_a_registered_worktree_is_refused(self):
+        g = self.guard(with_wdir=False)
+        why = cold_move.repo_guard(g, self.root / "worktrees" / "proj")
+        self.assertIn("holds a git worktree", why)
+
+    def test_path_inside_a_registered_worktree_is_refused(self):
+        g = self.guard(with_wdir=False)
+        why = cold_move.repo_guard(g, self.root / "worktrees" / "proj" / "t-done" / "README.md")
+        self.assertIn("sits inside a git worktree", why)
+
+    def test_overlap_with_worktrees_dir_is_refused(self):
+        put(self.root / "worktrees" / "stray" / "f.txt", "not registered, no .git")
+        why = cold_move.repo_guard(self.guard(), self.root / "worktrees" / "stray")
+        self.assertIn("worktrees folder", why)
+
+    def test_overlap_with_state_is_refused(self):
+        why = cold_move.repo_guard(self.guard(), self.root / "state" / "records")
+        self.assertIn("state", why)
+
+    def test_unreadable_walk_fails_closed(self):
+        put(self.root / "reference" / "r2" / "a" / "f.txt", "x")
+        real_walk = os.walk
+
+        def failing_walk(top, *a, onerror=None, **k):
+            if onerror is not None:
+                onerror(PermissionError("denied"))
+            yield from real_walk(top, *a, onerror=onerror, **k)
+
+        with mock.patch.object(cold_move.os, "walk", failing_walk):
+            with self.assertRaises(OSError):
+                cold_move.repo_guard(self.guard(), self.root / "reference" / "r2")
+
+    def test_reference_dir_over_worktrees_moves_nothing_end_to_end(self):
+        self.approve()
+        before = self.snapshot()
+        code, out = self.go(*self.YES, "--class", "reference", "--reference-dir", "worktrees/proj",
+                            "--reference-dir", "worktrees/proj/t-done")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("moved " + str(self.root / "worktrees"), out)
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-done" / "README.md").is_file())
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-run" / "README.md").is_file())
+        self.assertFalse((self.ext / "reference" / "worktrees").exists())
+
+    def test_nested_clone_end_to_end_is_skipped(self):
+        clone = self.root / "evidence" / "clone"
+        clone.mkdir(parents=True)
+        git(clone, "init", "-q")
+        put(clone / "work.txt", "untracked by the root repo")
+        self.approve()
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertIn(".git", out)
+        self.assertTrue((clone / "work.txt").is_file())
+        self.assertFalse((self.ext / "evidence" / "evidence" / "clone").exists())
+
+    def test_guard_runs_again_right_before_the_copy(self):
+        self.approve()
+        real_plan = cold_move.build_plan
+
+        def plan_then_clone_appears(*a, **k):
+            items = real_plan(*a, **k)
+            put(self.root / "evidence" / "ev1" / "nested" / ".git" / "HEAD", "ref: x")
+            return items
+
+        with mock.patch.object(cold_move, "build_plan", plan_then_clone_appears):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 1, out)
+        self.assertIn("found right before the copy", out)
+        self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
+        self.assertFalse((self.ext / "evidence" / "evidence" / "ev1").exists())
 
     def test_retired_worktree_with_gitignored_env_is_never_moved(self):
         with open(self.root / ".git" / "info" / "exclude", "a", encoding="utf-8") as f:

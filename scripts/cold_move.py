@@ -20,15 +20,26 @@ Classes (a class is only considered when its flag is given):
 The default run is a dry run: it prints each item with class, size and target path and moves
 nothing. It refuses to run unless free space of --root is under --trigger-gb (or --force-list,
 for a dry run only). --yes moves only the classes named by --class, and refuses unless the
-approval file (inside --state-dir) exists: a one-line file starting with APPROVED that the
-orchestrator writes only after Lazlo's yes in chat. The first real run needs that yes for every class.
+approval file (inside --state-dir) exists and is exactly one line
+
+    APPROVED <today's UTC date, YYYY-MM-DD> <class>[,<class>...]
+
+naming every class the run asks for. The orchestrator writes it only after Lazlo's yes in chat.
+An approval is used once: when a --yes run reaches the move step it renames the file to
+<name>.used-<UTC timestamp>-<id> (never deletes it) before moving anything, so the next --yes run
+of any class needs a new yes and a new file. A rename failure refuses the run, nothing moved.
 
 Never moved, whatever the flags: a path with a git-tracked file; anything inside --state-dir
 (state/ records); a worktree the board does not list as finished (running, queued, unknown, or
 the board cannot be read); a symlink or a folder holding one; a folder holding a secret file
-(.env*); anything whose target already exists. Files and folders are copied, the size and
-SHA-256 of every file are verified, and only then is the source removed. A retired worktree is
-moved with `git worktree move`, then `git worktree repair`.
+(.env*); anything whose target already exists. For the copy classes (build-cache, evidence,
+reference) every candidate also goes through repo_guard: one holding a .git entry (file or
+folder) at any depth, one that is, holds or sits inside a worktree from `git worktree list`
+(other than root itself), and one that overlaps --worktrees-dir or --state-dir is skipped; the
+guard runs at planning and again right before the copy. Files and folders are copied, the size
+and SHA-256 of every file are verified, and only then is the source removed. A retired worktree
+is moved with `git worktree move`, then `git worktree repair`; right before the move the board
+is read again and the target re-checked absent.
 With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
 exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
 name next to the target, is verified, then renamed into place; an error removes only that temp
@@ -54,7 +65,8 @@ APPROVAL_PREFIX = "APPROVED"
 LOCK_NAME = "cold-move.lock"
 REMINDER = (
     "The first real run (--yes) needs Lazlo's yes in chat for every class. "
-    "The orchestrator writes the approval file only after that yes."
+    "The orchestrator writes the approval file (APPROVED <UTC date> <classes>) only after that "
+    "yes; each --yes run uses it up."
 )
 
 
@@ -179,15 +191,76 @@ def read_board(args):
 
 # ---------------------------------------------------------------- listing
 class Item:
-    def __init__(self, cls, src, dst, size, skip=None):
+    def __init__(self, cls, src, dst, size, skip=None, guard=None):
         self.cls, self.src, self.dst, self.size, self.skip = cls, src, dst, size, skip
+        self.guard = guard  # RepoGuard for copy classes: re-run right before the copy
+
+
+def registered_worktrees(root):
+    """Resolved paths of every worktree `git worktree list --porcelain` names. Fails closed."""
+    p = run_git(root, "worktree", "list", "--porcelain")
+    if p.returncode != 0:
+        raise Refusal(f"git worktree list failed: {p.stderr.strip()}")
+    out = set()
+    for line in p.stdout.splitlines():
+        if line.startswith("worktree "):
+            out.add(Path(line[len("worktree "):]).resolve())
+    return out
+
+
+class RepoGuard:
+    """What a copy-class candidate must never be, hold or sit inside."""
+
+    def __init__(self, root, state, worktrees_dir, worktrees):
+        self.root = root
+        self.state = state
+        self.worktrees_dir = worktrees_dir  # resolved path, or None when --worktrees-dir is not given
+        self.worktrees = set(worktrees)  # resolved paths from git worktree list
+
+
+def _raise(e):
+    raise e
+
+
+def repo_guard(guard, src):
+    """Return a reason string when src must not be copied and removed, else None.
+
+    The one place every build-cache, evidence and reference candidate passes through, at planning
+    and again right before its copy. Refuses a candidate that:
+      - overlaps the state folder or --worktrees-dir (is, holds or sits inside it);
+      - is, holds or sits inside a worktree that `git worktree list` names (root itself is the
+        main worktree and every candidate sits inside it, so for root only "is or holds" counts);
+      - is named .git or holds a .git entry (file or folder) at any depth: a nested clone or a
+        worktree whose files the root repo's `git ls-files` cannot see.
+    An unreadable folder raises OSError (fail closed), never silently skips the walk.
+    """
+    real = src.resolve()
+    if is_inside(real, guard.state) or is_inside(guard.state, real):
+        return "overlaps the state folder"
+    if guard.worktrees_dir is not None and (
+        is_inside(real, guard.worktrees_dir) or is_inside(guard.worktrees_dir, real)
+    ):
+        return "overlaps the worktrees folder"
+    for wt in guard.worktrees:
+        if is_inside(wt, real):
+            return f"is or holds a git worktree ({wt.name})"
+        if wt != guard.root and is_inside(real, wt):
+            return f"sits inside a git worktree ({wt.name})"
+    if src.name.lower() == ".git":
+        return "is a .git entry"
+    if src.is_dir() and not src.is_symlink():
+        for dirpath, dirnames, filenames in os.walk(src, onerror=_raise):
+            if any(n.lower() == ".git" for n in dirnames + filenames):
+                where = Path(dirpath).relative_to(src).as_posix()
+                return f"holds a .git entry (nested repo or worktree at {where})"
+    return None
 
 
 def target_for(target, cls, root, src):
     return target / cls / src.relative_to(root)
 
 
-def plan_children(args, root, target, state, cls, dirs, cold_only):
+def plan_children(args, root, target, state, cls, dirs, cold_only, guard):
     items = []
     for rel in dirs:
         base = rel_under(root, rel, f"--{cls}-dir")
@@ -196,16 +269,18 @@ def plan_children(args, root, target, state, cls, dirs, cold_only):
         if not base.is_dir():
             continue
         for child in sorted(base.iterdir()):
-            items.append(classify(args, root, target, state, cls, child, cold_only))
+            items.append(classify(args, root, target, state, cls, child, cold_only, guard))
     return items
 
 
-def classify(args, root, target, state, cls, src, cold_only):
+def classify(args, root, target, state, cls, src, cold_only, guard):
     dst = target_for(target, cls, root, src)
     skip = None
     size = 0
     try:
-        skip = tree_has_symlink_or_secret(src)
+        skip = repo_guard(guard, src)
+        if skip is None:
+            skip = tree_has_symlink_or_secret(src)
         if skip is None and is_inside(src.resolve(), state):
             skip = "inside the state folder"
         if skip is None and tracked_in(root, src):
@@ -218,21 +293,14 @@ def classify(args, root, target, state, cls, src, cold_only):
             skip = "target already exists"
     except OSError as e:
         skip = f"unreadable ({e})"
-    return Item(cls, src, dst, size, skip)
+    return Item(cls, src, dst, size, skip, guard)
 
 
-def plan_worktrees(args, root, target, state):
+def plan_worktrees(args, root, target, state, registered):
     base = rel_under(root, args.worktrees_dir, "--worktrees-dir")
     if not base.is_dir():
         return []
     board = read_board(args)
-    p = run_git(root, "worktree", "list", "--porcelain")
-    if p.returncode != 0:
-        raise Refusal(f"git worktree list failed: {p.stderr.strip()}")
-    registered = set()
-    for line in p.stdout.splitlines():
-        if line.startswith("worktree "):
-            registered.add(Path(line[len("worktree "):]).resolve())
     items = []
     for proj in sorted(base.iterdir()):
         if not proj.is_dir() or proj.is_symlink():
@@ -272,12 +340,15 @@ def plan_worktrees(args, root, target, state):
 
 
 def build_plan(args, root, target, state):
+    registered = registered_worktrees(root)
+    wdir = rel_under(root, args.worktrees_dir, "--worktrees-dir") if args.worktrees_dir else None
+    guard = RepoGuard(root, state, wdir, registered)
     items = []
-    items += plan_children(args, root, target, state, "build-cache", args.cache_dir, True)
-    items += plan_children(args, root, target, state, "evidence", args.evidence_dir, False)
-    items += plan_children(args, root, target, state, "reference", args.reference_dir, False)
+    items += plan_children(args, root, target, state, "build-cache", args.cache_dir, True, guard)
+    items += plan_children(args, root, target, state, "evidence", args.evidence_dir, False, guard)
+    items += plan_children(args, root, target, state, "reference", args.reference_dir, False, guard)
     if args.worktrees_dir:
-        items += plan_worktrees(args, root, target, state)
+        items += plan_worktrees(args, root, target, state, registered)
     return items
 
 
@@ -326,6 +397,13 @@ def move_copy(item):
         raise MoveFailed("source is gone; nothing copied")
     if exists_any(item.dst):
         raise MoveFailed("target appeared after planning; nothing copied, nothing removed")
+    if item.guard is not None:
+        try:
+            why = repo_guard(item.guard, item.src)
+        except OSError as e:
+            raise MoveFailed(f"repo guard could not read the source ({e}); nothing copied")
+        if why is not None:
+            raise MoveFailed(f"{why} (found right before the copy); nothing copied")
     tmp = item.dst.parent / f"{item.dst.name}.cold-tmp-{os.getpid()}-{uuid.uuid4().hex}"
     try:
         item.dst.parent.mkdir(parents=True, exist_ok=True)
@@ -366,7 +444,16 @@ def remove_partial(dst):
         pass
 
 
-def move_worktree(root, item):
+def move_worktree(args, root, item):
+    """Re-check the board and the target right before `git worktree move`; planning is not enough."""
+    if exists_any(item.dst):
+        raise MoveFailed("target appeared after planning; source kept, nothing moved")
+    try:
+        status = read_board(args).get(item.src.name)
+    except Refusal as e:
+        raise MoveFailed(f"board unreadable at move time (source kept): {e}")
+    if status not in FINISHED:
+        raise MoveFailed(f"board status is now {status or 'missing'}, not finished; source kept")
     item.dst.parent.mkdir(parents=True, exist_ok=True)
     p = run_git(root, "worktree", "move", str(item.src), str(item.dst))
     if p.returncode != 0:
@@ -376,23 +463,66 @@ def move_worktree(root, item):
         raise MoveFailed(f"moved, but git worktree repair failed: {r.stderr.strip()}")
 
 
-def do_move(root, item):
+def do_move(args, root, item):
     if item.cls == "worktree":
-        move_worktree(root, item)
+        move_worktree(args, root, item)
     else:
         move_copy(item)
 
 
 # ---------------------------------------------------------------- run
-def check_approval(root, state, rel):
+def utc_today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def check_approval(root, state, rel, classes):
+    """Return the approval file path if it approves today (UTC) every class in classes, else refuse.
+
+    The file is exactly one line: APPROVED <YYYY-MM-DD> <class>[,<class>...].
+    """
     f = rel_under(root, rel, "--approval-file")
-    if not is_inside(f, state):
+    if not is_inside(f, state) or f == state:
         raise Refusal("--approval-file must be inside the state folder")
     if f.is_symlink() or not f.is_file():
         raise Refusal(f"refusing --yes: approval file {rel} does not exist. {REMINDER}")
     lines = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
-    if len(lines) != 1 or not lines[0].startswith(APPROVAL_PREFIX):
-        raise Refusal(f"refusing --yes: {rel} must be one line starting with {APPROVAL_PREFIX}. {REMINDER}")
+    form = f"{APPROVAL_PREFIX} <YYYY-MM-DD> <class>[,<class>...]"
+    if len(lines) != 1:
+        raise Refusal(f"refusing --yes: {rel} must be exactly one line, {form}. {REMINDER}")
+    parts = lines[0].split()
+    if len(parts) != 3 or parts[0] != APPROVAL_PREFIX:
+        raise Refusal(f"refusing --yes: {rel} must read {form}. {REMINDER}")
+    if parts[1] != utc_today():
+        raise Refusal(
+            f"refusing --yes: {rel} is dated {parts[1]!r}, not today ({utc_today()} UTC). {REMINDER}"
+        )
+    approved = parts[2].split(",")
+    for c in approved:
+        if c not in CLASSES:
+            raise Refusal(f"refusing --yes: {rel} names unknown class {c!r}. {REMINDER}")
+    missing = [c for c in classes if c not in approved]
+    if missing:
+        raise Refusal(
+            f"refusing --yes: {rel} does not approve class {', '.join(missing)} "
+            f"(it approves {', '.join(approved)}). {REMINDER}"
+        )
+    return f
+
+
+def consume_approval(f):
+    """Rename the approval file to a fresh .used-<UTC timestamp>-<id> name. Never deletes it.
+
+    Raises Refusal when the rename fails, so no move happens on an approval that was not used up.
+    """
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    used = f.with_name(f"{f.name}.used-{stamp}-{uuid.uuid4().hex[:8]}")
+    if exists_any(used):  # a fresh uuid name: cannot happen, but never replace a file
+        raise Refusal(f"cannot use up the approval file: {used.name} already exists; nothing moved")
+    try:
+        os.rename(f, used)
+    except OSError as e:
+        raise Refusal(f"cannot use up the approval file ({e}); nothing moved")
+    return used
 
 
 def parse(argv):
@@ -478,8 +608,9 @@ def run_locked(args, out):
     if not target.is_dir():
         raise Refusal(f"--target {args.target!r} is not an existing folder (is the drive attached?)")
     state = rel_under(root, args.state_dir, "--state-dir")
+    approval = None
     if args.yes:
-        check_approval(root, state, args.approval_file)
+        approval = check_approval(root, state, args.approval_file, args.classes)
     free = free_gb(root)
     if free >= args.trigger_gb and not args.force_list:
         raise Refusal(
@@ -495,13 +626,16 @@ def run_locked(args, out):
     if not args.yes:
         out.write(f"dry run: {len(todo)} item(s) would move, nothing moved. {REMINDER}\n")
         return 0
+    # The approval is used up before the first move, so it can never cover a second run.
+    used = consume_approval(approval)
+    out.write(f"approval used up: {approval.name} -> {used.name}\n")
     moved = failed = 0
     for it in todo:
         if it.cls not in args.classes:
             out.write(f"not moved (class {it.cls} not named by --class): {it.src}\n")
             continue
         try:
-            do_move(root, it)
+            do_move(args, root, it)
             moved += 1
             out.write(f"moved {it.src} -> {it.dst}\n")
         except MoveFailed as e:
