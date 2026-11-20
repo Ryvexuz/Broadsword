@@ -1,15 +1,17 @@
 """Lint a task brief against the measured first-pass rules. Read-only.
 
 Usage:
-    python -I scripts/brief_lint.py --max-lines N --max-bullets N --max-files N <brief.md> [...]
+    python -I scripts/brief_lint.py --max-lines N --max-bullets N --max-files N --max-done-lines N <brief.md> [...]
 
-The three limits are required flags (nothing is hard-coded here; the settings rule). The
-measured values (state/staging/selfcheck/NOTES.md) are 30, 8 and 2.
+The four limits are required flags (nothing is hard-coded here; the settings rule). The
+measured values (state/staging/selfcheck/NOTES.md) are 30, 8 and 2; the done-check cap is 10.
 
 Rules, each printed as `PASS` or `FAIL` per brief:
-  lines     non-blank lines, not counting the done-check block, at most --max-lines
-  bullets   top-level bullets in the Requirements section, at most --max-bullets
-  files     distinct backtick spans on the Claims line, at most --max-files unless the Claims
+  lines     non-blank lines at most --max-lines; the first --max-done-lines lines of the done check
+            are not counted, any beyond that are
+  bullets   top-level bullets in the Requirements section (any heading form), at most
+            --max-bullets; no Requirements section is a failure
+  files     distinct path-like tokens on the Claims line (backticked or not), at most --max-files unless the Claims
             line states a reason (the word "reason" or "because")
   donecheck a Done check section exists, has at least one item, and every item holds a
             backtick span that is a command (first word: broadsword, python, cargo, git, ...)
@@ -23,25 +25,42 @@ import sys
 
 COMMANDS = {"broadsword", "python", "python3", "cargo", "git", "pytest", "npm", "bash", "sh",
             "powershell", "pwsh"}
-# Section names a brief uses; a line starting with one (after "- " and bold markers) starts a section.
-SECTIONS = ("requirements", "done check", "claim", "claims", "task", "board", "build route",
-            "depends on", "model", "title", "source", "review", "order")
-SECTION_RE = re.compile(r"^(?:[-*]\s+)?\**\s*([A-Za-z][A-Za-z ]*?)\s*:\s*\**\s*(.*)$")
+# Names the lint reads. A section starts at a heading line ("## X"), a bold line ("**X:**",
+# "**X**") or, for these key names only, a plain or bullet line ("Claims: ...", "- Done check: ...").
+# Only a heading, a bold line or a key-name line ends a section: "- Order: lint first" does not.
+KEY_NAMES = {"requirements": "requirements", "requirement": "requirements", "claim": "claims",
+             "claims": "claims", "done check": "done check"}
+KEY_RE = re.compile(r"^(?:[-*]\s+)?([A-Za-z][A-Za-z -]*?)\s*:\s*(.*)$")
+HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+BOLD_RE = re.compile(r"^\*\*\s*([^*]+?)\s*:?\s*\*\*\s*:?\s*(.*)$")
 ITEM_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s")
 TICKS_RE = re.compile(r"`([^`]+)`")
+PATH_RE = re.compile(r"^(?:[\w.-]+[/\\])+[\w.-]*$|^[\w-][\w.-]*\.[A-Za-z][A-Za-z0-9]{1,5}$")
 
 
 class LintError(Exception):
     pass
 
 
+def norm(name):
+    return re.sub(r"[\s-]+", " ", name.replace("*", "").strip().rstrip(":").strip()).lower()
+
+
 def section_of(line):
-    """(name, rest) when the line opens a known section, else None."""
-    if line.startswith(" ") or line.startswith("\t"):
+    """(name, rest) when the line opens a section, else None. Indented lines never do."""
+    if line.startswith(" ") or line.startswith("\t") or not line.strip():
         return None
-    m = SECTION_RE.match(line.replace("**", ""))
-    if m and m.group(1).strip().lower() in SECTIONS:
-        return m.group(1).strip().lower(), m.group(2)
+    m = HEADING_RE.match(line)
+    if m:
+        text = m.group(1)
+        name, _, rest = text.partition(":")
+        return norm(name), rest.strip()
+    m = BOLD_RE.match(line.rstrip())
+    if m:
+        return norm(m.group(1)), m.group(2).strip()
+    m = KEY_RE.match(line.replace("**", ""))
+    if m and norm(m.group(1)) in KEY_NAMES:
+        return norm(m.group(1)), m.group(2).strip()
     return None
 
 
@@ -51,12 +70,22 @@ def split_sections(lines):
     for i, ln in enumerate(lines):
         s = section_of(ln)
         if s:
-            starts.append((s[0], i))
+            starts.append((KEY_NAMES.get(s[0], s[0]), i))
     out = []
     for k, (name, i) in enumerate(starts):
         end = starts[k + 1][1] if k + 1 < len(starts) else len(lines)
         out.append((name, i, end))
     return out
+
+
+def claim_paths(text):
+    """Distinct path-like tokens in `text` (backticks or not), each path of a span on its own."""
+    paths = set()
+    for tok in re.split(r"[\s,;()\[\]`'\"]+", text):
+        tok = tok.strip().rstrip(".:")
+        if tok and PATH_RE.match(tok):
+            paths.add(tok.replace("\\", "/"))
+    return paths
 
 
 def is_command(span):
@@ -69,42 +98,49 @@ def is_command(span):
     return first in COMMANDS
 
 
-def lint(text, max_lines, max_bullets, max_files):
+def lint(text, max_lines, max_bullets, max_files, max_done_lines):
     """Return a list of (rule, ok, message) for the four rules."""
     lines = text.splitlines()
     secs = split_sections(lines)
     results = []
 
     done = [s for s in secs if s[0] == "done check"]
-    done_idx = set()
-    for _, a, b in done:
-        done_idx.update(range(a, b))
+    done_n = sum(1 for _, a, b in done for ln in lines[a:b] if ln.strip())
+    total = sum(1 for ln in lines if ln.strip())
+    n = total - min(done_n, max_done_lines)
+    msg = f"{n} non-blank lines (max {max_lines}); done check {done_n} lines, first {max_done_lines} excluded"
+    results.append(("lines", n <= max_lines, msg))
 
-    n = sum(1 for i, ln in enumerate(lines) if ln.strip() and i not in done_idx)
-    results.append(("lines", n <= max_lines,
-                    f"{n} non-blank lines outside the done check (max {max_lines})"))
-
-    bullets = 0
-    for name, a, b in secs:
-        if name == "requirements":
+    reqs = [s for s in secs if s[0] == "requirements"]
+    if not reqs:
+        results.append(("bullets", False, "no Requirements section found (accepted forms: "
+                        "'Requirements:', '## Requirements', '**Requirements**')"))
+    else:
+        bullets = 0
+        for _, a, b in reqs:
+            head = section_of(lines[a])[1]
+            if head:
+                bullets += 1
             for ln in lines[a + 1:b]:
                 if ITEM_RE.match(ln) and not ln.startswith((" ", "\t")):
                     bullets += 1
-    results.append(("bullets", bullets <= max_bullets,
-                    f"{bullets} requirement bullets (max {max_bullets})"))
+        results.append(("bullets", bullets <= max_bullets,
+                        f"{bullets} requirement bullets (max {max_bullets})"))
 
-    claims = [s for s in secs if s[0] in ("claim", "claims")]
+    claims = [s for s in secs if s[0] == "claims"]
     if not claims:
         results.append(("files", False, "no Claims line found"))
     else:
         _, a, b = claims[0]
-        block = [lines[a].replace("**", "")] + [ln for ln in lines[a + 1:b]
-                                                if ln.startswith((" ", "\t")) and ln.strip()]
-        first = re.sub(r"^(?:[-*]\s+)?\s*[A-Za-z ]+:\s*", "", block[0], count=1)
-        block = [first] + block[1:]
+        rest = section_of(lines[a])[1]
+        if rest:
+            block = [rest] + [ln for ln in lines[a + 1:b] if ln.startswith((" ", "\t")) and ln.strip()]
+        else:
+            block = [ln for ln in lines[a + 1:b] if ln.strip()]
         joined = "\n".join(block)
-        files = set(TICKS_RE.findall(joined))
-        prose = TICKS_RE.sub("", joined).lower()
+        files = claim_paths(joined)
+        prose = " ".join(t for t in re.split(r"[\s,;()\[\]`'\"]+", joined)
+                         if t.strip().rstrip(".:").replace("\\", "/") not in files).lower()
         has_reason = "reason" in prose or "because" in prose
         ok = len(files) <= max_files or has_reason
         msg = f"{len(files)} claimed files (max {max_files} unless a reason is stated)"
@@ -116,7 +152,7 @@ def lint(text, max_lines, max_bullets, max_files):
         results.append(("donecheck", False, "no Done check section found"))
     else:
         _, a, b = done[0]
-        head = re.sub(r"^(?:[-*]\s+)?\s*[A-Za-z ]+:\s*", "", lines[a].replace("**", ""), count=1)
+        head = section_of(lines[a])[1]
         items = []
         if head.strip():
             items.append(head)
@@ -151,6 +187,7 @@ def main(argv):
     p.add_argument("--max-lines", type=positive, required=True)
     p.add_argument("--max-bullets", type=positive, required=True)
     p.add_argument("--max-files", type=positive, required=True)
+    p.add_argument("--max-done-lines", type=positive, required=True)
     p.add_argument("briefs", nargs="+")
     try:
         a = p.parse_args(argv)
@@ -164,7 +201,7 @@ def main(argv):
         except (OSError, UnicodeDecodeError) as e:
             print(f"brief_lint: cannot read {path}: {e}", file=sys.stderr)
             return 2
-        res = lint(text, a.max_lines, a.max_bullets, a.max_files)
+        res = lint(text, a.max_lines, a.max_bullets, a.max_files, a.max_done_lines)
         bad = [r for r in res if not r[1]]
         print(f"{path}: {'ok' if not bad else str(len(bad)) + ' rule(s) failed'}")
         for rule, ok, msg in res:

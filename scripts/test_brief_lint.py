@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("brief_lint", SCRIPT)
 bl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bl)
 
-LIMITS = (30, 8, 2)
+LIMITS = (30, 8, 2, 10)  # lines, bullets, files, done-check lines excluded from the line count
 
 GOOD = """# Brief: small task
 
@@ -62,8 +62,9 @@ class Rules(unittest.TestCase):
         self.assertFalse(res["lines"][0])
         self.assertIn("non-blank lines", res["lines"][1])
 
-    def test_lines_rule_ignores_the_done_check_block(self):
-        long_done = GOOD + "".join(f"{i}. `python -I x{i}.py`\n" for i in range(3, 60))
+    def test_lines_rule_ignores_a_short_done_check_block(self):
+        # a done check of about 10 lines on top of GOOD's 8 other lines still passes the line count
+        long_done = GOOD + "".join(f"{i}. `python -I x{i}.py`\n" for i in range(3, 11))
         res = lint(long_done)
         self.assertTrue(res["lines"][0], res["lines"][1])
         self.assertTrue(res["donecheck"][0], res["donecheck"][1])
@@ -122,6 +123,83 @@ class Rules(unittest.TestCase):
         self.assertFalse(bl.is_command("--push"))
 
 
+HEAD = "# Brief: x\n\n- Claims: `scripts/a.py` (new)\n\n"
+DONE = "\n**Done check:**\n1. `python -I scripts/test_a.py` shows OK.\n"
+TWENTY = "".join(f"- requirement {i}\n" for i in range(20))
+CLAIMS_GOOD = "- Claims: `scripts/a.py` (new), `scripts/test_a.py` (new)"
+
+
+class Bypasses(unittest.TestCase):
+    """One test per bypass found in review q-20261120-034119 (each failed before the fix)."""
+
+    def test_requirements_heading_forms_are_all_counted(self):
+        for heading in ("Requirements:", "## Requirements", "**Requirements**", "**Requirements:**",
+                        "### Requirements:", "- Requirements:"):
+            res = lint(HEAD + heading + "\n" + TWENTY + DONE)
+            self.assertFalse(res["bullets"][0], f"{heading!r}: {res['bullets'][1]}")
+            self.assertIn("requirement bullets", res["bullets"][1], heading)
+            self.assertTrue(res["bullets"][1].startswith("20 "), f"{heading!r}: {res['bullets'][1]}")
+
+    def test_bullets_without_a_requirements_heading_is_an_error_not_zero(self):
+        res = lint(HEAD + "**What to build**\n" + TWENTY + DONE)
+        self.assertFalse(res["bullets"][0])
+        self.assertIn("no Requirements section", res["bullets"][1])
+
+    def test_a_bullet_that_starts_with_a_listed_word_does_not_end_requirements(self):
+        res = lint(HEAD + "**Requirements:**\n- Order: lint first\n" + TWENTY + DONE)
+        self.assertFalse(res["bullets"][0])
+        self.assertTrue(res["bullets"][1].startswith("21 "), res["bullets"][1])
+
+    def test_a_real_bold_header_does_end_requirements(self):
+        res = lint(HEAD + "**Requirements:**\n- one\n- two\n**Notes:**\n" + TWENTY + DONE)
+        self.assertTrue(res["bullets"][0], res["bullets"][1])
+        self.assertTrue(res["bullets"][1].startswith("2 "), res["bullets"][1])
+
+    def test_long_done_check_prose_cannot_hide_lines(self):
+        res = lint(GOOD + "".join(f"prose line {i}\n" for i in range(200)))
+        self.assertFalse(res["lines"][0], res["lines"][1])
+
+    def test_unlisted_header_such_as_notes_counts_toward_the_lines(self):
+        res = lint(GOOD + "**Notes:**\n" + "".join(f"note line {i}\n" for i in range(200)))
+        self.assertFalse(res["lines"][0], res["lines"][1])
+
+    def test_a_heading_ends_the_done_check_so_later_prose_counts(self):
+        res = lint(GOOD + "## Background\n" + "".join(f"background {i}\n" for i in range(40)))
+        self.assertFalse(res["lines"][0], res["lines"][1])
+
+    def test_unbackticked_claims_are_counted(self):
+        res = lint(GOOD.replace(CLAIMS_GOOD, "- Claims: scripts/a.py, scripts/b.py, docs/c.md"))
+        self.assertFalse(res["files"][0])
+        self.assertTrue(res["files"][1].startswith("3 "), res["files"][1])
+
+    def test_several_paths_in_one_span_count_separately(self):
+        res = lint(GOOD.replace(CLAIMS_GOOD, "- Claims: `scripts/a.py scripts/b.py docs/c.md`"))
+        self.assertFalse(res["files"][0])
+        self.assertTrue(res["files"][1].startswith("3 "), res["files"][1])
+
+    def test_paths_listed_as_bullets_under_a_claims_header_are_counted(self):
+        text = (HEAD.replace("- Claims: `scripts/a.py` (new)", "**Claims:**\n- scripts/a.py\n- b/c.rs\n- d/e.md")
+                + "**Requirements:**\n- x\n" + DONE)
+        res = lint(text)
+        self.assertFalse(res["files"][0])
+        self.assertTrue(res["files"][1].startswith("3 "), res["files"][1])
+
+    def test_a_reason_is_still_accepted_with_unbackticked_paths(self):
+        res = lint(GOOD.replace(CLAIMS_GOOD,
+                                "- Claims: scripts/a.py, scripts/b.py, docs/c.md; reason: docs ship with it"))
+        self.assertTrue(res["files"][0], res["files"][1])
+
+    def test_a_path_named_reason_is_not_a_stated_reason(self):
+        res = lint(GOOD.replace(CLAIMS_GOOD, "- Claims: scripts/reasons.py, scripts/b.py, docs/because.md"))
+        self.assertFalse(res["files"][0], res["files"][1])
+
+    def test_a_done_check_over_the_cap_counts_only_its_excess(self):
+        # 8 other lines + a 41-line done check: 31 lines beyond the cap of 10 are counted, 39 > 30
+        text = GOOD + "".join(f"{i}. `python -I x{i}.py`\n" for i in range(3, 41))
+        res = lint(text)
+        self.assertFalse(res["lines"][0], res["lines"][1])
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.dir = pathlib.Path(os.environ.get("BRIEF_LINT_SCRATCH",
@@ -135,7 +213,8 @@ class Cli(unittest.TestCase):
         p.write_text(text, encoding="utf-8")
         return str(p)
 
-    FLAGS = ["--max-lines", "30", "--max-bullets", "8", "--max-files", "2"]
+    FLAGS = ["--max-lines", "30", "--max-bullets", "8", "--max-files", "2",
+             "--max-done-lines", "10"]
 
     def test_good_brief_exit_0(self):
         code, out, _ = run_cli(self.FLAGS + [self.write("g.md", GOOD)])
