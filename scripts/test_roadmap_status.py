@@ -242,6 +242,59 @@ class T(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Open decisions", out)
 
+    def run_plans(self, plans):
+        """Write ROADMAP.md and docs/nodes/<n>.md files, run --plans, return (code, stdout)."""
+        (self.root / "ROADMAP.md").write_text(roadmap(ROWS), encoding="utf-8")
+        d = self.root / "docs" / "nodes"
+        d.mkdir(parents=True, exist_ok=True)
+        for n, text in plans.items():
+            (d / f"{n}.md").write_text(text, encoding="utf-8")
+        r = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "--root", str(self.root), "--plans"],
+                           capture_output=True, text=True)
+        return r.returncode, r.stdout
+
+    FULL_PLAN = "# Plan\n\n" + "".join(
+        f"## {i}. Section {i}\n\n" + ("```check c1\nbroadsword test x\nPASS: ok\n```\n\n```check c2\ncmd\nPASS: ok\n```\n\n" if i == 1 else "")
+        + ("Crate foo: a decision for Lazlo.\n\n" if i == 4 else "text\n\n") for i in range(1, 9))
+
+    def test_plans_none_exist(self):
+        code, out = self.run_plans({})
+        self.assertEqual(code, 0, out)
+        self.assertIn("0.1: plan no", out)
+        self.assertIn("2.2: plan no", out)
+        self.assertIn("plans: 0 of 4 nodes have a plan", out)
+        self.assertLess(out.index("0.1:"), out.index("2.2:"))
+
+    def test_plans_full_plan(self):
+        code, out = self.run_plans({"2.1": self.FULL_PLAN})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2.1: plan yes, 2 checks, sections 8/8, decision for Lazlo yes", out)
+        self.assertIn("plans: 1 of 4 nodes have a plan", out)
+
+    def test_plans_partial_plan_names_missing_sections(self):
+        plan = "## 1. A\n```check only\ncmd\nPASS: x\n```\n## 2. B\n## 4. External needs\nNone, std only.\n"
+        code, out = self.run_plans({"0.1": plan})
+        self.assertIn("0.1: plan yes, 1 checks, sections 3/8 (missing 3, 5, 6, 7, 8), decision for Lazlo no", out)
+
+    def test_plans_ignores_headings_and_checks_inside_other_fences(self):
+        plan = "## 1. A\n```text\n## 4. Not a heading\n```\n"
+        code, out = self.run_plans({"0.1": plan})
+        self.assertIn("0.1: plan yes, 0 checks, sections 1/8 (missing 2, 3, 4, 5, 6, 7, 8), decision for Lazlo no", out)
+
+    def test_plans_does_not_change_default_run(self):
+        (self.root / "ROADMAP.md").write_text(roadmap(ROWS), encoding="utf-8")
+        before = self.run_script()
+        self.run_plans({"2.1": self.FULL_PLAN})
+        after = self.run_script()
+        self.assertEqual(before, after)
+        self.assertEqual(before[0], 0)
+        self.assertNotIn("plan", before[1])
+
+    def test_plans_missing_roadmap_fails(self):
+        r = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "--root", str(self.root), "--plans"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+
     def test_real_roadmap_passes(self):
         r = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "--root", str(REAL_ROOT)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout)

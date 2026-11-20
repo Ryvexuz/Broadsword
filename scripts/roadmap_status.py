@@ -14,6 +14,12 @@ Exit 0 and `roadmap: ok, N nodes` when:
     "done" also needs at least one `tag:` item. A status whose evidence is missing or does not check out is reported as
     UNVERIFIED and makes the exit code 1; it is never counted as done.
 Exit 1 with one line per problem otherwise; exit 2 when a Part 2 node row is malformed (not three cells). No network, no model calls.
+
+  python -I scripts/roadmap_status.py --plans [--root DIR] [--roadmap FILE]
+
+Instead of the check above, print one line per ROADMAP.md node: whether docs/nodes/<node>.md exists, how many `check <id>`
+fenced blocks it lists, how many of the eight plan sections (headings numbered 1 to 8) it has, and whether section 4 (External
+needs) lists a decision for Lazlo. Read-only; it never changes ROADMAP.md and exits 0 unless a file is missing (1).
 """
 import sys
 
@@ -242,16 +248,71 @@ def check(root, capability, roadmap):
     return problems, unverified, len(nodes), counts
 
 
+PLAN_SECTIONS = 8
+HEADING_RE = re.compile(r"^#{2,3}\s+(\d+)[.):]?\s")
+CHECK_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*check\s+\S+")
+NONE_RE = re.compile(r"^\W*none\b", re.I)
+
+
+def plan_info(text):
+    """(check_count, sections_present, section4_has_decision) for one docs/nodes/<n>.md text.
+    A section is present when a '##' or '###' heading starts with its number 1 to 8. A check is a fenced block whose info
+    string is `check <id>`. Section 4 lists a decision for Lazlo when its body mentions Lazlo and is not just 'none'."""
+    lines = text.splitlines()
+    checks = sum(1 for l in lines if CHECK_FENCE_RE.match(l))
+    present, bodies, current, in_fence = set(), {}, None, False
+    for l in lines:
+        if l.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        m = None if in_fence else HEADING_RE.match(l)
+        if m and 1 <= int(m.group(1)) <= PLAN_SECTIONS:
+            current = int(m.group(1))
+            present.add(current)
+            bodies.setdefault(current, [])
+        elif current is not None:
+            bodies[current].append(l)
+    body4 = "\n".join(bodies.get(4, [])).strip()
+    decision = bool(body4) and not NONE_RE.match(body4) and re.search(r"\bLazlo\b", body4) is not None
+    return checks, sorted(present), decision
+
+
+def plans_report(root, roadmap):
+    """Lines for --plans: one per ROADMAP.md node, in node order, then a summary."""
+    nodes = sorted({r[0] for r in roadmap_rows(read(roadmap))}, key=sort_key)
+    out, have = [], 0
+    for n in nodes:
+        path = root / "docs" / "nodes" / f"{n}.md"
+        if not path.is_file():
+            out.append(f"{n}: plan no")
+            continue
+        have += 1
+        checks, present, decision = plan_info(read(path))
+        missing = [str(i) for i in range(1, PLAN_SECTIONS + 1) if i not in present]
+        line = f"{n}: plan yes, {checks} checks, sections {len(present)}/{PLAN_SECTIONS}"
+        if missing:
+            line += " (missing " + ", ".join(missing) + ")"
+        out.append(line + f", decision for Lazlo {'yes' if decision else 'no'}")
+    out.append(f"plans: {have} of {len(nodes)} nodes have a plan")
+    return out
+
+
 def main():
     here = pathlib.Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=str(here))
     ap.add_argument("--capability", default=None)
     ap.add_argument("--roadmap", default=None)
+    ap.add_argument("--plans", action="store_true", help="show which nodes have a docs/nodes plan instead of checking")
     a = ap.parse_args()
     root = pathlib.Path(a.root).resolve()
     capability = pathlib.Path(a.capability) if a.capability else root / "CAPABILITY_ROADMAP.md"
     roadmap = pathlib.Path(a.roadmap) if a.roadmap else root / "ROADMAP.md"
+    if a.plans:
+        if not roadmap.is_file():
+            print(f"roadmap: FAILED, {roadmap} not found")
+            return 1
+        print("\n".join(plans_report(root, roadmap)))
+        return 0
     for f in (capability, roadmap):
         if not f.is_file():
             print(f"roadmap: FAILED, {f} not found")
