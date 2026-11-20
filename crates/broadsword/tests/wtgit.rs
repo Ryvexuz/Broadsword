@@ -1,5 +1,5 @@
 //! Tests for `wtgit::diff_since`: the review diff lists every changed file whose content it does not show, reads the reviewed
-//! commit's `.gitattributes` (not main's), and fails loudly. And for the queue's checkout calls: no tip-chosen filter driver runs.
+//! commit's `.gitattributes` (not main's), and fails loudly. And for the queue's checkout and rebase calls: no tip-chosen filter or merge driver runs.
 //! REAL Git repos in throwaway folders under the repo's `scratch/`.
 
 use std::fs;
@@ -262,6 +262,82 @@ fn a_conflicting_rebase_and_its_abort_run_no_filter_driver() {
     assert_eq!(git(&r.wt, &["rev-parse", "HEAD"]), tip);
     assert!(!wtgit::rebase_in_progress(&r.wt).unwrap());
     assert_eq!(fs::read_to_string(r.wt.join("main.rs")).unwrap(), "fn main() {}\n");
+}
+
+/// A branch whose first commit adds `.gitattributes` with `*.rs <attr>` and whose second commit changes `main.rs`, while `main` changes
+/// `main.rs` too. The rebase replays commit 1 first, so its `.gitattributes` is in the worktree when commit 2's `main.rs` is merged:
+/// that is when Git picks the merge driver. Returns the repo and the tip.
+fn merge_attr_branch(name: &str, attr: &str) -> (Repo, String) {
+    let r = repo(name);
+    fs::write(r.main.join("main.rs"), "fn main() {}\n").unwrap();
+    commit_all(&r.main);
+    git(&r.wt, &["merge", "-q", "--ff-only", "main"]);
+    fs::write(r.wt.join(".gitattributes"), format!("*.rs {attr}\n")).unwrap();
+    commit_all(&r.wt);
+    fs::write(r.wt.join("main.rs"), "fn main() { task(); }\n").unwrap();
+    let tip = commit_all(&r.wt);
+    fs::write(r.main.join("main.rs"), "fn main() { main_side(); }\n").unwrap();
+    commit_all(&r.main);
+    (r, tip)
+}
+
+/// A tip whose `.gitattributes` maps `*.rs` to `merge=evil`, with the machine's config tying `merge.evil.driver` to a script that
+/// writes a marker (and exits 1: "conflict"). The queue's rebase must run no merge driver: it reports the conflict on main.rs,
+/// aborts, and the branch is back at its tip.
+#[test]
+fn a_queue_rebase_never_runs_a_tip_chosen_merge_driver() {
+    let (r, tip) = merge_attr_branch("mergedrv", "merge=evil");
+    let marker = r.root.join("merge-driver-ran.txt");
+    let script = r.root.join("driver.sh");
+    fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> \"{}\"\nexit 1\n", marker.to_string_lossy().replace('\\', "/"))).unwrap();
+    git(&r.main, &["config", "merge.evil.driver", &format!("sh \"{}\" %O %A %B", script.to_string_lossy().replace('\\', "/"))]);
+
+    // control: a plain rebase with the same config runs the driver (proves the assertion below can fail)
+    let st = Command::new("git")
+        .args(["rebase", "main"])
+        .current_dir(&r.wt)
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@localhost")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!st.status.success(), "control: the plain rebase was expected to stop on the driver's conflict");
+    git(&r.wt, &["rebase", "--abort"]);
+    assert!(marker.exists(), "control: the planted merge driver did not run on a plain rebase, so this test proves nothing");
+    fs::remove_file(&marker).unwrap();
+    assert_eq!(git(&r.wt, &["rev-parse", "HEAD"]), tip);
+
+    match wtgit::rebase(&r.wt, "main").unwrap() {
+        wtgit::Rebase::Conflict(files) => assert_eq!(files, vec!["main.rs".to_string()]),
+        wtgit::Rebase::Done => panic!("expected a conflict, the rebase succeeded"),
+        wtgit::Rebase::Failed(m) => panic!("expected a conflict, got: {m}"),
+    }
+    assert!(!marker.exists(), "a tip-chosen merge driver ran: {}", fs::read_to_string(&marker).unwrap_or_default());
+    assert_eq!(git(&r.wt, &["rev-parse", "HEAD"]), tip);
+    assert!(!wtgit::rebase_in_progress(&r.wt).unwrap());
+    assert_eq!(fs::read_to_string(r.wt.join("main.rs")).unwrap(), "fn main() { task(); }\n");
+}
+
+/// The built-in drivers run no program, so they keep working: `merge=union` keeps both sides' lines and the rebase succeeds.
+#[test]
+fn the_built_in_union_merge_driver_still_works() {
+    let (r, _) = merge_attr_branch("mergeunion", "merge=union");
+    assert!(matches!(wtgit::rebase(&r.wt, "main").unwrap(), wtgit::Rebase::Done));
+    let text = fs::read_to_string(r.wt.join("main.rs")).unwrap();
+    assert!(text.contains("main_side();") && text.contains("task();"), "union did not keep both sides: {text}");
+}
+
+/// A configured merge driver whose name cannot be written as a `-c` key (it holds `=`) cannot be disabled: the rebase is refused.
+#[test]
+fn a_merge_driver_name_that_cannot_be_disabled_is_refused() {
+    let (r, tip) = merge_attr_branch("mergename", "merge=evil");
+    git(&r.main, &["config", "merge.a=b.driver", "true"]);
+    let e = match wtgit::rebase(&r.wt, "main") {
+        Err(e) => e,
+        Ok(_) => panic!("expected the rebase to be refused"),
+    };
+    assert!(e.contains("a=b") && e.contains("refusing"), "{e}");
+    assert_eq!(git(&r.wt, &["rev-parse", "HEAD"]), tip);
 }
 
 /// A configured filter whose name cannot be written as a `-c` key (it holds `=`) cannot be disabled, so the checkout is refused.

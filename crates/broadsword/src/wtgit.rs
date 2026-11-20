@@ -232,7 +232,7 @@ pub fn worktree_repair(dir: &Path, worktrees: &[&Path]) -> Result<String, String
 // the main checkout, and it can only move HEAD forward along a line it already contains). Neither can drop a commit
 // without it staying reachable: queue.rs saves the pre-rebase tip under refs/broadsword/queue/ first. Every call here that reads
 // or writes working-tree files (status, rebase and its abort, the unmerged-file list, checkout, merge --ff-only) goes through
-// `files_run`/`files_ok`, which switch off every configured filter driver (see `no_filter_args`).
+// `files_run`/`files_ok`, which switch off every configured filter driver and merge driver (see `no_filter_args`, `no_merge_driver_args`).
 
 /// `git status --porcelain` (NO `--ignored`): one line per modified, staged or untracked path; empty = clean. Why: the MAIN
 /// checkout must be clean before a merge; unlike a worktree about to be deleted, ignored files there (build folders,
@@ -254,26 +254,8 @@ pub fn status_porcelain_plain(dir: &Path) -> Result<String, String> {
 /// queue's rebases and merges leave LFS pointer files, not their content, in the task worktree and the main checkout.
 /// Why: merging a branch must never run a program the branch chose. `review_args` holds the same rule for diffs.
 fn no_filter_args(dir: &Path) -> Result<Vec<String>, String> {
-    let o = run(dir, &["config", "-z", "--name-only", "--get-regexp", r"^filter\."])?;
-    match o.code {
-        0 => {}
-        1 => return Ok(Vec::new()), // no filter configured
-        c => return Err(format!("git config --get-regexp ^filter\\. failed (exit {c}): {}; refusing to check files out with unknown filter drivers", o.stderr)),
-    }
-    let mut names: Vec<&str> = Vec::new();
-    for key in o.stdout.split('\0').filter(|k| !k.is_empty()) {
-        let rest = key.strip_prefix("filter.").ok_or_else(|| format!("git config listed `{key}` for ^filter\\.; refusing to check files out"))?;
-        let Some(dot) = rest.rfind('.') else { continue }; // `filter.<key>` with no driver name configures no driver
-        let name = &rest[..dot];
-        if name.contains(['=', '\n', '\r']) {
-            return Err(format!("filter driver `{name}` is configured, and its name cannot be switched off with `-c` (it holds `=` or a line break): refusing to check files out"));
-        }
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
     let mut args = Vec::new();
-    for n in names {
+    for n in configured_driver_names(dir, "filter")? {
         for (k, v) in [("smudge", ""), ("clean", ""), ("process", ""), ("required", "false")] {
             args.push("-c".to_string());
             args.push(format!("filter.{n}.{k}={v}"));
@@ -282,9 +264,60 @@ fn no_filter_args(dir: &Path) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-/// The ONE runner for queue-owned git calls that read or write working-tree files: `git <no_filter_args> <args>`.
+/// POLICY: no queue-owned git call runs a configured merge driver. During a rebase Git picks a file's merge driver from its
+/// `merge=<name>` attribute (from the untrusted branch: the `.gitattributes` of the commits already replayed) or from
+/// `merge.default`, and the machine's config ties that name to a program (`merge.<name>.driver`). So before every `files_run` call
+/// this lists every merge driver configured where the call runs (`git config -z --name-only --get-regexp ^merge\.`, the same
+/// scopes as for filters) and passes `-c merge.<name>.driver=` for each one. PROVEN FALLBACK (Git 2.56, the version this was tested
+/// on; tests/wtgit.rs `a_queue_rebase_never_runs_a_tip_chosen_merge_driver`): an empty driver command is not run through a shell
+/// (it holds no shell metacharacter), so Git tries to start a program whose name is empty, which cannot exist; it prints `cannot
+/// spawn`, starts nothing, and treats the file as conflicted. The queue's rebase then reports `Rebase::Conflict` naming the file
+/// and aborts, so the branch is back at its tip; no crash, no silent "ours". A path that two sides changed cleanly therefore also
+/// stops as a conflict: fail closed. A configured name that would shadow a built-in (`merge.union.driver`) is emptied the same
+/// way, because Git looks up configured drivers before built-ins. A name that cannot be written as a `-c` key (it holds `=` or a
+/// line break) is refused, so the call fails closed. NOT disabled, on purpose: the built-in drivers `text`, `binary` and `union`
+/// (and the plain `merge` / `-merge` attributes) when no config defines them, because they are code inside Git and run no
+/// program. Why: merging a branch must never run a program the branch chose.
+fn no_merge_driver_args(dir: &Path) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for n in configured_driver_names(dir, "merge")? {
+        args.push("-c".to_string());
+        args.push(format!("merge.{n}.driver="));
+    }
+    Ok(args)
+}
+
+/// Every `<name>` that has a `<section>.<name>.<key>` setting in the config a git call in `dir` will see (all scopes, includes,
+/// `-c`/`GIT_CONFIG_*`), via `git config -z --name-only --get-regexp ^<section>\.`. Two-level keys (`merge.ff`) name no driver and
+/// are skipped. A name holding `=` or a line break cannot be switched off with `-c`, so it is an error: the caller fails closed.
+fn configured_driver_names(dir: &Path, section: &str) -> Result<Vec<String>, String> {
+    let pattern = format!(r"^{section}\.");
+    let o = run(dir, &["config", "-z", "--name-only", "--get-regexp", &pattern])?;
+    match o.code {
+        0 => {}
+        1 => return Ok(Vec::new()), // nothing configured
+        c => return Err(format!("git config --get-regexp {pattern} failed (exit {c}): {}; refusing to touch files with unknown {section} drivers", o.stderr)),
+    }
+    let mut names: Vec<String> = Vec::new();
+    for key in o.stdout.split('\0').filter(|k| !k.is_empty()) {
+        let rest = key.strip_prefix(&format!("{section}.")).ok_or_else(|| format!("git config listed `{key}` for {pattern}; refusing to touch files"))?;
+        let Some(dot) = rest.rfind('.') else { continue }; // `<section>.<key>` with no driver name configures no driver
+        let name = &rest[..dot];
+        if name.contains(['=', '\n', '\r']) {
+            return Err(format!("{section} driver `{name}` is configured, and its name cannot be switched off with `-c` (it holds `=` or a line break): refusing to touch files"));
+        }
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// The ONE runner for queue-owned git calls that read or write working-tree files: `git <no_filter_args> <no_merge_driver_args>
+/// <args>`.
 fn files_run(dir: &Path, args: &[&str]) -> Result<Out, String> {
-    let pre = no_filter_args(dir)?;
+    let mut pre = no_filter_args(dir)?;
+    pre.extend(no_merge_driver_args(dir)?);
     let mut full: Vec<&str> = pre.iter().map(String::as_str).collect();
     full.extend_from_slice(args);
     run(dir, &full)
