@@ -561,8 +561,90 @@ class ReviewTests(unittest.TestCase):
         root = self.make_root()
         j = json.loads(self.run_script(codex="fail", root=root).stdout)  # codex answers --version, then fails: the API answers
         self.assertEqual(j["backend"], "api", j)
-        row = self.ledger_lines(root)[1].split("\t")
+        lines = self.ledger_lines(root)
+        self.assertEqual(len(lines), 3, "the failed codex attempt and the API call are each a row")
+        self.assertEqual(lines[1].split("\t")[6], "codex-plan-failed")
+        row = lines[2].split("\t")
         self.assertEqual((row[3], row[4], row[6]), ("100", "20", "api-credits"))
+
+    DIRECT_DRIVER = (
+        "import argparse, importlib.util, json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "spec = importlib.util.spec_from_file_location('orv', root / 'clients' / 'openai_review.py')\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "a = argparse.Namespace(model='gpt-5.6-sol', system_prompt=None)\n"
+        "if len(sys.argv) > 3:\n"
+        "    def boom(*x): raise OSError('disk full')\n"
+        "    m.record_spend = boom\n"
+        "try:\n"
+        "    if sys.argv[2] == 'review_codex':\n"
+        "        r = m.review_codex(a, 'p', dict(os.environ), time.monotonic() + 60, 60.0, 1.0)\n"
+        "    else:\n"
+        "        r = m.review_api(a, 'p', dict(os.environ), 60.0, 60.0)\n"
+        "    print(json.dumps({'ok': r['result'][:20]}))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'err': type(e).__name__, 'msg': str(e)}))\n"
+    )
+
+    def direct(self, root, fn="review_codex", codex="ok", break_ledger=False):
+        """Call review_codex() / review_api() directly (as bench/reviewer/run_codex.py does), bypassing review()."""
+        e = {k: v for k, v in os.environ.items() if not k.startswith("OPENAI_")}
+        e["OPENAI_API_KEY"], e["OPENAI_BASE_URL"] = FAKE_KEY, self.url
+        empty = Path(tempfile.mkdtemp(prefix="nocodex-"))
+        self.addCleanup(shutil.rmtree, empty, True)
+        e["APPDATA"] = str(empty)
+        self.codex_dir = self.make_codex_dir(codex)
+        e["PATH"] = str(self.codex_dir)
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", self.DIRECT_DRIVER, str(root), fn] + (["x"] if break_ledger else []), capture_output=True, text=True, env=e, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    def test_review_codex_called_directly_is_capped_and_ledgered(self):
+        root = self.make_root()
+        out = self.direct(root)
+        self.assertIn("ok", out, out)
+        lines = self.ledger_lines(root)
+        self.assertEqual(len(lines), 2, "one header and exactly one row for one direct call")
+        self.assertEqual(lines[1].split("\t")[6], "codex-plan")
+        root = self.make_root(cap="0")
+        out = self.direct(root)
+        self.assertEqual((out["err"], out["msg"]), ("Refused", "daily_cap_reached: 0.0000 of 0"))
+        self.assertFalse((self.codex_dir / "started").exists(), "cap reached: codex never starts")
+        self.assertFalse((root / "state" / "gpt-spend" / f"{self.today()}.tsv").exists())
+
+    def test_review_api_called_directly_is_capped_and_ledgered(self):
+        root = self.make_root(cap="0")
+        out = self.direct(root, "review_api")
+        self.assertEqual(out["err"], "Refused", out)
+        self.assertEqual(Fake.seen, [])
+        root = self.make_root()
+        self.assertIn("ok", self.direct(root, "review_api"))
+        self.assertEqual(self.ledger_lines(root)[1].split("\t")[6], "api-credits")
+
+    def test_a_ledger_that_cannot_be_written_closes_the_gate_for_later_calls(self):
+        root = self.make_root()
+        out = self.direct(root, break_ledger=True)
+        self.assertIn("ok", out, "the answer is kept")
+        self.assertTrue((root / "state" / "gpt-spend" / f"LEDGER-FAILED-{self.today()}.txt").is_file())
+        (self.codex_dir / "started").unlink()
+        out = self.direct(root)
+        self.assertEqual(out["err"], "Refused", out)
+        self.assertTrue(out["msg"].startswith("ledger_unwritable"), out)
+        self.assertFalse((self.codex_dir / "started").exists())
+
+    def test_a_result_with_several_models_is_summed_each_at_its_own_price(self):
+        root = self.make_root()
+        driver = (
+            "import importlib.util, sys\nfrom pathlib import Path\nroot = Path(sys.argv[1])\n"
+            "spec = importlib.util.spec_from_file_location('orv', root / 'clients' / 'openai_review.py')\n"
+            "m = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(m)\n"
+            "m.record_spend(root, {}, 'a', {'modelUsage': {'a': {'inputTokens': 10, 'outputTokens': 1}, 'b': {'inputTokens': 5, 'outputTokens': 2}}}, 'api')\n")
+        subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(root)], check=True, timeout=60)
+        row = self.ledger_lines(root)[1].split("\t")
+        self.assertEqual((row[3], row[4]), ("15", "3"))
+        self.assertAlmostEqual(float(row[5]), (15 * 30 + 3 * 120) / 1e6, places=6)
 
     def test_concurrent_appends_under_the_lock_lose_no_rows(self):
         root = self.make_root()

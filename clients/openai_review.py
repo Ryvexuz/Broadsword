@@ -21,11 +21,12 @@ inside the queue's shadow limit) and OPENAI_REVIEW_CODEX_SHARE (0 < share <= 1, 
 rest). Invalid values are an error naming the variable. Until the queue passes them, absent ones use 240 and 0.6 and the result's "notes"
 (and "codex_error" on a fallback) say so.
 
-Two gates sit in review(), the ONE function every GPT call goes through (shadow, second gate, full reviews, bench re-scores):
+Two gates sit at the lowest level every GPT call passes through: the cap and ledger wrap review_codex() and review_api() themselves
+(see `metered`), so review() and direct callers such as bench/reviewer/run_codex.py are both covered, and one call is counted once:
 
 1. Daily spend cap (Lazlo 2026-11-19: GPT reviews may draw on the OpenAI overflow credits, at most $20 a day). Every call that gets
    past the gates is appended as one row to <state_dir>/gpt-spend/<UTC date>.tsv (utc, caller, model, input_tokens, output_tokens,
-   est_usd, plan_or_credits) under an OS lock. Before a call, if today's est_usd sum is >= the cap, no model is called: the result
+   est_usd, plan_or_credits) under an OS lock. Before a call (a codex attempt and an API fallback are each a call), if today's est_usd sum is >= the cap, no model is called: the result
    is is_error with codex_error "daily_cap_reached: <sum> of <cap>" (callers record SKIPPED), and CAP-REACHED-<date>.txt is written
    once. THE ESTIMATE IS CONSERVATIVE: tokens x list price from bench/models.json, and calls the ChatGPT plan answered are counted
    at list price too, so the sum can only over-state what the credits were charged. A model with no listed price counts at the
@@ -384,6 +385,7 @@ GPT_DAILY_CAP_USD = 20.0
 # USD per million tokens, used only when bench/models.json lists NO price for any model (it holds none today). Deliberately high.
 UNPRICED_USD_PER_MTOK = {"input": 30.0, "output": 120.0}
 LEDGER_COLUMNS = ("utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits")
+CANARY_SHARE = 0.5  # the offline canary may use at most this part of what is left of the deadline, so codex keeps the rest
 LEDGER_LOCK_WAIT = 10.0  # seconds to wait for the ledger's OS lock
 
 
@@ -506,6 +508,8 @@ def cap_gate(root: Path) -> None:
     cap = daily_cap(root)
     day = utc_today()
     folder = spend_dir(root)
+    if (folder / f"LEDGER-FAILED-{day}.txt").is_file():  # a paid call went unrecorded today: the sum cannot be trusted, so fail closed
+        raise Refused(f"ledger_unwritable: a GPT call today could not be recorded (see LEDGER-FAILED-{day}.txt)")
     with ledger_lock(folder / f"{day}.lock"):
         total = spent_today(folder / f"{day}.tsv")
     if total < cap:
@@ -525,12 +529,13 @@ def cap_gate(root: Path) -> None:
 def record_spend(root: Path, environ, model: str, result: dict, backend: str) -> None:
     """Append one ledger row for a call that got past the gates. Tokens come from the result (0 when the call failed)."""
     tin = tout = 0
+    est = 0.0
     mu = result.get("modelUsage") if isinstance(result.get("modelUsage"), dict) else {}
-    for v in mu.values():
+    for name, v in mu.items():  # every model the result reports, each at its own price
         if isinstance(v, dict):
-            tin, tout = int(v.get("inputTokens") or 0), int(v.get("outputTokens") or 0)
-    pin, pout = model_prices(root, model)
-    est = (tin * pin + tout * pout) / 1e6
+            i, o = int(v.get("inputTokens") or 0), int(v.get("outputTokens") or 0)
+            pin, pout = model_prices(root, str(name))
+            tin, tout, est = tin + i, tout + o, est + (i * pin + o * pout) / 1e6
     caller = (environ.get("OPENAI_REVIEW_CALLER") or "unlabelled").replace("\t", " ").replace("\n", " ")
     label = ("codex-plan" if backend == "codex" else "api-credits") + ("" if not result.get("is_error") else "-failed")
     row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), caller, model, str(tin), str(tout), f"{est:.6f}", label])
@@ -545,6 +550,48 @@ def record_spend(root: Path, environ, model: str, result: dict, backend: str) ->
             f.write(row + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+
+def metered(backend: str, fn):
+    """Wrap a function that makes ONE paid GPT call (args, prompt, environ, ...) in the cap check and the ledger, so every caller is covered.
+    Refused (a gate stopped it before any model was reached) is passed on with no ledger row. A call that ran and failed gets a row with
+    0 tokens (the real usage is unknown); a call that returns gets its reported usage. If the row cannot be written the answer is kept,
+    a note says so, and LEDGER-FAILED-<date>.txt makes cap_gate refuse every later call that day (fail closed, no unrecorded spending)."""
+    def inner(args, prompt, environ, *a, **k):
+        root = oc.find_main_root(HERE)
+        cap_gate(root)
+        try:
+            result = fn(args, prompt, environ, *a, **k)
+        except Refused:
+            raise
+        except Exception:
+            ledger_row(root, environ, args.model, {"is_error": True}, backend)
+            raise
+        note = ledger_row(root, environ, args.model, result, backend)
+        if note:
+            result.setdefault("notes", []).append(note)
+        return result
+    inner.__name__ = fn.__name__
+    inner.__doc__ = fn.__doc__
+    return inner
+
+
+def ledger_row(root: Path, environ, model: str, result: dict, backend: str) -> str:
+    """record_spend, but never raises: returns "" or a note. On a failed write, plants the fail-closed marker."""
+    try:
+        record_spend(root, environ, model, result, backend)
+        return ""
+    except Exception as e:
+        try:
+            folder = spend_dir(root)
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"LEDGER-FAILED-{utc_today()}.txt").write_text(f"A GPT call could not be written to the ledger ({type(e).__name__}). No GPT call is made until this file is removed.\n", encoding="utf-8")
+        except Exception:
+            pass
+        return f"spend ledger NOT written: {oc.redact(type(e).__name__)}"
+
+
+review_codex = metered("codex", review_codex)
 
 
 # ---- gate 2: the canary must have passed for this codex version -------------------------------------------------------------
@@ -586,7 +633,7 @@ def canary_gate(root: Path, exe: str, child: dict, deadline: float) -> None:
         raise Refused("canary_failed: scripts/shadow_canary.py not found")
     try:
         with tempfile.TemporaryDirectory(prefix="bsw-canary-") as work:
-            code, out, err = run_with_deadline([sys.executable, "-I", "-B", str(script), "--offline-only"], "", work, child, deadline - time.monotonic())
+            code, out, err = run_with_deadline([sys.executable, "-I", "-B", str(script), "--offline-only"], "", work, child, (deadline - time.monotonic()) * CANARY_SHARE)
     except oc.Fail as e:
         raise Refused(f"canary_failed: {oc.redact(str(e))}"[:300])
     if code != 0:
@@ -601,18 +648,9 @@ def review(args, prompt: str, environ) -> dict:
     deadline = time.monotonic() + timeout
     root = oc.find_main_root(HERE)
     try:
-        cap_gate(root)
+        return answer_call(args, prompt, environ, timeout, share, notes, deadline)  # the cap and ledger are inside review_codex / review_api
     except Refused as e:
         return refused_result(e)
-    try:
-        result = answer_call(args, prompt, environ, timeout, share, notes, deadline)
-    except Refused as e:
-        return refused_result(e)
-    try:
-        record_spend(root, environ, args.model, result, result.get("backend", "api"))
-    except Exception as e:  # the call is made; say the ledger missed it rather than lose the answer
-        result.setdefault("notes", []).append(f"spend ledger NOT written: {oc.redact(type(e).__name__)}")
-    return result
 
 
 def refused_result(e: Refused) -> dict:
@@ -626,7 +664,7 @@ def answer_call(args, prompt: str, environ, timeout: float, share: float, notes:
     try:
         result = review_codex(args, prompt, environ, deadline, timeout, share)
         if notes:
-            result["notes"] = notes
+            result["notes"] = result.get("notes", []) + notes
         return result
     except Refused:
         raise
@@ -634,6 +672,8 @@ def answer_call(args, prompt: str, environ, timeout: float, share: float, notes:
         codex_error = oc.redact(f"{type(e).__name__}: {e}" if not isinstance(e, oc.Fail) else str(e))[:400]
     try:
         result = review_api(args, prompt, environ, deadline - time.monotonic(), timeout)
+    except Refused:
+        raise
     except oc.Fail as e:
         result = error_result(str(e))
     except Exception as e:
@@ -643,7 +683,7 @@ def answer_call(args, prompt: str, environ, timeout: float, share: float, notes:
     result["backend"] = "api"
     result["codex_error"] = codex_error + ("; " + "; ".join(notes) if notes else "")
     if notes:
-        result["notes"] = notes
+        result["notes"] = result.get("notes", []) + notes
     return result
 
 
@@ -684,6 +724,9 @@ def review_api(args, prompt: str, environ, remaining: float, timeout_total: floa
         result["is_error"] = True
         result["result"] = "the model's answer is empty"
     return result
+
+
+review_api = metered("api", review_api)
 
 
 def main(argv=None, stdin=None, environ=None) -> int:

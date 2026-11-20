@@ -72,6 +72,12 @@ class LastPassTests(unittest.TestCase):
         self.assertEqual(self.main(["--offline-only"], version=None), canary.INCONCLUSIVE)
         self.assertFalse(self.last.exists())
 
+    def test_codex_version_never_raises(self):
+        with mock.patch.object(canary, "run", side_effect=RuntimeError("boom")), mock.patch.object(canary.rv, "find_codex", return_value="codex"):
+            self.assertIsNone(canary.codex_version())
+        with mock.patch.object(canary, "run", return_value=(None, "", "")), mock.patch.object(canary.rv, "find_codex", return_value="codex"):
+            self.assertIsNone(canary.codex_version(), "a timeout is no version")
+
 
 if __name__ == "__main__":
     unittest.main()

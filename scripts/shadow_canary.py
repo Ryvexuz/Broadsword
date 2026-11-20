@@ -363,12 +363,12 @@ def leg_real(canary_dir: Path, cwd: Path, model: str, timeout: float, system_pro
 
 def codex_version(timeout: float = 20.0):
     """The output of `codex --version`, stripped, or None if codex is missing or fails."""
-    exe = rv.find_codex(scrubbed_env())
-    if exe is None:
-        return None
     try:
+        exe = rv.find_codex(scrubbed_env())
+        if exe is None:
+            return None
         code, out, _ = run([exe, "--version"], "", CHECKOUT, scrubbed_env(), timeout)
-    except OSError:
+    except Exception:  # a start error or any other failure is "no version", never a traceback out of main()
         return None
     out = (out or "").strip()
     return out if code == 0 and out else None
