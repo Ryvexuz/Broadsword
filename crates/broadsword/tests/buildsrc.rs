@@ -455,6 +455,53 @@ fn a_junction_in_main_bins_makes_the_refresh_refuse_and_writes_nothing_outside()
     assert!(o.stderr.contains("refusing to keep main's binaries") && o.stderr.contains("junction"), "{}", o.stderr);
 }
 
+/// Review q-20261120-233123: the temp names beside a kept exe (`<exe>.source.tmp`, `.stale.tmp`, `.bskeep.tmp`) are written too,
+/// so a link planted there must never let a main build write outside the build folder. (a) a junction at `<exe>.source.tmp`
+/// pointing outside: the job refuses (`guard_kept_files` checks every temp name) and the outside folder is untouched. (b) a hard
+/// link at `<exe>.source.tmp` to a file outside (not a reparse point, so no path check can see it): the name is removed and a
+/// NEW temp file is created, so the outside file keeps its bytes and the build passes. On 4a3bdd7 (a) failed with another
+/// error than the refusal and (b) overwrote the outside file. Windows only (a junction; NTFS hard links).
+#[cfg(windows)]
+#[test]
+fn a_link_planted_at_a_temp_name_beside_a_kept_exe_never_writes_outside() {
+    use std::os::windows::process::CommandExt;
+    let r = Root::new("keeptmp", 120);
+    let proj = r.dir.join("projects/proj");
+    r.ok(&["build", "proj"]);
+    let kept = r.dir.join("build/main.bins/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let tmp = PathBuf::from(format!("{}.source.tmp", kept.display()));
+    let prints = |p: &Path| -> String {
+        let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    // (a) a junction to an outside folder
+    let outside = r.dir.join("outside-dir");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("precious.txt"), "precious").unwrap();
+    let ok = Command::new("cmd").arg("/C").raw_arg(format!("mklink /J \"{}\" \"{}\"", tmp.display(), outside.display())).output().unwrap().status.success();
+    assert!(ok, "mklink /J failed");
+    set_marker(&proj, "MARK-main2");
+    let o = r.run(&["build", "proj"]);
+    let listing: Vec<String> = fs::read_dir(&outside).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let _ = fs::remove_dir(&tmp); // the junction only
+    assert_eq!(listing, ["precious.txt"], "nothing was created in the outside folder");
+    assert_eq!(fs::read_to_string(outside.join("precious.txt")).unwrap(), "precious");
+    assert_eq!(o.code, 1, "the job refuses:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("refusing to keep main's binaries") && o.stderr.contains("junction") && o.stderr.contains(".source.tmp"), "{}", o.stderr);
+    assert_eq!(prints(&kept), "MARK-main", "nothing was kept through it");
+
+    // (b) a hard link to an outside file
+    let precious = r.dir.join("outside-file.txt");
+    fs::write(&precious, "precious file").unwrap();
+    fs::hard_link(&precious, &tmp).unwrap();
+    let o = r.ok(&["build", "proj"]);
+    assert_eq!(fs::read_to_string(&precious).unwrap(), "precious file", "the outside file keeps its bytes:\n{}", o.stdout);
+    assert_eq!(prints(&kept), "MARK-main2", "and the kept copy is refreshed through a new temp file:\n{}", o.stdout);
+    assert_eq!(fs::read_to_string(format!("{}.source", kept.display())).unwrap().trim(), "projects/proj");
+    assert!(!tmp.exists(), "no temp name is left");
+}
+
 #[test]
 fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     let r = Root::new("run", 120);

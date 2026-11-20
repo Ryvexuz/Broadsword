@@ -73,7 +73,10 @@
 //! inside it. Cargo deletes only regenerable artifacts below the target directory it is given; it never touches sources. The
 //! kept copies replace their own older versions (a rename over the file, and the `.source` note removed before a new copy is
 //! written), inside `<build_dir>/main.bins` only, behind `guard_kept_files`: the build-folder guard, plus no symlink, junction
-//! or reparse point at `main.bins`, its profile folder or the files, and every existing part resolving inside `build_dir`.
+//! or reparse point at `main.bins`, its profile folder or any file it writes (`kept_files`: the exe, `.source`, `.stale` and
+//! each one's temp name), and every existing part resolving inside `build_dir`. A temp file is always created NEW
+//! (`create_fresh`: an entry of that name is removed first, then `create_new`), so a hard link planted there is never written
+//! through. Limit (accepted residual): a link created between the check and the write, by someone already writing in build/.
 
 use crate::config::Config;
 use crate::lock::{self, Lock};
@@ -447,6 +450,32 @@ fn copy_tmp(to: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
+/// The temp file `write_atomic` writes beside `path` before renaming it over `path`.
+fn atomic_tmp(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
+/// EVERY path this module creates, writes, renames or removes for the kept (or restored) exe `exe`: the exe, its `.source` note
+/// and `.stale` marker, and the temp file of each (`copy_tmp`, `atomic_tmp`). `guard_kept_files` checks exactly this list, and
+/// `copy_atomic` and `write_atomic` build their temp names with the same helpers.
+fn kept_files(exe: &Path) -> [PathBuf; 6] {
+    let (side, stale) = (kept_note(exe), stale_marker(exe));
+    [exe.to_path_buf(), copy_tmp(exe), atomic_tmp(&side), atomic_tmp(&stale), side, stale]
+}
+
+/// Create the temp file `tmp` as a NEW file: whatever entry already has that name (a leftover of a crash, a symlink, a hard link
+/// to a file elsewhere) is removed first (removing a link removes the link, never its target), and the create fails if anything
+/// appears there in between (`create_new`), so writing it never truncates or overwrites any other file.
+fn create_fresh(tmp: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
+}
+
 /// THE check before any file of a kept copy (or the cargo exe a kept copy is restored to) is read, written or removed: the
 /// build-folder guard, then for the exe `exe` and every file written beside it (`.source`, `.stale`, the temp file): neither the
 /// file nor any folder on its way (`main.bins`, the profile folder, up to the drive root) may be a symlink, junction or reparse
@@ -454,7 +483,7 @@ fn copy_tmp(to: &Path) -> PathBuf {
 fn guard_kept_files(cfg: &Config, what: &str, exe: &Path) -> Result<(), String> {
     guard_build_dir(cfg, what)?;
     let build = cfg.build_dir.canonicalize().map_err(|e| format!("{what}: cannot resolve the build folder {}: {e}", cfg.build_dir.display()))?;
-    for p in [exe.to_path_buf(), kept_note(exe), stale_marker(exe), copy_tmp(exe)] {
+    for p in kept_files(exe) {
         if !p.starts_with(&cfg.build_dir) {
             return Err(format!("{what}: {} is not inside the build folder {}", p.display(), cfg.build_dir.display()));
         }
@@ -481,12 +510,16 @@ fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
         if let Some(d) = to.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let n = std::fs::copy(from, &tmp)?;
-        let want = std::fs::metadata(from)?.len();
-        if n != want || std::fs::metadata(&tmp)?.len() != want {
+        let mut out = create_fresh(&tmp)?;
+        let n = std::io::copy(&mut std::fs::File::open(from)?, &mut out)?;
+        let meta = std::fs::metadata(from)?;
+        let want = meta.len();
+        if n != want || out.metadata()?.len() != want {
             return Err(std::io::Error::other(format!("the copy has {n} bytes, the original {want}")));
         }
-        std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()
+        // the copy keeps the build's time (readers such as render's tests pick the newest exe)
+        out.set_modified(meta.modified()?)?;
+        out.sync_all()
     })();
     let r = copied.map_err(CopyFail::Copy).and_then(|_| std::fs::rename(&tmp, to).map_err(CopyFail::Replace));
     if r.is_err() {
@@ -643,11 +676,9 @@ fn restore_main_bins(cfg: &Config, main: &str, bins: &[String]) -> Result<Vec<St
 
 /// Write `text` and a newline to `path` atomically (temp file, flushed, renamed).
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = atomic_tmp(path);
     let r = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_fresh(&tmp)?;
         std::io::Write::write_all(&mut f, format!("{text}\n").as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
