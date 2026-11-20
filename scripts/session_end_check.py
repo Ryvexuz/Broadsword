@@ -6,7 +6,7 @@ Gates, in order, one line each: `<name>: ok | FAIL | SKIPPED  <reason>`
   2. ledger_check       scripts/ledger_check.py              the improvement ledger (nb-07)
   3. main_provenance    scripts/main_provenance.py           commits on main that skipped the queue (nb-10)
   4. sync_playbook      scripts/sync_playbook.py --check     the playbook copy is current
-  5. records_updated    PROGRESS.md and LAB_LOG.md changed (committed or uncommitted) since --since
+  5. records_updated    PROGRESS.md and LAB_LOG.md changed since --since (committed: commit time; uncommitted: file mtime)
   6. stale_tasks        no `running` task whose worktree had no commit and no job for longer than --stale-hours
 A child script that is missing is SKIPPED (not installed). shadow_report.py without an `--open` flag counts as not installed
 too. A child that crashes, times out or cannot be started is FAIL. Last line: `session-end: ok` or `session-end: N failing`.
@@ -14,8 +14,8 @@ Exit 0 when nothing fails (SKIPPED does not fail), 1 otherwise, 2 for bad argume
 
 Needs from the caller: --since (session start, UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS][Z]), --timeout-seconds (per child),
 --stale-hours, and --max-pending-days (ledger_check requires it). main_provenance's `--since` is the last commit on main
-before --since. Children run with the Broadsword root as working directory. Paths come from broadsword.toml via
---root; the only files read are PROGRESS.md, LAB_LOG.md, state/tasks/*.task and state/jobs/*.rec, and git is used read-only.
+before --since. Children run with the Broadsword root as working directory. The root is --root (default: this
+script's project); the folders are fixed (state/tasks, state/jobs), not read from broadsword.toml. The only files read are PROGRESS.md, LAB_LOG.md, state/tasks/*.task and state/jobs/*.rec, and git is used read-only.
 """
 import argparse
 import datetime as dt
@@ -33,12 +33,14 @@ def parse_since(text):
     """UTC epoch seconds for a date or datetime string."""
     s = text.strip()
     if s.endswith(("Z", "z")):
-        s = s[:-1]
+        s = s[:-1] + "+00:00"
     try:
         d = dt.datetime.fromisoformat(s)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"not a date or UTC datetime: {text!r}") from None
-    return int(d.replace(tzinfo=dt.timezone.utc).timestamp())
+        raise argparse.ArgumentTypeError(f"not a date or datetime: {text!r}") from None
+    if d.tzinfo is None:  # no offset given: UTC; an explicit offset such as +02:00 is honoured
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return int(d.timestamp())
 
 
 def positive(kind):
@@ -101,11 +103,37 @@ def gate_script(root, name, extra, timeout, need_flag=None):
     return FAIL, f"exit {code}", tail(out)
 
 
+GIT_TIMEOUT = [None]  # set from --timeout-seconds in main; every git call is bounded by it
+
+
 def git(root, *args):
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-    p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=env)
+    try:
+        p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", env=env, timeout=GIT_TIMEOUT[0])
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git {args[0]} timed out after {GIT_TIMEOUT[0]:g}s"
+    except OSError as e:
+        return 127, "", f"cannot run git: {e}"
     return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def record_changed_at(root, name):
+    """(epoch seconds of the file's latest change, error). One rule for both cases: the newest of its last
+    commit time and, when it has uncommitted changes, its modification time."""
+    code, status, err = git(root, "status", "--porcelain", "--", name)
+    if code != 0:
+        return None, f"git status failed: {err[:200]}"
+    code, ct, err = git(root, "log", "-1", "--format=%ct", "--", name)
+    if code != 0:
+        return None, f"git log failed: {err[:200]}"
+    latest = int(ct) if ct.isdigit() else 0
+    if status:
+        try:
+            latest = max(latest, int(os.path.getmtime(os.path.join(root, name))))
+        except OSError as e:
+            return None, f"cannot stat {name}: {e}"
+    return latest, None
 
 
 def gate_records(root, since):
@@ -114,15 +142,10 @@ def gate_records(root, since):
         if not os.path.isfile(os.path.join(root, name)):
             missing.append(name)
             continue
-        code, status, err = git(root, "status", "--porcelain", "--", name)
-        if code != 0:
-            return FAIL, f"git status failed: {err[:200]}", []
-        if status:  # uncommitted edit counts as changed
-            continue
-        code, ct, err = git(root, "log", "-1", "--format=%ct", "--", name)
-        if code != 0:
-            return FAIL, f"git log failed: {err[:200]}", []
-        if not ct.isdigit() or int(ct) < since:
+        latest, err = record_changed_at(root, name)
+        if err:
+            return FAIL, err, []
+        if latest < since:
             stale.append(name)
     if missing:
         return FAIL, "missing: " + ", ".join(missing), []
@@ -180,14 +203,14 @@ def gate_stale(root, stale_hours, now):
         tid = r.get("id") or n[:-5]
         last = max(as_int(r.get("started")), as_int(r.get("created")), last_job.get(tid, 0))
         wt = r.get("worktree", "")
-        if wt and not r.get("worktree_removed"):
+        if wt and r.get("base") and not r.get("worktree_removed"):
             wpath = os.path.join(root, wt)
             if os.path.isdir(wpath):
-                code, head, _ = git(wpath, "rev-parse", "HEAD")
-                if code == 0 and head != r.get("base"):  # a commit exists beyond the base
-                    code, ct, _ = git(wpath, "log", "-1", "--format=%ct", "HEAD")
-                    if code == 0:
-                        last = max(last, as_int(ct))
+                # newest commit beyond the base (base may be a commit id or a branch name; if it does not
+                # resolve, git fails and no commit time is counted)
+                code, ct, _ = git(wpath, "log", "-1", "--format=%ct", f"{r.get('base', '')}..HEAD")
+                if code == 0:
+                    last = max(last, as_int(ct))
         age_h = (now - last) / 3600.0
         if last == 0 or age_h > stale_hours:
             stale.append(f"{tid} ({r.get('title', '')[:60]}): no commit or job for {age_h:.1f}h")
@@ -209,6 +232,7 @@ def main(argv=None):
     root = os.path.abspath(args.root)
     since_date = dt.datetime.fromtimestamp(args.since, dt.timezone.utc).date().isoformat()
     t = args.timeout_seconds
+    GIT_TIMEOUT[0] = t
 
     results = [("shadow_report", *gate_script(root, "shadow_report.py", ["--root", root, "--open"], t, "--open"))]
     results.append(("ledger_check", *gate_script(root, "ledger_check.py",

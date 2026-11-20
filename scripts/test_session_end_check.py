@@ -5,6 +5,7 @@ Each test builds a throw-away Broadsword-shaped root (own Git repo, fake child s
 checkout's scratch folder and removes it afterwards. The script under test runs as a real subprocess.
 SESSION_END_SCRIPT overrides the script path (used to prove the tests fail against a deliberately broken copy).
 """
+import datetime as dt
 import os
 import shutil
 import subprocess
@@ -65,10 +66,10 @@ class Case(unittest.TestCase):
     def child(self, name, body):
         self.write(f"scripts/{name}.py", body)
 
-    def task(self, tid, status="running", started=None, worktree=""):
+    def task(self, tid, status="running", started=None, worktree="", base="abc"):
         started = int(time.time()) if started is None else started
         self.write(f"state/tasks/{tid}.task", f"id = {tid}\nstatus = {status}\nstarted = {started}\ncreated = {started}\n"
-                   f"title = T {tid}\nworktree = {worktree}\nbase = abc\n")
+                   f"title = T {tid}\nworktree = {worktree}\nbase = {base}\n")
 
     def run_check(self, since=SINCE, timeout="20", stale="12", extra=()):
         p = subprocess.run([sys.executable, "-I", "-B", SCRIPT, "--root", self.root, "--since", since,
@@ -127,12 +128,69 @@ class Tests(Case):
         self.assertEqual(code, 1)
         self.assertIn("PROGRESS.md, LAB_LOG.md", self.line(out, "records_updated"))
 
-    def test_uncommitted_record_edit_counts_as_changed(self):
-        self.write("PROGRESS.md", "edited")
-        code, out, _ = self.run_check(since="2999-01-01")
+    def age_records(self):
+        """Make the last commit of both records old (before SINCE)."""
+        git(self.root, "commit", "-q", "--amend", "--no-edit", date=OLD)
+
+    def set_mtime(self, rel, iso):
+        t = dt.datetime.fromisoformat(iso).timestamp()
+        os.utime(os.path.join(self.root, rel), (t, t))
+
+    def test_new_uncommitted_record_edit_counts_as_changed(self):
+        self.age_records()
+        self.write("PROGRESS.md", "edited now")  # dirty, mtime now (after SINCE); LAB_LOG commit is old
+        code, out, _ = self.run_check()
         line = self.line(out, "records_updated")
         self.assertIn("LAB_LOG.md", line)
         self.assertNotIn("PROGRESS.md", line)
+
+    def test_old_uncommitted_record_edit_fails(self):
+        self.age_records()
+        for n in ("PROGRESS.md", "LAB_LOG.md"):
+            self.write(n, "left over from long ago")
+            self.set_mtime(n, OLD)
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("PROGRESS.md, LAB_LOG.md", self.line(out, "records_updated"))
+
+    def test_old_commit_fails_and_new_commit_passes(self):
+        self.age_records()
+        code, out, _ = self.run_check()
+        self.assertIn("PROGRESS.md, LAB_LOG.md", self.line(out, "records_updated"))
+        git(self.root, "commit", "-q", "--amend", "--no-edit")  # now: after SINCE
+        code, out, _ = self.run_check()
+        self.assertTrue(self.line(out, "records_updated").endswith("ok"), out)
+
+    def test_since_offset_is_honoured(self):
+        self.age_records()
+        self.write("PROGRESS.md", "e")
+        self.write("LAB_LOG.md", "e")
+        self.set_mtime("PROGRESS.md", "2026-06-01T01:00:00+00:00")
+        self.set_mtime("LAB_LOG.md", "2026-06-01T01:00:00+00:00")
+        # 2026-06-01T02:00+02:00 is 00:00Z: the 01:00Z edits are after it
+        _, out, _ = self.run_check(since="2026-06-01T02:00:00+02:00")
+        self.assertTrue(self.line(out, "records_updated").endswith("ok"), out)
+        # 2026-06-01T00:00-02:00 is 02:00Z: the 01:00Z edits are before it
+        _, out, _ = self.run_check(since="2026-06-01T00:00:00-02:00")
+        self.assertIn("PROGRESS.md", self.line(out, "records_updated"))
+
+    def test_hung_git_is_bounded_by_timeout(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sec_mod", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.GIT_TIMEOUT[0] = 1
+        real_run = subprocess.run
+
+        def hung_git(cmd, **kw):  # stand-in: the git process never returns; everything else is real
+            return real_run([sys.executable, "-I", "-c", "import time; time.sleep(30)"], **kw)
+
+        mod.subprocess = type("S", (), {"run": staticmethod(hung_git), "TimeoutExpired": subprocess.TimeoutExpired})
+        t0 = time.time()
+        code, _, err = mod.git(self.root, "status")
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", err)
+        self.assertLess(time.time() - t0, 15)
 
     def test_stale_task_listed_and_fresh_one_not(self):
         self.task("t-old", started=int(time.time()) - 40 * 3600)
@@ -155,10 +213,12 @@ class Tests(Case):
     def test_recent_commit_in_worktree_keeps_old_task_alive(self):
         wt = os.path.join(self.root, "wt")
         subprocess.run(["git", "-C", self.root, "worktree", "add", "-q", "-b", "task/x", wt], check=True)
+        base = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
         self.write("wt/f.txt", "f")
         git(wt, "add", "-A")
         git(wt, "commit", "-q", "-m", "work")
-        self.task("t-old", started=int(time.time()) - 40 * 3600, worktree="wt")
+        self.task("t-old", started=int(time.time()) - 40 * 3600, worktree="wt", base=base)
         code, out, _ = self.run_check()
         self.assertEqual(code, 0, out)
 
