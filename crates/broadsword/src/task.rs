@@ -15,7 +15,7 @@
 //! Claims are paths relative to the project root, never patterns. See `normalize_claim` and `overlaps`.
 //!
 //! Caps checked by `start`: `max_agents` counts running tasks with a working coder, i.e. running tasks WITHOUT an open
-//! merge-queue entry that waits (`queued` or `running`, see `WAITING_QUEUE_STATUSES`; a `blocked` or `stale` entry needs
+//! merge-queue entry that waits (`queued`, `running` or `approved`, see `WAITING_QUEUE_STATUSES`; a `blocked` or `stale` entry needs
 //! its coder, so it counts); `max_queued` counts every open merge-queue entry (see `OPEN_QUEUE_STATUSES`). The queue folder is read
 //! without the queue locks, and an unusable entry file fails the start.
 
@@ -252,12 +252,14 @@ pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
 /// entry for its task. This mirrors queue.rs's private `is_open` (queue.rs has no exported list); the unit test
 /// `queue_status_lists_match_queue_rs` reads queue.rs and fails if its `is_open` or its status constants change.
 /// A `running` entry whose runner died ("interrupted" in `queue list`) is still `running` here.
-pub const OPEN_QUEUE_STATUSES: [&str; 4] = [queue::QUEUED, queue::RUNNING, queue::BLOCKED, queue::STALE];
+pub const OPEN_QUEUE_STATUSES: [&str; 5] = [queue::QUEUED, queue::RUNNING, queue::BLOCKED, queue::STALE, queue::APPROVED];
 /// The open statuses in which a running task's coder is NOT at work, so `start` does not count it against max_agents: the
-/// entry waits for (`queued`) or is in (`running`) a queue run. A `running` entry whose runner died stays here too: it
+/// entry waits for (`queued`) or is in (`running`) a queue run, or has passed review and waits for a merge train
+/// (`approved`). A `running` entry whose runner died stays here too: it
 /// waits for `queue run` to resume it, not for its coder, so counting it as waiting is accepted. `blocked` (dirty worktree,
 /// changes after review) and `stale` (branch moved, no checked commit) need the coder, so they are left out on purpose.
-pub const WAITING_QUEUE_STATUSES: [&str; 2] = [queue::QUEUED, queue::RUNNING];
+/// Every one of these is still open, so it counts for max_queued.
+pub const WAITING_QUEUE_STATUSES: [&str; 3] = [queue::QUEUED, queue::RUNNING, queue::APPROVED];
 /// The queue statuses in which an entry has ended: its task, if still running, is back with its coder (a fix round).
 pub const ENDED_QUEUE_STATUSES: [&str; 6] = [queue::MERGED, queue::CONFLICT, queue::CHECK_FAILED, queue::REJECTED, queue::MERGED_CHECK_FAILED, queue::CANCELLED];
 
@@ -501,7 +503,7 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             Err(e) => return fail(EXIT_ERROR, format!("cannot start {id}: cannot read the merge queue, so the max_agents and max_queued caps cannot be checked: {e}")),
         };
         // The agent cap: one running task is one coder at work, unless its branch waits in the merge queue, i.e. it has an
-        // open entry in a WAITING status (`queued` or `running`, see WAITING_QUEUE_STATUSES). A `blocked` or `stale` entry is
+        // open entry in a WAITING status (`queued`, `running` or `approved`, see WAITING_QUEUE_STATUSES). A `blocked` or `stale` entry is
         // open but needs its coder to act, so that task counts. Counted under the board lock, across every project.
         // Known design limit: the cap is checked only here, at start. Waiting tasks free their slots, so when many entries
         // end at once (e.g. mass rejections) their coders all return to fix rounds and up to max_agents + max_queued coders
@@ -511,7 +513,7 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
         let (queued, working): (Vec<&Record>, Vec<&Record>) = running.iter().partition(|o| waiting(o));
         if working.len() as u64 >= cfg.max_agents {
             let ids: Vec<String> = working.iter().map(|o| format!("{} ({})", o.id(), o.get("project"))).collect();
-            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running with a working coder, the max_agents cap in broadsword.toml is {} (running tasks whose merge-queue entry is queued or running are not counted; {} are): {}
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running with a working coder, the max_agents cap in broadsword.toml is {} (running tasks whose merge-queue entry is queued, running or approved are not counted; {} are): {}
 start it after one of them is queued, done, failed or abandoned (`task abandon` frees the slot of a task whose agent died)", working.len(), cfg.max_agents, queued.len(), ids.join(", ")));
         }
         // The queue cap: so finished-but-unmerged work cannot pile up without limit. An ORPHAN entry (open, but its task is no
@@ -720,6 +722,11 @@ mod tests {
         assert_eq!(open, mine, "queue.rs's is_open changed: update OPEN_QUEUE_STATUSES");
         assert!(WAITING_QUEUE_STATUSES.iter().all(|w| OPEN_QUEUE_STATUSES.contains(w)), "every waiting status is open");
         assert!(!WAITING_QUEUE_STATUSES.contains(&queue::BLOCKED) && !WAITING_QUEUE_STATUSES.contains(&queue::STALE), "blocked and stale need their coder");
+        let mut waiting = WAITING_QUEUE_STATUSES.to_vec();
+        waiting.sort_unstable();
+        let mut expected = vec![queue::QUEUED, queue::RUNNING, queue::APPROVED];
+        expected.sort_unstable();
+        assert_eq!(waiting, expected, "the waiting set changed: an approved entry waits for a merge train, not for its coder");
     }
 
     fn n(s: &str) -> String {

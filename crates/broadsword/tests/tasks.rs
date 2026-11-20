@@ -688,6 +688,33 @@ fn tasks_with_blocked_or_stale_entries_count_against_max_agents() {
 }
 
 #[test]
+fn an_approved_entry_frees_its_max_agents_slot_but_counts_for_max_queued() {
+    // `approved` (review passed, waiting for a merge train): the coder is not at work, so the task does not count against
+    // max_agents, but the entry is open, so it counts for max_queued.
+    let r = Root::new("qappr");
+    set_cap(&r, 1);
+    set_key(&r, "max_queued", 2);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    let c = r.add("p", "c", &["src/c.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    put_entry(&r, "q-1", &a, "approved");
+    let o = r.start(&b, "coder-2");
+    assert_eq!(o.code, 0, "a task whose entry is approved leaves its slot free at max_agents = 1: {}", o.stderr);
+    put_entry(&r, "q-2", &b, "approved");
+    let o = r.start(&c, "coder-3");
+    assert_eq!(o.code, 3, "two approved entries fill max_queued = 2: {}", o.stderr);
+    assert!(o.stderr.contains("max_queued") && o.stderr.contains("q-1") && o.stderr.contains("q-2"), "{}", o.stderr);
+    assert!(!o.stderr.contains("max_agents"), "no coder is at work, so max_agents is not what refused: {}", o.stderr);
+    assert_eq!(r.status_of(&c), "open", "a refused start changes nothing");
+    // b's entry is rejected: b is back with its coder (1 working = max_agents 1) and one entry is open.
+    put_entry(&r, "q-2", &b, "rejected");
+    let o = r.start(&c, "coder-3");
+    assert_eq!(o.code, 3, "b's coder is at work again, so max_agents = 1 refuses: {}", o.stderr);
+    assert!(o.stderr.contains("max_agents") && o.stderr.contains(&format!("{b} (")) && !o.stderr.contains(&format!("{a} (")), "{}", o.stderr);
+}
+
+#[test]
 fn start_refuses_at_max_queued_open_entries() {
     let r = Root::new("qmax");
     set_key(&r, "max_queued", 1);
@@ -750,7 +777,7 @@ fn a_malformed_queue_entry_makes_start_fail_naming_the_file() {
     let a = r.add("p", "a", &["src/a.rs"]);
     let dir = r.dir.join("state/queue");
     fs::create_dir_all(&dir).unwrap();
-    for (name, text) in [("q-bad.entry", "this is not a record\n"), ("q-bad.entry", ""), ("q-bad.entry", "id = q-bad\ntask = t-x\nstatus = approved\n"), ("q-bad.entry", "id = q-bad\nstatus = queued\n")] {
+    for (name, text) in [("q-bad.entry", "this is not a record\n"), ("q-bad.entry", ""), ("q-bad.entry", "id = q-bad\ntask = t-x\nstatus = no-such-status\n"), ("q-bad.entry", "id = q-bad\nstatus = queued\n")] {
         fs::write(dir.join(name), text).unwrap();
         let o = r.start(&a, "coder-1");
         assert_eq!(o.code, 1, "{text:?}: {}", o.stderr);
