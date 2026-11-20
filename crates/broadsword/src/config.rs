@@ -184,6 +184,42 @@ fn inside_root(m: &HashMap<String, Value>, k: &str, required: bool) -> Result<Pa
     }
 }
 
+/// True when one folder is the other or lies inside the other (either way round).
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// The one place that checks the managed folders against each other, in BOTH directions. A pair is refused when either folder
+/// is the other or inside the other, because cleanup of one (scratch sweep, build cleanup) or its records would then delete or
+/// shadow the other. install_dir may sit inside build_dir (the shipped default), so that pair is not checked.
+fn check_folders_apart(scratch: &Path, build: &Path, state: &Path, install: &Path, worktrees: &Path) -> Result<(), String> {
+    // (name, folder, other name, other folder, why it matters)
+    let pairs: [(&str, &Path, &str, &Path, &str); 9] = [
+        ("build_dir", build, "scratch_dir", scratch, "the scratch sweep would delete build output, or the build cleanup would delete scratch files"),
+        ("state_dir", state, "scratch_dir", scratch, "cleanup would delete the job records"),
+        ("state_dir", state, "build_dir", build, "cleanup would delete the job records"),
+        ("install_dir", install, "scratch_dir", scratch, "that folder is cleaned up, not the stable binary"),
+        ("install_dir", install, "state_dir", state, "that folder holds records, not the stable binary"),
+        ("worktrees_dir", worktrees, "scratch_dir", scratch, "that folder is cleaned up, and a worktree holds a task's unmerged work"),
+        ("worktrees_dir", worktrees, "build_dir", build, "that folder is cleaned up, and a worktree holds a task's unmerged work"),
+        ("worktrees_dir", worktrees, "state_dir", state, "that folder holds records, and a worktree holds a task's unmerged work"),
+        ("worktrees_dir", worktrees, "install_dir", install, "the stable binary folder must hold only the binary, and a worktree holds a task's unmerged work"),
+    ];
+    for (name, dir, other_name, other, why) in pairs {
+        if !overlaps(dir, other) {
+            continue;
+        }
+        return Err(if dir == other {
+            format!("{name} and {other_name} must be different folders: {why}")
+        } else if dir.starts_with(other) {
+            format!("{name} must not be inside {other_name}: {why}")
+        } else {
+            format!("{other_name} must not be inside {name}: {why}")
+        });
+    }
+    Ok(())
+}
+
 impl Config {
     /// Build a Config from parsed text. `config_dir` is the folder holding broadsword.toml;
     /// `root` and every path in the file are resolved relative to it.
@@ -192,23 +228,9 @@ impl Config {
         let root = normalize(&config_dir.join(get_str(&m, "root")?));
         let (scratch_dir, build_dir) = (root.join(inside_root(&m, "scratch_dir", true)?), root.join(inside_root(&m, "build_dir", true)?));
         let state_dir = root.join(inside_root(&m, "state_dir", true)?);
-        for (name, other) in [("scratch_dir", &scratch_dir), ("build_dir", &build_dir)] {
-            if state_dir.starts_with(other) {
-                return Err(format!("state_dir must not be inside {name}: cleanup would delete the job records"));
-            }
-        }
         let install_dir = root.join(inside_root(&m, "install_dir", true)?);
-        for (name, other) in [("scratch_dir", &scratch_dir), ("state_dir", &state_dir)] {
-            if install_dir.starts_with(other) {
-                return Err(format!("install_dir must not be inside {name}: that folder is cleaned up or holds records, not the stable binary"));
-            }
-        }
         let worktrees_dir = root.join(inside_root(&m, "worktrees_dir", true)?);
-        for (name, other) in [("scratch_dir", &scratch_dir), ("build_dir", &build_dir), ("state_dir", &state_dir)] {
-            if worktrees_dir.starts_with(other) {
-                return Err(format!("worktrees_dir must not be inside {name}: that folder is cleaned up or holds records, and a worktree holds a task's unmerged work"));
-            }
-        }
+        check_folders_apart(&scratch_dir, &build_dir, &state_dir, &install_dir, &worktrees_dir)?;
         let positive = |k: &str| get_int(&m, k).and_then(|v| if v == 0 { Err(format!("{k}: must be at least 1")) } else { Ok(v) });
         let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
         let reviewer_backend = get_str(&m, "reviewer_backend")?;
@@ -372,6 +394,65 @@ mod tests {
         assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
         assert_eq!(c.worktrees_dir, Path::new("proj").join(".").join("worktrees"));
         assert!(c.build_lock_wait_seconds > 0);
+    }
+
+    /// The shipped broadsword.toml with some `key = "value"` lines replaced.
+    fn real_toml_with(changes: &[(&str, &str)]) -> String {
+        let text = include_str!("../../../broadsword.toml");
+        text.lines()
+            .map(|l| {
+                let key = l.split('=').next().unwrap_or("").trim();
+                match changes.iter().find(|(k, _)| *k == key) {
+                    Some((k, v)) => format!("{k} = \"{v}\""),
+                    None => l.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn folder_overlap_is_refused_when_the_inner_folder_is_the_worktrees_dir() {
+        // worktrees_dir inside another managed folder (the old one-way check)
+        for (key, val) in [("scratch_dir", "scratch/w"), ("build_dir", "build/w"), ("state_dir", "state/w")] {
+            let text = real_toml_with(&[("worktrees_dir", val), (key, &val[..val.find('/').unwrap()])]);
+            let e = Config::from_text(&text, Path::new("p")).unwrap_err();
+            assert!(e.contains("worktrees_dir must not be inside"), "{key}: {e}");
+        }
+    }
+
+    #[test]
+    fn folder_overlap_is_refused_when_the_other_folder_is_inside_worktrees_dir() {
+        // the reverse direction: scratch, build, state or install inside worktrees_dir (the sweep would delete task worktrees)
+        for (key, val) in [("scratch_dir", "worktrees/p"), ("build_dir", "worktrees/p"), ("state_dir", "worktrees/p"), ("install_dir", "worktrees/bin")] {
+            let text = real_toml_with(&[("worktrees_dir", "worktrees"), (key, val)]);
+            let e = Config::from_text(&text, Path::new("p")).unwrap_err();
+            assert!(e.contains(&format!("{key} must not be inside worktrees_dir")), "{key}: {e}");
+        }
+    }
+
+    #[test]
+    fn folder_overlap_is_refused_in_both_directions_for_state_and_install() {
+        // state vs scratch/build, install vs scratch/state: each way round, and the same folder twice
+        let cases: [(&str, &str, &str, &str); 10] = [
+            ("build_dir", "scratch/b", "scratch_dir", "scratch"),
+            ("scratch_dir", "build/s", "build_dir", "build"),
+            ("state_dir", "scratch/s", "scratch_dir", "scratch"),
+            ("scratch_dir", "state/x", "state_dir", "state"),
+            ("state_dir", "build/s", "build_dir", "build"),
+            ("build_dir", "state/b", "state_dir", "state"),
+            ("install_dir", "scratch/bin", "scratch_dir", "scratch"),
+            ("scratch_dir", "bin/s", "install_dir", "bin"),
+            ("install_dir", "state/bin", "state_dir", "state"),
+            ("state_dir", "scratch", "scratch_dir", "scratch"),
+        ];
+        for (a, av, b, bv) in cases {
+            let text = real_toml_with(&[(a, av), (b, bv)]);
+            assert!(Config::from_text(&text, Path::new("p")).is_err(), "{a}={av} with {b}={bv} must be refused");
+        }
+        // install_dir inside build_dir is the shipped default and stays allowed; the shipped file loads
+        assert!(Config::from_text(&real_toml_with(&[]), Path::new("p")).is_ok());
+        assert!(Config::from_text(&real_toml_with(&[("install_dir", "build/bin")]), Path::new("p")).is_ok());
     }
 
     #[test]
