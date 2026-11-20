@@ -66,6 +66,8 @@ const BASE: &[(&str, &str)] = &[
     ("queue_per_project", "\"off\""),
     // no test project runs Python tests unless its test sets this (SCALING F9)
     ("python_tests", "\"\""),
+    // one after another unless a test sets it: the serial path keeps its streamed output and first-failure-stops order
+    ("test_parallel_binaries", "1"),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),

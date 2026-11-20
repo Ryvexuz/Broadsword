@@ -157,6 +157,8 @@ pub struct Config {
     /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
     /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
     pub python_tests: Vec<(String, Vec<String>)>,
+    /// The test step runs up to this many copied test executables (and Python test scripts) at once; 1 = one after another.
+    pub test_parallel_binaries: u64,
 }
 
 /// Parse the `python_tests` setting: `"<project>: <script> <script> ...; <project>: ..."`, or `""` when no project has Python
@@ -346,6 +348,7 @@ impl Config {
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
+            test_parallel_binaries: positive("test_parallel_binaries")?,
             recover_lock_wait_seconds: positive("recover_lock_wait_seconds")?,
             sweep_older_than_days: positive("sweep_older_than_days")?,
             redact_min_chars: positive("redact_min_chars")?,
@@ -543,6 +546,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+test_parallel_binaries = 1
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -652,6 +656,16 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn test_parallel_binaries_is_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        assert!(Config::from_text(text, Path::new("p")).unwrap().test_parallel_binaries >= 1);
+        let e = Config::from_text(&without_key(text, "test_parallel_binaries"), Path::new("p")).unwrap_err();
+        assert!(e.contains("test_parallel_binaries") && e.contains("missing"), "{e}");
+        let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "test_parallel_binaries") { "test_parallel_binaries = 0" } else { l }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&zero, Path::new("p")).is_err(), "0 would run no test");
+    }
+
+    #[test]
     fn python_tests_is_required_and_validated() {
         let text = include_str!("../../../broadsword.toml");
         let shipped = Config::from_text(text, Path::new("p")).unwrap().python_tests;
@@ -692,6 +706,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+test_parallel_binaries = 1
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -739,6 +754,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+test_parallel_binaries = 1
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
