@@ -234,6 +234,134 @@ class Run(Base):
         self.assertIn("clone NOT deleted: locked file", out)
 
 
+MOVING_TEXT = ("# Moving\n\n4. Rebuild:\n   - `cargo build --offline`;\n   - copy `build/debug/broadsword.exe` to `scratch/bs-boot.exe`;\n"
+               "   - then `scratch/bs-boot.exe build broadsword`;\n   - then `build/debug/broadsword.exe install`.\n")
+REAL_STEPS = getattr(fc, "bootstrap_steps", None)
+TOML = 'root = "."\nbuild_dir = "build"\ninstall_dir = "build/bin"\nprojects_dir = "projects"\n'
+
+
+class Bootstrap(Base):
+    """The clone has no build/bin/broadsword.exe (it is built, not committed): the check builds it per docs/MOVING.md first."""
+
+    def setUp(self):
+        super().setUp()
+        self.crash = self.tmp / "crash"
+        self.crash.mkdir()
+        git(self.crash, "init", "-q", "-b", "main")
+        (self.crash / "marker.txt").write_text("crash-sim", encoding="utf-8")
+        git(self.crash, "add", "-A")
+        git(self.crash, "commit", "-q", "-m", "c")
+        self.log = self.tmp / "steps.log"
+
+    def repo_with_command(self, moving=MOVING_TEXT):
+        cmd = "build/bin/broadsword.exe check crash-sim"
+        files = {"README.md": f"One command: {TICK}{cmd}{TICK}\n", "broadsword.toml": TOML, "docs/MOVING.md": moving}
+        self.make_repo(files)
+
+    def fake_steps(self, fail_at=None):
+        """Replace the real cargo/broadsword steps by python one-liners that record their order and create the same files."""
+        log = str(self.log)
+
+        def steps(clone, cfg):
+            real = REAL_STEPS(clone, cfg)  # the real list is still built (and checked against MOVING.md)
+            self.assertEqual([s[0].split("  ")[0] for s in real][0], "cargo build --offline")
+            out = []
+            for i, (label, step) in enumerate(real):
+                if step[0] == "copy":
+                    out.append((label, ("run", [sys.executable, "-I", "-c", f"open({log!r},'a').write('copy\\n')"], {})))
+                    continue
+                code = 7 if fail_at == i else 0
+                make = ""
+                if i == 2:
+                    make = f"import pathlib; p=pathlib.Path({str(clone / 'build' / 'bin')!r}); p.mkdir(parents=True, exist_ok=True); (p/'broadsword.exe').write_text('x')"
+                src = f"import sys; {make}; open({log!r},'a').write('step{i}\\n'); sys.exit({code})" if make else f"import sys; open({log!r},'a').write('step{i}\\n'); sys.exit({code})"
+                out.append((label, ("run", [sys.executable, "-I", "-c", src], {})))
+            return out
+
+        return steps
+
+    def test_bootstrap_runs_the_moving_steps_in_order_provisions_crash_sim_then_runs_the_command(self):
+        self.repo_with_command()
+        # the one command is the broadsword.exe the fake step 2 made: replace it by a python script via a stub exe is not
+        # possible, so the fake step also provisions nothing; the final command is checked through its failure message below
+        real = fc.bootstrap_steps
+        fc.bootstrap_steps = self.fake_steps()
+        try:
+            code, out = self.go({}, "--crash-sim", str(self.crash))
+        finally:
+            fc.bootstrap_steps = real
+        self.assertIn("bootstrap: build/bin/broadsword.exe is not committed", out)
+        self.assertEqual(self.log.read_text().split(), ["step0", "copy", "step2", "step3"], out)
+        self.assertIn("== bootstrap step: provision projects/crash-sim", out)
+        self.assertIn("== bootstrap step: cargo build --offline  (the one plain-cargo bootstrap exception in docs/MOVING.md)", out)
+        # step 2 made a file named broadsword.exe that is not a program: the one command ran (and failed), after the bootstrap
+        self.assertIn("one command (from README.md): build/bin/broadsword.exe check crash-sim", out)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failing_bootstrap_step_is_a_fail_naming_the_step_and_the_command_is_not_run(self):
+        self.repo_with_command()
+        real = fc.bootstrap_steps
+        fc.bootstrap_steps = self.fake_steps(fail_at=0)
+        try:
+            code, out = self.go({}, "--crash-sim", str(self.crash))
+        finally:
+            fc.bootstrap_steps = real
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL: bootstrap step failed: cargo build --offline", out)
+        self.assertIn("the one command was not run", out)
+        self.assertEqual(self.log.read_text().split(), ["step0"])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_real_step_list_is_exactly_the_moving_md_commands(self):
+        self.repo_with_command()
+        clone = self.tmp / "clone"
+        subprocess.run(["git", "clone", "-q", str(self.repo), str(clone)], check=True)
+        steps = fc.bootstrap_steps(clone, fc.clone_config(clone))
+        self.assertEqual(steps[0][1][1], ["cargo", "build", "--offline"])
+        self.assertEqual(steps[0][1][2], {"CARGO_TARGET_DIR": str(clone / "build")})
+        self.assertEqual(steps[1][1][0], "copy")
+        self.assertEqual(pathlib.Path(steps[2][1][1][0]), clone / "scratch" / "bs-boot.exe")
+        self.assertEqual(steps[2][1][1][1:], ["build", "broadsword"])
+        self.assertEqual(pathlib.Path(steps[3][1][1][0]), clone / "build" / "debug" / "broadsword.exe")
+        self.assertEqual(steps[3][1][1][1:], ["install"])
+
+    def test_refused_when_moving_md_does_not_give_the_command(self):
+        self.repo_with_command(moving="# Moving\nrun `cargo build` and hope\n")
+        code, out = self.go({}, "--crash-sim", str(self.crash))
+        self.assertEqual(code, 2, out)
+        self.assertIn("docs/MOVING.md does not contain `cargo build --offline`", out)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_crash_sim_url_or_missing_folder_is_refused_not_cloned(self):
+        self.repo_with_command()
+        real = fc.bootstrap_steps
+        fc.bootstrap_steps = self.fake_steps()
+        try:
+            for bad in ("https://example.invalid/crash-sim.git", str(self.tmp / "nope")):
+                with self.subTest(bad=bad):
+                    code, out = self.go({}, "--crash-sim", bad)
+                    self.assertEqual(code, 2, out)
+                    self.assertIn("is not a local Git repo folder", out)
+                    self.assertEqual(self.leftovers(), [])
+        finally:
+            fc.bootstrap_steps = real
+
+    def test_no_bootstrap_when_the_command_is_not_the_installed_binary(self):
+        n, t = doc("python -I check.py")
+        self.make_repo({n: t, "check.py": "print('ok')\n", "broadsword.toml": TOML})
+        code, out = self.go({})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("bootstrap", out)
+
+    def test_provision_clones_the_local_crash_sim_repo(self):
+        clone = self.tmp / "c"
+        clone.mkdir()
+        rc, out = fc.provision_crash_sim(clone, {"projects_dir": "projects"}, self.crash)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((clone / "projects" / "crash-sim" / "marker.txt").read_text(), "crash-sim")
+
+
 class Refusals(Base):
     def test_refused_when_cargo_target_dir_is_the_shared_build_folder_a_job_sets(self):
         n, t = doc("python -I check.py")
