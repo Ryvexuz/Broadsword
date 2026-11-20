@@ -15,8 +15,8 @@ Paths are relative to the Broadsword root.
 | Project repos | crash-sim 5,755 Rust lines, render 5,493 | `find projects/<p> -name '*.rs' \| xargs cat \| wc -l` |
 | All Rust | 21,666 + 5,755 + 5,493 = 32,914 lines | sum of the two rows above |
 | Python (scripts, clients, bench) | 13,522 lines | `find scripts clients bench -name '*.py' \| xargs cat \| wc -l` |
-| Board | 238 task files: 80 done, 69 abandoned, 63 open, 25 running; 118 broadsword, 114 crash-sim, 6 render | `grep -h '^status = ' state/tasks/*.task \| sort \| uniq -c`, same for `project` |
-| Queue | 256 entry files; 68 merged (42 broadsword, 22 crash-sim, 4 render); 198 `risk = low`, 57 `risk = high` | `grep` over `state/queue/*.entry` |
+| Board | 238 task files by `ls state/tasks/*.task \| wc -l`; the four status counts 80 done + 69 abandoned + 63 open + 25 running sum to 237, so one file has a status outside these four (not identified); 118 broadsword, 114 crash-sim, 6 render | `grep -h '^status = ' state/tasks/*.task \| sort \| uniq -c`, same for `project` |
+| Queue | 256 entry files; 68 merged (42 broadsword, 22 crash-sim, 4 render); 198 `risk = low` + 57 `risk = high` = 255, so one of the 256 files has no `risk` line (not identified) | `grep` over `state/queue/*.entry` |
 | Throughput | 6.79 merged/h with 14 slots (22:00-23:46Z), 8.44/h at 10, 4.45/h over a 4.5 h session, 3.27/h in S4 | `state/baselines/slots-14-pre16.json`, `pc-agents-10.json`, `pc-session-2026-11-19.json`, `s4-session.json` (`merged_per_hour`) |
 | Queue step times | check median 109 s, review median 54 s, entry median 1,066 s | `slots-14-pre16.json` (`check_median_s`, `review_median_s`, `entry_median_s`) |
 | Review rounds | 1.67 per merged task, first-pass fail rate 0.50 | `slots-14-pre16.json` |
@@ -167,7 +167,7 @@ The safety net is therefore per shard and rotating:
 ### Budget
 
 The selection only helps if R(D) stays small. With an affected-set budget of 50k lines, a check takes about
-50,000 x 5.03 ms = 251 s, close to today's 109 s. Section 3 is what keeps R(D) inside that budget.
+50,000 x 5.03 ms = 251 s, about 2.3x today's 109 s (the 2.3x used in section 8). Section 3 is what keeps R(D) inside that budget.
 
 ## 3. Crate boundaries and ownership rules
 
@@ -398,9 +398,9 @@ The pipeline that scales is four levels, each owned by a different role, each wi
 | LAB_LOG.md | 51,857 B, 23 entries = 2.25 KB per entry, 3 days | grows with sessions without bound | One file per month; agents read only the newest |
 | `state/pc-progress.md` | 107,676 B in one 8.3 h session = 13 KB/h | grows without bound | One file per session (it is outside Git already) |
 | AGENTS.md | 12,355 B, loaded by every agent every session | must not grow with stages | Stage sections move to DEVELOPMENT_PLAN.md and the node plans; AGENTS.md keeps rules only |
-| Claude memory | 16 files, 23,885 B, 16 index lines | bounded by hand | A cap on index lines, and the `consolidate-memory` pass at each stage end |
+| Claude memory | 16 files, 23,885 B, 16 index lines (`ls` and `cat memory/*.md \| wc -c` in the Claude project memory folder, 2026-11-20; it has grown since) | bounded by hand | A cap on index lines, and the `consolidate-memory` pass at each stage end |
 | PROGRESS.md (handoff) | 12,718 B, rewritten each session | bounded by design | One per shard plus a short top-level one |
-| evidence/ | 774 KB after 4 stages = 194 KB per stage | 1,400 x 194 KB = 271 MB in Git | Per-shard folders; fine in size |
+| evidence/ | 774 KB (`du -sk evidence`) after 4 stages = 194 KB per stage | 1,400 x 194 KB = 271 MB in Git | Per-shard folders; fine in size |
 
 ## 8. Limits and risks
 
@@ -412,7 +412,7 @@ The pipeline that scales is four levels, each owned by a different role, each wi
   2e6 x 25.8 KB = 51.6 GB, so 8 active shards need 413 GB.
 - The build folder is **not swept today**: "cargo-sweep is NOT installed, so the build folder was NOT swept"
   (`state/pc-progress.md`, 22:37:50Z autoclean). At size this fills the disk; installing it is Lazlo's call (Ask first).
-- Worktrees: tracked Rust and Python in the broadsword repo is 2,032,239 B for 35,188 lines (21,666 + 13,522) = 57.8 B per
+- Worktrees: tracked Rust and Python in the broadsword repo is 2,032,239 B (`git ls-files '*.rs' '*.py' \| xargs cat \| wc -c`, 2026-11-20 about 01:50Z; the repo has grown since) for 35,188 lines (21,666 + 13,522) = 57.8 B per
   line. A full checkout of 100M lines is 5.78 GB (70M: 4.0 GB, 125M: 7.2 GB); 14 worktrees x 5.78 GB = 81 GB, 32 worktrees =
   185 GB. Worktrees need sparse checkout limited to the shard plus its dependencies.
 - State: 37 MB for 238 tasks = 155 KB per task, so 4.3 GB at 28k tasks and 32 GB at 208k: fine on disk; the cost is the
@@ -491,7 +491,7 @@ main fefe8b1. The size table counts the proposals below as written here; "brief 
 
 | Brief | Lines here | Requirements | Files | Brief lines (est.) | Within the rule |
 | --- | --- | --- | --- | --- | --- |
-| F0 | 4 | 3 | 3 (stated reason) | 16 | the one stated exception to "1-2 files" |
+| F0 | 4 | 3 | 3 (stated reason) | 16 | the one exception to "1-2 files", granted by the orchestrator |
 | F1 | 4 | 4 | 2 | 16 | yes |
 | F2 | 4 | 4 | 2 | 16 | yes (was 5 requirements and 4 files with the setting) |
 | F3 | 4 | 3 | 2 | 16 | yes (setting moved to F0) |
@@ -505,8 +505,8 @@ main fefe8b1. The size table counts the proposals below as written here; "brief 
 Changes made in the fix round. The "new required setting" requirement of F2, F3, F7 and F9 touches `broadsword.toml`,
 `config.rs` and the test configs. `grep -l disk_floor_gb` finds `config.rs`, `tests/support/mod.rs`, `tests/cli.rs`,
 `tests/jobs.rs` and `tests/tools.rs` besides `broadsword.toml`, so a new key can touch more than 2 files. All four keys now
-live in F0, which has no logic and states why it needs more than 2 files; if the grep finds more config-writing test files
-when it is boarded, F0 splits per file. F0 lands first. F5 and F9 share `job.rs`, so F9 runs after F5 (a sequencing note,
+live in F0, which has no logic and states why it needs more than 2 files; the other three test files use `support::config`
+and need no change; a hand-written full config found when it is boarded joins F0's claim (orchestrator exception). F0 lands first. F5 and F9 share `job.rs`, so F9 runs after F5 (a sequencing note,
 not an extra requirement).
 
 Every done check below is a command with the output it must show, runnable as written. "Shown failing once" is dropped
@@ -514,8 +514,8 @@ Every done check below is a command with the output it must show, runnable as wr
 command itself runs.
 
 ### F0. Four required settings (for F2, F3, F7, F9)
-- Claim: `crates/broadsword/src/config.rs`, `broadsword.toml`, `crates/broadsword/tests/support/mod.rs` (3 files: a required key must be in all of them, AGENTS.md "Settings").
-- Requirements: add required keys `queue_per_project` and `build_per_project` (both `false`), `python_tests` (a list, may be empty) and `task_archive_days`; a missing key is an error naming it; every test config gets them (grep every test file that writes its own config; if one is outside the claim, stop and report).
+- Claim: `crates/broadsword/src/config.rs`, `broadsword.toml`, `crates/broadsword/tests/support/mod.rs` (3 files). Exception granted by the orchestrator (2026-11-20 UTC), reason: a new required config key always touches all three files (AGENTS.md "Settings": the key goes in the code, the real `broadsword.toml` and every test config), so the claim cannot be split. A fourth or later file under the same exception is fine.
+- Requirements: add required keys `queue_per_project` and `build_per_project` (both `false`), `python_tests` (a list, may be empty) and `task_archive_days`; a missing key is an error naming it; every test config gets them. `grep -l disk_floor_gb` lists `tests/cli.rs`, `tests/jobs.rs` and `tests/tools.rs` as well, but they build their config through `support::config(&[...])` (overrides on the defaults in `tests/support/mod.rs`), so they need no change; `tests/cli.rs` line 240 writes two deliberately broken configs and needs none. If the grep finds another test file that writes a full config by hand, add it to this claim (same exception) instead of stopping.
 - Done check: `broadsword test broadsword` ends `test: ok`; a config test with one key removed expects the error naming that key, so the run covers the missing-key case.
 
 ### F1. Record coder prices (cost data for section 8)
