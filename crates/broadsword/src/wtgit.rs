@@ -5,7 +5,7 @@
 //! `git branch -D`, and nothing that deletes files itself. A worktree or branch with work in it can only be refused.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub struct Out {
     pub code: i32,
@@ -20,7 +20,8 @@ fn run(dir: &Path, args: &[&str]) -> Result<Out, String> {
 
 /// Same, feeding `input` to git's stdin (used for long lists of commits, which would not fit on a command line).
 fn run_with(dir: &Path, args: &[&str], input: Option<String>) -> Result<Out, String> {
-    let mut child = Command::new("git")
+    // the scrubbed environment (scrub.rs); `Err` (no child) when the secrets to keep out cannot be known
+    let mut child = crate::scrub::command_in(dir, "git")?
         .args(args)
         .current_dir(dir)
         .env_remove("GIT_DIR")
@@ -649,4 +650,29 @@ fn rebase_with(worktree: &Path, args: &[&str], onto: &str) -> Result<Rebase, Str
 /// work enters main, and it cannot rewrite or lose anything main already has.
 pub fn merge_ff_only(main_dir: &Path, commit: &str) -> Result<(), String> {
     files_ok(main_dir, &["merge", "--ff-only", commit]).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The git child (`run_with`, which `run`, `ok`, `files_run` and `files_ok` all use) sees no planted secret.
+    #[test]
+    fn git_child_sees_no_planted_secret() {
+        let root = crate::scrub::planted::root("wtgit");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert_eq!(run(&repo, &["init", "-q"]).unwrap().code, 0);
+        let o = run(&repo, &["-c", "alias.envdump=!env", "envdump"]).unwrap();
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        crate::scrub::planted::assert_clean("wtgit.rs run_with", &o.stdout);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_is_not_started_without_a_config() {
+        let nowhere = std::env::temp_dir().join(format!("bs-wtgit-no-config-{}", std::process::id()));
+        let e = run(&nowhere, &["--version"]).err().expect("must refuse");
+        assert!(e.contains("refusing to start it"), "{e}");
+    }
 }

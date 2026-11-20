@@ -2009,7 +2009,8 @@ mod tests {
     #[test]
     fn json_round_trips_through_python_if_available() {
         use std::io::Write;
-        let Ok(mut child) = std::process::Command::new("python")
+        let Ok(mut child) = crate::scrub::command_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), "python")
+            .unwrap()
             .args(["-I", "-c", "import json,sys; d=json.load(sys.stdin); assert isinstance(d,list) and all({'name','description','inputSchema'} <= set(t) for t in d); print(len(d))"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

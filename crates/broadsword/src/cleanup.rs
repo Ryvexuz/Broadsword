@@ -5,7 +5,7 @@ use crate::pause;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Default)]
@@ -76,7 +76,7 @@ pub const SWEEP_MISSING_NOTE: &str = "WARNING: cargo-sweep is NOT installed, so 
 
 /// Sweep the shared build folder. Returns the note and whether the sweep really ran.
 fn sweep(cfg: &Config) -> (String, bool) {
-    let installed = Command::new("cargo")
+    let installed = crate::scrub::command(cfg, "cargo")
         .args(["sweep", "--version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -86,7 +86,7 @@ fn sweep(cfg: &Config) -> (String, bool) {
         return (SWEEP_MISSING_NOTE.to_string(), false);
     }
     let days = cfg.sweep_older_than_days.to_string();
-    match Command::new("cargo")
+    match crate::scrub::command(cfg, "cargo")
         .args(["sweep", "--time", days.as_str()])
         .env("CARGO_TARGET_DIR", &cfg.build_dir)
         .current_dir(&cfg.root)

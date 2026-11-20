@@ -23,7 +23,7 @@ use crate::config::{Config, MB};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CHECKPOINT_REFS: &str = "refs/broadsword/checkpoints";
@@ -202,7 +202,7 @@ pub fn is_repo(dir: &Path) -> bool {
 }
 
 fn git(dir: &Path, args: &[&str], index: Option<&Path>, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
-    let mut c = Command::new("git");
+    let mut c = crate::scrub::command_in(dir, "git")?; // the scrubbed environment (scrub.rs); refuses when it cannot be known
     c.args(args)
         .current_dir(dir)
         .env_remove("GIT_DIR")
@@ -840,6 +840,18 @@ mod tests {
 
     fn show(d: &Path, r: &str, p: &str) -> String {
         git_text(d, &["show", &format!("{r}:{p}")], None).unwrap_or_else(|e| format!("<{e}>"))
+    }
+
+    /// The git child (`git()`, every git.rs call) sees no planted secret: an alias that runs `env` dumps git's own environment.
+    #[test]
+    fn git_child_sees_no_planted_secret() {
+        let root = crate::scrub::planted::root("gitrs");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_text(&repo, &["init", "-q"], None).unwrap();
+        let out = git_text(&repo, &["-c", "alias.envdump=!env", "envdump"], None).unwrap();
+        crate::scrub::planted::assert_clean("git.rs git()", &out);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -10,6 +10,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[allow(dead_code)]
 #[path = "../src/wtgit.rs"]
 mod wtgit;
+// wtgit.rs starts git through scrub.rs (the scrubbed environment), which reads the settings through config.rs
+#[allow(dead_code)]
+#[path = "../src/config.rs"]
+mod config;
+#[allow(dead_code)]
+#[path = "../src/scrub.rs"]
+mod scrub;
 use wtgit::{diff_since, diff_since_mode, AttrMode};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);

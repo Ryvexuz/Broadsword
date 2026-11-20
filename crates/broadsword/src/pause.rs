@@ -72,16 +72,16 @@ pub fn resume_decision(free: u64, floor: u64, force: bool) -> Result<(), u64> {
 /// Run `cmd /C "<command> "<message>""` with the command line passed verbatim, so Rust's
 /// argument quoting cannot mangle it. cmd strips the outer quotes.
 #[cfg(windows)]
-fn run_cmd_verbatim(command: &str, msg: &str) -> std::io::Result<std::process::ExitStatus> {
+fn run_cmd_verbatim(cfg: &Config, command: &str, msg: &str) -> std::io::Result<std::process::ExitStatus> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("cmd")
+    crate::scrub::command(cfg, "cmd")
         .arg("/C")
         .raw_arg(format!("\"{command} \"{msg}\"\""))
         .status()
 }
 
 #[cfg(not(windows))]
-fn run_cmd_verbatim(_: &str, _: &str) -> std::io::Result<std::process::ExitStatus> {
+fn run_cmd_verbatim(_: &Config, _: &str, _: &str) -> std::io::Result<std::process::ExitStatus> {
     unreachable!("only used on Windows")
 }
 
@@ -97,9 +97,9 @@ pub fn alert(cfg: &Config, message: &str) {
     if !cfg.alert_command.trim().is_empty() {
         let msg: String = message.chars().filter(|c| !matches!(c, '"' | '%')).collect();
         let result = if cfg!(windows) {
-            run_cmd_verbatim(&cfg.alert_command, &msg)
+            run_cmd_verbatim(cfg, &cfg.alert_command, &msg)
         } else {
-            std::process::Command::new("sh").arg("-c").arg(format!("{} \"$0\"", cfg.alert_command)).arg(&msg).status()
+            crate::scrub::command(cfg, "sh").arg("-c").arg(format!("{} \"$0\"", cfg.alert_command)).arg(&msg).status()
         };
         if let Err(e) = result {
             eprintln!("alert_command failed to start: {e}");
@@ -187,6 +187,19 @@ pub fn read_only_call(stdin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `alert_command` child sees no planted secret: the command writes its own environment to a file.
+    #[test]
+    fn alert_command_child_sees_no_planted_secret() {
+        let root = crate::scrub::planted::root("alert");
+        let mut cfg = Config::load_from(&root).unwrap();
+        let dump = root.join("alert-env.txt");
+        cfg.alert_command = if cfg!(windows) { format!("set > \"{}\" & rem", dump.display()) } else { format!("env > \"{}\"; true", dump.display()) };
+        alert(&cfg, "planted test alert");
+        let out = std::fs::read_to_string(&dump).unwrap_or_else(|e| panic!("alert_command wrote no environment dump to {}: {e}", dump.display()));
+        crate::scrub::planted::assert_clean("pause.rs alert_command", &out);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn pause_below_floor_only() {

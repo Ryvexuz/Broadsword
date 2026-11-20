@@ -205,97 +205,8 @@ pub fn parse_verdict(text: &str) -> Verdict {
 
 // ---- secrets ----------------------------------------------------------------------------------
 
-/// Names that carry a secret (case-insensitive, as Windows treats them): `*_API_KEY`, `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PAT`,
-/// `*_PASSWORD`, `*_PASS`, `*_CREDENTIAL*`, `*_AUTH*`, and the bare `API_KEY`, `TOKEN`, `SECRET`, `PAT`, `PASSWORD`, `PASS`.
-pub fn secret_name(name: &str) -> bool {
-    let n = name.to_uppercase();
-    ["_KEY", "_TOKEN", "_SECRET", "_PAT", "_PASSWORD", "_PASS"].iter().any(|suffix| n.ends_with(suffix))
-        || n.contains("_CREDENTIAL")
-        || n.contains("_AUTH")
-        || ["API_KEY", "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS"].contains(&n.as_str())
-}
-
-/// Every secret value this process knows of.
-/// - EVERY value in `<root>/.env` is a secret, whatever its name (`GITHUB_PAT`, `DB_PASSWORD`, `REGION`...);
-/// - so is the value of every secret-named variable of the process environment.
-///
-/// Values of `redact_min_chars` characters or more are replaced by `[REDACTED]` in any text; shorter `.env` values are not (they
-/// would redact common words), but a variable of the reviewer's environment that EQUALS one is still removed.
-#[derive(Debug, Default, Clone)]
-pub struct Secrets {
-    redact: Vec<String>,
-    short_env: Vec<String>,
-}
-
-fn env_file_values(root: &Path) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(root.join(".env")) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let line = line.strip_prefix("export ").unwrap_or(line);
-            if let Some((_, val)) = line.split_once('=') {
-                let val = val.trim().trim_matches(['"', '\'']);
-                if !val.is_empty() {
-                    v.push(val.to_string());
-                }
-            }
-        }
-    }
-    v
-}
-
-impl Secrets {
-    /// `min_len` is the `redact_min_chars` setting: values shorter than this are not redacted from text (they would blank out
-    /// ordinary words); they are still kept out of the reviewer's environment (see `scrub_names`).
-    pub fn collect(root: &Path, env: &[(String, String)], min_len: usize) -> Secrets {
-        let mut redact: Vec<String> = Vec::new();
-        let mut short_env: Vec<String> = Vec::new();
-        for val in env_file_values(root) {
-            if val.chars().count() >= min_len {
-                redact.push(val);
-            } else {
-                short_env.push(val);
-            }
-        }
-        for (k, val) in env {
-            if secret_name(k) && val.chars().count() >= min_len {
-                redact.push(val.clone());
-            }
-        }
-        // longest first, so a secret that contains another is replaced whole
-        redact.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
-        redact.dedup();
-        short_env.sort();
-        short_env.dedup();
-        Secrets { redact, short_env }
-    }
-
-    /// How many `.env` values are too short to redact from text.
-    pub fn short_count(&self) -> usize {
-        self.short_env.len()
-    }
-
-    /// `text` with every known secret value replaced by `[REDACTED]`.
-    pub fn redact(&self, text: &str) -> String {
-        let mut out = text.to_string();
-        for s in &self.redact {
-            out = out.replace(s.as_str(), "[REDACTED]");
-        }
-        out
-    }
-
-    /// Which variables of `env` the reviewer CLI must NOT inherit: secret-named ones; any whose value equals or contains a
-    /// secret value; any whose value equals a short `.env` value.
-    pub fn scrub_names(&self, env: &[(String, String)]) -> Vec<String> {
-        env.iter()
-            .filter(|(k, v)| secret_name(k) || self.redact.iter().any(|s| v.contains(s.as_str())) || self.short_env.iter().any(|s| v == s))
-            .map(|(k, _)| k.clone())
-            .collect()
-    }
-}
+/// The secret rule lives in `scrub.rs` (the one boundary for child processes); re-exported so reviewer code keeps its names.
+pub use crate::scrub::Secrets;
 
 // ---- model families ---------------------------------------------------------------------------
 
@@ -683,6 +594,7 @@ pub fn check_model(rev: &mut Review, requested: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrub::secret_name;
 
     #[test]
     fn gate_prompt_is_shadow_prompt_plus_block() {
