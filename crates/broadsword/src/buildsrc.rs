@@ -72,7 +72,8 @@
 //! `--target-dir` and `CARGO_TARGET_DIR`, and refuses if `build_dir` is not strictly inside root or the source folder is
 //! inside it. Cargo deletes only regenerable artifacts below the target directory it is given; it never touches sources. The
 //! kept copies replace their own older versions (a rename over the file, and the `.source` note removed before a new copy is
-//! written), inside `<build_dir>/main.bins` only, behind the same build-folder guard (`guard_build_dir`).
+//! written), inside `<build_dir>/main.bins` only, behind `guard_kept_files`: the build-folder guard, plus no symlink, junction
+//! or reparse point at `main.bins`, its profile folder or the files, and every existing part resolving inside `build_dir`.
 
 use crate::config::Config;
 use crate::lock::{self, Lock};
@@ -439,12 +440,42 @@ impl std::fmt::Display for CopyFail {
     }
 }
 
+/// The temp file `copy_atomic` writes beside `to` before renaming it over `to`.
+fn copy_tmp(to: &Path) -> PathBuf {
+    let mut tmp = to.as_os_str().to_os_string();
+    tmp.push(".bskeep.tmp");
+    PathBuf::from(tmp)
+}
+
+/// THE check before any file of a kept copy (or the cargo exe a kept copy is restored to) is read, written or removed: the
+/// build-folder guard, then for the exe `exe` and every file written beside it (`.source`, `.stale`, the temp file): neither the
+/// file nor any folder on its way (`main.bins`, the profile folder, up to the drive root) may be a symlink, junction or reparse
+/// point, and a file or folder that exists must resolve inside `build_dir`. Err = refuse: nothing of it is touched.
+fn guard_kept_files(cfg: &Config, what: &str, exe: &Path) -> Result<(), String> {
+    guard_build_dir(cfg, what)?;
+    let build = cfg.build_dir.canonicalize().map_err(|e| format!("{what}: cannot resolve the build folder {}: {e}", cfg.build_dir.display()))?;
+    for p in [exe.to_path_buf(), kept_note(exe), stale_marker(exe), copy_tmp(exe)] {
+        if !p.starts_with(&cfg.build_dir) {
+            return Err(format!("{what}: {} is not inside the build folder {}", p.display(), cfg.build_dir.display()));
+        }
+        if let Some(l) = link_in_path(&p) {
+            return Err(format!("{what}: {} is a symlink, junction or reparse point (on the way to {}), so writing there could reach outside the build folder {}; nothing was written", l.display(), p.display(), cfg.build_dir.display()));
+        }
+        // the deepest part that exists must resolve inside the build folder
+        if let Some(a) = p.ancestors().find(|a| std::fs::symlink_metadata(a).is_ok()) {
+            let r = a.canonicalize().map_err(|e| format!("{what}: cannot resolve {}: {e}", a.display()))?;
+            if !r.starts_with(&build) {
+                return Err(format!("{what}: {} resolves to {}, outside the build folder {}; nothing was written", a.display(), r.display(), build.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copy `from` to `to` through a temp file beside `to` and a rename (a reader sees the old file or the new one). Cargo-built
 /// executables only, inside the build folder. On any failure the temp file is removed and `to` is left as it was.
 fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
-    let mut tmp = to.as_os_str().to_os_string();
-    tmp.push(".bskeep.tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = copy_tmp(to);
     // flushing needs a handle with write access on Windows (FlushFileBuffers); the copy must be the whole file before it replaces anything
     let copied = (|| {
         if let Some(d) = to.parent() {
@@ -517,6 +548,7 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             if !from.is_file() {
                 continue;
             }
+            guard_kept_files(cfg, "refusing to keep main's binaries", &to)?;
             let (side, stale) = (kept_note(&to), stale_marker(&to));
             let old = read_kept_note(cfg, profile, b);
             let same = old.as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
@@ -592,9 +624,14 @@ fn restore_main_bins(cfg: &Config, main: &str, bins: &[String]) -> Result<Vec<St
     let mut lines = Vec::new();
     for b in bins {
         for profile in CLEAN_PROFILES {
-            let Some(note) = read_kept_note(cfg, profile, b) else { continue };
             let (from, to) = (kept_exe(cfg, profile, b), built_exe(cfg, profile, b));
-            if note_folder(&note) != main || to.exists() {
+            if !from.is_file() || to.exists() {
+                continue;
+            }
+            guard_kept_files(cfg, "refusing to restore main's binaries", &from)?;
+            guard_kept_files(cfg, "refusing to restore main's binaries", &to)?;
+            let Some(note) = read_kept_note(cfg, profile, b) else { continue };
+            if note_folder(&note) != main {
                 continue;
             }
             copy_atomic(&from, &to).map_err(|e| format!("cannot put main's kept `{b}` back at {}: {e}", to.display()))?;

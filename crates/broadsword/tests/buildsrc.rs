@@ -414,6 +414,47 @@ fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build(
     assert!(!stale.exists(), "the marker is gone once the copy is fresh");
 }
 
+/// Review q-20261120-231552: a junction at build/main.bins/debug pointing OUTSIDE the build folder must never make the refresh
+/// delete a `.source` note or replace an exe there. The job refuses and the outside folder is untouched, byte for byte. On
+/// 1e9bf60 the refresh followed the junction (the outside exe and its note were replaced). Windows only (a junction).
+#[cfg(windows)]
+#[test]
+fn a_junction_in_main_bins_makes_the_refresh_refuse_and_writes_nothing_outside() {
+    use std::os::windows::process::CommandExt;
+    let r = Root::new("keepjunction", 120);
+    let proj = r.dir.join("projects/proj");
+    r.ok(&["build", "proj"]);
+    let debug = r.dir.join("build/main.bins/debug");
+    assert!(debug.is_dir());
+    // the profile folder becomes a junction to a folder outside the build folder that holds files of the same names
+    let outside = r.dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let exe_name = format!("markprobe{}", std::env::consts::EXE_SUFFIX);
+    fs::write(outside.join(&exe_name), "not ours").unwrap();
+    fs::write(outside.join(format!("{exe_name}.source")), "projects/proj\n").unwrap();
+    fs::remove_dir_all(&debug).unwrap();
+    let ok = Command::new("cmd").arg("/C").raw_arg(format!("mklink /J \"{}\" \"{}\"", debug.display(), outside.display())).output().unwrap().status.success();
+    assert!(ok, "mklink /J failed");
+    let before: Vec<(String, Vec<u8>)> = {
+        let mut v: Vec<_> = fs::read_dir(&outside).unwrap().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap())).collect();
+        v.sort();
+        v
+    };
+
+    // new main code: the build succeeds, the refresh must refuse
+    set_marker(&proj, "MARK-main2");
+    let o = r.run(&["build", "proj"]);
+    let after: Vec<(String, Vec<u8>)> = {
+        let mut v: Vec<_> = fs::read_dir(&outside).unwrap().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap())).collect();
+        v.sort();
+        v
+    };
+    let _ = fs::remove_dir(&debug); // the junction only, not its target
+    assert_eq!(after, before, "nothing outside the build folder was written, removed or replaced:\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(o.code, 1, "the job refuses:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("refusing to keep main's binaries") && o.stderr.contains("junction"), "{}", o.stderr);
+}
+
 #[test]
 fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     let r = Root::new("run", 120);
