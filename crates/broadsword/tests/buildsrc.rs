@@ -373,6 +373,47 @@ fn every_successful_main_build_refreshes_main_bins_and_no_worktree_build_replace
     assert_eq!(prints(&kept("release")), "MARK-main3", "a worktree release build never replaces main's kept release binary");
 }
 
+/// A kept copy that is RUNNING (Lazlo drives main's crash-sim from main.bins) cannot be replaced on Windows. A successful main
+/// build must still pass: the old copy stays, a `.stale` marker names the new build, the job says so loudly, and the next main
+/// build that finds the copy free refreshes it and removes the marker. On 8574bf2 the main build failed ("cannot keep main's").
+/// Windows only: elsewhere a rename replaces a running exe, so there is no in-use case.
+#[cfg(windows)]
+#[test]
+fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build() {
+    let r = Root::new("inuse", 120);
+    let proj = r.dir.join("projects/proj");
+    // main's binary waits while it is given `wait`, so the kept copy can be kept running
+    fs::write(proj.join("src/main.rs"), "fn main() {\n    if std::env::args().nth(1).as_deref() == Some(\"wait\") {\n        std::thread::sleep(std::time::Duration::from_secs(120));\n    }\n    print!(\"{}\", markprobe::MARKER);\n}\n").unwrap();
+    let kept = r.dir.join("build/main.bins/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let stale = PathBuf::from(format!("{}.stale", kept.display()));
+    let prints = |p: &Path| -> String {
+        let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    r.ok(&["build", "proj"]);
+    assert_eq!(prints(&kept), "MARK-main");
+
+    // run the kept copy, then build new main code
+    let mut running = Command::new(&kept).arg("wait").stdout(Stdio::null()).spawn().unwrap();
+    set_marker(&proj, "MARK-main2");
+    let o = r.run(&["build", "proj"]);
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_eq!(o.code, 0, "a kept copy in use must not fail a successful main build:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("main.bins: `markprobe` (debug) NOT refreshed (in use") && o.stdout.contains("the copy is from projects/proj"), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-main2", "the new build is in cargo's folder");
+    assert_eq!(prints(&kept), "MARK-main", "the old copy stays as it was");
+    let marker = fs::read_to_string(&stale).unwrap_or_else(|e| panic!("no stale marker at {}: {e}\n{}", stale.display(), o.stdout));
+    assert!(marker.starts_with("stale: projects/proj, in use at "), "{marker}");
+    assert_eq!(fs::read_to_string(format!("{}.source", kept.display())).unwrap().trim(), "projects/proj", "the copy is still named by its own note");
+
+    // nothing runs it now: the next main build (no code change) refreshes it and removes the marker
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug"), "{}", o.stdout);
+    assert_eq!(prints(&kept), "MARK-main2");
+    assert!(!stale.exists(), "the marker is gone once the copy is fresh");
+}
+
 #[test]
 fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     let r = Root::new("run", 120);

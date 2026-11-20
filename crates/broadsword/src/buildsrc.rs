@@ -55,6 +55,13 @@
 //! (`restore_main_bins`), for readers that still look there; the clean removed cargo's fingerprint, so a cargo step that needs
 //! the target still rebuilds it from the job's own source. The package and bin notes stay conservative: after a restore they
 //! name the job's folder, so the next job of another folder cleans again and `install` still refuses.
+//! In use: on Windows a kept copy that is running (Lazlo drives it) cannot be replaced. After a successful main step that does
+//! NOT fail the job: the old copy stays, still named by its own `.source` note, a marker `<exe>.stale` beside it says
+//! `stale: <note of the new build>, in use at <UTC>`, the job prints a loud `main.bins: <bin> NOT refreshed (in use)` line,
+//! and the next main step that finds the copy free refreshes it and removes the marker. Every other copy error (disk full, a
+//! length mismatch) still fails the job. Before another folder's clean an in-use copy refuses that job instead (nothing built
+//! or cleaned): the clean would delete main's newer build from cargo's folder while main.bins holds only the older one.
+//!
 //! Limits: a main `build`/`check`/`run` that FAILS refreshes nothing (main.bins keeps the last good build, the cache may hold the
 //! failed attempt's leftovers); a `run` of the main checkout counts (its command may build anything there, so its kept note is
 //! `run:<folder>`, never `.`); a `run` whose packages cannot be listed refreshes nothing (its line says so); cargo-sweep never
@@ -416,29 +423,79 @@ pub fn main_folder(cfg: &Config, source: &str) -> Option<String> {
     Some(if p == crate::job::SELF_PROJECT { MAIN_SOURCE.to_string() } else { format!("{projects}/{p}") })
 }
 
-/// Copy `from` to `to` through a temp file beside `to` and a rename (a reader sees the old file or the new one). Cargo-built
-/// executables only, inside the build folder.
-fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
-    if let Some(d) = to.parent() {
-        std::fs::create_dir_all(d)?;
+/// Why `copy_atomic` failed: making the full copy beside `to` (disk full, a length mismatch, ...), or putting it in place of `to`
+/// (the rename; on Windows a running or open exe cannot be replaced).
+enum CopyFail {
+    Copy(std::io::Error),
+    Replace(std::io::Error),
+}
+
+impl std::fmt::Display for CopyFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopyFail::Copy(e) => write!(f, "{e}"),
+            CopyFail::Replace(e) => write!(f, "cannot replace the old file: {e}"),
+        }
     }
+}
+
+/// Copy `from` to `to` through a temp file beside `to` and a rename (a reader sees the old file or the new one). Cargo-built
+/// executables only, inside the build folder. On any failure the temp file is removed and `to` is left as it was.
+fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
     let mut tmp = to.as_os_str().to_os_string();
     tmp.push(".bskeep.tmp");
     let tmp = PathBuf::from(tmp);
     // flushing needs a handle with write access on Windows (FlushFileBuffers); the copy must be the whole file before it replaces anything
-    let r = std::fs::copy(from, &tmp)
-        .and_then(|n| {
-            let want = std::fs::metadata(from)?.len();
-            if n != want || std::fs::metadata(&tmp)?.len() != want {
-                return Err(std::io::Error::other(format!("the copy has {n} bytes, the original {want}")));
-            }
-            std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()
-        })
-        .and_then(|_| std::fs::rename(&tmp, to));
+    let copied = (|| {
+        if let Some(d) = to.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let n = std::fs::copy(from, &tmp)?;
+        let want = std::fs::metadata(from)?.len();
+        if n != want || std::fs::metadata(&tmp)?.len() != want {
+            return Err(std::io::Error::other(format!("the copy has {n} bytes, the original {want}")));
+        }
+        std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()
+    })();
+    let r = copied.map_err(CopyFail::Copy).and_then(|_| std::fs::rename(&tmp, to).map_err(CopyFail::Replace));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     r
+}
+
+/// True if `p` exists and another process has it open or is running it, so it cannot be replaced now: an exclusive open for
+/// writing fails with a sharing or lock violation. Only Windows refuses to replace a running exe (elsewhere a rename always
+/// replaces it), so elsewhere this is always false.
+#[cfg(windows)]
+fn in_use(p: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    // ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33)
+    matches!(std::fs::OpenOptions::new().write(true).share_mode(0).open(p), Err(e) if matches!(e.raw_os_error(), Some(32 | 33)))
+}
+#[cfg(not(windows))]
+fn in_use(_: &Path) -> bool {
+    false
+}
+
+/// The marker beside a kept copy that could not be refreshed because it was in use: `<exe>.stale`, holding `stale: <note of the
+/// newer build>, in use at <UTC>`. The `.source` note keeps naming the build the copy really is; the next refresh that can
+/// replace the copy removes the marker.
+pub fn stale_marker(exe: &Path) -> PathBuf {
+    let mut s = exe.as_os_str().to_os_string();
+    s.push(".stale");
+    PathBuf::from(s)
+}
+
+/// What a kept copy that is in use (cannot be replaced) does to the job.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InUse {
+    /// after a successful main step (`refresh_main_bins`): the copy is main's previous build and the new one is in cargo's
+    /// folder, so the job passes, says so loudly and marks the copy stale
+    LeaveStale,
+    /// before another folder's clean: the clean would delete main's newer build from cargo's folder with no copy of it, so the
+    /// job is refused (nothing built or cleaned)
+    Refuse,
 }
 
 /// Copy main's exes of package `pkg` (whose binary targets are `bins`) to their kept place: every exe of those targets whose note
@@ -447,7 +504,7 @@ fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
 /// job of ANOTHER folder cleans `pkg` (`prepare_packages`: nothing is cleaned until this succeeded; Err refuses the job, nothing
 /// deleted). The caller holds the build lock. An unchanged copy is not rewritten (and gets no line). The note beside the copy is removed first and written last, so a crash in between leaves a copy with no
 /// note, which is never restored.
-fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &str) -> Result<Vec<String>, String> {
+fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &str, busy: InUse) -> Result<Vec<String>, String> {
     guard_build_dir(cfg, "refusing to keep main's binaries")?;
     let mut lines = Vec::new();
     for b in bins {
@@ -460,17 +517,46 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             if !from.is_file() {
                 continue;
             }
-            let same = read_kept_note(cfg, profile, b).as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
-            if !same {
-                let side = kept_note(&to);
-                let fail = |e: std::io::Error| format!("cannot keep main's `{b}` ({}) at {} {when}: {e}\nIf a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
-                match std::fs::remove_file(&side) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail(e)),
-                    _ => {}
+            let (side, stale) = (kept_note(&to), stale_marker(&to));
+            let old = read_kept_note(cfg, profile, b);
+            let same = old.as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
+            let fail = |e: &dyn std::fmt::Display| format!("cannot keep main's `{b}` ({}) at {} {when}: {e}\nIf a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
+            let remove = |f: &Path| match std::fs::remove_file(f) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(fail(&e)),
+                _ => Ok(()),
+            };
+            if same {
+                remove(&stale)?; // up to date after all: no longer stale
+                continue;
+            }
+            // the note goes first and comes back last, so a crash in between leaves a copy with no note (never restored)
+            remove(&side)?;
+            match copy_atomic(&from, &to) {
+                Ok(()) => {
+                    write_atomic(&side, &note).map_err(|e| fail(&e))?;
+                    remove(&stale)?;
+                    lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
                 }
-                copy_atomic(&from, &to).map_err(fail)?;
-                write_atomic(&side, &note).map_err(fail)?;
-                lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
+                Err(CopyFail::Replace(e)) if busy == InUse::LeaveStale && in_use(&to) => {
+                    // the old copy stays, still named by its own note; the marker says a newer build exists
+                    if let Some(o) = &old {
+                        write_atomic(&side, o).map_err(|e| fail(&e))?;
+                    }
+                    write_atomic(&stale, &format!("stale: {note}, in use at {}", crate::pause::now_string())).map_err(|e| fail(&e))?;
+                    lines.push(format!(
+                        "main.bins: `{b}` ({}) NOT refreshed (in use: {e}); the copy is from {}. The new build is only in {} for now; the next main build refreshes the copy once nothing runs it ({} says so meanwhile)",
+                        profile.dir(),
+                        old.as_deref().unwrap_or("an unknown build (no note)"),
+                        from.display(),
+                        stale.display()
+                    ));
+                }
+                Err(e) => {
+                    if let Some(o) = &old {
+                        let _ = write_atomic(&side, o); // the old copy is still there: name it again before failing
+                    }
+                    return Err(fail(&e));
+                }
             }
         }
     }
@@ -492,7 +578,7 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<S
     };
     let mut lines = Vec::new();
     for (p, bins) in &targets {
-        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)")?);
+        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)", InUse::LeaveStale)?);
     }
     Ok(lines)
 }
@@ -767,7 +853,7 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let main = main_folder(cfg, source);
     for (p, was) in &stale {
         if let Some(m) = main.as_deref().filter(|m| *m != source) {
-            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (nothing was built or cleaned)"))?);
+            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (nothing was built or cleaned)"), InUse::Refuse)?);
         }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };
