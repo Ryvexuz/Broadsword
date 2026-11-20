@@ -126,6 +126,23 @@ class Completion(unittest.TestCase):
         rows = self.costs([task("t1")], entries, [], verdicts)
         self.assertEqual(rows["t1"]["first_adjudicated"], ["real"])
 
+    def test_coder_dollars_are_summed_when_recorded_and_unknown_never_zero_when_not(self):
+        priced = [dict(run("t1", "100"), cost_usd="0.50"), dict(run("t1", "100", role="fix"), cost_usd="0.25")]
+        r = self.costs([task("t1")], [entry("q-0001", "t1")], priced)["t1"]
+        self.assertEqual(r["coder_usd"], [0.75, 0])
+        r = self.costs([task("t1")], [entry("q-0001", "t1")], [run("t1", "100"), dict(run("t1", "5"), cost_usd="0.5")])["t1"]
+        self.assertEqual(r["coder_usd"], [0.5, 1])  # one run has no price: counted unknown, not 0
+        out = self.completion_text([task("t1")], [entry("q-0001", "t1")], priced)
+        self.assertRegex(out, r"coder \$\s+0\.7500 / 0\.7500")
+        self.assertRegex(out, r"total \$\s+0\.7600 / 0\.7600")  # 0.75 coder + 0.01 review
+        self.assertRegex(out, r"review \$\s+0\.0100")
+
+    def test_total_is_unknown_not_review_only_when_coder_dollars_are_missing(self):
+        out = self.completion_text([task("t1")], [entry("q-0001", "t1")], [run("t1", "100")])
+        self.assertRegex(out, r"coder \$\s+- / -.*known for 0 of 1 done tasks.*never counted as \$0")
+        self.assertRegex(out, r"total \$\s+- / -.*no total")
+        self.assertNotRegex(out, r"total \$\s+0\.0100")
+
     def completion_text(self, tasks, entries, runs=()):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

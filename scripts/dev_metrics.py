@@ -29,7 +29,8 @@ Cost to completion (per coder model, over the tasks in range): everything a task
   rounds = queue entries of the task; wall = task started -> ended. Median and worst over DONE tasks only. Tasks that are
   not done are counted as open (open or running) or not merged (abandoned) and never enter a median. An empty token field
   is unknown, never 0: a task whose sum has an unknown part is a lower bound (counted), a task with no known number
-  is left out of that median. Claude coder tokens are not priced (no $ recorded) and Codex (shadow) tokens are plan
+  is left out of that median. Printed as "coder $", "review $" and "total $": coder $ is summed from an optional cost_usd column of agent-runs.tsv (not recorded today, so
+  it shows "-", unknown, and total $ is then not shown, never review $ alone or $0); Codex (shadow) tokens are plan
   allowance, shown as tokens, never as $0. Also per coder: first-pass PASS rate under the gating reviewer, BLOCKING lines
   per first review split by the adjudicated verdict in state/shadow-verdicts.tsv, and fix rounds (rounds - 1).
 Reusable by other scripts: model_rows() (per model and role: runs, seconds, tokens, $; coder use = role "coder" seconds
@@ -304,8 +305,17 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
             else:
                 bucket[0] += n
 
+        coder_usd = [0.0, 0]  # [known $, runs without a recorded $]: state/agent-runs.tsv has no price column today
         for v in rs:
             add(openai if is_openai(v.get("model")) else claude, v.get("tokens"))
+            try:
+                c = float(v.get("cost_usd"))  # optional column; absent or empty = unknown, never 0
+            except (TypeError, ValueError):
+                c = None
+            if c is None or is_openai(v.get("model")):  # Codex runs are on the plan allowance: no $
+                coder_usd[1] += 1
+            else:
+                coder_usd[0] += c
         usd, usd_unknown = 0.0, 0
         for e in es:
             if e.get("reviewer_model") and (e.get("verdict") or e.get("review_calls")):
@@ -326,7 +336,7 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
         adj = [v for v in verdicts if first and str(v.get("entry", "")).strip().lower() == fid]  # case and spaces never hide an adjudication
         out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "coder_runs": len(coder_rs),
                     "wall": (ended - (started or created)) if ended and (started or created) else None,
-                    "claude": claude, "openai": openai, "usd": usd, "usd_unknown": usd_unknown,
+                    "claude": claude, "openai": openai, "usd": usd, "usd_unknown": usd_unknown, "coder_usd": coder_usd,
                     "first_reviewer": first.get("reviewer_model") if first else None,
                     "first_verdict": first.get("verdict") if first else None,
                     "first_lines": len(blocking_lines(first)) if first else 0,
@@ -380,10 +390,19 @@ def completion(tasks, entries, runs):
             m, w = stats(known)
             print(f"  {label:<20}  {fmt(m)} / {fmt(w)}  (lower bounds, part unknown: {lower}; no number, left out: {nothing})")
         print(f"  coder runs recorded for {sum(1 for r in done if r['coder_runs'])} of {len(done)} done tasks (the rest: no coder tokens in the sums above)")
+        # coder $ is known only for a task whose every coder run carries a price; otherwise it is unknown, never 0
+        coder_known = [r for r in done if r["coder_runs"] and not r["coder_usd"][1]]
+        m, w = stats([r["coder_usd"][0] for r in coder_known])
+        print(f"  coder $             {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (known for {len(coder_known)} of {len(done)} done tasks; "
+              f"unknown for {len(done) - len(coder_known)}: no price recorded in state/agent-runs.tsv, left out, never counted as $0)")
         m, w = stats([r["usd"] for r in done])
         unpriced = sum(r["usd_unknown"] for r in done)
-        print(f"  review $            {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (gating reviews only; coder $ and Codex shadow are not priced: plan, not $0)"
+        print(f"  review $            {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (gating reviews only; Codex shadow is plan allowance: tokens above, not $0)"
               + (f"; {unpriced} review(s) without a price in {sum(1 for r in done if r['usd_unknown'])} task(s): lower bounds" if unpriced else ""))
+        totals = [r["coder_usd"][0] + r["usd"] for r in coder_known if not r["usd_unknown"]]
+        m, w = stats(totals)
+        print(f"  total $             {fmt(m, lambda x: f'{x:.4f}')} / {fmt(w, lambda x: f'{x:.4f}')}  (coder $ + review $, only for the {len(totals)} of {len(done)} done tasks where both are known; "
+              + ("the others have an unknown coder $ or an unpriced review, so no total" if len(totals) < len(done) else "all known") + ")")
         # coders are compared under the same gating reviewer only: the first-pass numbers never mix reviewers
         firsts_all = [r for r in done if r["first_verdict"]]
         for reviewer in sorted({r["first_reviewer"] or "?" for r in firsts_all}):
