@@ -178,14 +178,23 @@ pub mod planted {
     pub const DOTENV_VALUE: &str = "planted-dotenv-value-5be84d";
     pub const COPY_NAME: &str = "BS_PLANTED_DOTENV_COPY";
 
-    /// `<repo>/scratch/scrub-<tag>-<pid>`: a root with the real `broadsword.toml` and a `.env` holding `DOTENV_VALUE`; the two
-    /// planted variables are set in this process.
-    pub fn root(tag: &str) -> PathBuf {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("scrub-{tag}-{}", std::process::id()));
+    /// `<repo>/scratch/<tag>-<pid>`, emptied, holding this build's own shipped `broadsword.toml` and nothing else: the root
+    /// for a unit test that starts a child (git, python) through `command_in`. Why: a test folder with no `broadsword.toml`
+    /// of its own would find the checkout's, and in a linked worktree `command_in` then loads the MAIN checkout's file,
+    /// which lacks any required key this branch adds, so every git call in the test would be refused. No `.env`, and no
+    /// variable is set.
+    pub fn config_root(tag: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        let toml = include_str!("../../../broadsword.toml");
-        std::fs::write(d.join("broadsword.toml"), toml).unwrap();
+        std::fs::write(d.join("broadsword.toml"), include_str!("../../../broadsword.toml")).unwrap();
+        d
+    }
+
+    /// `config_root("scrub-<tag>")` plus a `.env` holding `DOTENV_VALUE`; the two
+    /// planted variables are set in this process.
+    pub fn root(tag: &str) -> PathBuf {
+        let d = config_root(&format!("scrub-{tag}"));
         std::fs::write(d.join(".env"), format!("SOME_SETTING={DOTENV_VALUE}\n")).unwrap();
         std::env::set_var(API_NAME, API_VALUE);
         std::env::set_var(COPY_NAME, DOTENV_VALUE);

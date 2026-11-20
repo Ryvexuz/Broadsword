@@ -2037,7 +2037,10 @@ mod tests {
     #[test]
     fn json_round_trips_through_python_if_available() {
         use std::io::Write;
-        let Ok(mut child) = crate::scrub::command_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), "python")
+        // A root holding this build's own broadsword.toml: from the crate folder of a linked worktree, `command_in` would
+        // load the main checkout's file, which lacks any required key this branch adds.
+        let root = crate::scrub::planted::config_root("tools-python");
+        let Ok(mut child) = crate::scrub::command_in(&root, "python")
             .unwrap()
             .args(["-I", "-c", "import json,sys; d=json.load(sys.stdin); assert isinstance(d,list) and all({'name','description','inputSchema'} <= set(t) for t in d); print(len(d))"])
             .stdin(std::process::Stdio::piped())

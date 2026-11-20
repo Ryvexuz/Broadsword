@@ -813,11 +813,11 @@ mod tests {
         Opts { excludes: vec![PathBuf::from("state")], ignored_max_bytes: 50 * MB }
     }
 
-    /// A throwaway repo under the repo's scratch folder with one commit: tracked.txt = "one".
+    /// A throwaway repo under the repo's scratch folder with one commit: tracked.txt = "one". It is `repo/` inside a
+    /// `scrub::planted::config_root`, so git (started through `scrub::command_in`) loads this build's own settings, never
+    /// a main checkout's that may lack a key this branch adds.
     pub fn temp_repo(tag: &str) -> PathBuf {
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch");
-        let d = scratch.join(format!("git-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let d = crate::scrub::planted::config_root(&format!("git-{tag}")).join("repo");
         fs::create_dir_all(&d).unwrap();
         for a in [&["init", "-q"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["config", "core.autocrlf", "false"]] {
             git_text(&d, a, None).unwrap();

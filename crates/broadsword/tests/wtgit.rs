@@ -51,9 +51,9 @@ impl Drop for Repo {
 /// A repo with one commit on `main` (no `.gitattributes`) and a worktree on branch `task` where the test commits.
 fn repo(name: &str) -> Repo {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch").join(format!("wtgit-{name}-{}-{n}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    // The root holds this build's own broadsword.toml (wtgit starts git through scrub::command_in, which would otherwise find
+    // the checkout's file and, in a linked worktree, load the main checkout's, lacking any required key this branch adds).
+    let root = scrub::planted::config_root(&format!("wtgit-{name}-{n}"));
     let root = fs::canonicalize(&root).unwrap();
     let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
     let main = root.join("main");
