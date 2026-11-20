@@ -304,6 +304,26 @@ fn run_after_another_worktrees_build_tests_its_own_code_not_the_other_binary() {
     assert_eq!(r.note().as_deref(), Some(format!("run:worktrees/proj/{t2}").as_str()), "a `run` build is still never installable: the note is a `run:` note");
 }
 
+/// The stale `--release` case (found by the merge queue's perf gate): checkout B builds release, checkout A builds release,
+/// then B again. `cargo clean -p` alone cleans only the dev profile, so B's second release build said `Finished` without
+/// compiling and left A's exe in build/release. Every clean now covers the release profile too, so each build gives its own
+/// checkout's binary.
+#[test]
+fn a_release_build_after_another_checkouts_release_build_rebuilds_its_own_binary() {
+    let r = Root::new("relstale", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let t2 = r.task("b", "MARK-t2");
+    let probe_release = || {
+        let exe = r.dir.join("build/release").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+        let o = Command::new(&exe).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", exe.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    for (id, want) in [(&t2, "MARK-t2"), (&t1, "MARK-t1"), (&t2, "MARK-t2"), (&t1, "MARK-t1")] {
+        let o = r.ok(&["run", "proj", "--task", id, "--", "cargo", "build", "--release", "--offline"]);
+        assert_eq!(probe_release(), want, "the release exe after a release build in {id} must be its own:\n{}", o.stdout);
+    }
+}
+
 /// The blocker of the first review: every `run` after another `run` in the same folder used to clean the package, so
 /// `run -- cargo build` followed by `run -- <the built program>` deleted the program before the second command started.
 /// Same folder now means no clean; the note stays a `run:` note throughout, so `install` still refuses it.

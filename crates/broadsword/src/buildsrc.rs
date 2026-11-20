@@ -7,8 +7,9 @@
 //!
 //! The rule that closes it: `state/build-sources/<package>` holds the source folder (relative to root, `/` separators,
 //! `.` for the main checkout) that last built that package. Before a cargo step, every package of the folder about to be
-//! built whose note differs (or is missing: whoever built it is unknown) gets `cargo clean -p <package> --offline`, which
-//! removes that package's own artifacts, its binary included, and nothing else (dependencies stay). Order matters for
+//! built whose note differs (or is missing: whoever built it is unknown) gets `cargo clean -p <package> --offline`, and the
+//! same with `--release` (`CLEAN_PROFILES`: a plain `-p` clean leaves the release profile's artifacts, which cargo then calls
+//! fresh), which removes that package's own artifacts, its binary included, and nothing else (dependencies stay). Order matters for
 //! crashes: clean first, THEN write the note, THEN build. A crash after the clean leaves a note naming the old source and
 //! no artifact (harmless: the next build of the old source cleans again or builds fresh). A crash after the note is
 //! written leaves the new source named and nothing stale. Writing the note after the build instead could leave a new
@@ -268,10 +269,22 @@ fn link_in_path(p: &Path) -> Option<PathBuf> {
     p.ancestors().find(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink() || is_reparse_point(&m))).map(Path::to_path_buf)
 }
 
-/// The one and only place a `cargo clean` is made. Always `-p <package>`, always aimed at `build_dir`. Refuses (Err, nothing
-/// run) if the package name is not a plain cargo name, `build_dir` is not strictly inside root, or the source folder lies
-/// inside `build_dir` (cleaning would then be pointed at, or beside, sources).
-pub fn clean_command(cfg: &Config, dir: &Path, package: &str) -> Result<Command, String> {
+/// A cargo profile whose artifacts a clean removes. `cargo clean -p <package>` alone removes only the dev profile's: a
+/// `--release` build from another checkout stays in `build/release`, and cargo then calls it fresh and runs it (found by the
+/// merge queue's perf gate: one worktree's `cargo run --release --example bench` ran another worktree's bench).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Dev,
+    Release,
+}
+
+/// Every profile a stale package is cleaned in, in this order. Limit: a custom `[profile.<name>]` is not cleaned.
+pub const CLEAN_PROFILES: [Profile; 2] = [Profile::Dev, Profile::Release];
+
+/// The one and only place a `cargo clean` is made. Always `-p <package>`, always aimed at `build_dir`, for one `profile` (dev, or
+/// `--release`). Refuses (Err, nothing run) if the package name is not a plain cargo name, `build_dir` is not strictly inside
+/// root, or the source folder lies inside `build_dir` (cleaning would then be pointed at, or beside, sources).
+pub fn clean_command(cfg: &Config, dir: &Path, package: &str, profile: Profile) -> Result<Command, String> {
     if !valid_package(package) {
         return Err(format!("refusing to clean: `{package}` is not a plain package name"));
     }
@@ -287,6 +300,9 @@ pub fn clean_command(cfg: &Config, dir: &Path, package: &str) -> Result<Command,
     }
     let mut c = cargo(cfg);
     c.arg("clean").arg("-p").arg(package).arg("--offline").arg("--target-dir").arg(b).current_dir(dir).env("CARGO_TARGET_DIR", b).stdin(Stdio::null());
+    if profile == Profile::Release {
+        c.arg("--release");
+    }
     Ok(c)
 }
 
@@ -529,14 +545,17 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
     for (p, was) in &stale {
-        let out = clean_command(cfg, dir, p)?.output().map_err(|e| format!("cannot start `cargo clean -p {p}`: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "`cargo clean -p {p}` failed in {}: {}
+        for profile in CLEAN_PROFILES {
+            let flag = if profile == Profile::Release { " --release" } else { "" };
+            let out = clean_command(cfg, dir, p, profile)?.output().map_err(|e| format!("cannot start `cargo clean -p {p}{flag}`: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "`cargo clean -p {p}{flag}` failed in {}: {}
 nothing was built. The old copy of `{p}` in the build folder could not be removed; on Windows a binary that is running cannot be deleted, so stop whatever runs it (run the installed copy under install_dir, not the one in the build folder) and repeat",
-                dir.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+                    dir.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
         }
         write_note(cfg, p, &wanted)?;
         for b in bins_of_pkg(p) {
@@ -718,7 +737,7 @@ mod tests {
     fn clean_is_always_per_package_and_aimed_at_the_build_folder() {
         let cfg = cfg_at(Path::new("r"));
         let dir = cfg.worktrees_dir.join("p").join("t");
-        let c = clean_command(&cfg, &dir, "my-pkg").unwrap();
+        let c = clean_command(&cfg, &dir, "my-pkg", Profile::Dev).unwrap();
         let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(args[0], "clean");
         let at = args.iter().position(|a| a == "-p").expect("-p is always there");
@@ -731,17 +750,34 @@ mod tests {
         assert_eq!(Path::new(env[0].1.unwrap()), cfg.build_dir);
         // refusals: no package name, a name that is not plain, a build folder that is not inside root, sources inside it
         for bad in ["", "a b", "../x", "a/b"] {
-            assert!(clean_command(&cfg, &dir, bad).is_err(), "{bad}");
+            assert!(clean_command(&cfg, &dir, bad, Profile::Dev).is_err(), "{bad}");
         }
         let mut wild = cfg.clone();
         wild.build_dir = wild.root.clone();
-        assert!(clean_command(&wild, &dir, "p").is_err(), "build_dir == root");
+        assert!(clean_command(&wild, &dir, "p", Profile::Dev).is_err(), "build_dir == root");
         wild.build_dir = PathBuf::from("elsewhere").join("build");
-        assert!(clean_command(&wild, &dir, "p").is_err(), "build_dir outside root");
+        assert!(clean_command(&wild, &dir, "p", Profile::Dev).is_err(), "build_dir outside root");
         wild.build_dir = cfg.root.join("..").join("build");
-        assert!(clean_command(&wild, &dir, "p").is_err(), "build_dir with ..");
-        assert!(clean_command(&cfg, &cfg.build_dir.join("deep"), "p").is_err(), "source inside the build folder");
-        assert!(clean_command(&cfg, &cfg.root, "p").is_ok(), "the main checkout contains the build folder, which is fine");
+        assert!(clean_command(&wild, &dir, "p", Profile::Dev).is_err(), "build_dir with ..");
+        assert!(clean_command(&cfg, &cfg.build_dir.join("deep"), "p", Profile::Dev).is_err(), "source inside the build folder");
+        assert!(clean_command(&cfg, &cfg.root, "p", Profile::Dev).is_ok(), "the main checkout contains the build folder, which is fine");
+    }
+
+    #[test]
+    fn a_stale_package_is_cleaned_in_the_release_profile_too_with_the_same_guards() {
+        let cfg = cfg_at(Path::new("r"));
+        let dir = cfg.worktrees_dir.join("p").join("t");
+        let args = |p: Profile| -> Vec<String> { clean_command(&cfg, &dir, "my-pkg", p).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect() };
+        let (dev, rel) = (args(Profile::Dev), args(Profile::Release));
+        assert!(!dev.contains(&"--release".to_string()), "{dev:?}");
+        assert_eq!(rel.iter().filter(|a| *a == "--release").count(), 1, "{rel:?}");
+        // the release clean is the same per-package clean aimed at the build folder, plus the flag
+        assert_eq!(rel[..rel.len() - 1], dev[..], "{rel:?} vs {dev:?}");
+        let at = rel.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(rel[at + 1], "my-pkg");
+        assert!(clean_command(&cfg, &dir, "a b", Profile::Release).is_err(), "the release clean keeps the refusals");
+        // and every stale package is cleaned in both profiles
+        assert_eq!(CLEAN_PROFILES, [Profile::Dev, Profile::Release]);
     }
 
     #[test]
@@ -780,12 +816,12 @@ mod tests {
         };
         assert!(ok, "mklink /J failed");
         cfg.build_dir = link.join("build"); // a parent of the build folder is a junction
-        let e = clean_command(&cfg, &d, "p").unwrap_err();
+        let e = clean_command(&cfg, &d, "p", Profile::Dev).unwrap_err();
         assert!(e.contains("junction"), "{e}");
         cfg.build_dir = link.clone();
-        assert!(clean_command(&cfg, &d, "p").is_err(), "the build folder itself");
+        assert!(clean_command(&cfg, &d, "p", Profile::Dev).is_err(), "the build folder itself");
         cfg.build_dir = parent;
-        assert!(clean_command(&cfg, &d, "p").is_ok());
+        assert!(clean_command(&cfg, &d, "p", Profile::Dev).is_ok());
         let _ = std::fs::remove_dir(&link);
         std::fs::remove_dir_all(&d).unwrap();
     }
