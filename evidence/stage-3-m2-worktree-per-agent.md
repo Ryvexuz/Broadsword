@@ -92,3 +92,7 @@ The full suite on `main` passes 268 Rust tests, including 33 worktree tests and 
 - There is a small window in which an ignored file written between the cleanliness check and `git worktree remove` would be lost. It is documented in the code.
 - Claims are still compared lexically.
 - `refs/broadsword/kept/*` refs accumulate.
+
+## Note 2026-11-20 (t-20261120-134432-2): the base is the trunk, not HEAD
+
+The statements above that a task's worktree starts from "the tip of the project's current branch in the main checkout" (`git rev-parse HEAD`) and that "merged" means reachable from that branch describe the code as reviewed here. They were replaced by the trunk rule in t-20261119-215210: the base and the "merged" test now use the project's trunk, the one of the local branches `main` and `master` that exists (`wtgit::trunk_branch`; both or neither is refused), whatever the main checkout has checked out. The merge queue (t-20261120-134432) merges only into that trunk and refuses when the main checkout does not have it checked out, and automatic recovery before a job acts only on the caller's own project and task (t-20261120-152958). The MCP tool descriptions were updated to match in t-20261120-134432-2. This note does not change the review results above.

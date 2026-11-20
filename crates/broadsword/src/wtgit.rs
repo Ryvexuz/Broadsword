@@ -71,8 +71,9 @@ pub fn current_branch(dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// `git rev-parse HEAD`: the commit at the tip of the checked-out branch, resolved fresh. Why: the merge queue fast-forwards
-/// the checked-out branch. NOT the task base or the "merged" test: those use the trunk (`trunk_branch`).
+/// `git rev-parse HEAD`: the commit the given checkout has checked out, resolved fresh. Why: the merge queue reads it in a
+/// task's worktree, to notice that the worktree's HEAD moved during a check. NOT the task base, the "merged" test or the
+/// queue's main: those use the trunk (`trunk_branch`, `trunk_commit`).
 pub fn head_commit(dir: &Path) -> Result<String, String> {
     ok(dir, &["rev-parse", "HEAD"])
 }
