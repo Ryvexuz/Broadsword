@@ -244,6 +244,10 @@ def run_command(command, cwd, env, timeout, outfile, append=False):
     command can never block a read). Returns (exit code or 'timeout' or 'not started', error text)."""
     # Windows takes the command line as written (so `python scripts\x.py` survives); elsewhere split it like a shell
     argv = command if os.name == "nt" else shlex.split(command)
+    if os.name == "nt":  # CreateProcess does not find `build/bin/x.exe` (a relative path with `/`) from `cwd`: make it absolute
+        first, _, rest = command.partition(" ")
+        if "/" in first and not os.path.isabs(first):
+            argv = f'"{pathlib.Path(cwd) / first}"' + (" " + rest if rest else "")
     kw = {"start_new_session": True} if os.name != "nt" else {}
     with open(outfile, "ab" if append else "wb") as f:
         try:

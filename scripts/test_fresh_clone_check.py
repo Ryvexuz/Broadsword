@@ -196,6 +196,15 @@ class Run(Base):
         self.assertEqual(code, 0, out)
         self.assertIn("ran sub check", out)
 
+    def test_forward_slash_relative_program_in_the_documented_command_runs_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("CreateProcess path rule is Windows only")
+        n, t = doc("sub/run.bat arg1")
+        self.make_repo({n: t, "sub/run.bat": "@echo ran-bat %1\n"})
+        code, out = self.go()
+        self.assertEqual(code, 0, out)
+        self.assertIn("ran-bat arg1", out)
+
     def test_timeout_kills_a_grandchild_that_would_hang_the_script_and_keeps_the_output(self):
         pidfile = self.tmp / "grandchild.pid"
         n, t = doc("python -I check.py")
