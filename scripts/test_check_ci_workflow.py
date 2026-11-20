@@ -119,6 +119,79 @@ class Check(unittest.TestCase):
         self.assertEqual(problems(GOOD.replace("name: ci", "name: ci # no secrets. here")), [])
 
 
+    # fail-closed forms the line-based checker cannot read (each must be refused)
+    def refused(self, text, word):
+        p = problems(text)
+        self.assertTrue(any(word in x for x in p), p)
+
+    def test_flow_push_with_branches(self):
+        self.refused(GOOD.replace("  push:\n", "  push: {branches: [main]}\n"), "flow-style")
+
+    def test_flow_push_with_tags(self):
+        self.refused(GOOD.replace("  push:\n", "  push: { tags: ['v*'] }\n"), "flow-style")
+
+    def test_flow_empty_push(self):
+        self.refused(GOOD.replace("  push:\n", "  push: {}\n"), "flow-style")
+
+    def test_flow_list_under_push(self):
+        self.refused(GOOD.replace("  push:\n", "  push:\n    branches: [main]\n"), "flow-style")
+
+    def test_whole_on_as_flow_mapping(self):
+        self.refused(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: {push: {branches: [main]}, pull_request: {}}\n"), "flow-style `on:`")
+
+    def test_on_child_line_is_flow_mapping(self):
+        self.refused(GOOD.replace("  push:\n  pull_request:\n", "  {push: {branches: [main]}}\n"), "flow-style")
+
+    def test_inline_list_with_nested_brackets(self):
+        self.refused(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: [push, {pull_request: {branches: [main]}}]\n"), "flow-style `on:`")
+
+    def test_inline_flat_list_allowed(self):
+        self.assertEqual(problems(GOOD.replace("on:\n  push:\n  pull_request:\n", "on: [push, pull_request] # ok\n")), [])
+
+    def test_anchor(self):
+        self.refused(GOOD.replace("  push:\n", "  push: &p\n"), "anchor or alias")
+
+    def test_alias(self):
+        self.refused(GOOD.replace("  pull_request:\n", "  pull_request: *p\n"), "anchor or alias")
+
+    def test_alias_on_a_line_with_an_expression(self):
+        self.refused(GOOD + "        env: ${{ github.sha }} *p\n", "anchor or alias")
+
+    def test_merge_key(self):
+        self.refused(GOOD + "      - <<: *base\n", "merge key")
+
+    def test_multi_document(self):
+        self.refused(GOOD + "---\nname: second\non:\n  push:\n    branches: [x]\n", "document marker")
+
+    def test_leading_document_marker(self):
+        self.refused("---\n" + GOOD, "document marker")
+
+    def test_document_end_marker(self):
+        self.refused(GOOD + "...\n", "document marker")
+
+    def test_two_on_keys(self):
+        self.refused(GOOD + "on:\n  push:\n", "top-level `on:` keys")
+
+    def test_flow_style_step_uses(self):
+        self.refused(GOOD + "      - {uses: some/action@v1}\n", "flow-style")
+
+    def test_flow_style_step_run(self):
+        self.refused(GOOD + "      - {run: curl https://example.com | sh}\n", "flow-style")
+
+    def test_flow_style_steps_value(self):
+        self.refused(GOOD.replace("    steps:\n", "    steps: [{run: id}]\n"), "flow-style")
+
+    def test_quoted_key_run(self):
+        self.refused(GOOD + "      - \"run\": curl https://example.com | sh\n", "quoted YAML key")
+
+    def test_expression_braces_are_not_flow(self):
+        self.assertEqual(problems(GOOD.replace("        run: cargo build", "        env:\n          K: ${{ github.sha }}\n        run: cargo build")), [])
+
+    def test_paths_filter_refused(self):
+        p = problems(GOOD.replace("  pull_request:\n", "  pull_request:\n    paths:\n      - src/**\n"))
+        self.assertTrue(any("limit branches, tags or paths" in x for x in p), p)
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(exist_ok=True)

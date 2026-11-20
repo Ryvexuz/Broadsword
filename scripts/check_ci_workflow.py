@@ -70,10 +70,46 @@ def read_triggers(lines):
     return [], []
 
 
+FLOW_START = re.compile(r"(^\s*(-\s+)?[{\[])|(:\s+[{\[])")  # a flow mapping or sequence as a line, list item or value
+ANCHOR_ALIAS = re.compile(r"(^|[\s,\[{])[&*][^\s,\]}]+")
+QUOTED_KEY = re.compile(r"^\s*(-\s+)?[\"'][^\"']*[\"']\s*:")
+ON_INLINE_LIST = re.compile(r"^on:\s*\[\s*[\w-]+(\s*,\s*[\w-]+)*\s*,?\s*\]$")
+
+
+def shape_problems(lines):
+    """Fail closed: the checker reads block-style YAML only, so any form it cannot read line by line is refused, not guessed at.
+    Refused: document markers (multi-document files), anchors and aliases, flow-style `{...}` or `[...]` (the one exception is a flat
+    `on: [push, pull_request]` list of plain names), quoted keys, and more than one top-level `on:`."""
+    problems = []
+    on_keys = 0
+    for n, raw in enumerate(lines, 1):
+        line = re.sub(r"\$\{\{.*?\}\}", "", strip_comment(raw))  # a ${{ expression }} is not YAML structure
+        if not line.strip():
+            continue
+        if re.match(r"^(---|\.\.\.)(\s|$)", line):
+            problems.append(f"line {n}: YAML document marker (multi-document files are refused): {line.strip()}")
+        if ANCHOR_ALIAS.search(line):
+            problems.append(f"line {n}: YAML anchor or alias (refused; the checker cannot follow them): {line.strip()}")
+        if re.match(r"^\s*(-\s+)?<<\s*:", line):
+            problems.append(f"line {n}: YAML merge key (refused): {line.strip()}")
+        if QUOTED_KEY.match(line):
+            problems.append(f"line {n}: quoted YAML key (refused; the checker reads plain keys only): {line.strip()}")
+        if re.match(r"^(on|\"on\"|'on'|true)\s*:", line):
+            on_keys += 1
+        if re.match(r"^on:\s*[{\[]", line):
+            if not ON_INLINE_LIST.match(line):
+                problems.append(f"line {n}: flow-style `on:` other than a flat `on: [push, pull_request]` list (refused): {line.strip()}")
+        elif FLOW_START.search(line):
+            problems.append(f"line {n}: flow-style YAML `{{...}}` or `[...]` (refused; write block style): {line.strip()}")
+    if on_keys > 1:
+        problems.append(f"{on_keys} top-level `on:` keys (refused)")
+    return problems
+
+
 def check(workflow_text, contract):
     """The list of problems (empty = OK)."""
-    problems = []
     lines = workflow_text.splitlines()
+    problems = shape_problems(lines)
 
     triggers, limited = read_triggers(lines)
     want = [t.strip() for t in contract["triggers"].split(",") if t.strip()]
