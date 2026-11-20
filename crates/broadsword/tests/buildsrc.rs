@@ -430,7 +430,7 @@ fn a_folder_marker_survives_plain_builds_of_other_folders() {
     let dir = r.dir.join("state/build-sources/unlisted-run.d");
     let names = |d: &Path| -> Vec<String> { fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default() };
     let wt_marker = format!("worktrees%2Fproj%2F{t1}");
-    assert_eq!(names(&dir), [wt_marker.clone()]);
+    assert_eq!(names(&dir), std::slice::from_ref(&wt_marker));
     assert_eq!(fs::read_to_string(dir.join(&wt_marker)).unwrap().trim(), format!("worktrees/proj/{t1}"));
     let refused = |r: &Root| {
         let o = r.run(&["install"]);
@@ -441,7 +441,7 @@ fn a_folder_marker_survives_plain_builds_of_other_folders() {
     // plain builds of the main checkout and of the other project, in between: the marker stays, install stays refused
     r.ok(&["build", "proj"]);
     r.ok(&["build", "other"]);
-    assert_eq!(names(&dir), [wt_marker.clone()], "another folder's build must not remove it");
+    assert_eq!(names(&dir), std::slice::from_ref(&wt_marker), "another folder's build must not remove it");
     refused(&r);
     // the worktree's own plain build cleans every package there, then removes only its marker
     let o = r.ok(&["build", "proj", "--task", &t1]);

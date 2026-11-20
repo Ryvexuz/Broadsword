@@ -459,9 +459,12 @@ pub fn parse_artifacts(stdout: &str) -> Result<Artifacts, String> {
     Ok(a)
 }
 
+/// One package's run-time variables as (name, value) pairs, keyed by the package's Cargo.toml.
+type PackageEnvs = Vec<(PathBuf, Vec<(String, String)>)>;
+
 /// The run-time variables `cargo test` gives a test of each package (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`),
 /// keyed by the package's Cargo.toml, from `cargo metadata --no-deps` in `dir`.
-fn package_envs(cfg: &Config, dir: &Path) -> Result<Vec<(PathBuf, Vec<(String, String)>)>, String> {
+fn package_envs(cfg: &Config, dir: &Path) -> Result<PackageEnvs, String> {
     use crate::json::J;
     let j = crate::json::parse(&buildsrc::metadata_json(cfg, dir)?).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
     let Some(J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output has no `packages` list".into()) };
