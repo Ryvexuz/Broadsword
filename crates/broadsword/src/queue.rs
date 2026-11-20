@@ -43,10 +43,15 @@
 //!   review    if the verdict was already recorded it is NOT asked again (no second bill); otherwise the branch tip must still be the
 //!             commit the check passed on (`checked_tip`), else the entry is `stale` ("branch changed after check") and nothing is
 //!             reviewed; then the reviewer is called again (every real call counts toward reviewer_max_calls_per_entry);
-//!   merge     if main's HEAD already is the reviewed commit, the fast-forward is recorded as done; otherwise it is attempted;
+//!   merge     if main's HEAD already contains the reviewed commit (is it, or a merge train's later commit on top of it), the
+//!             fast-forward is recorded as done; otherwise it is attempted;
 //!   main_check, done   run again (`task done` on a task that is already done is skipped).
+//! A HALF-FINISHED TRAIN MERGE (an `approved` entry at step merge, main_check or done, or with `main_sha`: see `half_merged`) is
+//! resumed the same way and just as first: `queue run` and `queue run --all` take it before anything else, at its recorded step, so
+//! its main check runs on the merged main; it never joins a new train. `--all` starts no train while one is being finished.
 //! To give up instead: `queue cancel <id>` on an interrupted entry aborts a leftover rebase, touches nothing else, and is refused
-//! once the merge step began (main may already hold the commit: resume instead).
+//! once the merge step began, for a half-finished train merge, and for any entry whose reviewed commit is on main (`cancel_refusal`:
+//! main already holds it, resume instead).
 //!
 //! RUN --ALL. `queue run --all` drains the queue under ONE hold of queue.lock: interrupted entries first, then queued and stale ones
 //! oldest first, each at most once; an internal error (exit 1) or merged_check_failed (exit 6) stops it; a summary table follows and
@@ -59,7 +64,8 @@
 //! overlap form a train of up to merge_train_max entries (a lone one at the end of the drain too): their branches are chained one on
 //! top of the other (rebase), ONE check runs on the chain tip, main is fast-forwarded ONCE and checked ONCE, and every entry is `merged`
 //! with its train id, position and the shared check job. A failing check is bisected (see `run_train`): an entry that fails alone is
-//! `check_failed`, the entries proven good merge; entries that only fail together are all `conflict` and none merges. The review stays
+//! `check_failed`, the entries proven good merge; entries that only fail together are all held out and none merges (the first of them
+//! `conflict`, the ones chained on it `blocked` by the left-train rule; see `run_train` 5). The review stays
 //! bound to its commits: an entry whose rebased commits are not the same patches (`git patch-id --stable`) as the reviewed ones goes
 //! back to `queued` and is reviewed again (`train_link`). Nothing unchecked ever reaches main: an entry whose check was deferred
 //! (`check_deferred = yes`) is checked on its own first if it is ever merged outside a train (`merge_phase`). The two places nb-18
@@ -497,6 +503,7 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
         ("commit that was reviewed (before the train chained it)", "reviewed_orig_tip"),
         ("own commit before the train chained it", "alone_tip"),
         ("left a train chained on", "left_train_base"),
+        ("worktree detached for its own check at", "alone_detached"),
         ("main check", "main_check"),
         ("last error", "error"),
     ] {
@@ -767,6 +774,13 @@ fn next_for_all(all: &[Record], taken: &[String], train: bool) -> Option<Record>
         .cloned()
 }
 
+/// The exit code of `queue run --all`: the worst (see `badness`) of every row's code and of `stop`, the code that stopped the drain (0
+/// when it ran to its end). A stop is counted even when no row carries it, so "the check could not give a verdict" (exit 1) is never
+/// reported as the exit 3 of the rows it left `approved`.
+fn worst_exit(rows: impl Iterator<Item = u8>, stop: u8) -> u8 {
+    rows.chain(std::iter::once(stop)).max_by_key(|c| badness(*c)).unwrap_or(0)
+}
+
 /// One line of the `--all` summary table.
 struct Row {
     id: String,
@@ -797,6 +811,9 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
     let mut taken: Vec<String> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut stopped = String::new();
+    // the exit code that stopped the drain (1 or 6), which may be on no row (a train check without a verdict leaves its entries
+    // `approved` with exit 3 rows): it counts for the drain's exit code (`worst_exit`)
+    let mut stop_code = 0u8;
     let mut approved: Vec<(Run, std::time::Instant)> = Vec::new();
     if train {
         // entries an earlier drain approved and then died before merging them: they join the trains first (they are the oldest)
@@ -826,6 +843,7 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
                     let code = run_trains(cfg, &mut approved, true, &mut rows);
                     if code == EXIT_ERROR || code == EXIT_MERGED_BAD {
                         stopped = train_stop_note(code);
+                        stop_code = code;
                     }
                     settle_approved(cfg, &mut approved, &mut rows);
                 }
@@ -870,17 +888,20 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
             rows.push(row_for(cfg, &id, code, t));
         }
         let mut train_code = 0u8;
-        if train && !approved.is_empty() && code != EXIT_ERROR && code != EXIT_MERGED_BAD {
+        // no new train while a half-finished merge is being finished (`resume_first` entries come first): a train only starts once
+        // main's last merge has had its main check
+        if train && start < STEP_MERGE && !approved.is_empty() && code != EXIT_ERROR && code != EXIT_MERGED_BAD {
             train_code = run_trains(cfg, &mut approved, false, &mut rows);
         }
         let hard = if code == EXIT_ERROR || code == EXIT_MERGED_BAD { code } else { train_code };
         if hard == EXIT_ERROR || hard == EXIT_MERGED_BAD {
+            stop_code = hard;
             stopped = if hard == train_code && train_code != 0 { train_stop_note(hard) } else { format!("stopped after entry {id} (exit {code}): {}", if code == EXIT_ERROR { "it stays `running` at its step; fix the cause, then `queue run` resumes it" } else { "main holds a commit whose check failed; a human decides before anything else merges" }) };
             settle_approved(cfg, &mut approved, &mut rows);
             break;
         }
     }
-    let worst = rows.iter().map(|r| r.code).max_by_key(|c| badness(*c)).unwrap_or(0);
+    let worst = worst_exit(rows.iter().map(|r| r.code), stop_code);
     if rows.is_empty() {
         println!("the queue is empty: nothing is queued, interrupted or stale");
     } else {
@@ -1332,12 +1353,22 @@ impl<'a> Run<'a> {
             return TrainCheck::Blocked("no alone commit is recorded for this entry".into());
         }
         let (wt, branch) = (self.wt.clone(), self.branch());
+        // recorded BEFORE the worktree is detached: a run killed while it is detached leaves this key, and the next run's `locate`
+        // puts the worktree back on its branch (`restore_alone_checkout`)
+        self.e.set("alone_detached", alone.clone());
+        if self.save().is_err() {
+            return TrainCheck::Blocked("could not record that the worktree is about to be detached; it was not moved".into());
+        }
         if let Err(m) = wtgit::checkout_detach(&wt, &alone) {
             return TrainCheck::Blocked(format!("cannot put the worktree on the entry's own commit {}: {m}", short(&alone)));
         }
         let res = self.check_commit(&alone, "alone: the entry's own commit without the entries before it");
         if let Err(m) = wtgit::checkout_branch(&wt, &branch) {
             return TrainCheck::Blocked(format!("the worktree could NOT be put back on `{branch}` ({m}); do it by hand: git -C {} checkout {branch}", wt.display()));
+        }
+        self.e.set("alone_detached", "");
+        if self.save().is_err() {
+            return TrainCheck::Blocked("the worktree is back on its branch, but the record could not be written".into());
         }
         res
     }
@@ -1349,10 +1380,39 @@ impl<'a> Run<'a> {
         match worktree::job_dir(self.cfg, self.e.get("task"), self.e.get("project")) {
             Ok(p) => {
                 self.wt = p;
-                Ok(())
+                self.restore_alone_checkout()
             }
             Err(JobDirError::Unknown(m) | JobDirError::Refused(m)) => Err(self.blocked(&m)),
         }
+    }
+
+    /// A run killed inside `check_alone` left the task's worktree detached on the entry's own commit (`alone_detached` records it).
+    /// Every run that uses the worktree passes `locate`, which calls this: the worktree goes back on its branch, and only when it is
+    /// exactly where the queue put it (detached at that commit); a worktree the coder moved since is never touched (the entry ends
+    /// `blocked`, with the command to run by hand). Nothing recorded: nothing done.
+    fn restore_alone_checkout(&mut self) -> R<()> {
+        let at = self.e.get("alone_detached").to_string();
+        if at.is_empty() {
+            return Ok(());
+        }
+        let (wt, branch) = (self.wt.clone(), self.branch());
+        match self.g(wtgit::current_branch(&wt))? {
+            Some(b) if b == branch => {}
+            Some(other) => return Err(self.blocked(&format!("a killed merge-train check left a note that the worktree was detached at {}, but it is on branch `{other}` now, not `{branch}`; it was not touched. Put it back with `git -C {} checkout {branch}`", short(&at), wt.display()))),
+            None => {
+                let head = self.g(wtgit::head_commit(&wt))?;
+                if head != at {
+                    return Err(self.blocked(&format!("the worktree is detached at {}, not at {} where a killed merge-train check put it; it was not touched. Put it back with `git -C {} checkout {branch}`", short(&head), short(&at), wt.display())));
+                }
+                if let Err(m) = wtgit::checkout_branch(&wt, &branch) {
+                    return Err(self.blocked(&format!("a killed merge-train check left the worktree detached at {}, and it could not be put back on `{branch}`: {m}. Do it by hand: git -C {} checkout {branch}", short(&at), wt.display())));
+                }
+                self.e.set("alone_detached", "");
+                return self.log("train", &format!("a killed merge-train check had left the worktree detached on the entry's own commit {}: put it back on `{branch}`", short(&at)));
+            }
+        }
+        self.e.set("alone_detached", "");
+        self.save()
     }
 
     fn s_preconditions(&mut self, start: usize) -> R<()> {
@@ -2056,7 +2116,13 @@ fn chain_tip(chain: &[(Run<'_>, std::time::Instant)], i: usize) -> String {
 ///    (`check_alone`): if it fails alone it is `check_failed` with that check's log, the proven-good entries before it merge as a
 ///    smaller train, and the entries after it start a new round on the new main. If it passes alone the failure only shows when it is
 ///    combined with the entries before it: the culprit AND every entry before it in the chain (the partner is not searched for) are
-///    `conflict` with the combined failure's log, and NOTHING is merged for them. Every round removes at least one entry, so it ends.
+///    held out with the combined failure's log, and NOTHING is merged for them. COMBINED-ONLY PAIR, DECIDED (round 3, kept as the brief
+///    says: "neither merges"; the proven prefix is NOT merged): each held entry asks for `conflict`, and the left-train rule
+///    (`leave_train`) decides what it ends as. The first entry of the chain sits on main's HEAD and ends a plain `conflict`; every later
+///    one still carries the earlier held entries' commits, which are not on main, so it ends `blocked` ("left a train: ... it would
+///    have been `conflict`", with the rebase command). So for a pair e1, e2: e1 `conflict`, e2 `blocked`, main unchanged. Merging the
+///    proven prefix instead would turn e2 into a plain `conflict` but put e1 on main while its partner is unknown; that is a later
+///    choice for the measurement window, not this phase. Every round removes at least one entry, so it ends.
 /// 6. A main check that fails after the fast-forward: every entry of the merge is `merged_check_failed` (exit 6), main is NOT reset, the
 ///    drain stops. A check that cannot run to a verdict leaves all its entries `approved` and stops the drain.
 ///
@@ -2241,6 +2307,7 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                 todo = after;
             }
             Alone::Fine => {
+                // COMBINED-ONLY (see 5 above): all held out; the first ends `conflict`, the ones chained on it `blocked` (left-train rule)
                 println!("merge train {train_id}: entry {culprit_id} passes on its own, but fails combined with the entries before it: conflict for it and for those {lo} entr{}; nothing of them is merged", if lo == 1 { "y" } else { "ies" });
                 let mut held = chain;
                 held.push((culprit, ct));
@@ -2466,5 +2533,15 @@ mod tests {
         let mut codes = vec![0u8, 4, 2, 3, 5, 1, 6];
         codes.sort_by_key(|c| std::cmp::Reverse(badness(*c)));
         assert_eq!(codes, vec![6, 1, 5, 3, 2, 4, 0]);
+    }
+
+    #[test]
+    fn run_all_exit_counts_the_stop_code_even_when_no_row_carries_it() {
+        // a train check without a verdict: its entries stay approved (rows exit 3), the drain stopped with 1
+        assert_eq!(worst_exit([3u8, 3, 0].into_iter(), EXIT_ERROR), EXIT_ERROR);
+        assert_eq!(worst_exit([5u8, 3].into_iter(), EXIT_ERROR), EXIT_ERROR, "1 is worse than rejected / check_failed");
+        assert_eq!(worst_exit([6u8, 3].into_iter(), EXIT_ERROR), EXIT_MERGED_BAD, "merged_check_failed stays the worst");
+        assert_eq!(worst_exit([3u8, 0].into_iter(), 0), 3, "no stop: the worst row");
+        assert_eq!(worst_exit(std::iter::empty(), 0), 0);
     }
 }
