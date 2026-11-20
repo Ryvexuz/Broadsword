@@ -76,8 +76,8 @@ class Rules(unittest.TestCase):
         self.assertIn("10 requirement bullets", res["bullets"][1])  # 9 + the Board title bullet
 
     def test_bullets_rule_allows_exactly_the_limit_and_skips_nested(self):
-        eight = "".join(f"- requirement {i}\n  - nested {i}\n" for i in range(8))
-        res = lint(GOOD.replace("- does one thing\n- does another thing\n", eight))
+        seven = "".join(f"- requirement {i}\n  - nested {i}\n" for i in range(7))  # + the Board title bullet = 8
+        res = lint(GOOD.replace("- does one thing\n- does another thing\n", seven))
         self.assertTrue(res["bullets"][0], res["bullets"][1])
 
     def test_files_rule_fails_with_three_files_and_no_reason(self):
