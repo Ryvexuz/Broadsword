@@ -112,3 +112,64 @@ For the RETRO ledger:
 - One run (A2) is a clear outlier by a factor of about 1.8 and is kept in the median as the task asked; the median is unaffected (398.7 s is A1).
 - Failure output of nextest was not measured (no failing test was planted); the Summary format for failures is therefore not quoted.
 - A1 was run as a standalone first probe (not through the script); its load reading (7) was taken just before that command.
+
+## Rerun on a quiet board (2026-11-20 evening)
+
+Task t-20261120-174239-2. Measurement only: no code, setting, `broadsword.toml` or tool install changed. Raw outputs: `scratch/nextest2-<project>-<runner>-<n>.txt` (one file per run). Each run first read CPU with `build/bin/broadsword.exe status` and started only at CPU below 30 percent; a run whose CPU stayed at 30 percent or over for 20 minutes was recorded as skipped. Commands (same as the trial, run through `broadsword run`):
+- cargo: `broadsword run <project> [--task t-20261120-174239-2] -- cargo test --offline` (`--task` used for broadsword only: crash-sim and foundation have no worktree for this task)
+- nextest: `broadsword run <project> [--task t-20261120-174239-2] -- cargo nextest run --offline --no-fail-fast`
+
+Order per project: cargo, nextest, cargo, nextest, cargo, nextest (broadsword, crash-sim, foundation). Start CPU = the CPU reading that let the run start (the last `check` line of its wait log). Each raw file also carries a second status reading taken just before the command; it is in the file, not in the table. Wall = the job summary `run: ok (N s)` line, except the three broadsword nextest runs, which failed and print no seconds: for those the wall is the script's own clock around the command (`EXIT CODE ... WALL-CLOCK`), which runs a few seconds above the job summary on the broadsword cargo runs (e.g. 487.3 s vs 490.8 s).
+
+### Raw per-run table
+
+| run | raw file | start CPU % | wall s | passed / failed / skipped | note |
+|---|---|---|---|---|---|
+| broadsword cargo 1 | nextest2-broadsword-cargo-1.txt | 24 | 550.7 | 651 / 0 / 0 | |
+| broadsword nextest 1 | nextest2-broadsword-nextest-1.txt | 27 | 471.6 | 650 / 1 / 0 | FAIL `a_reviewer_model_equal_to_the_coder_blocks_the_entry_before_anything_runs`; exit 100 |
+| broadsword cargo 2 | nextest2-broadsword-cargo-2.txt | 11 | 487.3 | 651 / 0 / 0 | |
+| broadsword nextest 2 | nextest2-broadsword-nextest-2.txt | 6 | 508.5 | 650 / 1 / 0 | FAIL `abandon_does_not_wait_for_an_unrelated_recover_but_never_races_one_on_the_same_record`; exit 100 |
+| broadsword cargo 3 | nextest2-broadsword-cargo-3.txt | 27 | 550.4 | 651 / 0 / 0 | |
+| broadsword nextest 3 | nextest2-broadsword-nextest-3.txt | 19 | 475.7 | 650 / 1 / 0 | FAIL `abandon_does_not_wait_for_an_unrelated_recover_but_never_races_one_on_the_same_record`; exit 100 |
+| crash-sim cargo 1 | nextest2-crash-sim-cargo-1.txt | 22 | 66.8 | 439 / 0 / 0 | |
+| crash-sim nextest 1 | nextest2-crash-sim-nextest-1.txt | 4 | 46.3 | 439 / 0 / 0 | |
+| crash-sim cargo 2 | nextest2-crash-sim-cargo-2.txt | 20 | 69.5 | 439 / 0 / 0 | |
+| crash-sim nextest 2 | nextest2-crash-sim-nextest-2.txt | 12 | 56.4 | 439 / 0 / 0 | |
+| crash-sim cargo 3 | nextest2-crash-sim-cargo-3.txt | 17 | 91.4 | 439 / 0 / 0 | job summary 91.4 s, script wall 215.4 s (gap not explained) |
+| crash-sim nextest 3 | nextest2-crash-sim-nextest-3.txt | - | - | - | SKIPPED: CPU 99% for 20 minutes |
+| foundation cargo 1 | nextest2-foundation-cargo-1.txt | - | - | - | SKIPPED: CPU 99% for 20 minutes |
+| foundation nextest 1 | nextest2-foundation-nextest-1.txt | 29 | 9.4 | 629 / 0 / 0 | |
+| foundation cargo 2 | nextest2-foundation-cargo-2.txt | 10 | 7.8 | 629 / 0 / 0 | |
+| foundation nextest 2 | nextest2-foundation-nextest-2.txt | 13 | 5.6 | 629 / 0 / 0 | |
+| foundation cargo 3 | nextest2-foundation-cargo-3.txt | 12 | 8.2 | 629 / 0 / 0 | |
+| foundation nextest 3 | nextest2-foundation-nextest-3.txt | 18 | 5.4 | 629 / 0 / 0 | |
+
+16 runs done, 2 skipped (of 18). The broadsword totals reconcile: cargo 651 passed, nextest 650 passed + 1 failed = 651 tests.
+
+### Medians and ratio
+
+| project | cargo test median s | nextest median s | ratio (cargo / nextest) | runs used |
+|---|---|---|---|---|
+| broadsword | 550.4 (550.7, 487.3, 550.4) | 475.7 (471.6, 508.5, 475.7) | 1.16 | 3 and 3 |
+| crash-sim | 69.5 (66.8, 69.5, 91.4) | 51.4 (46.3, 56.4) | 1.35 | 3 and 2 (nextest 3 skipped) |
+| foundation | 8.0 (7.8, 8.2) | 5.6 (9.4, 5.6, 5.4) | 1.43 | 2 and 3 (cargo 1 skipped) |
+
+The crash-sim nextest median is the mean of two values. Broadsword nextest is 13.6 percent less wall time than cargo in the median, but the nextest broadsword runs are the failing ones in the next section.
+
+### Flakes and failures
+
+- Under nextest, `a_reviewer_model_equal_to_the_coder_blocks_the_entry_before_anything_runs` failed in `nextest2-broadsword-nextest-1.txt` and passed in `nextest2-broadsword-nextest-2.txt` (`PASS [ 40.742s] (181/651)`). By the flake rule (fails in one run, passes in another) it is FLAKY.
+- Under nextest, `abandon_does_not_wait_for_an_unrelated_recover_but_never_races_one_on_the_same_record` failed in `nextest2-broadsword-nextest-2.txt` and `nextest2-broadsword-nextest-3.txt`, and passed in `nextest2-broadsword-nextest-1.txt` (`PASS [ 10.490s] (232/651)`). FLAKY. The failure text in run 2: `job 20260101-000002-p-check: still running (broadsword pid 29476), left alone`, assertion `left == right` (right: `Some(1)`), at `crates\broadsword\tests\recovery.rs:797`.
+- Under `cargo test`, no test failed in any of the three broadsword runs (651 passed each), and none in the crash-sim or foundation runs. So the harm signal fires: in 3 of 3 broadsword nextest runs a test that passed under cargo test failed under nextest (the tests above), against 0 of 3 cargo runs.
+- No `FLAKY` or `TRY n` line was printed by nextest (no retries were used in this rerun).
+
+### Verdict
+
+KEEP `cargo test`. Do not switch the setting. The speed gain is real and measured (broadsword 1.16x, crash-sim 1.35x, foundation 1.43x), but the watch-for-harm signal set in the trial (a test that passes under cargo test and fails under nextest) fired on every broadsword nextest run, with two different tests. 2 of 18 runs were skipped, which is not enough to make the verdict inconclusive; the verdict rests on the failures, not on the skips.
+
+### Limits
+
+- CPU was read at the start of each run only. A run that started under 30 percent could still have shared the machine with other builds during its run.
+- The three broadsword nextest runs and the crash-sim cargo 3 run have a gap between their two wall measures: crash-sim cargo 3 reports 91.4 s in the job summary but 215.4 s on the script clock. The cause was not checked.
+- The broadsword test count is now 651 and crash-sim is 439, both higher than the trial's 629 and 378 because tests were added since. The rerun compares cargo and nextest on the same tree, not with the trial's numbers.
+- Two skipped runs (crash-sim nextest 3, foundation cargo 1) leave the crash-sim and foundation medians on 2 and 3 runs.
