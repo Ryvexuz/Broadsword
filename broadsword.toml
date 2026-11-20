@@ -6,7 +6,8 @@ root = "."                 # everything is relative to this folder
 disk_floor_gb = 20         # pause and clean up below this much free space
 cleanup_every_hours = 1
 scratch_max_age_hours = 24
-max_agents = 14             # the most tasks running on the board at once (task start refuses at the cap); scale-up (Lazlo 2026-11-19): +4 per step while merges/h rise with no more failures and RAM < 90%, no swap growth; lock wait and test time are warnings only (RETRO lesson 35)
+max_agents = 14             # the most tasks with a working coder at once (task start refuses at the cap); a running task with an open merge-queue entry (queued, running, blocked, stale) is not counted; scale-up (Lazlo 2026-11-19): +4 per step while merges/h rise with no more failures and RAM < 90%, no swap growth; lock wait and test time are warnings only (RETRO lesson 35)
+max_queued = 30             # task start refuses while this many merge-queue entries (any project) are open, so unmerged work cannot pile up
 
 # Paths, relative to root
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time

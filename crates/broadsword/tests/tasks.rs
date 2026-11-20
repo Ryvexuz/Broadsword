@@ -621,6 +621,96 @@ fn eight_gated_starts_never_exceed_a_cap_of_three() {
     }
 }
 
+// ---- the merge queue and the cap (max_agents counts working coders; max_queued) ------------
+
+fn set_key(r: &Root, key: &str, value: u64) {
+    let p = r.dir.join("broadsword.toml");
+    let t: String = fs::read_to_string(&p).unwrap().lines().map(|l| if l.split_once(" = ").is_some_and(|(k, _)| k == key) { format!("{key} = {value}\n") } else { format!("{l}\n") }).collect();
+    assert_eq!(t.matches(&format!("{key} = {value}\n")).count(), 1);
+    fs::write(p, t).unwrap();
+}
+
+/// Write a queue entry record the way queue.rs stores it (`<state>/queue/<id>.entry`, `key = value` lines).
+fn put_entry(r: &Root, id: &str, task: &str, status: &str) {
+    let dir = r.dir.join("state/queue");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{id}.entry")), format!("id = {id}\ntask = {task}\nproject = p\nstatus = {status}\ncreated = 1\n")).unwrap();
+}
+
+#[test]
+fn tasks_waiting_in_the_merge_queue_do_not_count_against_max_agents() {
+    let r = Root::new("qcap");
+    set_cap(&r, 2);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    let c = r.add("p", "c", &["src/c.rs"]);
+    let d = r.add("q", "d", &["src/d.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    assert_eq!(r.start(&b, "coder-2").code, 0);
+    put_entry(&r, "q-1", &a, "queued");
+    put_entry(&r, "q-2", &b, "running");
+    let o = r.start(&c, "coder-3");
+    assert_eq!(o.code, 0, "two running tasks that wait in the queue leave both slots free: {}", o.stderr);
+    // a's entry is rejected: a is back in a fix round, so it counts again (a and c count, b still waits): cap 2 is reached.
+    put_entry(&r, "q-1", &a, "rejected");
+    let o = r.start(&d, "coder-4");
+    assert_eq!(o.code, 3, "a task whose entry ended counts again: {}", o.stderr);
+    assert!(o.stderr.contains("max_agents") && o.stderr.contains(&format!("{a} (")) && o.stderr.contains(&format!("{c} (")), "{}", o.stderr);
+    assert!(!o.stderr.contains(&format!("{b} (")), "b waits in the queue, it is not listed as counted: {}", o.stderr);
+    assert_eq!(r.status_of(&d), "open");
+    // Blocked and stale entries are still open in queue.rs (`queue run --entry` resumes them): they do not count either.
+    put_entry(&r, "q-1", &a, "stale");
+    assert_eq!(r.start(&d, "coder-4").code, 0, "a stale entry is still in the queue");
+}
+
+#[test]
+fn start_refuses_at_max_queued_open_entries() {
+    let r = Root::new("qmax");
+    set_key(&r, "max_queued", 1);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    put_entry(&r, "q-1", &a, "blocked");
+    put_entry(&r, "q-0", "t-old", "merged"); // ended entries never count
+    let o = r.start(&b, "coder-2");
+    assert_eq!(o.code, 3, "one open entry at max_queued = 1 refuses the next start: {}", o.stderr);
+    assert!(o.stderr.contains("max_queued") && o.stderr.contains("q-1") && o.stderr.contains(&a), "{}", o.stderr);
+    assert!(!o.stderr.contains("q-0"), "{}", o.stderr);
+    assert_eq!(r.status_of(&b), "open");
+    put_entry(&r, "q-1", &a, "cancelled");
+    assert_eq!(r.start(&b, "coder-2").code, 0, "below max_queued again");
+}
+
+#[test]
+fn a_malformed_queue_entry_makes_start_fail_naming_the_file() {
+    let r = Root::new("qbad");
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let dir = r.dir.join("state/queue");
+    fs::create_dir_all(&dir).unwrap();
+    for (name, text) in [("q-bad.entry", "this is not a record\n"), ("q-bad.entry", ""), ("q-bad.entry", "id = q-bad\ntask = t-x\nstatus = approved\n"), ("q-bad.entry", "id = q-bad\nstatus = queued\n")] {
+        fs::write(dir.join(name), text).unwrap();
+        let o = r.start(&a, "coder-1");
+        assert_eq!(o.code, 1, "{text:?}: {}", o.stderr);
+        assert!(o.stderr.contains("q-bad.entry"), "{text:?}: the message names the file: {}", o.stderr);
+        assert_eq!(r.status_of(&a), "open", "nothing was started");
+    }
+    fs::write(dir.join("q-bad.entry"), "id = q-bad\ntask = t-x\nstatus = merged\n").unwrap();
+    assert_eq!(r.start(&a, "coder-1").code, 0, "a well-formed entry is fine");
+}
+
+#[test]
+fn missing_max_queued_is_a_config_error() {
+    let r = Root::new("qcfg");
+    let a = r.add("p", "a", &["src/a.rs"]);
+    fs::write(r.dir.join("broadsword.toml"), support::config_without("max_queued")).unwrap();
+    let o = r.start(&a, "coder-1");
+    assert_ne!(o.code, 0, "{}", o.stdout);
+    assert!(o.stderr.contains("max_queued") && o.stderr.contains("missing"), "{}", o.stderr);
+    fs::write(r.dir.join("broadsword.toml"), support::config(&[("max_queued", "0")])).unwrap();
+    let o = r.start(&a, "coder-1");
+    assert!(o.code != 0 && o.stderr.contains("max_queued"), "max_queued = 0 is refused: {}", o.stderr);
+}
+
 // ---- the RAM line (ram_warn_percent) ------------------------------------------------------
 // Every test root sets ram_warn_percent = 100, so the real RAM level (which may be above 90% on this machine) never
 // refuses an unrelated start. The hook can only RAISE the reading, so the refusal cases use hook values at or above the

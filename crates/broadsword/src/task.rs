@@ -13,11 +13,16 @@
 //! milliseconds, never while a task "runs": tasks are long-lived agent work, not processes.
 //!
 //! Claims are paths relative to the project root, never patterns. See `normalize_claim` and `overlaps`.
+//!
+//! Caps checked by `start`: `max_agents` counts running tasks with a working coder, i.e. running tasks WITHOUT an open
+//! merge-queue entry (see `OPEN_QUEUE_STATUSES`); `max_queued` counts open merge-queue entries. The queue folder is read
+//! without the queue locks, and an unusable entry file fails the start.
 
 use crate::config::Config;
 use crate::job;
 use crate::lock;
 use crate::pause;
+use crate::queue;
 use crate::record::{self, Record};
 use crate::worktree;
 use std::path::PathBuf;
@@ -240,6 +245,81 @@ pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     }
 }
 
+// ---- the merge queue, as `start` sees it ---------------------------------------------------
+
+/// Queue entry statuses (queue.rs) in which the entry is OPEN: `queue run` can still act on it and `queue add` refuses a second
+/// entry for its task. This mirrors queue.rs's private `is_open` (queue.rs has no exported list); the unit test
+/// `queue_status_lists_match_queue_rs` reads queue.rs and fails if its `is_open` or its status constants change.
+/// A `running` entry whose runner died ("interrupted" in `queue list`) is still `running` here.
+pub const OPEN_QUEUE_STATUSES: [&str; 4] = [queue::QUEUED, queue::RUNNING, queue::BLOCKED, queue::STALE];
+/// The queue statuses in which an entry has ended: its task, if still running, is back with its coder (a fix round).
+pub const ENDED_QUEUE_STATUSES: [&str; 6] = [queue::MERGED, queue::CONFLICT, queue::CHECK_FAILED, queue::REJECTED, queue::MERGED_CHECK_FAILED, queue::CANCELLED];
+
+/// One open merge-queue entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenEntry {
+    pub id: String,
+    pub task: String,
+    pub status: String,
+}
+
+/// Why an entry record cannot be used, or `None` if it is well-formed.
+fn entry_problem(r: &Record) -> Option<String> {
+    if r.id().is_empty() {
+        return Some("it has no `id` (empty, half-written or not a queue entry)".into());
+    }
+    if r.get("task").is_empty() {
+        return Some("it has no `task`".into());
+    }
+    let s = r.status();
+    if !OPEN_QUEUE_STATUSES.contains(&s) && !ENDED_QUEUE_STATUSES.contains(&s) {
+        return Some(format!("its status `{s}` is not a queue status"));
+    }
+    None
+}
+
+/// The open entries of `<state_dir>/queue/*.entry`, read WITHOUT the queue locks (records are saved atomically by rename).
+/// A file that cannot be read or is not a well-formed entry is retried briefly (the empty file `queue add` creates exists for
+/// milliseconds), then is an error naming the file: never skipped, never counted as closed. No queue folder is an empty queue.
+pub fn open_queue_entries(cfg: &Config) -> Result<Vec<OpenEntry>, String> {
+    let dir = queue::queue_dir(cfg);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot list {}: {e}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for e in rd {
+        let p = e.map_err(|e| format!("cannot list {}: {e}", dir.display()))?.path();
+        if p.extension().is_none_or(|x| x != "entry") {
+            continue;
+        }
+        let mut last = String::new();
+        let mut good = None;
+        for n in 0..5 {
+            if n > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            match record::load(&p) {
+                Ok(r) => match entry_problem(&r) {
+                    None => {
+                        good = Some(r);
+                        break;
+                    }
+                    Some(why) => last = format!("queue entry file {} is not usable: {why}", p.display()),
+                },
+                Err(e) => last = format!("queue entry file {} cannot be read: {e}", p.display()),
+            }
+        }
+        let r = good.ok_or(last)?;
+        if OPEN_QUEUE_STATUSES.contains(&r.status()) {
+            out.push(OpenEntry { id: r.id().to_string(), task: r.get("task").to_string(), status: r.status().to_string() });
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
+}
+
 pub fn save(r: &Record) -> Result<(), String> {
     r.save().map_err(|e| format!("cannot write task record {}: {e}", r.path.display()))
 }
@@ -396,12 +476,27 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             }
             Ok(_) => {}
         }
-        // The agent cap: one running task is one agent at work. Counted under the board lock, across every project.
+        // The merge queue, read without its locks (read-only; every entry is written atomically). An entry that cannot be
+        // read or makes no sense fails the start: counting it as closed could break either cap below.
+        let open_entries = match open_queue_entries(cfg) {
+            Ok(v) => v,
+            Err(e) => return fail(EXIT_ERROR, format!("cannot start {id}: cannot read the merge queue, so the max_agents and max_queued caps cannot be checked: {e}")),
+        };
+        // The agent cap: one running task is one coder at work, unless its branch waits in the merge queue (an open entry).
+        // Counted under the board lock, across every project.
+        let waiting = |o: &Record| open_entries.iter().any(|e| e.task == o.id());
         let running: Vec<&Record> = all.iter().filter(|o| o.status() == RUNNING).collect(); // this task is still `open` here
-        if running.len() as u64 >= cfg.max_agents {
-            let ids: Vec<String> = running.iter().map(|o| format!("{} ({})", o.id(), o.get("project"))).collect();
-            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running, the max_agents cap in broadsword.toml is {}: {}
-start it after one of them is done, failed or abandoned (`task abandon` frees the slot of a task whose agent died)", running.len(), cfg.max_agents, ids.join(", ")));
+        let (queued, working): (Vec<&Record>, Vec<&Record>) = running.iter().partition(|o| waiting(o));
+        if working.len() as u64 >= cfg.max_agents {
+            let ids: Vec<String> = working.iter().map(|o| format!("{} ({})", o.id(), o.get("project"))).collect();
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running with a working coder, the max_agents cap in broadsword.toml is {} (running tasks waiting in the merge queue are not counted; {} do): {}
+start it after one of them is queued, done, failed or abandoned (`task abandon` frees the slot of a task whose agent died)", working.len(), cfg.max_agents, queued.len(), ids.join(", ")));
+        }
+        // The queue cap: so finished-but-unmerged work cannot pile up without limit.
+        if open_entries.len() as u64 >= cfg.max_queued {
+            let ids: Vec<String> = open_entries.iter().map(|e| format!("{} (task {}, {})", e.id, e.task, e.status)).collect();
+            return fail(EXIT_CONFLICT, format!("cannot start {id}: {} merge-queue entries are open, the max_queued cap in broadsword.toml is {}: {}
+start it after the queue has merged or ended some of them", open_entries.len(), cfg.max_queued, ids.join(", ")));
         }
         let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
         if !conflicts.is_empty() {
@@ -560,6 +655,35 @@ pub fn cmd_check(cfg: &Config, project: &str, claims: &[&str]) -> ExitCode {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The queue statuses `start` knows must be exactly queue.rs's: every `pub const X: &str = "..."` status constant is in
+    /// OPEN_QUEUE_STATUSES or ENDED_QUEUE_STATUSES (once), and queue.rs's `is_open` names exactly the open ones. A status added
+    /// to queue.rs, or a change of what it treats as open, fails here until task.rs is updated.
+    #[test]
+    fn queue_status_lists_match_queue_rs() {
+        let src = include_str!("queue.rs");
+        let mut consts: Vec<(String, String)> = Vec::new(); // (NAME, value)
+        for l in src.lines() {
+            let Some(rest) = l.strip_prefix("pub const ") else { continue };
+            let Some((name, val)) = rest.split_once(": &str = \"") else { continue };
+            consts.push((name.to_string(), val.trim_end_matches("\";").to_string()));
+        }
+        let mut known: Vec<&str> = OPEN_QUEUE_STATUSES.iter().chain(ENDED_QUEUE_STATUSES.iter()).copied().collect();
+        let mut theirs: Vec<&str> = consts.iter().map(|(_, v)| v.as_str()).collect();
+        known.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(known.len(), OPEN_QUEUE_STATUSES.len() + ENDED_QUEUE_STATUSES.len());
+        known.dedup();
+        assert_eq!(known.len(), OPEN_QUEUE_STATUSES.len() + ENDED_QUEUE_STATUSES.len(), "a status is both open and ended");
+        assert_eq!(known, theirs, "queue.rs's status constants changed: update OPEN_QUEUE_STATUSES / ENDED_QUEUE_STATUSES");
+        let body = src.split("fn is_open(status: &str) -> bool {").nth(1).expect("queue.rs has fn is_open").split('}').next().unwrap();
+        let named: Vec<&str> = body.split(|c: char| !(c.is_ascii_uppercase() || c == '_')).filter(|w| !w.is_empty()).collect();
+        let mut open: Vec<&str> = named.iter().map(|n| consts.iter().find(|(c, _)| c == n).map(|(_, v)| v.as_str()).unwrap_or_else(|| panic!("is_open names `{n}`"))).collect();
+        let mut mine = OPEN_QUEUE_STATUSES.to_vec();
+        open.sort_unstable();
+        mine.sort_unstable();
+        assert_eq!(open, mine, "queue.rs's is_open changed: update OPEN_QUEUE_STATUSES");
+    }
 
     fn n(s: &str) -> String {
         normalize_claim(s).unwrap()

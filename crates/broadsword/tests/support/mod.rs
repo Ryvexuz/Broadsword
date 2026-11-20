@@ -59,7 +59,15 @@ const BASE: &[(&str, &str)] = &[
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),
     ("max_agents", "50"),
+    ("max_queued", "50"),
 ];
+
+/// `config` without the key `missing`, for the "a required key is missing" tests. Panics if `BASE` lacks it.
+#[allow(dead_code)]
+pub fn config_without(missing: &str) -> String {
+    assert!(BASE.iter().any(|(b, _)| *b == missing), "unknown key `{missing}`");
+    config(&[]).lines().filter(|l| l.split_once(" = ").is_none_or(|(k, _)| k != missing)).map(|l| format!("{l}\n")).collect()
+}
 
 /// The text of a test root's `broadsword.toml`: `BASE` with `overrides` (raw TOML values) replacing the keys they name. An
 /// override naming a key `BASE` lacks panics, so a typo cannot silently add a setting nothing reads.
