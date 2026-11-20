@@ -1748,8 +1748,8 @@ mod tests {
             assert!(desc.contains(d), "the description must say: {d}");
         }
         assert!(run.contains("[--project <p>]") && run.contains("project (string, optional)"), "queue_run must show the --project flag and input");
-        // the setting the descriptions name exists, and ships off
-        assert!(include_str!("../../../broadsword.toml").lines().any(|l| l.starts_with("queue_per_project = \"off\"")));
+        // the setting the descriptions name exists (its shipped value is a trial choice, "on" or "off")
+        assert!(include_str!("../../../broadsword.toml").lines().any(|l| l.starts_with("queue_per_project = \"on\"") || l.starts_with("queue_per_project = \"off\"")));
     }
 
     /// The perf gate as the queue tools describe it, each sentence paired with the queue.rs / perfgate.rs text it restates.

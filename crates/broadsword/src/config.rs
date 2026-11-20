@@ -601,9 +601,9 @@ install_dir=\"build/bin\"\n";
     #[test]
     fn queue_per_project_is_required_shipped_off_and_validated() {
         let text = include_str!("../../../broadsword.toml");
-        let c = Config::from_text(text, Path::new("p")).unwrap();
-        assert!(!c.queue_per_project, "shipped off (SCALING F2): one global queue.lock, exactly as before");
-        let e = Config::from_text(&without_key(text, "queue_per_project"), Path::new("p")).unwrap_err();
+        // the shipped value may be "on" or "off" (a trial setting, 2026-11-20); only that it loads is pinned here
+        Config::from_text(text, Path::new("p")).unwrap();
+        let e =Config::from_text(&without_key(text, "queue_per_project"), Path::new("p")).unwrap_err();
         assert!(e.contains("queue_per_project") && e.contains("missing"), "{e}");
         let with = |line: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "queue_per_project") { line.to_string() } else { l.to_string() }).collect::<Vec<_>>().join("\n");
         assert!(Config::from_text(&with("queue_per_project = \"on\""), Path::new("p")).unwrap().queue_per_project);
