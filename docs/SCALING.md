@@ -45,8 +45,13 @@ Everything serial in the harness today goes through three OS file locks (lock.rs
 An entry that merges pays check + review + main check; a rejected one pays check + review. With 1.67 review rounds per
 merged task, 0.67 rejected attempts ride along with each merge. Assuming the main check takes as long as the entry's check:
 
-- per merged task: (109 + 54 + 109) + 0.67 x (109 + 54) = 272 + 109 = 381 s, so the ceiling is 3,600 / 381 = **9.4 merged/h**.
-- measured 6.79/h is 72% of that ceiling (6.79 / 9.4). The queue, not the 14 coder slots, sets the pace, which matches
+- **ESTIMATE.** Measured inputs: check 109 s, review 54 s, 1.67 rounds (`slots-14-pre16.json`). **Assumed inputs, not
+  measured:** (a) the main check costs the same 109 s as an entry check (no baseline file records a main-check time); (b) a
+  rejected attempt costs one check plus one review and nothing else; (c) the queue is never idle and no bisect or retry
+  time is counted.
+- per merged task: (109 + 54 + 109) + 0.67 x (109 + 54) = 272 + 109 = 381 s, so the ceiling is 3,600 / 381 = **9.4 merged/h
+  (ESTIMATE)**. If the real main check is 60 s the ceiling is 3,600 / 332 = 10.8/h; at 150 s it is 3,600 / 422 = 8.5/h.
+- measured 6.79/h is 72% of that estimated ceiling (6.79 / 9.4). The queue, not the 14 coder slots, sets the pace, which matches
   the log: 14 tasks running, 11 to 14 of them waiting in the queue (`state/pc-progress.md` 00:24Z to 00:32Z lines).
 
 ### Why size breaks the current design
@@ -263,9 +268,12 @@ shard it changes only the grouping key (shard instead of project) and the check:
 - the bisect stays inside the shard; the left-train rule (NOTES.md: "left a train: rebase your own commits onto main") is
   unchanged.
 
-Ceiling with a train of 4 and deferred per-entry checks: review per merged 1.67 x 54 = 90 s, plus one check and one main
-check shared by 4 = (109 + 109) / 4 = 54.5 s, so 144.5 s per merged = **24.9 merged/h per lane** (no bisects counted). With
-affected checks at the 50k-line budget (251 s): 90 + (251 + 251) / 4 = 215.5 s = **16.7 merged/h per lane**.
+Ceiling with a train of 4 and deferred per-entry checks (**both figures are ESTIMATES**): review per merged 1.67 x 54 = 90 s
+(measured inputs), plus one check and one main check shared by 4 = (109 + 109) / 4 = 54.5 s, so 144.5 s per merged =
+**24.9 merged/h per lane (ESTIMATE)**. Assumed, not measured: a train size of 4 (`merge_train_max` is a setting, no train has
+run at that size), main check = 109 s (as in section 0), no bisect time, no failing trains, review time unchanged by batching.
+With affected checks at the 50k-line budget (251 s = 50,000 x 5.03 ms, which assumes check time linear in lines and the 50k
+budget are both assumed): 90 + (251 + 251) / 4 = 215.5 s = **16.7 merged/h per lane (ESTIMATE)**.
 
 ### Perf gate (t-20261120-013256-3, boarded, not built)
 
@@ -360,10 +368,13 @@ At 6.79 merged/h: 28,000 / 6.79 = 4,124 h; 116,667 / 6.79 = 17,182 h; 208,333 / 
 
 ### Brief generation
 
-- Boarded per done task: among the 149 resolved tasks, 80 are done and 69 abandoned, so 149 / 80 = 1.86 briefs are written
-  for each task that lands (board counts, section 0). Some abandons are early experiments, so this is pessimistic.
+- **DERIVED, not measured directly.** Briefs per landed task: the board has 80 done and 69 abandoned tasks (section 0), each
+  with one brief, so (80 + 69) / 80 = 149 / 80 = **1.86** briefs written for each task that lands. It assumes every abandoned
+  task cost one brief and that the abandon share stays as it is. Some abandons are early experiments, so it is probably
+  pessimistic.
 - Briefs needed: 28,000 x 1.86 = 52,080 to 208,333 x 1.86 = 387,500. At 5.3 KB each: 276 MB to 2.05 GB.
-- Rate needed: 6.79 merged/h x 1.86 = 12.6 briefs/h, one every 4.8 min, from the orchestrator alone. Today it writes them in
+- Rate needed (**DERIVED**): today's measured 6.79 merged/h x the derived 1.86 = **12.6 briefs/h**, one every 4.8 min (60 /
+  12.6), from the orchestrator alone. Today it writes them in
   batches (46 briefs boarded at 17:13Z, `state/pc-progress.md`).
 
 The pipeline that scales is four levels, each owned by a different role, each with a size limit:
@@ -410,11 +421,18 @@ The pipeline that scales is four levels, each owned by a different role, each wi
 ### CPU
 
 - One full check at size: 98-175 h on this PC (section 0). Affected checks inside the 50k-line budget: about 251 s.
-- Machine-wide merges per hour: measured CPU mean 19.7% at about 6.8 merged/h (one 3-minute sample, so weak). If CPU use is
-  linear in merges, 100% is 6.8 / 0.197 = 34.5 merged/h at today's check size. With checks 2.3x bigger (50k / 21.7k lines),
-  34.5 / 2.3 = **15 merged/h for the whole PC**, however many shards run.
-- So the PC, not the queue design, becomes the limit after about 2 lanes (16.7/h per lane, section 4). 208,333 tasks at
-  15/h is 13,889 h = 1.58 years 24/7. Beyond that, checks need a second machine or build runners. Spending money is Ask first.
+- Machine-wide merges per hour (**ESTIMATE**, two samples). Assumption named: CPU use is linear in merges per hour, with no
+  idle baseline, so 100% CPU = merged/h at 100%. Sample 1 (weak): `state/pc-progress.md` 23:56Z, mean 19.7% over 3 minutes
+  at 6.8 merged/h gives 6.8 / 0.197 = 34.5 merged/h; with checks 2.3x bigger (50k / 21.7k lines), 34.5 / 2.3 = **15
+  merged/h**. Sample 2 (longer): `scratch/scale/sys-14.csv` (380 rows at 10 s, 21:56:21Z-23:00:32Z) mean 35.3% and
+  `sys-14-resume.csv` (168 rows, 23:16:30Z-23:44:51Z) mean 42.1%, so weighted (380 x 35.3 + 168 x 42.1) / 548 = 37.4%
+  across the 14-slot window that measured 6.79 merged/h (`slots-14-pre16.json`): 6.79 / 0.374 = 18.2 merged/h; 18.2 / 2.3 =
+  **7.9 merged/h**. The CPU there also carries coder compiles and tests that do not scale with merges, so the true figure
+  lies between the two: **about 8 to 15 merged/h for the whole PC, however many shards run (ESTIMATE)**. Later windows run
+  hotter (`sys-14-resume2.csv` mean 50.3%, `sys-14-resume3.csv` 53.3%, `sys-14-resume4.csv` 78.2%, 705, 706 and 166 rows) but
+  have no merge-rate baseline, so they are not used.
+- So the PC, not the queue design, becomes the limit at about 1 lane (16.7/h per lane, section 4, against 8 to 15/h for the
+  PC). 208,333 tasks at 15/h is 13,889 h = 1.58 years 24/7; at 8/h it is 26,042 h = 2.97 years. Beyond that, checks need a second machine or build runners. Spending money is Ask first.
 - Coder test runs dominate: 5.05 test jobs per merged task at 98 s median (pc-session) = 495 s of test jobs per merge,
   against 0.5 queue checks per merge in a train of 4. Affected-only selection must apply to `broadsword test --task` too, not
   only to the queue.
@@ -467,72 +485,83 @@ The pipeline that scales is four levels, each owned by a different role, each wi
 
 ## Follow-up briefs (proposals only; nothing is boarded until Lazlo reads this)
 
-Each is sized by the brief rules: at most about 30 lines and 8 requirements, 1-2 files. Claims are the files as they stand
-on main fefe8b1.
+Each is sized by the brief rule (at most about 30 lines, 8 requirements, 1-2 files). Claims are the files as they stand on
+main fefe8b1. The size table counts the proposals below as written here; "brief lines" is an estimate of the finished
+`templates/brief.md` brief (these lines plus about 12 lines of template: board, task, claim, never-do, report).
+
+| Brief | Lines here | Requirements | Files | Brief lines (est.) | Within the rule |
+| --- | --- | --- | --- | --- | --- |
+| F0 | 4 | 3 | 3 (stated reason) | 16 | the one stated exception to "1-2 files" |
+| F1 | 4 | 4 | 2 | 16 | yes |
+| F2 | 4 | 4 | 2 | 16 | yes (was 5 requirements and 4 files with the setting) |
+| F3 | 4 | 3 | 2 | 16 | yes (setting moved to F0) |
+| F4 | 4 | 4 | 2 | 16 | yes |
+| F5 | 4 | 4 | 2 | 16 | yes |
+| F6 | 4 | 3 | 2 | 16 | yes |
+| F7 | 4 | 4 | 2 | 16 | yes (setting moved to F0) |
+| F8 | 4 | 4 | 2 | 16 | yes |
+| F9 | 4 | 4 | 2 | 16 | yes (was 6 requirements and 4 files with the setting) |
+
+Changes made in the fix round. The "new required setting" requirement of F2, F3, F7 and F9 touches `broadsword.toml`,
+`config.rs` and the test configs. `grep -l disk_floor_gb` finds `config.rs`, `tests/support/mod.rs`, `tests/cli.rs`,
+`tests/jobs.rs` and `tests/tools.rs` besides `broadsword.toml`, so a new key can touch more than 2 files. All four keys now
+live in F0, which has no logic and states why it needs more than 2 files; if the grep finds more config-writing test files
+when it is boarded, F0 splits per file. F0 lands first. F5 and F9 share `job.rs`, so F9 runs after F5 (a sequencing note,
+not an extra requirement).
+
+Every done check below is a command with the output it must show, runnable as written. "Shown failing once" is dropped
+(it needs a step that is not built). The proof that a test can fail is a negative case inside the test set, which the
+command itself runs.
+
+### F0. Four required settings (for F2, F3, F7, F9)
+- Claim: `crates/broadsword/src/config.rs`, `broadsword.toml`, `crates/broadsword/tests/support/mod.rs` (3 files: a required key must be in all of them, AGENTS.md "Settings").
+- Requirements: add required keys `queue_per_project` and `build_per_project` (both `false`), `python_tests` (a list, may be empty) and `task_archive_days`; a missing key is an error naming it; every test config gets them (grep every test file that writes its own config; if one is outside the claim, stop and report).
+- Done check: `broadsword test broadsword` ends `test: ok`; a config test with one key removed expects the error naming that key, so the run covers the missing-key case.
 
 ### F1. Record coder prices (cost data for section 8)
 - Claim: `scripts/dev_metrics.py`, `scripts/test_dev_metrics.py`.
-- Requirements: read a `cost_usd` column in `state/agent-runs.tsv` when present; keep "unknown, never 0" for rows without one;
-  report coder $ per merged task beside review $; a test with priced and unpriced rows.
-- Done check: `python -I scripts/test_dev_metrics.py` passes; the new test is shown failing once without the change.
+- Requirements: read a `cost_usd` column in `state/agent-runs.tsv` when present; keep "unknown, never 0" for rows without one; report coder $ per merged task beside review $; a test with priced and unpriced rows.
+- Done check: `python -I scripts/test_dev_metrics.py` ends `OK`; the test set includes an unpriced row that must print `unknown`, not `0`.
 
-### F2. Per-project queue lock (step S1, part 1)
-- Claim: `crates/broadsword/src/queue.rs`, `crates/broadsword/tests/queue.rs`. After the merge train and the perf gate merge.
-- Requirements: `queue.lock` per project (`state/queue/<project>.queue.lock`); `queue run --all` drains one project when
-  given `--project`; two drivers on different projects run at once, two on one project get exit 4; the entries lock stays
-  global; a new required setting turns it on (ship off) and every test config gets it.
-- Done check: `broadsword test broadsword` ends `test: ok`; a test runs two projects' entries at once and shows the second
-  driver of one project refused; shown failing once.
+### F2. Per-project queue lock (step S1, part 1; after F0, the merge train and the perf gate)
+- Claim: `crates/broadsword/src/queue.rs`, `crates/broadsword/tests/queue.rs`.
+- Requirements: with `queue_per_project = true`, `queue.lock` is per project (`state/queue/<project>.queue.lock`); `queue run --all --project <p>` drains one project; two drivers on different projects run at once, two on one project get exit 4 "queue busy"; the entries lock stays global.
+- Done check: `broadsword test broadsword` ends `test: ok`; the queue tests include one that starts two drivers on different projects (both succeed) and two on one project (the second exits 4).
 
-### F3. Per-project build subfolders (step S1, part 2)
+### F3. Per-project build subfolders (step S1, part 2; after F0 and Lazlo's yes on the Disk rule, section 1)
 - Claim: `crates/broadsword/src/buildsrc.rs`, `crates/broadsword/tests/buildsrc.rs`.
-- Requirements: `CARGO_TARGET_DIR` = `build/<project>/`, its own build lock and source notes; never outside `build/`; the
-  install path is unchanged; a required setting (ship off). Needs Lazlo's yes on the Disk rule first (section 1).
-- Done check: `broadsword test broadsword` ends `test: ok`; a test builds two projects with both locks held at once.
+- Requirements: with `build_per_project = true`, `CARGO_TARGET_DIR` = `build/<project>/` with its own build lock and source notes; never outside `build/`; the install path is unchanged.
+- Done check: `broadsword test broadsword` ends `test: ok`; a buildsrc test holds two projects' build locks at once, and a path test refuses a project name that escapes `build/` (for example `..`).
 
 ### F4. Affected-package selection, library part (step S2)
 - Claim: `crates/broadsword/src/affected.rs` (new), `crates/broadsword/tests/affected.rs` (new).
-- Requirements: from `cargo metadata` JSON and a changed-file list, return D, R(D) and a reason per package; global files and
-  unmapped files return "full"; unreadable metadata returns an error (the caller runs full); no cargo call inside the
-  function under test (JSON in, list out).
-- Done check: `broadsword test broadsword` ends `test: ok`, including a fixture with a 3-level reverse dependency where the
-  leaf's dependent is selected; shown failing once.
+- Requirements: from `cargo metadata` JSON and a changed-file list, return D, R(D) and a reason per package; global files and unmapped files return "full"; unreadable metadata returns an error (the caller runs full); no cargo call inside the function under test (JSON in, list out).
+- Done check: `broadsword test broadsword` ends `test: ok`; the tests include a fixture with a 3-level reverse dependency where the leaf's dependent is selected, and a changed `Cargo.lock` that must return "full".
 
-### F5. `check --affected <base>` (step S2, wiring)
-- Claim: `crates/broadsword/src/job.rs`, `crates/broadsword/tests/jobs.rs`. After F4.
-- Requirements: runs `-p` for each package of R(D); writes D and R(D) to the job record; any error from F4 runs the full
-  check and says so; the plain `check` is unchanged.
-- Done check: `broadsword test broadsword` ends `test: ok`; a test changes one leaf and shows only it and its dependents built.
+### F5. `check --affected <base>` (step S2, wiring; after F4)
+- Claim: `crates/broadsword/src/job.rs`, `crates/broadsword/tests/jobs.rs`.
+- Requirements: runs `-p` for each package of R(D); writes D and R(D) to the job record; any error from F4 runs the full check and says so; the plain `check` is unchanged.
+- Done check: `broadsword test broadsword` ends `test: ok`; one test changes a leaf and asserts only it and its dependents appear in the job record, another feeds unreadable metadata and asserts the full check ran.
 
 ### F6. Mode dependency rule check (step S3)
 - Claim: `crates/broadsword/src/deprule.rs` (new), `crates/broadsword/tests/deprule.rs` (new).
-- Requirements: from `cargo metadata` and a group map (crate -> group) plus an allow table (group -> groups), list every
-  forbidden edge with both crates and groups; a crate missing from the map is an error; mode-to-mode edges are forbidden in
-  the shipped table.
-- Done check: `broadsword test broadsword` ends `test: ok`; a fixture where a render-mode crate depends on a physics-mode crate
-  is rejected with both names; shown failing once by allowing the edge.
+- Requirements: from `cargo metadata`, a group map (crate -> group) and an allow table (group -> groups), list every forbidden edge with both crates and groups; a crate missing from the map is an error; mode-to-mode edges are forbidden in the shipped table.
+- Done check: `broadsword test broadsword` ends `test: ok`; the tests include a fixture where a render-mode crate depends on a physics-mode crate (rejected, naming both crates) and a crate absent from the map (an error).
 
-### F7. Board and queue archive (step S5)
-- Claim: `crates/broadsword/src/task.rs`, `crates/broadsword/tests/tasks.rs`. A matching queue half follows as its own brief.
-- Requirements: `task archive` moves done, failed and abandoned tasks older than a required setting into
-  `state/tasks/archive/<yyyy-mm>/`; never deletes; `task show <id>` still finds archived tasks; `start` reads only the board
-  folder; under the board lock.
-- Done check: `broadsword test broadsword` ends `test: ok`; a test archives one task, shows it with `task show`, and shows
-  `start` unaffected.
+### F7. Board archive (step S5; the queue half is its own brief; after F0)
+- Claim: `crates/broadsword/src/task.rs`, `crates/broadsword/tests/tasks.rs`.
+- Requirements: `task archive` moves done, failed and abandoned tasks older than `task_archive_days` into `state/tasks/archive/<yyyy-mm>/`; never deletes; `task show <id>` still finds archived tasks; `start` reads only the board folder, and archiving runs under the board lock.
+- Done check: `broadsword test broadsword` ends `test: ok`; a test archives one old task, `task show` still prints it, `start` ignores it, and an open task is not archived.
 
 ### F8. Brief lint at `task add`
 - Claim: `scripts/brief_lint.py` (new), `scripts/test_brief_lint.py` (new).
-- Requirements: refuse a brief over 30 lines (excluding the done-check block), over 8 requirement bullets, or claiming more
-  than 2 files without a stated reason; require a done check whose lines are commands; print each failed rule.
-- Done check: `python -I scripts/test_brief_lint.py` passes, with one test per rule shown failing once.
+- Requirements: refuse a brief over 30 lines (excluding the done-check block), over 8 requirement bullets, or claiming more than 2 files without a stated reason; require a done check whose lines are commands; print each failed rule.
+- Done check: `python -I scripts/test_brief_lint.py` ends `OK`; the test set has one over-limit brief per rule, each expected to be refused with that rule named.
 
-### F9. Python tests behind the job interface (first multi-language runner)
-- Claim: `crates/broadsword/src/job.rs`, `crates/broadsword/tests/jobs.rs`. After F5 (same file), or before it if F5 waits.
-- Requirements: a project can declare a Python test command in its settings table (a required key when present); `test` and
-  `check` run it after cargo, with the same disk guard, log, job record and exit codes; a Python failure fails the job; the
-  scrubbed environment applies (no secrets in the child); Broadsword itself declares `python -I scripts/...` tests.
-- Done check: `broadsword test broadsword` ends `test: ok`; a test with a failing Python test shows the job fails; shown
-  failing once.
+### F9. Python tests behind the job interface (first multi-language runner; after F0 and F5)
+- Claim: `crates/broadsword/src/job.rs`, `crates/broadsword/tests/jobs.rs`.
+- Requirements: `test` and `check` run each command in `python_tests` after cargo, with the same disk guard, log, job record and exit codes; a Python failure fails the job; the scrubbed environment applies (no secrets in the child); Broadsword's own `python -I scripts/...` entries in `broadsword.toml` are a one-line follow-up outside this claim.
+- Done check: `broadsword test broadsword` ends `test: ok`; a jobs test with a failing Python command asserts the job exits non-zero and the log names it.
 
 ### Decisions for Lazlo named in this document
 1. Move toward ADR 0001 option (d2) for the shared core (section 1).
