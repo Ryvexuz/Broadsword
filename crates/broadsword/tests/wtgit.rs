@@ -127,6 +127,55 @@ fn a_modified_binary_shows_old_and_new_sizes() {
     assert!(out2.contains("D  x.bin  old size 4 bytes  new size -"), "{out2}");
 }
 
+/// A tip whose `.gitattributes` routes `*.rs` to a driver the machine has configured (`diff.evil.textconv`, `diff.evil.command`,
+/// `filter.evil.clean/smudge`, and a global `diff.external`). Each driver writes a marker file. The review diff must run none
+/// of them and show the raw text. The drivers are configured only AFTER the tip is committed, so the test's own `git add`
+/// cannot run the clean filter.
+#[test]
+fn tip_attributes_cannot_make_the_review_diff_run_a_driver() {
+    let r = repo("drivers");
+    fs::write(r.wt.join(".gitattributes"), "*.rs diff=evil filter=evil\n").unwrap();
+    fs::write(r.wt.join("main.rs"), "fn main() { println!(\"raw source\"); }\n").unwrap();
+    let tip = commit_all(&r.wt);
+    let marker = r.root.join("driver-ran.txt");
+    let m = marker.to_string_lossy().replace('\\', "/");
+    let script = r.root.join("driver.sh");
+    // textconv gets the file as $1 and prints the converted text; an external diff gets 7 args; a filter copies stdin
+    fs::write(&script, format!("#!/bin/sh\necho \"$0 $*\" >> \"{m}\"\necho CONVERTED-BY-DRIVER\nif [ -n \"$1\" ] && [ -f \"$1\" ]; then :; else cat; fi\n")).unwrap();
+    let s = script.to_string_lossy().replace('\\', "/");
+    let cmd = format!("sh \"{s}\"");
+    for (k, v) in [("diff.evil.textconv", &cmd), ("diff.evil.command", &cmd), ("filter.evil.clean", &cmd), ("filter.evil.smudge", &cmd), ("diff.external", &cmd)] {
+        git(&r.main, &["config", k, v]);
+    }
+    // the test's driver works: a plain `git diff` with the same config runs it (proves the assertion below can fail)
+    let o = Command::new("git").args(["diff", "--no-ext-diff", &format!("main...{tip}")]).current_dir(&r.wt).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("CONVERTED-BY-DRIVER") && marker.exists(), "control: the textconv driver did not run, so this test proves nothing");
+    fs::remove_file(&marker).unwrap();
+    for mode in [AttrMode::Auto, AttrMode::AttrSource, AttrMode::Worktree] {
+        let out = diff_since_mode(&r.main, "main", &tip, mode).unwrap();
+        assert!(!marker.exists(), "mode {mode:?}: a tip-chosen driver ran: {}", fs::read_to_string(&marker).unwrap_or_default());
+        assert!(out.contains("+fn main() { println!(\"raw source\"); }"), "mode {mode:?}: raw text missing: {out}");
+        assert!(!out.contains("CONVERTED-BY-DRIVER"), "mode {mode:?}: converted text shown: {out}");
+    }
+}
+
+/// Older-Git route: the diff runs inside the tip's worktree, where Git reads `.gitattributes` from the working tree first. An
+/// uncommitted `.gitattributes` there would replace the reviewed commit's: refused.
+#[test]
+fn worktree_route_refuses_uncommitted_gitattributes() {
+    let (r, tip) = attr_branch("dirtyattr");
+    fs::write(r.wt.join(".gitattributes"), "").unwrap();
+    let e = diff_since_mode(&r.main, "main", &tip, AttrMode::Worktree).unwrap_err();
+    assert!(e.contains(".gitattributes"), "{e}");
+    git(&r.wt, &["checkout", "--", ".gitattributes"]);
+    fs::create_dir_all(r.wt.join("sub")).unwrap();
+    fs::write(r.wt.join("sub/.gitattributes"), "*.txt binary\n").unwrap();
+    let e = diff_since_mode(&r.main, "main", &tip, AttrMode::Worktree).unwrap_err();
+    assert!(e.contains(".gitattributes"), "untracked one: {e}");
+    fs::remove_file(r.wt.join("sub/.gitattributes")).unwrap();
+    assert!(diff_since_mode(&r.main, "main", &tip, AttrMode::Worktree).is_ok());
+}
+
 #[test]
 fn git_failures_are_errors_not_empty_diffs() {
     let (r, tip) = attr_branch("err");

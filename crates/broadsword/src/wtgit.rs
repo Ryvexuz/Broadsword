@@ -299,6 +299,39 @@ fn worktree_at(dir: &Path, commit: &str) -> Result<String, String> {
     Err(format!("no worktree has {commit} checked out, so its .gitattributes cannot be read without --attr-source (Git 2.40+): refusing to diff with another commit's attributes"))
 }
 
+/// `git ls-tree -r -z --name-only <tip>`, `git ls-files -z -c -o -- ':(glob)**/.gitattributes'`, `git diff-index --cached
+/// --name-only -z <tip>` and `git cat-file blob <tip>:<path>`: in the worktree route Git reads `.gitattributes` from the worktree's
+/// files first and its index second, so both must hold exactly the reviewed commit's: every `.gitattributes` in the tip exists on
+/// disk with the same text (CR ignored, for checkouts with core.autocrlf), there is no other one on disk (untracked or ignored
+/// included), and the index matches the tip. None of these calls runs a filter: they list names or read the object store.
+/// Why: an uncommitted edit in the task worktree must not decide what the reviewer is shown.
+fn attributes_match_commit(wt: &Path, tip: &str) -> Result<(), String> {
+    let is_attr = |p: &&str| !p.is_empty() && (*p == ".gitattributes" || p.ends_with("/.gitattributes"));
+    let tree = raw(wt, &["ls-tree", "-r", "-z", "--name-only", tip])?;
+    let in_tip: Vec<&str> = tree.split('\0').filter(is_attr).collect();
+    let listed = raw(wt, &["ls-files", "-z", "-c", "-o", "--", ":(glob)**/.gitattributes"])?;
+    let on_disk: Vec<&str> = listed.split('\0').filter(is_attr).filter(|p| wt.join(p).is_file()).collect();
+    let refuse = |why: String| Err(format!("{why}: the task worktree's .gitattributes differ from the reviewed commit {tip}, and without --attr-source (Git 2.40+) Git would use the worktree's; refusing to diff"));
+    for p in &on_disk {
+        if !in_tip.contains(p) {
+            return refuse(format!("{p} is on disk but not in the commit"));
+        }
+    }
+    for p in &in_tip {
+        let disk = std::fs::read(wt.join(p)).map_err(|e| format!("{p}: {e}"))?;
+        let want = ok(wt, &["cat-file", "blob", &format!("{tip}:{p}")])?;
+        let clean = |s: &str| s.replace('\r', "").trim().to_string();
+        if clean(&String::from_utf8_lossy(&disk)) != clean(&want) {
+            return refuse(format!("{p} on disk is not the committed text"));
+        }
+    }
+    let staged = raw(wt, &["diff-index", "--cached", "--name-only", "-z", tip, "--", ":(glob)**/.gitattributes"])?;
+    if let Some(p) = staged.split('\0').find(|p| !p.is_empty()) {
+        return refuse(format!("{p} in the index is not the committed one"));
+    }
+    Ok(())
+}
+
 /// One changed path whose content the diff text does not show.
 struct Hidden {
     status: String,
@@ -315,6 +348,21 @@ fn size_label(dir: &Path, hash: &str) -> Result<String, String> {
     Ok(format!("{} bytes", ok(dir, &["cat-file", "-s", hash])?))
 }
 
+/// The ONE builder for every git call that turns commit content into text for the reviewer or the merge check (`diff`, `log
+/// --patch`). The attributes it reads come from the untrusted reviewed tip, and an attribute can name a driver (`diff=<x>`) that the
+/// machine's config ties to a program (`diff.<x>.textconv`, `diff.<x>.command`). So every such call gets `-c diff.external=` (no
+/// global external diff), `--no-ext-diff` and `--no-textconv`: Git then runs no external program and shows the raw content.
+/// Filter drivers (`filter.<x>.clean/smudge`) only run when Git reads or writes a working tree file; these calls compare two
+/// commits' trees from the object store, so none runs (the test `tip_attributes_cannot_make_the_review_diff_run_a_driver` proves
+/// it for textconv, external diff and filters). Why: reviewing a branch must never run a program the branch chose.
+fn review_args<'a>(attr: &'a [String], sub: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
+    let mut v: Vec<&str> = vec!["-c", "diff.external="];
+    v.extend(attr.iter().map(|a| a.as_str())); // `--attr-source` is an option of `git` itself, before the subcommand
+    v.extend([sub, "--no-color", "--no-ext-diff", "--no-textconv"]);
+    v.extend_from_slice(rest);
+    v
+}
+
 /// Git's stdout untrimmed (NUL-separated records must not lose a trailing byte); a non-zero exit is an error.
 fn raw(dir: &Path, args: &[&str]) -> Result<String, String> {
     let o = run(dir, args)?;
@@ -328,14 +376,8 @@ fn raw(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// shows `-` for both counts: binary content, a `-diff` attribute, or a file over core.bigFileThreshold) with status and blob ids.
 /// Why: the reviewer is told about every change it cannot read. A mismatch between the two listings is an error.
 fn hidden_files(dir: &Path, attr: &[String], range: &str) -> Result<Vec<Hidden>, String> {
-    let mut raw_args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
-    raw_args.extend(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--raw", "-z", "--no-abbrev"]);
-    let mut num_args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
-    num_args.extend(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z"]);
-    raw_args.push(range);
-    num_args.push(range);
-    let raw_out = raw(dir, &raw_args)?;
-    let num_out = raw(dir, &num_args)?;
+    let raw_out = raw(dir, &review_args(attr, "diff", &["--no-renames", "--raw", "-z", "--no-abbrev", range]))?;
+    let num_out = raw(dir, &review_args(attr, "diff", &["--no-renames", "--numstat", "-z", range]))?;
     let mut binary: Vec<String> = Vec::new();
     for rec in num_out.split('\0').filter(|r| !r.is_empty()) {
         let mut it = rec.splitn(3, '\t');
@@ -389,14 +431,15 @@ pub fn diff_since_mode(dir: &Path, base: &str, tip: &str, mode: AttrMode) -> Res
         m => m,
     };
     let (run_dir, attr): (std::path::PathBuf, Vec<String>) = match mode {
-        AttrMode::Worktree => (std::path::PathBuf::from(worktree_at(dir, &tip_id)?), Vec::new()),
+        AttrMode::Worktree => {
+            let wt = std::path::PathBuf::from(worktree_at(dir, &tip_id)?);
+            attributes_match_commit(&wt, &tip_id)?;
+            (wt, Vec::new())
+        }
         _ => (dir.to_path_buf(), vec![format!("--attr-source={tip_id}")]),
     };
     let range = format!("{base}...{tip_id}");
-    // `--attr-source` is an option of `git` itself (before the subcommand), not of `git diff`
-    let mut args: Vec<&str> = attr.iter().map(|a| a.as_str()).collect();
-    args.extend(["diff", "--no-color", "--no-ext-diff", &range]);
-    let text = raw(&run_dir, &args)?;
+    let text = raw(&run_dir, &review_args(&attr, "diff", &[&range]))?;
     let hidden = hidden_files(&run_dir, &attr, &range)?;
     if hidden.is_empty() {
         return Ok(text.trim().to_string());
@@ -474,7 +517,7 @@ pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<(), String> {
 /// make the same changes. Why: the merge train rebases an entry's commits after their review; the review only stands when the
 /// rebased commits are the same patches that were reviewed.
 pub fn patch_ids(dir: &Path, range: &str) -> Result<Vec<String>, String> {
-    let log = run(dir, &["log", "--patch", "--reverse", "--no-color", "--no-ext-diff", "--no-textconv", range])?;
+    let log = run(dir, &review_args(&[], "log", &["--patch", "--reverse", range]))?;
     if log.code != 0 {
         return Err(format!("git log --patch {range} failed: {}", log.stderr));
     }
