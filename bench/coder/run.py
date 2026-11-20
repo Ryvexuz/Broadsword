@@ -24,7 +24,10 @@ that is how the smoke test uses a fake CLI. The model sees only the task's spec.
 
 Per task it writes <out-dir>/<task>__<provider>__<model>__<effort>.{raw.json,answer.txt,rs,json}.
 The result .json holds: provider, model, effort, task, tokens, cost_usd, wall_s (the model call),
-harness_wall_s, compiles, passed, total, graded, call_failed, format_failure, first_error, model_used.
+harness_wall_s, compiles, passed, total, graded, call_failed, is_error, error, format_failure, first_error, model_used.
+is_error is true (with the error text in error, as in the reviewer bench) for a provider error: an HTTP error such as 429 or
+no credits, a CLI error or non-zero exit, a timeout. call_failed is the same flag. score.py lists such runs separately and
+leaves them out of the percentages.
 graded is false when the model call was made but grading failed; passed/compiles are then not real.
 With --attempts N > 1 the JSON also holds (the fields above describe the LAST attempt): attempts_made, max_attempts,
 pass_at (number of the first attempt that fully passed, null = no pass), cost_usd_total (sum over the attempts' known
@@ -93,6 +96,17 @@ def extract_code(answer):
     if len(blocks) == 1 and blocks[0].strip():
         return blocks[0], None
     return None, f"{len(blocks)} code blocks in the answer (exactly one is required)"
+
+
+def provider_error(res):
+    """The error text of a provider call, or None when the call gave a usable reply. A provider error is an HTTP error
+    (for example 429, no credits), a CLI error (is_error, or a non-zero exit) or a timeout. The headless CLI reports an
+    API error as is_error=true with the error text IN the answer, so an error with an answer is still an error."""
+    if res.get("is_error"):
+        return str(res.get("error") or res.get("answer") or "").strip()[:500] or "(no error text)"
+    if res.get("exit") not in (0, None):
+        return f"CLI exit code {res['exit']}"
+    return None
 
 
 def check_workdir():
@@ -230,12 +244,13 @@ def main():
             res = PROVIDERS[provider](sent, model, effort)
             dt = time.time() - t0
             code, problem = extract_code(res["answer"])
-            call_failed = bool(res.get("is_error") and not res["answer"])
+            error = provider_error(res)
+            call_failed = error is not None  # a provider error is never graded and never a format failure
             if call_failed:
-                problem = f"model call failed: {res.get('error')}"
+                code, problem = None, f"model call failed: {error}"
             rec = {"provider": provider, "model": model, "effort": effort, "task": t.name, "tokens": res["tokens"],
                    "cost_usd": res["cost_usd"], "wall_s": round(dt, 1), "exit": res["exit"], "harness_wall_s": None,
-                   "compiles": False, "passed": 0, "total": st["total"], "graded": True, "call_failed": call_failed, "format_failure": problem is not None and not call_failed,
+                   "compiles": False, "passed": 0, "total": st["total"], "graded": True, "call_failed": call_failed, "is_error": call_failed, "error": error, "format_failure": problem is not None and not call_failed,
                    "first_error": problem, "model_used": res.get("model_used", [])}
             # attempt 1 keeps the file names of a one-shot run; later attempts add __aN, and <tag>.* always holds the latest
             for name in {atag, tag}:

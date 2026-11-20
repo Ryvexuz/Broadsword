@@ -146,10 +146,14 @@ class Attempts(unittest.TestCase):
         run, out, prompts, rec = self.scripted('"no code here"')
         a = rec["attempts"]
         self.assertEqual([x["prompt"] for x in a], prompts)
-        self.assertTrue(a[1]["format_failure"])
+        # the CLI said is_error=true and put its error text in the answer: a provider error, not a format failure
+        self.assertTrue(a[1]["is_error"])
+        self.assertTrue(a[1]["call_failed"])
+        self.assertIn("no code here", a[1]["error"])
+        self.assertFalse(a[1]["format_failure"])
         self.assertFalse(a[1]["compiles"])
         self.assertEqual(a[1]["passed"], 0)
-        self.assertIn("exactly one fenced rust code block", prompts[2])  # fed back from attempt 2, not attempt 1
+        self.assertEqual(prompts[2], prompts[0])  # nothing to feed back from an errored call: the base prompt again
 
     def ungraded_run(self):
         def refuse(items):
