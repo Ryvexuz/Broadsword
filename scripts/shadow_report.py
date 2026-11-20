@@ -75,7 +75,7 @@ def finding_id(text: str) -> str:
 
 
 def grouped_findings(rec: dict, key: str) -> list:
-    """Like findings(), but a line that does not start a finding is the continuation of the finding before it (a reviewer quote
+    """The findings of a BLOCKING block. A line that does not start a finding is the continuation of the finding before it (a reviewer quote
     that spans lines). A line starts a finding when it begins with `path:line` or is a bullet (`-`, `*`, `1.`) at the indent of
     the finding's own bullet or shallower; a text-only bullet is a finding of its own. A block with neither paths nor bullets is
     one finding per line. Returns [(finding_key of the whole text, text)] in order; two findings at one location are both kept."""
