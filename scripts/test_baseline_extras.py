@@ -165,6 +165,28 @@ class Fail(unittest.TestCase):
                 bx.record_v2(root, "x-v2", 0, 3600, NoUnmerged)
             self.assertFalse((root / "state" / "baselines").exists() and any((root / "state" / "baselines").iterdir()))
 
+    def test_v1_value_but_no_merged_coder_runs_fails_closed(self):
+        with self.assertRaises(bx.InputError) as cm:
+            bx.coder_tokens_v2({"coder_tokens_per_merged": 5.0, "coder_tokens_unmerged": 0}, {"merged_with_coder_run": 0})
+        self.assertIn("merged_with_coder_run", str(cm.exception))
+
+    def test_no_data_record_says_no_data_and_makes_no_value_claim(self):
+        class NoCoderRuns(FakeBase):
+            @staticmethod
+            def measure(root, since, until):
+                return ({"coder_tokens_per_merged": None, "coder_tokens_unmerged": None},
+                        {"merged_with_coder_run": 0}, {}, "abc123", [])
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "broadsword.toml").write_text('root = "."\n', encoding="utf-8")
+            out, data = bx.record_v2(root, "x-nodata", 0, 3600, NoCoderRuns)
+            self.assertIsNone(data["metrics"]["coder_tokens_per_merged"])
+            notes = " ".join(data["notes"])
+            self.assertIn("no data", notes)
+            self.assertNotIn("merged tasks' coder tokens / merged tasks", notes)
+            self.assertNotIn("the v1 measurement was", notes)
+
     def run_main(self, argv):
         err, out = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):

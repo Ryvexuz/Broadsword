@@ -184,8 +184,11 @@ def coder_tokens_v2(metrics, samples):
     v1 = (all finished tasks' coder tokens) / n, so v1 * n is the numerator and coder_tokens_unmerged is the part to remove."""
     v1 = metrics.get("coder_tokens_per_merged")
     n = samples.get("merged_with_coder_run")
-    if v1 is None or not n:
-        return None
+    if v1 is None:
+        return None  # no coder runs at all: no data (record_v2 says so in the notes)
+    if not n:
+        raise InputError("baseline.py measured coder_tokens_per_merged but merged_with_coder_run is 0 or missing; "
+                         "v2 cannot be computed (fail closed)")
     unmerged = metrics.get("coder_tokens_unmerged")
     if unmerged is None:
         raise InputError("baseline.py measured coder_tokens_per_merged but not coder_tokens_unmerged; "
@@ -216,8 +219,12 @@ def record_v2(root, name, since, until, base=None):
     base.check_finite(values, per_model)
     definitions = dict(base.DEFINITIONS)
     definitions["coder_tokens_per_merged"] = V2
-    notes = list(notes) + [f"coder_tokens_per_merged is definition {V2}: merged tasks' coder tokens / merged tasks with a coder run "
-                           f"(the v1 measurement was {old})"]
+    if values["coder_tokens_per_merged"] is None:
+        notes = list(notes) + [f"coder_tokens_per_merged is definition {V2} but there is no data in this window "
+                               "(no coder runs): the value is null, not a measurement"]
+    else:
+        notes = list(notes) + [f"coder_tokens_per_merged is definition {V2}: merged tasks' coder tokens / merged tasks with a coder run "
+                               f"(the v1 measurement was {old})"]
     data = {
         "schema": base.SCHEMA, "name": name, "recorded_at": base.iso(int(time.time())),
         "window": {"since": base.iso(since), "until": base.iso(until), "hours": round((until - since) / 3600, 3)},
