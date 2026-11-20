@@ -18,6 +18,9 @@
 //!                        rebases or fixes it, then re-queues with `queue add` [3]
 //!   stale                main (or the branch) moved after the rebase and the review; nothing merged; `queue run --entry` rebases again [3]
 //!   check_failed         build or tests failed on the rebased branch; no model was asked; fix, commit, `queue add` again [5]
+//!   perf_failed          the check passed but the PERF GATE failed (see PERF GATE): a bench case got slower than its baseline's
+//!                        threshold_pct allows, or the project's baseline or bench could not be used (fail closed); no model was
+//!                        asked; fix, commit, `queue add` again [5]
 //!   rejected             the reviewer said FAIL (or gave no usable verdict); the task stays running and its worktree is kept;
 //!                        fix, commit, `queue add` again [5]
 //!   merged_check_failed  the branch IS on main but `check` failed there; main was NOT reset; a human decides [6]
@@ -27,7 +30,16 @@
 //! verdict and cost are only recorded in the entry (`shadow_*`) and in `<entry id>.shadow.review`; it never changes the outcome (see `s_shadow`).
 //!
 //! Exit codes of `queue run`: 0 merged, 1 internal error (the entry stays `running`, resumable), 2 bad input, 3 blocked /
-//! conflict / stale, 4 queue busy, 5 rejected / check_failed, 6 merged_check_failed.
+//! conflict / stale, 4 queue busy, 5 rejected / check_failed / perf_failed, 6 merged_check_failed.
+//!
+//! PERF GATE (perfgate.rs, setting `perf_gate`). It is part of every check of a commit: right after the build and tests pass, the
+//! entry's own project is benched on that commit (`perf_runs` times, as `run` jobs in the task's worktree, each holding the build
+//! lock), when that project has a baseline `<state_dir>/perf/<project>-baseline.json`; a project without one is skipped (printed and
+//! logged in the entry's `perf`), and no other project is ever benched. A case slower than its baseline's `threshold_pct` (per case,
+//! from the file), or a baseline or bench that cannot be used, makes the check a FAILURE: `perf_failed`, with each case's baseline,
+//! now and change in % in the reason. A bench job that never ran gives no verdict (`blocked`). Single entry: in the check step
+//! (`s_check`), before the review. Merge train: ONCE on the chain tip, inside `Run::check_commit`, so a perf failure is bisected
+//! exactly like a failed check (each bisect check and the culprit's own check include the gate), and the culprit ends `perf_failed`.
 //!
 //! PIPELINE, steps in this order: preconditions, rebase, check, review, merge, main_check, done. Every step is recorded in the
 //! entry (`step`, the `log` lines, and the facts each step learned) BEFORE its effect is relied on, and every step is safe to
@@ -95,6 +107,7 @@ use crate::record::{self, Record};
 use crate::reviewer::{self, CallError};
 use crate::task::{self, fail, now_secs};
 use crate::worktree::{self, JobDirError};
+use crate::perfgate::{self, Gate as Perf};
 use crate::{git, pause, sys, tools, wtgit};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -108,6 +121,7 @@ pub const BLOCKED: &str = "blocked";
 pub const CONFLICT: &str = "conflict";
 pub const STALE: &str = "stale";
 pub const CHECK_FAILED: &str = "check_failed";
+pub const PERF_FAILED: &str = "perf_failed";
 pub const REJECTED: &str = "rejected";
 pub const MERGED_CHECK_FAILED: &str = "merged_check_failed";
 pub const CANCELLED: &str = "cancelled";
@@ -293,7 +307,7 @@ fn is_open(status: &str) -> bool {
 }
 
 /// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
-const TEXT_KEYS: [&str; 10] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason"];
+const TEXT_KEYS: [&str; 11] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason", "perf"];
 
 /// What a shadow review records in the entry (cleared on a fresh attempt).
 /// How the GPT client is named in a review file and the entry.
@@ -546,7 +560,10 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
     if !e.get("check_summary").is_empty() {
         println!("check summary:\n  {}", e.get("check_summary").replace('\n', "\n  "));
     }
-    for (label, k) in [("blocking findings", "blocking"), ("minor findings", "minor"), ("shadow blocking findings (recorded only, never gating)", "shadow_blocking")] {
+    if !e.get("perf").is_empty() {
+        println!("perf gate:\n  {}", e.get("perf").replace('\n', "\n  "));
+    }
+    for (label, k) in [("blocking findings", "blocking"),("minor findings", "minor"), ("shadow blocking findings (recorded only, never gating)", "shadow_blocking")] {
         if !e.get(k).is_empty() {
             println!("{label}:\n  {}", e.get(k).replace('\n', "\n  "));
         }
@@ -709,7 +726,7 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
 /// `queue run` refuses a finished entry: exit 2 with the way on.
 fn not_runnable(x: &Record) -> ExitCode {
     let hint = match x.status() {
-        REJECTED | CHECK_FAILED | CONFLICT => "fix the code, commit, and queue the task again with `queue add`",
+        REJECTED | CHECK_FAILED | PERF_FAILED | CONFLICT => "fix the code, commit, and queue the task again with `queue add`",
         _ => "it is finished",
     };
     fail(EXIT_BAD_INPUT, format!("queue entry {} is `{}` and cannot be run; {hint}", x.id(), x.status()))
@@ -731,7 +748,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
     if !resumed {
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
-            "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail",
+            "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf",
             "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
         ] {
             e.set(k, "");
@@ -1378,6 +1395,25 @@ impl<'a> Run<'a> {
         self.blocked(&format!("{text}. Why it left (it would have been `{status}`): {reason}"))
     }
 
+    /// PERF GATE of the commit the task's worktree holds now (`perfgate::run_gate`, the one gate every check path calls): the report
+    /// is recorded in the entry (`perf`) and its log; a skip is printed. The caller decides what the outcome means for the entry.
+    fn perf_gate(&mut self, what: &str) -> Perf {
+        let (project, task_id) = (self.e.get("project").to_string(), self.e.get("task").to_string());
+        let g = perfgate::run_gate(self.cfg, &project, &task_id, what);
+        let text = match &g {
+            Perf::Skipped(line) => {
+                println!("{line}");
+                line.clone()
+            }
+            Perf::Pass(lines) | Perf::Fail(_, lines) => lines.join("\n"),
+            Perf::NoVerdict(m) => format!("perf gate {project}: no verdict: {m}"),
+        };
+        self.e.set("perf", text.clone());
+        let last = text.lines().last().unwrap_or("").to_string();
+        let _ = self.log("perf", &format!("{what}: {last}"));
+        g
+    }
+
     /// NB-18 PLUG-IN POINT 1 of 2. Check `commit` of this entry's project: the build and tests, as `check <project>` runs them.
     /// Interim implementation (nb-18 is not merged): the check runs in this entry's task worktree (`check <project> --task <id>`), and
     /// only for a commit that worktree has checked out right now. nb-18 (check from a clean checkout of the exact commit) replaces the
@@ -1402,9 +1438,19 @@ impl<'a> Run<'a> {
         println!("queue entry {}: check {project} --task {task_id} ({what}; commit {})", self.e.id(), short(commit));
         let mut info = JobInfo::default();
         let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.clone()) }, &mut info);
-        let summary = info.summary.join("\n");
+        let mut summary = info.summary.join("\n");
         let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
         let job_id = info.id.clone().unwrap_or_default();
+        // PERF GATE, part of the check: only once the build and tests passed, on the same commit (verified below, after it too)
+        let mut perf_fail = String::new();
+        if code == 0 {
+            match self.perf_gate(what) {
+                Perf::Skipped(_) | Perf::Pass(_) => {}
+                Perf::Fail(reason, _) => perf_fail = reason,
+                Perf::NoVerdict(m) => return TrainCheck::Blocked(format!("the perf gate could not run to a verdict (check job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
+            }
+            summary = format!("{summary}\n{}", self.e.get("perf"));
+        }
         // The check is bound to `commit` only if the worktree still holds exactly that commit, with nothing else, when it ends (the
         // single-entry path's "branch changed during the check" guard). Whatever the verdict, a changed worktree gives none.
         let head_after = match wtgit::head_commit(&self.wt) {
@@ -1420,8 +1466,9 @@ impl<'a> Run<'a> {
             Err(m) => return TrainCheck::Blocked(format!("the worktree of task {task_id} could not be read after the check (job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
         }
         match code {
-            0 => TrainCheck::Pass { job: job_id, summary, tail },
-            1 if !info.summary.is_empty() => TrainCheck::Fail { job: job_id, summary, tail },
+            0 if perf_fail.is_empty() => TrainCheck::Pass { job: job_id, summary, tail },
+            0 => TrainCheck::Fail { job: job_id, summary, tail, perf: perf_fail },
+            1 if !info.summary.is_empty() => TrainCheck::Fail { job: job_id, summary, tail, perf: String::new() },
             c => TrainCheck::Blocked(format!("the check could not run to a verdict (exit {c}; job {})", if job_id.is_empty() { "none" } else { job_id.as_str() })),
         }
     }
@@ -1662,6 +1709,24 @@ impl<'a> Run<'a> {
                 let tip_after = self.g(wtgit::branch_tip(&dir, &branch))?;
                 if tip_after != tip_before {
                     return Err(self.end(STALE, &format!("branch changed during the check: `{branch}` was at {} when the check started and is at {} now; nothing was reviewed or merged. Run `queue run --entry {}` to check it again", short(&tip_before), short(&tip_after), self.e.id()), EXIT_RETRY));
+                }
+                // PERF GATE on the commit the check just passed, before any model is asked
+                let gate = self.perf_gate("the entry's own check");
+                let tip_perf = self.g(wtgit::branch_tip(&dir, &branch))?;
+                if tip_perf != tip_before {
+                    return Err(self.end(STALE, &format!("branch changed during the perf gate: `{branch}` was at {} when the check started and is at {} now; nothing was reviewed or merged. Run `queue run --entry {}` to check it again", short(&tip_before), short(&tip_perf), self.e.id()), EXIT_RETRY));
+                }
+                match gate {
+                    Perf::Skipped(_) | Perf::Pass(_) => {
+                        let perf = self.e.get("perf").to_string();
+                        self.e.set("check_summary", format!("{summary}\n{perf}"));
+                    }
+                    Perf::Fail(reason, _) => {
+                        return Err(self.end(PERF_FAILED, &format!("the build and tests passed (job {}) but the perf gate failed on commit {}: {reason}. No model was asked. Make it fast again, commit, and queue the task again with `queue add` (if the slowdown is intended, the baseline must be re-recorded first)", info.id.as_deref().unwrap_or("?"), short(&tip_before)), EXIT_REJECTED));
+                    }
+                    Perf::NoVerdict(m) => {
+                        return Err(self.blocked(&format!("the build and tests passed but the perf gate could not run to a verdict: {m}; nothing was reviewed or merged; fix the cause, then `queue run --entry {}`", self.e.id())));
+                    }
                 }
                 self.e.set("checked_tip", tip_before.clone());
                 self.e.set("check_deferred", "");
@@ -2104,7 +2169,8 @@ verdict: {} (answer followed the format: {})
 /// The result of one check of a commit (see `Run::check_commit`).
 enum TrainCheck {
     Pass { job: String, summary: String, tail: String },
-    Fail { job: String, summary: String, tail: String },
+    /// The build or tests failed (`perf` empty), or they passed and the PERF GATE failed (`perf` is its reason).
+    Fail { job: String, summary: String, tail: String, perf: String },
     /// The check could not run to a verdict for a reason that is not this entry's own (refused, paused, git could not be read, the
     /// job could not start or end): no conclusion about the code, and the drain stops (the next one tries again).
     Blocked(String),
@@ -2120,6 +2186,8 @@ struct PassInfo {
     job: String,
     summary: String,
     tail: String,
+    /// A failed check: the perf gate's reason when it was the perf gate that failed (empty for a build or test failure).
+    perf: String,
 }
 
 /// What a `check_alone` said about the culprit of a failed train.
@@ -2501,9 +2569,9 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
         match first {
             TrainCheck::Pass { job, summary, tail } => {
                 lo = m;
-                good = PassInfo { job, summary, tail };
+                good = PassInfo { job, summary, tail, perf: String::new() };
             }
-            TrainCheck::Fail { job, summary, tail } => bad = PassInfo { job, summary, tail },
+            TrainCheck::Fail { job, summary, tail, perf } => bad = PassInfo { job, summary, tail, perf },
             TrainCheck::Blocked(msg) => blocked = Some(msg),
             TrainCheck::EntryBlocked(msg) => entry_blocked = Some((m, msg)),
         }
@@ -2518,11 +2586,11 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
             match res {
                 TrainCheck::Pass { job, summary, tail } => {
                     lo = mid;
-                    good = PassInfo { job, summary, tail };
+                    good = PassInfo { job, summary, tail, perf: String::new() };
                 }
-                TrainCheck::Fail { job, summary, tail } => {
+                TrainCheck::Fail { job, summary, tail, perf } => {
                     hi = mid;
-                    bad = PassInfo { job, summary, tail };
+                    bad = PassInfo { job, summary, tail, perf };
                 }
                 TrainCheck::Blocked(msg) => blocked = Some(msg),
                 TrainCheck::EntryBlocked(msg) => entry_blocked = Some((mid, msg)),
@@ -2567,7 +2635,7 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
         } else {
             checks += 1;
             match culprit.check_alone() {
-                TrainCheck::Fail { job, summary, tail } => Alone::Bad(PassInfo { job, summary, tail }),
+                TrainCheck::Fail { job, summary, tail, perf } => Alone::Bad(PassInfo { job, summary, tail, perf }),
                 TrainCheck::Pass { job, summary, .. } => {
                     let _ = culprit.log("train", &format!("checked on its own commit: passes (job {job}: {summary}); so the failure only shows when it is combined with the entries before it"));
                     Alone::Fine
@@ -2594,9 +2662,10 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                 break;
             }
             Alone::Bad(info) => {
-                println!("merge train {train_id}: entry {culprit_id} fails on its own (job {}): check_failed; the {} entr{} before it merge", info.job, lo, if lo == 1 { "y" } else { "ies" });
+                let failed = if info.perf.is_empty() { CHECK_FAILED } else { PERF_FAILED };
+                println!("merge train {train_id}: entry {culprit_id} fails on its own (job {}): {failed}; the {} entr{} before it merge", info.job, lo, if lo == 1 { "y" } else { "ies" });
                 culprit.e.set("check_job", info.job.clone());
-                culprit.e.set("check_exit", "1");
+                culprit.e.set("check_exit", if info.perf.is_empty() { "1" } else { "0" });
                 culprit.e.set("check_summary", info.summary.clone());
                 culprit.e.set("check_tail", info.tail.clone());
                 // the proven-good entries before it merge FIRST: then a culprit chained only on them sits on main and ends a plain
@@ -2608,7 +2677,13 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                         hard = c;
                     }
                 }
-                let c = culprit.leave_train(CHECK_FAILED, &format!("build or tests failed on this entry on its own (job {}): {}. Found by the bisect of merge train {train_id}; nothing of it was merged. Fix it, commit, and queue the task again with `queue add`", if info.job.is_empty() { "?" } else { info.job.as_str() }, info.summary.replace('\n', "; ")), EXIT_REJECTED);
+                let job_shown = if info.job.is_empty() { "?" } else { info.job.as_str() };
+                let why = if info.perf.is_empty() {
+                    format!("build or tests failed on this entry on its own (job {job_shown}): {}", info.summary.replace('\n', "; "))
+                } else {
+                    format!("the build and tests passed on this entry on its own (job {job_shown}) but the perf gate failed: {}", info.perf)
+                };
+                let c = culprit.leave_train(failed, &format!("{why}. Found by the bisect of merge train {train_id}; nothing of it was merged. Fix it, commit, and queue the task again with `queue add`"), EXIT_REJECTED);
                 finish_member(cfg, culprit, code_num(c), ct, rows, &mut worst);
                 if hard != 0 {
                     leave_approved(cfg, after, "the merge train stopped before this entry's turn", rows, &mut worst);
@@ -2627,7 +2702,8 @@ fn run_train<'a>(cfg: &'a Config, group: Vec<(Run<'a>, std::time::Instant)>, row
                     r.e.set("check_exit", "1");
                     r.e.set("check_summary", bad.summary.clone());
                     r.e.set("check_tail", bad.tail.clone());
-                    let reason = format!("the combined check of merge train {train_id} failed (job {}) although each of these entries passes on its own: {}. They only fail together, so none of them was merged (main is unchanged). The entry's check summary and tail are the combined failure's. Rebase or fix them yourself, commit, and queue them again with `queue add`", if bad.job.is_empty() { "?" } else { bad.job.as_str() }, ids.join(", "));
+                    let perf_note = if bad.perf.is_empty() { String::new() } else { format!(" (it was the perf gate that failed: {})", bad.perf) };
+                    let reason = format!("the combined check of merge train {train_id} failed (job {}){perf_note} although each of these entries passes on its own: {}. They only fail together, so none of them was merged (main is unchanged). The entry's check summary and tail are the combined failure's. Rebase or fix them yourself, commit, and queue them again with `queue add`", if bad.job.is_empty() { "?" } else { bad.job.as_str() }, ids.join(", "));
                     let c = r.leave_train(CONFLICT, &reason, EXIT_RETRY);
                     finish_member(cfg, r, code_num(c), t, rows, &mut worst);
                 }

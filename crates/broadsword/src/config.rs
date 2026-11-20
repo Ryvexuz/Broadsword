@@ -122,6 +122,11 @@ pub struct Config {
     /// (even 1 entry) at the next entry boundary, although entries of that project are still queued. Without it, approved entries of
     /// one project could wait behind another project's stream of entries until the drain ends (the 2026-11-20 starvation).
     pub merge_train_wait_minutes: u64,
+    /// The merge queue's perf gate (perfgate.rs): `"on"` runs a project's bench on every checked commit of a project that has a baseline
+    /// in `<state_dir>/perf/`, and fails an entry that got slower than a case's `threshold_pct` allows; `"off"` runs no bench.
+    pub perf_gate: bool,
+    /// How many times the perf gate runs the bench per checked commit; each case is judged on the median of these runs.
+    pub perf_runs: u64,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -261,6 +266,11 @@ impl Config {
         if !["low", "medium", "high", "xhigh", "max"].contains(&reviewer_effort_high.as_str()) {
             return Err(format!("reviewer_effort_high = \"{reviewer_effort_high}\": must be low, medium, high, xhigh or max"));
         }
+        let perf_gate = match get_str(&m, "perf_gate")?.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("perf_gate = \"{other}\": must be \"on\" or \"off\"")),
+        };
         let shadow_reviewer = get_str(&m, "shadow_reviewer")?;
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
@@ -284,6 +294,8 @@ impl Config {
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             merge_train_max: positive("merge_train_max")?,
             merge_train_wait_minutes: positive("merge_train_wait_minutes")?,
+            perf_gate,
+            perf_runs: positive("perf_runs")?,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -480,6 +492,8 @@ shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
 queue_entry_read_wait_ms = 2000
+perf_gate = \"on\"
+perf_runs = 5
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -557,6 +571,24 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn perf_gate_settings_are_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert!(c.perf_gate, "shipped on");
+        assert_eq!(c.perf_runs, 5, "the shipped perf_runs");
+        for key in ["perf_gate", "perf_runs"] {
+            let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
+            assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
+        }
+        let with = |key: &str, line: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { line.to_string() } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+        assert!(!Config::from_text(&with("perf_gate", "perf_gate = \"off\""), Path::new("p")).unwrap().perf_gate);
+        for bad in ["perf_gate = \"yes\"", "perf_gate = true", "perf_gate = \"\""] {
+            assert!(Config::from_text(&with("perf_gate", bad), Path::new("p")).is_err(), "{bad}");
+        }
+        assert!(Config::from_text(&with("perf_runs", "perf_runs = 0"), Path::new("p")).is_err(), "0 runs would judge nothing");
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
@@ -571,6 +603,8 @@ shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
 queue_entry_read_wait_ms = 2000
+perf_gate = \"on\"
+perf_runs = 5
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -614,6 +648,8 @@ shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
 queue_entry_read_wait_ms = 2000
+perf_gate = \"on\"
+perf_runs = 5
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

@@ -28,6 +28,7 @@ mod json;
 mod lock;
 mod mcp;
 mod pause;
+mod perfgate;
 mod queue;
 mod recover;
 mod record;
