@@ -1974,3 +1974,48 @@ fn an_approved_entry_can_be_cancelled_and_blocks_a_second_queue_add_for_its_task
     assert_eq!(r.status(&es[0]), "cancelled");
     assert_eq!(r.task_status(&task), "running", "cancelling touches nothing else");
 }
+
+/// A drain killed while the ONE main check of a train runs (main already holds all three entries' commits): a test of the last entry
+/// hangs while `main-hang.flag` exists, and only in the main checkout (projects/p), so the train's own check passes first.
+#[test]
+fn a_train_killed_during_its_main_check_is_finished_by_the_next_drain_and_every_entry_merges() {
+    let r = train_root("trainkillmain", 4);
+    let hang = "\n#[cfg(test)]\nmod hang_on_main {\n    #[test]\n    fn waits_on_main_while_the_flag_exists() {\n        let dir = env!(\"CARGO_MANIFEST_DIR\").replace('\\', \"/\");\n        if !dir.contains(\"/projects/p\") {\n            return;\n        }\n        let flag = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"../../main-hang.flag\");\n        for _ in 0..600 {\n            if !flag.exists() {\n                break;\n            }\n            std::thread::sleep(std::time::Duration::from_millis(100));\n        }\n    }\n}\n";
+    let (t1, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (t2, e2) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let (t3, e3) = queued_claim(&r, "src/lib.rs", "src/lib.rs", &lib_with(hang), "task: c hangs on main");
+    let flag = r.dir.join("main-hang.flag");
+    fs::write(&flag, "1").unwrap();
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    // the train's check is job 1, the main check job 2: kill once the main check job exists
+    let end = Instant::now() + Duration::from_secs(240);
+    while !(r.field(&e3, "step") == "main_check" && jobs_of(&r, "check") >= 2) {
+        assert!(Instant::now() < end, "timed out waiting for the train's main check to start; check jobs {}; e3:
+{}", jobs_of(&r, "check"), r.show(&e3));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    kill_tree(&mut child);
+    fs::remove_file(&flag).unwrap();
+    let tip = r.branch_tip(&t3);
+    assert_eq!(r.head(), tip, "the fast-forward happened: main holds the train");
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b", "task: c hangs on main"]);
+    // a half-finished merge cannot be cancelled: its commits are on main
+    for e in [&e1, &e2, &e3] {
+        let o = r.run(&["queue", "cancel", e]);
+        assert_eq!(o.code, 3, "{e}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains("on main"), "{}", o.stderr);
+        assert_ne!(r.status(e), "cancelled");
+    }
+    let checks = jobs_of(&r, "check");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for (t, e) in [(&t1, &e1), (&t2, &e2), (&t3, &e3)] {
+        assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
+        assert_eq!(r.task_status(t), "done");
+    }
+    assert!(jobs_of(&r, "check") > checks, "the main check ran again on the merged main");
+    assert!(r.show(&e3).contains("check on main passed"), "{}", r.show(&e3));
+    assert_eq!(r.head(), tip, "nothing else moved main");
+    assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b", "task: c hangs on main"]);
+    assert!(git(&r.p(), &["rev-list", "--merges", "HEAD"]).is_empty());
+}

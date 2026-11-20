@@ -241,6 +241,20 @@ fn same_model(a: &str, b: &str) -> bool {
 /// An entry is "open" while `queue run` can still act on it (queued, running, blocked, stale, approved): it blocks `queue add` for its task.
 /// Finished entries do not: merged, cancelled, rejected, and also check_failed, conflict and merged_check_failed, which `queue run`
 /// refuses to run again (the documented way on is a new `queue add`, or a human for merged_check_failed).
+/// HALF-FINISHED MERGE, the ONE test: an `approved` entry that a merge train already took into its merge (`merge_members` records
+/// step `merge` on every member BEFORE the fast-forward, `main_sha` after it, then `main_check` and `done`). Its commits may be on
+/// main already, so it is never chained into a new train (`claim_approved` skips it), never cancelled (`cancel_refusal`), and it is
+/// resumed FIRST, at its recorded step, exactly as an interrupted `running` entry is (`resume_first`): `s_merge` takes "the reviewed
+/// commit is already on main" as merged, and `s_main_check` checks the merged main.
+fn half_merged(e: &Record) -> bool {
+    e.status() == APPROVED && (matches!(e.get("step"), "merge" | "main_check" | "done") || !e.get("main_sha").is_empty())
+}
+
+/// An entry a run takes before any other: an interrupted `running` one, or a half-finished train merge (`half_merged`).
+fn resume_first(e: &Record) -> bool {
+    e.status() == RUNNING || half_merged(e)
+}
+
 fn is_open(status: &str) -> bool {
     matches!(status, QUEUED | RUNNING | BLOCKED | STALE | APPROVED)
 }
@@ -507,6 +521,37 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
 
 // ---- cancel -----------------------------------------------------------------------------
 
+/// CANCEL RULE, the ONE place: an entry whose commits may already be on main is never cancelled (it would leave main holding code
+/// whose main check and `task done` never ran). Refused: a half-finished train merge (`half_merged`), and any entry whose reviewed
+/// commit (or recorded main commit) is an ancestor of the project's main HEAD. When that cannot be decided (git or the project
+/// fails), the cancel is refused too: fail closed. `None` = may be cancelled.
+fn cancel_refusal(cfg: &Config, e: &Record) -> Option<String> {
+    let id = e.id();
+    if half_merged(e) {
+        return Some(format!("queue entry {id} is a half-finished merge (a merge train took it into its merge at step `{}`): its commits may be on main already. Not cancelled; finish it with `broadsword queue run --all` or `broadsword queue run --entry {id}`", e.get("step")));
+    }
+    let mut commits: Vec<&str> = [e.get("reviewed_tip"), e.get("main_sha")].into_iter().filter(|c| !c.is_empty()).collect();
+    commits.dedup();
+    if commits.is_empty() {
+        return None;
+    }
+    let on_main = (|| -> Result<Option<String>, String> {
+        let dir = job::resolve_project(&cfg.root, &cfg.projects_dir, e.get("project"))?;
+        let head = wtgit::head_commit(&dir)?;
+        for c in &commits {
+            if wtgit::is_ancestor(&dir, c, &head)? {
+                return Ok(Some(c.to_string()));
+            }
+        }
+        Ok(None)
+    })();
+    match on_main {
+        Ok(None) => None,
+        Ok(Some(c)) => Some(format!("queue entry {id}: its reviewed commit {} is already on main of project `{}`. Not cancelled (main would hold it with no main check and no `task done`); finish it with `broadsword queue run --entry {id}`", short(&c), e.get("project"))),
+        Err(m) => Some(format!("queue entry {id}: cannot tell whether its reviewed commit is already on main ({m}); not cancelled")),
+    }
+}
+
 pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
     // A queued entry: only the entry changes, under the short lock.
     {
@@ -524,6 +569,9 @@ pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             QUEUED | BLOCKED | STALE | APPROVED => {
+                if let Some(why) = cancel_refusal(cfg, &e) {
+                    return fail(EXIT_RETRY, why);
+                }
                 let was = e.status().to_string();
                 e.set("status", CANCELLED);
                 e.set("reason", format!("cancelled while {was}"));
@@ -557,6 +605,9 @@ pub fn cmd_cancel(cfg: &Config, id: &str) -> ExitCode {
     let step = STEPS.iter().position(|s| *s == e.get("step")).unwrap_or(0);
     if step >= STEP_MERGE {
         return fail(EXIT_RETRY, format!("queue entry {id} was interrupted at step `{}`, at or after the merge: main may already hold the commit. Not cancelled; finish it with `broadsword queue run --entry {id}`", e.get("step")));
+    }
+    if let Some(why) = cancel_refusal(cfg, &e) {
+        return fail(EXIT_RETRY, why);
     }
     let mut note = String::new();
     if let Ok(t) = task::load_task(cfg, e.get("task")) {
@@ -600,7 +651,7 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>) -> ExitCode {
             Some(x) => Err(not_runnable(x)),
             None => Err(fail(EXIT_BAD_INPUT, format!("no queue entry with the exact id `{id}` (see `broadsword queue list`)"))),
         },
-        None => Ok(all.iter().find(|x| x.status() == RUNNING).or_else(|| all.iter().find(|x| matches!(x.status(), QUEUED | STALE))).or_else(|| all.iter().find(|x| x.status() == APPROVED)).cloned()),
+        None => Ok(all.iter().find(|x| resume_first(x)).or_else(|| all.iter().find(|x| matches!(x.status(), QUEUED | STALE))).or_else(|| all.iter().find(|x| x.status() == APPROVED)).cloned()),
     });
     let e = match chosen {
         Ok(Some(e)) => e,
@@ -710,7 +761,7 @@ fn next_for_all(all: &[Record], taken: &[String], train: bool) -> Option<Record>
     let fresh = |x: &&Record| !taken.iter().any(|t| t == x.id());
     all.iter()
         .filter(fresh)
-        .find(|x| x.status() == RUNNING)
+        .find(|x| resume_first(x))
         .or_else(|| all.iter().filter(fresh).find(|x| matches!(x.status(), QUEUED | STALE)))
         .or_else(|| if train { None } else { all.iter().filter(fresh).find(|x| x.status() == APPROVED) })
         .cloned()
@@ -1018,7 +1069,9 @@ impl<'a> Run<'a> {
     /// died, or `queue run` of an `approved` entry on its own) is checked alone first: nothing unchecked ever merges.
     fn merge_phase(&mut self, start: usize) -> R<ExitCode> {
         if start <= STEP_MERGE {
-            if self.e.get("check_deferred") == "yes" && self.e.get("train_checked") != self.e.get("reviewed_tip") {
+            // a commit already on main (a train that died after its fast-forward) is not checked alone: it is merged, and the main
+            // check below checks the main that holds it
+            if self.e.get("check_deferred") == "yes" && self.e.get("train_checked") != self.e.get("reviewed_tip") && !self.reviewed_on_main()? {
                 self.log("merge", "this entry's check was deferred to a merge train that has not checked this commit: it is checked on its own before it can merge")?;
                 self.s_check()?;
             }
@@ -1028,6 +1081,17 @@ impl<'a> Run<'a> {
             self.s_main_check()?;
         }
         self.s_done()
+    }
+
+    /// Is the reviewed commit already on the main checkout's HEAD (equal to it or an ancestor of it)? False when none is recorded.
+    fn reviewed_on_main(&mut self) -> R<bool> {
+        let reviewed = self.e.get("reviewed_tip").to_string();
+        if reviewed.is_empty() {
+            return Ok(false);
+        }
+        let dir = self.dir.clone();
+        let head = self.g(wtgit::head_commit(&dir))?;
+        self.g(wtgit::is_ancestor(&dir, &reviewed, &head))
     }
 
     // -- merge train (see `run_train`) ------------------------------------------------------
@@ -1709,10 +1773,11 @@ verdict: {} (answer followed the format: {})
             return Err(self.blocked(&format!("the main checkout is on {now}, but this entry was reviewed against `{was}`; nothing merged")));
         }
         let head = self.g(wtgit::head_commit(&dir))?;
-        if head == reviewed {
-            // an earlier run already fast-forwarded main to exactly this commit and died before recording it
-            self.e.set("main_sha", head.clone());
-            return self.log("merge", &format!("main's HEAD already is the reviewed commit {}: recorded as merged", short(&head)));
+        if head == reviewed || self.g(wtgit::is_ancestor(&dir, &reviewed, &head))? {
+            // an earlier run already fast-forwarded main to this commit (a merge train: to a later commit that contains it) and died
+            // before recording it
+            self.e.set("main_sha", reviewed.clone());
+            return self.log("merge", &format!("the reviewed commit {} is already on main (HEAD {}): recorded as merged", short(&reviewed), short(&head)));
         }
         let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
         if !dirty.is_empty() {
@@ -1906,7 +1971,8 @@ fn claim_approved(cfg: &Config) -> Result<Vec<Record>, ExitCode> {
     let all = load_entries(cfg).map_err(|m| fail(EXIT_ERROR, m))?;
     let me = std::process::id();
     let mut out = Vec::new();
-    for mut e in all.into_iter().filter(|x| x.status() == APPROVED) {
+    // a half-finished merge is not a train candidate: the drain resumes it on its own first (`resume_first`)
+    for mut e in all.into_iter().filter(|x| x.status() == APPROVED && !half_merged(x)) {
         e.set("pid", me.to_string());
         e.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
         e.save().map_err(|err| fail(EXIT_ERROR, format!("cannot write the queue entry {}: {err}", e.path.display())))?;
@@ -2228,6 +2294,16 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
         }
         return 0;
     }
+    // BEFORE the fast-forward: every member records step `merge`, so a drain killed from here on leaves each one a half-finished
+    // merge (`half_merged`) that the next run resumes at its step, never one that is chained into a new train while its commits may
+    // already be on main. A member whose record cannot be written stops the train before main moves.
+    let mut members = members;
+    for (r, _) in members.iter_mut() {
+        r.e.set("step", "merge");
+        if r.save().is_err() {
+            return fail_members(cfg, members, &format!("could not record the merge step of merge train {train_id} before its fast-forward; main was not moved"), rows, worst);
+        }
+    }
     if let Err(m) = wtgit::merge_ff_only(&dir, tip) {
         let after = wtgit::head_commit(&dir).unwrap_or_default();
         for (mut r, t) in members {
@@ -2249,7 +2325,6 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
         let msg = format!("after `git merge --ff-only` main's HEAD is {} but the train tip is {}; main was {} before; look at the project", short(&after), short(tip), short(head));
         return fail_members(cfg, members, &msg, rows, worst);
     }
-    let mut members = members;
     let last = n - 1;
     let last_id = members[last].0.e.id().to_string();
     for (i, (r, _)) in members.iter_mut().enumerate() {
