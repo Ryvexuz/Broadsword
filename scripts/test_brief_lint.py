@@ -12,6 +12,7 @@ import io
 import os
 import pathlib
 import shutil
+import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -212,13 +213,32 @@ class Bypasses(unittest.TestCase):
         self.assertFalse(res["lines"][0], res["lines"][1])
 
 
+class HiddenBullets(unittest.TestCase):
+    def test_bullets_after_a_claims_line_are_counted(self):
+        many = "".join(f"- req {i}\n" for i in range(20))
+        text = "Requirements:\n- one\nClaims: a.py\n" + many + "Done check: `python t.py`\n"
+        res = lint(text)
+        self.assertFalse(res["bullets"][0], res["bullets"][1])
+
+    def test_a_path_bullet_under_claims_is_not_a_requirement_bullet(self):
+        text = "Requirements:\n- one\nClaims:\n" + "- a/b.py\n" * 9 + "Done check: `python t.py`\n"
+        res = lint(text)
+        self.assertTrue(res["bullets"][0], res["bullets"][1])
+
+    def test_bullets_before_the_first_section_are_counted(self):
+        many = "".join(f"- req {i}\n" for i in range(20))
+        text = many + "Requirements:\n- one\nClaims: a.py\nDone check: `python t.py`\n"
+        res = lint(text)
+        self.assertFalse(res["bullets"][0], res["bullets"][1])
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
-        self.dir = pathlib.Path(os.environ.get("BRIEF_LINT_SCRATCH",
-                                               HERE.parent / "scratch")) / "test_brief_lint"
-        shutil.rmtree(self.dir, ignore_errors=True)
-        self.dir.mkdir(parents=True)
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_"))
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_scratch_dir_is_a_fresh_temp_directory_not_a_repo_folder(self):
+        self.assertTrue(self.dir.parent.samefile(tempfile.gettempdir()), self.dir)
 
     def write(self, name, text):
         p = self.dir / name

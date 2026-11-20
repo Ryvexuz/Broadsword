@@ -9,10 +9,11 @@ measured values (state/staging/selfcheck/NOTES.md) are 30, 8 and 2; the done-che
 Rules, each printed as `PASS` or `FAIL` per brief:
   lines     non-blank lines at most --max-lines; the first --max-done-lines lines of the done check
             are not counted, any beyond that are
-  bullets   top-level bullets in the Requirements section (any heading form), at most
-            --max-bullets; no Requirements section is a failure
-  files     distinct path-like tokens on the Claims line (backticked or not), at most --max-files unless the Claims
-            line states a reason (the word "reason" or "because")
+  bullets   top-level bullets anywhere outside the Done check (before the first section too; in
+            Claims only bullets that name no path), at most --max-bullets; a brief with no
+            Requirements section (any heading form) is a failure
+  files     distinct path-like tokens on any line outside the Done check (backticked or not), at
+            most --max-files unless the Claims text states a reason (the word "reason" or "because")
   donecheck a Done check section exists, has at least one item, and every item holds a
             backtick span that is a command (first word: broadsword, python, cargo, git, ...)
 
@@ -120,13 +121,20 @@ def lint(text, max_lines, max_bullets, max_files, max_done_lines):
                         "'Requirements:', '## Requirements', '**Requirements**')"))
     else:
         bullets = 0
+        first = secs[0][1] if secs else len(lines)
+        for ln in lines[:first]:
+            if ITEM_RE.match(ln) and not ln.startswith((" ", "	")):
+                bullets += 1
         for name, a, b in secs:
-            if name in ("done check", "claims"):
+            if name == "done check":
                 continue
             if name == "requirements" and section_of(lines[a])[1]:
                 bullets += 1
             for ln in lines[a + 1:b]:
                 if ITEM_RE.match(ln) and not ln.startswith((" ", "	")):
+                    # In Claims a bullet that names a path is a claimed file, not a requirement.
+                    if name == "claims" and claim_paths(ln):
+                        continue
                     bullets += 1
         results.append(("bullets", bullets <= max_bullets,
                         f"{bullets} requirement bullets (max {max_bullets}; all sections but "
