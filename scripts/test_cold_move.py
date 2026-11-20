@@ -2,8 +2,10 @@
 
 Run: python -I -B scripts/test_cold_move.py   (or python -I -m unittest scripts/test_cold_move.py -v)
 """
+import contextlib
 import io
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -624,6 +626,330 @@ class Trigger(Fixture):
             code = cold_move.main(self.argv(*self.YES, *self.ALL))
         self.assertEqual(code, 2)
         self.assertIn("refused", err.getvalue())
+
+
+def tree_state(path):
+    """{relative path: (size, mtime_ns, bytes)} for files, None for folders. Test-side, plain
+    os.walk (the fixtures that use it hold no links), independent of cold_move.scan_tree."""
+    out = {}
+    for dirpath, dirnames, files in os.walk(path):
+        for n in dirnames:
+            out[(Path(dirpath) / n).relative_to(path).as_posix()] = None
+        for n in files:
+            q = Path(dirpath) / n
+            st = q.stat()
+            out[q.relative_to(path).as_posix()] = (st.st_size, st.st_mtime_ns, q.read_bytes())
+    return out
+
+
+def junction(link, target):
+    """Make an NTFS junction (no admin right needed). Returns False when it cannot be made."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True)
+    return p.returncode == 0 and os.path.isjunction(link)
+
+
+def read_only(path):
+    os.chmod(path, stat.S_IREAD)
+
+
+def is_read_only(path):
+    return not os.stat(path).st_mode & stat.S_IWRITE
+
+
+class CrossDrive(Fixture):
+    """Requirement 1: a worktree across drives is copied, verified, repaired, listed, then removed.
+
+    A second drive is not available, so `git worktree move` is made to fail the way it does across
+    drives on Windows, and the FORCE_WORKTREE_COPY hook (which may only make the guard stricter)
+    sends the move down the copy path.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.wt = self.root / "worktrees" / "proj" / "t-done"
+        self.new = self.ext / "worktree" / "worktrees" / "proj" / "t-done"
+        self.calls = []
+
+    def cross_drive(self, fail=None):
+        """fail(args) -> CompletedProcess or None: a git call to fake. `worktree move` always fails."""
+        real = cold_move.run_git
+
+        def fake(root, *args):
+            self.calls.append(args)
+            if args[:2] == ("worktree", "move"):
+                return subprocess.CompletedProcess(args, 128, "", "fatal: simulated cross-drive move failure")
+            if fail is not None and (r := fail(args)) is not None:
+                return r
+            return real(root, *args)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(cold_move, "FORCE_WORKTREE_COPY", True, create=True))
+        stack.enter_context(mock.patch.object(cold_move, "run_git", fake))
+        return stack
+
+    def listing(self):
+        return git(self.root, "worktree", "list", "--porcelain").replace("\\", "/")
+
+    def assert_source_untouched_and_no_copy(self, before, out):
+        self.assertEqual(tree_state(self.wt), before, out)
+        self.assertEqual(list(self.new.parent.iterdir()) if self.new.parent.exists() else [], [], out)
+        self.assertIn(self.wt.as_posix(), self.listing())
+        self.assertNotIn(self.new.as_posix(), self.listing())
+        self.assertEqual(git(self.wt, "status", "--porcelain").strip(), "")
+
+    def test_cross_drive_copy_verify_repair_list_then_remove(self):
+        read_only(self.wt / "README.md")  # read-only files, as git objects are
+        self.approve(["worktree"])
+        with self.cross_drive():
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(("worktree", "move"), [c[:2] for c in self.calls])
+        self.assertIn(("worktree", "repair", str(self.new)), self.calls)
+        self.assertEqual((self.new / "README.md").read_text(), "hello")
+        self.assertTrue((self.new / ".git").read_text().startswith("gitdir:"))
+        self.assertFalse(self.wt.exists())
+        self.assertIn(self.new.as_posix(), self.listing())
+        self.assertNotIn(self.wt.as_posix() + "\n", self.listing())
+        self.assertEqual(git(self.new, "status", "--porcelain").strip(), "")
+        self.assertEqual(list(self.new.parent.iterdir()), [self.new])  # no temp copy left
+
+    def test_cross_drive_verify_failure_keeps_source_and_removes_the_copy(self):
+        read_only(self.wt / "README.md")  # the partial copy then holds a read-only file too
+        before = tree_state(self.wt)
+        self.approve(["worktree"])
+        real_copy = cold_move.copy_item
+
+        def corrupting(src, dst):
+            real_copy(src, dst)
+            q = dst / "README.md"
+            os.chmod(q, stat.S_IWRITE | stat.S_IREAD)
+            q.write_text("HELLO")  # same size, other bytes
+            read_only(q)
+
+        with self.cross_drive(), mock.patch.object(cold_move, "copy_item", corrupting):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("step verify", out)
+        self.assert_source_untouched_and_no_copy(before, out)
+
+    def test_cross_drive_repair_failure_keeps_source_and_removes_the_copy(self):
+        before = tree_state(self.wt)
+        self.approve(["worktree"])
+
+        def repair_fails(args):
+            if args[:2] == ("worktree", "repair"):
+                return subprocess.CompletedProcess(args, 1, "", "error: simulated repair failure")
+            return None
+
+        with self.cross_drive(repair_fails):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("step repair", out)
+        self.assert_source_untouched_and_no_copy(before, out)
+
+    def test_cross_drive_list_failure_points_git_back_and_keeps_source(self):
+        before = tree_state(self.wt)
+        self.approve(["worktree"])
+        state = {"repaired": False}
+
+        def list_fails_after_repair(args):
+            if args[:2] == ("worktree", "repair") and str(self.new) in args:
+                state["repaired"] = True
+            if args[:2] == ("worktree", "list") and state["repaired"]:
+                return subprocess.CompletedProcess(args, 1, "", "error: simulated list failure")
+            return None
+
+        with self.cross_drive(list_fails_after_repair):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("step list", out)
+        self.assertIn("pointed back", out)
+        # git's record was put back from its saved bytes, not by repairing (which would rewrite
+        # the source's .git file): the source is byte- and mtime-identical, and git lists it again
+        self.assertNotIn(("worktree", "repair", str(self.wt)), self.calls)
+        self.assert_source_untouched_and_no_copy(before, out)
+
+    def test_cross_drive_source_changed_after_verify_is_not_removed(self):
+        self.approve(["worktree"])
+        real_verify = cold_move.verify_copy
+
+        def verify_then_someone_writes(src, dst):
+            real_verify(src, dst)
+            if src == self.wt:
+                put(self.wt / "late.txt", "written after the verify")
+
+        with self.cross_drive(), mock.patch.object(cold_move, "verify_copy", verify_then_someone_writes):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("changed after it was verified", out)
+        self.assertEqual((self.wt / "late.txt").read_text(), "written after the verify")
+        self.assertTrue((self.wt / "README.md").is_file())
+
+    def test_cross_drive_board_flip_after_planning_keeps_source(self):
+        before = tree_state(self.wt)
+        self.approve(["worktree"])
+        real_plan = cold_move.build_plan
+
+        def plan_then_task_reopened(*a, **k):
+            items = real_plan(*a, **k)
+            put(self.board, "t-done\trunning\nt-run\trunning\n")
+            return items
+
+        with self.cross_drive(), mock.patch.object(cold_move, "build_plan", plan_then_task_reopened):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 1, out)
+        self.assertIn("board status is now running", out)
+        self.assert_source_untouched_and_no_copy(before, out)
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-run" / "README.md").is_file())
+
+    def test_same_drive_still_uses_git_worktree_move(self):
+        real = cold_move.run_git
+
+        def spy(root, *args):
+            self.calls.append(args)
+            return real(root, *args)
+
+        self.approve(["worktree"])
+        with mock.patch.object(cold_move, "run_git", spy):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 0, out)
+        self.assertIn(("worktree", "move"), [c[:2] for c in self.calls])
+        self.assertIn(self.new.as_posix(), self.listing())
+
+    def test_locked_worktree_is_skipped(self):
+        git(self.root, "worktree", "lock", str(self.wt))
+        self.approve(["worktree"])
+        code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped: locked in git", out)
+        self.assertTrue((self.wt / "README.md").is_file())
+        self.assertFalse(self.new.exists())
+
+
+class UsedApproval(Fixture):
+    """Requirement 2: a used-up approval (.used-<UTC>) is never accepted again."""
+
+    def test_used_approval_file_is_refused(self):
+        used = self.root / "state" / "cold-move-approved.txt.used-20261120T000000Z-abcd1234"
+        put(used, f"APPROVED {cold_move.utc_today()} evidence\n")
+        code, out = self.go("--yes", "--approval-file", "state/" + used.name, "--class", "evidence")
+        self.assertEqual(code, 2, out)
+        self.assertIn("used-up approval", out)
+        self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
+        self.assertTrue(used.is_file())
+
+
+class Links(Fixture):
+    """Requirement 3: an item that is or holds a junction or symlink is skipped, never followed."""
+
+    def setUp(self):
+        super().setUp()
+        self.outside = Path(self.tmp.name).resolve() / "outside"
+        put(self.outside / "keep.txt", "not ours")
+        read_only(self.outside / "keep.txt")
+        self.addCleanup(os.chmod, self.outside / "keep.txt", stat.S_IWRITE | stat.S_IREAD)
+
+    def link(self, at):
+        if not junction(at, self.outside):
+            self.skipTest("cannot make an NTFS junction here")
+
+    def assert_outside_untouched(self):
+        self.assertEqual((self.outside / "keep.txt").read_text(), "not ours")
+        self.assertTrue(is_read_only(self.outside / "keep.txt"))  # never chmod'ed
+        self.assertEqual(sorted(p.name for p in self.outside.iterdir()), ["keep.txt"])
+
+    def test_junction_inside_an_item_is_skipped(self):
+        self.link(self.root / "evidence" / "ev1" / "sub" / "j")
+        self.approve(["evidence"])
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped: contains a link (sub/j)", out)
+        self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
+        self.assertTrue(os.path.isjunction(self.root / "evidence" / "ev1" / "sub" / "j"))
+        self.assertFalse((self.ext / "evidence" / "evidence" / "ev1").exists())
+        self.assert_outside_untouched()
+
+    def test_item_that_is_a_junction_is_skipped(self):
+        self.link(self.root / "evidence" / "jtop")
+        self.approve(["evidence"])
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped: contains a link (.)", out)
+        self.assertTrue(os.path.isjunction(self.root / "evidence" / "jtop"))
+        self.assertFalse((self.ext / "evidence" / "evidence" / "jtop").exists())
+        self.assert_outside_untouched()
+
+    def test_worktree_holding_a_junction_is_skipped(self):
+        with open(self.root / ".git" / "info" / "exclude", "a", encoding="utf-8") as f:
+            f.write("\njl\n")
+        wt = self.root / "worktrees" / "proj" / "t-done"
+        self.link(wt / "jl")
+        self.approve(["worktree"])
+        code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped: contains a link (jl)", out)
+        self.assertTrue((wt / "README.md").is_file())
+        self.assertFalse((self.ext / "worktree").exists())
+        self.assert_outside_untouched()
+
+    def test_junction_appearing_after_the_verify_stops_the_removal(self):
+        self.approve(["evidence"])
+        real_verify = cold_move.verify_copy
+        ev1 = self.root / "evidence" / "ev1"
+
+        def verify_then_link_appears(src, dst):
+            real_verify(src, dst)
+            if src == ev1:
+                self.link(ev1 / "j")
+
+        with mock.patch.object(cold_move, "verify_copy", verify_then_link_appears):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 1, out)
+        self.assertIn("link", out)
+        self.assertTrue((ev1 / "e.txt").is_file())
+        self.assertTrue(os.path.isjunction(ev1 / "j"))
+        self.assert_outside_untouched()
+
+    def test_delete_tree_refuses_a_link_and_deletes_nothing(self):
+        d = self.root / "evidence" / "ev1"
+        snap = cold_move.scan_tree(d)
+        self.link(d / "j")
+        with self.assertRaises(cold_move.LinkFound):
+            cold_move.delete_tree(d, snap)
+        self.assertTrue((d / "e.txt").is_file())
+        self.assert_outside_untouched()
+
+    def test_delete_tree_refuses_a_changed_tree_and_deletes_nothing(self):
+        d = self.root / "evidence" / "ev1"
+        snap = cold_move.scan_tree(d)
+        put(d / "new.txt", "added after the snapshot")
+        with self.assertRaises(cold_move.TreeChanged):
+            cold_move.delete_tree(d, snap)
+        self.assertTrue((d / "e.txt").is_file())
+        self.assertTrue((d / "new.txt").is_file())
+
+
+class ReadOnly(Fixture):
+    """Requirement 4: a source with read-only files is removed; nothing outside it is chmod'ed."""
+
+    def test_read_only_files_in_a_copied_source_are_removed(self):
+        ev1 = self.root / "evidence" / "ev1"
+        put(ev1 / "objects" / "ab" / "obj", "git object")
+        read_only(ev1 / "objects" / "ab" / "obj")
+        read_only(ev1 / "e.txt")
+        other = self.root / "reference" / "ref1" / "r.txt"
+        read_only(other)  # another item, not moved in this run: must stay read-only
+        self.addCleanup(os.chmod, other, stat.S_IWRITE | stat.S_IREAD)
+        self.approve(["evidence"])
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(ev1.exists(), out)
+        dst = self.ext / "evidence" / "evidence" / "ev1"
+        self.assertEqual((dst / "objects" / "ab" / "obj").read_text(), "git object")
+        self.assertTrue(is_read_only(dst / "e.txt"))  # the copy keeps the attribute
+        self.assertTrue(is_read_only(other))
 
 
 if __name__ == "__main__":

@@ -27,19 +27,41 @@ approval file (inside --state-dir) exists and is exactly one line
 naming every class the run asks for. The orchestrator writes it only after Lazlo's yes in chat.
 An approval is used once: when a --yes run reaches the move step it renames the file to
 <name>.used-<UTC timestamp>-<id> (never deletes it) before moving anything, so the next --yes run
-of any class needs a new yes and a new file. A rename failure refuses the run, nothing moved.
+of any class needs a new yes and a new file (this is stricter than renaming only after a
+successful run: a run that fails part-way has used its approval too). A rename failure refuses
+the run, nothing moved. A file whose name holds ".used-" is never accepted as an approval. Only
+classes that are both named by --class and approved by the file are moved; do_move checks this
+again for every item.
 
 Never moved, whatever the flags: a path with a git-tracked file; anything inside --state-dir
 (state/ records); a worktree the board does not list as finished (running, queued, unknown, or
-the board cannot be read); a symlink or a folder holding one; a folder holding a secret file
-(.env*); anything whose target already exists. For the copy classes (build-cache, evidence,
-reference) every candidate also goes through repo_guard: one holding a .git entry (file or
-folder) at any depth, one that is, holds or sits inside a worktree from `git worktree list`
-(other than root itself), and one that overlaps --worktrees-dir or --state-dir is skipped; the
-guard runs at planning and again right before the copy. Files and folders are copied, the size
-and SHA-256 of every file are verified, and only then is the source removed. A retired worktree
-is moved with `git worktree move`, then `git worktree repair`; right before the move the board
-is read again and the target re-checked absent.
+the board cannot be read), or that git lists as locked; an item that is or holds a link
+(symlink, NTFS junction or any other reparse point, found by scan_tree, which never follows
+one), listed as "skipped: contains a link"; a folder holding a secret file (.env*); anything
+whose target already exists. For the copy classes (build-cache, evidence, reference) every
+candidate also goes through repo_guard: one holding a .git entry (file or folder) at any depth,
+one that is, holds or sits inside a worktree from `git worktree list` (other than root itself),
+and one that overlaps --worktrees-dir or --state-dir is skipped; the guard runs at planning and
+again right before the copy. Files and folders are copied, the size and SHA-256 of every file
+are verified, and only then is the source removed.
+
+A retired worktree on the same drive as the target is moved with `git worktree move`, then
+`git worktree repair`. Across drives (where `git worktree move` fails on Windows) it is copied,
+every file (the worktree's .git file included) is verified by size and SHA-256, then
+`git worktree repair <new path>` runs from root, `git worktree list` must show the new path and
+no longer the old one, and only then is the source removed. If a step fails, the source is left
+untouched, the copy this run made is removed (after a repair, git's record of the worktree,
+<admin>/gitdir in the main repo, is first put back from the bytes saved before the repair; if
+that fails the copy is kept so git never points at nothing), and the item is reported FAILED
+with the step named. Right before
+either kind of move the board, git's lock flag, the clean status and the target are re-checked.
+
+Removal (delete_tree, the one place this script deletes a tree): the source must still match,
+path for path and by size and mtime, the snapshot taken before its copy, and hold no link; then
+only the files and folders of that snapshot are removed, bottom up, never through a link. A
+read-only attribute is cleared only on a file or folder inside the tree being removed, right
+before its removal (git objects are read-only). A partial copy is removed the same way, and only
+the temp name this run created.
 With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
 exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
 name next to the target, is verified, then renamed into place; an error removes only that temp
@@ -51,12 +73,18 @@ import argparse
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
+# Test hook. It may only make the guard stricter (lesson 11): True forces every worktree move
+# through the verified copy path (copy, verify, repair, list, then remove), never the reverse.
+# Tests use it because a second drive is not available. Nothing else sets it.
+FORCE_WORKTREE_COPY = False
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400  # junctions, symlinks and every other reparse point
 GIT_TIMEOUT = 120
 BOARD_TIMEOUT = 60
 CLASSES = ("build-cache", "evidence", "reference", "worktree")
@@ -76,6 +104,116 @@ class Refusal(Exception):
 
 class MoveFailed(Exception):
     """One item could not be moved; its source is kept."""
+
+
+class LinkFound(Exception):
+    """scan_tree met a symlink, junction or other reparse point; `where` is its relative path."""
+
+    def __init__(self, where):
+        super().__init__(f"contains a link ({where})")
+        self.where = where
+
+
+class TreeChanged(Exception):
+    """The tree no longer matches the snapshot it was verified against; nothing was deleted."""
+
+
+# ---------------------------------------------------------------- tree walking and removal
+def is_link_stat(st):
+    """True for a symlink, an NTFS junction or any other reparse point (an lstat result)."""
+    return stat.S_ISLNK(st.st_mode) or bool(
+        getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def scan_tree(top):
+    """Snapshot top without ever following a link: (dirs, files).
+
+    dirs is a set of relative posix paths of folders; files maps each relative posix path to
+    (size, mtime_ns). A file top gives files {".": ...}. Raises LinkFound when top or anything
+    under it is a link (symlink, junction, other reparse point), OSError when a folder cannot be
+    read or an entry is neither a plain file nor a folder (fail closed, never skipped).
+    """
+    st = os.lstat(top)
+    if is_link_stat(st):
+        raise LinkFound(".")
+    if stat.S_ISREG(st.st_mode):
+        return set(), {".": (st.st_size, st.st_mtime_ns)}
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"{top} is neither a plain file nor a folder")
+    dirs, files = set(), {}
+    stack = [(Path(top), "")]
+    while stack:
+        folder, rel = stack.pop()
+        with os.scandir(folder) as it:
+            entries = sorted(it, key=lambda e: e.name)
+        for e in entries:
+            r = f"{rel}/{e.name}" if rel else e.name
+            est = e.stat(follow_symlinks=False)
+            if is_link_stat(est) or e.is_junction():
+                raise LinkFound(r)
+            if stat.S_ISDIR(est.st_mode):
+                dirs.add(r)
+                stack.append((Path(e.path), r))
+            elif stat.S_ISREG(est.st_mode):
+                files[r] = (est.st_size, est.st_mtime_ns)
+            else:
+                raise OSError(f"{r} is neither a plain file nor a folder")
+    return dirs, files
+
+
+def link_reason(path):
+    """'contains a link (<where>)' when path is or holds a link, else None. OSError propagates."""
+    try:
+        scan_tree(path)
+    except LinkFound as e:
+        return str(e)
+    return None
+
+
+def _make_writable(path, st):
+    """Clear the read-only attribute of one entry. Called only from delete_tree, on an entry of
+    the tree being removed that was just lstat'ed as a plain file or folder (never a link)."""
+    if not st.st_mode & stat.S_IWRITE:
+        os.chmod(path, stat.S_IMODE(st.st_mode) | stat.S_IWRITE)
+
+
+def _plain_lstat(path, want_dir):
+    st = os.lstat(path)
+    if is_link_stat(st):
+        raise LinkFound(str(path))
+    if not (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+        raise TreeChanged(f"{path} changed kind; not deleted")
+    return st
+
+
+def delete_tree(top, expected):
+    """The one place this script deletes a file or tree.
+
+    expected is a scan_tree snapshot taken before the copy was made and verified. The tree is
+    scanned again (never following a link); if it holds a link (LinkFound) or differs from
+    expected in any path, size or mtime (TreeChanged), nothing is deleted. Otherwise only the
+    snapshot's own files and folders are removed, deepest first, each lstat'ed right before its
+    removal so a link that appears meanwhile stops the removal instead of being followed.
+    Read-only attributes are cleared only on these entries, inside top.
+    """
+    top = Path(top)
+    now = scan_tree(top)
+    if now != expected:
+        raise TreeChanged("the tree changed after it was verified; nothing deleted")
+    dirs, files = now
+    if "." in files:
+        _make_writable(top, _plain_lstat(top, False))
+        os.unlink(top)
+        return
+    for rel in sorted(files):
+        p = top / rel
+        _make_writable(p, _plain_lstat(p, False))
+        os.unlink(p)
+    for rel in sorted(dirs, key=lambda r: r.count("/"), reverse=True) + [None]:
+        p = top if rel is None else top / rel
+        _make_writable(p, _plain_lstat(p, True))
+        os.rmdir(p)  # only ever an empty folder: never recursive
 
 
 # ---------------------------------------------------------------- helpers
@@ -120,34 +258,31 @@ def is_inside(child, parent):
 
 
 def tree_has_symlink_or_secret(path):
-    """Return a reason string if the folder holds a symlink or secret file, else None."""
-    if path.is_symlink():
-        return "is a symlink"
-    if path.is_file():
+    """Return a reason string if path is or holds a link or a secret file, else None.
+
+    Links (symlinks, junctions, other reparse points) are found by scan_tree, which never
+    follows one; the reason then reads "contains a link (<where>)".
+    """
+    try:
+        dirs, files = scan_tree(path)
+    except LinkFound as e:
+        return str(e)
+    if "." in files:
         return "is a secret file" if path.name.lower().startswith(".env") else None
-    for dirpath, dirnames, filenames in os.walk(path):
-        for n in dirnames + filenames:
-            q = Path(dirpath) / n
-            if q.is_symlink():
-                return f"holds a symlink ({q.name})"
-            if n.lower().startswith(".env"):
-                return f"holds a secret file ({n})"
+    for rel in sorted(dirs | set(files)):
+        n = rel.rsplit("/", 1)[-1]
+        if n.lower().startswith(".env"):
+            return f"holds a secret file ({n})"
     return None
 
 
 def size_and_newest(path):
-    total = 0
-    newest = 0.0
-    if path.is_file():
-        st = path.stat()
-        return st.st_size, st.st_mtime
-    for dirpath, _d, files in os.walk(path):
-        for n in files:
-            st = (Path(dirpath) / n).stat()
-            total += st.st_size
-            newest = max(newest, st.st_mtime)
+    """Total size and newest mtime (seconds) of path, from scan_tree (links are never followed)."""
+    _dirs, files = scan_tree(path)
+    total = sum(s for s, _m in files.values())
+    newest = max((m for _s, m in files.values()), default=0) / 1e9
     if newest == 0.0:
-        newest = path.stat().st_mtime
+        newest = os.lstat(path).st_mtime
     return total, newest
 
 
@@ -196,16 +331,26 @@ class Item:
         self.guard = guard  # RepoGuard for copy classes: re-run right before the copy
 
 
-def registered_worktrees(root):
-    """Resolved paths of every worktree `git worktree list --porcelain` names. Fails closed."""
+def worktree_records(root):
+    """{resolved path: True when locked} for every worktree `git worktree list --porcelain`
+    names. Fails closed (Refusal) when git fails."""
     p = run_git(root, "worktree", "list", "--porcelain")
     if p.returncode != 0:
         raise Refusal(f"git worktree list failed: {p.stderr.strip()}")
-    out = set()
+    out = {}
+    cur = None
     for line in p.stdout.splitlines():
         if line.startswith("worktree "):
-            out.add(Path(line[len("worktree "):]).resolve())
+            cur = Path(line[len("worktree "):]).resolve()
+            out[cur] = False
+        elif cur is not None and (line == "locked" or line.startswith("locked ")):
+            out[cur] = True
     return out
+
+
+def registered_worktrees(root):
+    """Resolved paths of every worktree `git worktree list --porcelain` names. Fails closed."""
+    return set(worktree_records(root))
 
 
 class RepoGuard:
@@ -234,6 +379,9 @@ def repo_guard(guard, src):
         worktree whose files the root repo's `git ls-files` cannot see.
     An unreadable folder raises OSError (fail closed), never silently skips the walk.
     """
+    why = link_reason(src)  # first: resolve() and the walk below must never go through a link
+    if why is not None:
+        return why
     real = src.resolve()
     if is_inside(real, guard.state) or is_inside(guard.state, real):
         return "overlaps the state folder"
@@ -278,9 +426,10 @@ def classify(args, root, target, state, cls, src, cold_only, guard):
     skip = None
     size = 0
     try:
-        skip = repo_guard(guard, src)
+        # Links first: no later walk (repo_guard, git, size) runs over a tree holding one.
+        skip = tree_has_symlink_or_secret(src)
         if skip is None:
-            skip = tree_has_symlink_or_secret(src)
+            skip = repo_guard(guard, src)
         if skip is None and is_inside(src.resolve(), state):
             skip = "inside the state folder"
         if skip is None and tracked_in(root, src):
@@ -291,96 +440,163 @@ def classify(args, root, target, state, cls, src, cold_only, guard):
                 skip = "not cold yet"
         if skip is None and (dst.exists() or dst.is_symlink()):
             skip = "target already exists"
+    except LinkFound as e:  # a link that appeared between the checks above
+        skip = str(e)
     except OSError as e:
         skip = f"unreadable ({e})"
     return Item(cls, src, dst, size, skip, guard)
 
 
-def plan_worktrees(args, root, target, state, registered):
+def plan_worktrees(args, root, target, state, records):
     base = rel_under(root, args.worktrees_dir, "--worktrees-dir")
     if not base.is_dir():
         return []
     board = read_board(args)
     items = []
     for proj in sorted(base.iterdir()):
-        if not proj.is_dir() or proj.is_symlink():
+        if is_link_stat(os.lstat(proj)):
+            items.append(Item("worktree", proj, target_for(target, "worktree", root, proj), 0,
+                              "contains a link (.)"))
+            continue
+        if not proj.is_dir():
             continue
         for wt in sorted(proj.iterdir()):
             dst = target_for(target, "worktree", root, wt)
             size = 0
             skip = None
             status = board.get(wt.name)
-            if wt.is_symlink() or not wt.is_dir():
+            if is_link_stat(os.lstat(wt)):
+                skip = "contains a link (.)"
+            elif not wt.is_dir():
                 skip = "not a plain folder"
             elif status is None:
                 skip = "not on the board (treated as active)"
             elif status not in FINISHED:
                 skip = f"active worktree (board status {status})"
-            elif wt.resolve() not in registered:
+            elif wt.resolve() not in records:
                 skip = "not registered with git"
+            elif records[wt.resolve()]:
+                skip = "locked in git (git worktree lock)"
             elif is_inside(wt.resolve(), state):
                 skip = "inside the state folder"
             else:
-                st = run_git(wt, "status", "--porcelain")
-                if st.returncode != 0:
-                    skip = f"git status failed: {st.stderr.strip()}"
-                elif st.stdout.strip():
-                    skip = "dirty (uncommitted changes)"
-                elif (why := tree_has_symlink_or_secret(wt)) is not None:
-                    skip = why
-                elif dst.exists() or dst.is_symlink():
-                    skip = "target already exists"
-                else:
-                    try:
+                try:
+                    skip = worktree_tree_reason(wt)
+                    if skip is None and (dst.exists() or dst.is_symlink()):
+                        skip = "target already exists"
+                    if skip is None:
                         size, _n = size_and_newest(wt)
-                    except OSError as e:
-                        skip = f"unreadable ({e})"
+                except LinkFound as e:
+                    skip = str(e)
+                except OSError as e:
+                    skip = f"unreadable ({e})"
             items.append(Item("worktree", wt, dst, size, skip))
     return items
 
 
+def worktree_tree_reason(wt):
+    """Why the worktree folder must not move (link, secret, dirty), else None. Links are checked
+    first, so git never runs over a tree that holds one. OSError propagates (fail closed)."""
+    why = tree_has_symlink_or_secret(wt)
+    if why is not None:
+        return why
+    st = run_git(wt, "status", "--porcelain")
+    if st.returncode != 0:
+        return f"git status failed: {st.stderr.strip()}"
+    if st.stdout.strip():
+        return "dirty (uncommitted changes)"
+    return None
+
+
 def build_plan(args, root, target, state):
-    registered = registered_worktrees(root)
+    records = worktree_records(root)
     wdir = rel_under(root, args.worktrees_dir, "--worktrees-dir") if args.worktrees_dir else None
-    guard = RepoGuard(root, state, wdir, registered)
+    guard = RepoGuard(root, state, wdir, set(records))
     items = []
     items += plan_children(args, root, target, state, "build-cache", args.cache_dir, True, guard)
     items += plan_children(args, root, target, state, "evidence", args.evidence_dir, False, guard)
     items += plan_children(args, root, target, state, "reference", args.reference_dir, False, guard)
     if args.worktrees_dir:
-        items += plan_worktrees(args, root, target, state, registered)
+        items += plan_worktrees(args, root, target, state, records)
     return items
 
 
 # ---------------------------------------------------------------- moving
 def manifest(path):
-    """{relative path: (size, sha256) or None for a folder} of a file or tree."""
-    if path.is_file():
-        return {".": (path.stat().st_size, sha256_file(path))}
-    out = {}
-    for dirpath, dirnames, files in os.walk(path):
-        for n in dirnames:
-            out[(Path(dirpath) / n).relative_to(path).as_posix()] = None
-        for n in files:
-            q = Path(dirpath) / n
-            out[q.relative_to(path).as_posix()] = (q.stat().st_size, sha256_file(q))
+    """{relative path: (size, sha256) or None for a folder} of a file or tree.
+
+    Built on scan_tree, so a link anywhere raises LinkFound instead of being followed.
+    """
+    dirs, files = scan_tree(path)
+    if "." in files:
+        return {".": (files["."][0], sha256_file(path))}
+    out = {d: None for d in dirs}
+    for rel, (size, _m) in files.items():
+        out[rel] = (size, sha256_file(Path(path) / rel))
     return out
 
 
 def copy_item(src, dst):
+    """Copy a file or tree to dst, which must not exist, never through a link.
+
+    The tree is scanned first (LinkFound if it holds a link: nothing is copied), then only the
+    scanned folders and files are copied, each lstat'ed as a plain entry right before. Known
+    limit: a folder swapped for a junction between that lstat and the copy of a file inside it is
+    not caught here; the verify step re-scans the source and fails the item on it.
+    """
+    dirs, files = scan_tree(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_file():
-        shutil.copy2(src, dst)
-    else:
-        shutil.copytree(src, dst, symlinks=False)
+    if "." in files:
+        _plain_lstat(src, False)
+        shutil.copy2(src, dst, follow_symlinks=False)
+        return
+    os.mkdir(dst)  # fails if dst exists: never copies into something this run did not make
+    for rel in sorted(dirs, key=lambda r: r.count("/")):
+        _plain_lstat(src / rel, True)
+        os.mkdir(dst / rel)
+    for rel in sorted(files):
+        _plain_lstat(src / rel, False)
+        shutil.copy2(src / rel, dst / rel, follow_symlinks=False)
 
 
 def verify_copy(src, dst):
-    """Raise MoveFailed unless every entry, size and SHA-256 of dst equals src."""
-    a, b = manifest(src), manifest(dst)
+    """Raise MoveFailed unless every entry, size and SHA-256 of dst equals src (no links)."""
+    try:
+        a, b = manifest(src), manifest(dst)
+    except LinkFound as e:
+        raise MoveFailed(f"a link appeared during the copy: {e}")
     if a != b:
         bad = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
         raise MoveFailed(f"copy does not match the source (size or SHA-256), first difference: {bad[0]}")
+
+
+def snapshot_source(src):
+    """scan_tree(src) for the copy; a link or an unreadable folder fails the item, nothing copied."""
+    try:
+        return scan_tree(src)
+    except LinkFound as e:
+        raise MoveFailed(f"step check: {e} (found right before the copy); nothing copied")
+    except OSError as e:
+        raise MoveFailed(f"step check: source unreadable ({e}); nothing copied")
+
+
+def new_temp_name(dst):
+    tmp = dst.parent / f"{dst.name}.cold-tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    if exists_any(tmp):  # a uuid name: cannot happen, but then it is not ours to remove
+        raise MoveFailed(f"temp path {tmp.name} already exists; nothing copied")
+    return tmp
+
+
+def remove_source(src, snap, what):
+    """Remove the verified source through delete_tree only. Failure is reported, never forced."""
+    try:
+        delete_tree(src, snap)
+    except LinkFound as e:
+        raise MoveFailed(f"step remove source: {what}; source holds a link now ({e}), not removed")
+    except TreeChanged as e:
+        raise MoveFailed(f"step remove source: {what}; {e}")
+    except OSError as e:
+        raise MoveFailed(f"step remove source: {what}; source could not be removed: {e}")
 
 
 def exists_any(p):
@@ -397,6 +613,9 @@ def move_copy(item):
         raise MoveFailed("source is gone; nothing copied")
     if exists_any(item.dst):
         raise MoveFailed("target appeared after planning; nothing copied, nothing removed")
+    # Links first, so repo_guard's walk never runs over a tree holding one. This snapshot is
+    # what delete_tree later requires the source to still match.
+    snap = snapshot_source(item.src)
     if item.guard is not None:
         try:
             why = repo_guard(item.guard, item.src)
@@ -404,48 +623,63 @@ def move_copy(item):
             raise MoveFailed(f"repo guard could not read the source ({e}); nothing copied")
         if why is not None:
             raise MoveFailed(f"{why} (found right before the copy); nothing copied")
-    tmp = item.dst.parent / f"{item.dst.name}.cold-tmp-{os.getpid()}-{uuid.uuid4().hex}"
     try:
         item.dst.parent.mkdir(parents=True, exist_ok=True)
-        if exists_any(tmp):  # a uuid name: cannot happen, but then it is not ours to remove
-            raise MoveFailed(f"temp path {tmp.name} already exists; nothing copied")
-        try:
-            copy_item(item.src, tmp)
-            verify_copy(item.src, tmp)
-            if exists_any(item.dst):
-                raise MoveFailed("target appeared during the copy; temp copy dropped, target untouched")
-            os.rename(tmp, item.dst)  # fails if dst exists on Windows; the check above covers POSIX
-        except MoveFailed:
-            remove_partial(tmp)
-            raise
-        except OSError as e:
-            remove_partial(tmp)
-            raise MoveFailed(f"copy failed: {e}")
+        tmp = new_temp_name(item.dst)
     except OSError as e:
-        raise MoveFailed(f"copy failed: {e}")
+        raise MoveFailed(f"step copy: cannot prepare the target folder ({e}); nothing copied")
+    step = "copy"
+    try:
+        copy_item(item.src, tmp)
+        step = "verify"
+        verify_copy(item.src, tmp)
+        step = "rename into place"
+        if exists_any(item.dst):
+            raise MoveFailed("target appeared during the copy; temp copy dropped, target untouched")
+        os.rename(tmp, item.dst)  # fails if dst exists on Windows; the check above covers POSIX
+    except (MoveFailed, OSError, LinkFound, TreeChanged) as e:
+        note = drop_own_copy(tmp)
+        raise MoveFailed(f"step {step} failed: {e}; source kept; {note}")
     # Verified and in place. Only now is the source removed.
-    try:
-        if item.src.is_file():
-            item.src.unlink()
-        else:
-            shutil.rmtree(item.src)
-    except OSError as e:
-        raise MoveFailed(f"copy verified but the source could not be removed: {e}")
+    remove_source(item.src, snap, f"copy verified at {item.dst}")
 
 
-def remove_partial(dst):
-    """Remove only what this run created at the target."""
+def drop_own_copy(path):
+    """Remove a copy this run made (a fresh temp name, or the target it renamed that temp to).
+
+    Goes through delete_tree, so it never follows or deletes through a link. Returns a note for
+    the report; a copy that cannot be removed is left and named, never forced.
+    """
+    if not exists_any(path):
+        return "no partial copy was left"
     try:
-        if dst.is_symlink() or dst.is_file():
-            dst.unlink()
-        elif dst.is_dir():
-            shutil.rmtree(dst)
+        delete_tree(path, scan_tree(path))
+        return f"partial copy {path.name} removed"
+    except (LinkFound, TreeChanged, OSError) as e:
+        return f"partial copy left at {path} ({e})"
+
+
+def same_volume(src, dst):
+    """True when src and the existing part of dst's path are on one volume (same drive and st_dev).
+
+    FORCE_WORKTREE_COPY (test hook) makes this False, which only ever selects the stricter,
+    verified copy path. Any error also selects the copy path.
+    """
+    if FORCE_WORKTREE_COPY:
+        return False
+    probe = dst.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return (src.drive.lower() == probe.drive.lower()
+                and os.stat(src).st_dev == os.stat(probe).st_dev)
     except OSError:
-        pass
+        return False
 
 
-def move_worktree(args, root, item):
-    """Re-check the board and the target right before `git worktree move`; planning is not enough."""
+def recheck_worktree(args, root, item):
+    """Right before a worktree moves: target absent, board finished, not locked, registered,
+    no link, no secret, clean. Planning is not enough. Raises MoveFailed (source kept)."""
     if exists_any(item.dst):
         raise MoveFailed("target appeared after planning; source kept, nothing moved")
     try:
@@ -454,6 +688,24 @@ def move_worktree(args, root, item):
         raise MoveFailed(f"board unreadable at move time (source kept): {e}")
     if status not in FINISHED:
         raise MoveFailed(f"board status is now {status or 'missing'}, not finished; source kept")
+    try:
+        records = worktree_records(root)
+        if item.src.resolve() not in records:
+            raise MoveFailed("git no longer lists this worktree; source kept, nothing moved")
+        if records[item.src.resolve()]:
+            raise MoveFailed("worktree is locked in git now; source kept, nothing moved")
+        why = worktree_tree_reason(item.src)
+    except (Refusal, OSError) as e:
+        raise MoveFailed(f"re-check failed at move time ({e}); source kept, nothing moved")
+    if why is not None:
+        raise MoveFailed(f"{why} (found right before the move); source kept, nothing moved")
+
+
+def move_worktree(args, root, item):
+    recheck_worktree(args, root, item)
+    if not same_volume(item.src, item.dst):
+        copy_worktree(root, item)
+        return
     item.dst.parent.mkdir(parents=True, exist_ok=True)
     p = run_git(root, "worktree", "move", str(item.src), str(item.dst))
     if p.returncode != 0:
@@ -463,7 +715,125 @@ def move_worktree(args, root, item):
         raise MoveFailed(f"moved, but git worktree repair failed: {r.stderr.strip()}")
 
 
-def do_move(args, root, item):
+def verify_gitfile(src, copy):
+    """The worktree's .git file: a plain file in both, the same bytes, and a gitdir: line."""
+    a, b = src / ".git", copy / ".git"
+    for p in (a, b):
+        st = os.lstat(p)
+        if is_link_stat(st) or not stat.S_ISREG(st.st_mode):
+            raise MoveFailed(f"{p} is not a plain .git file")
+    ta, tb = a.read_bytes(), b.read_bytes()
+    if ta != tb or not ta.startswith(b"gitdir:"):
+        raise MoveFailed("the copied .git file does not match the source's gitdir: file")
+
+
+def admin_gitdir_file(src):
+    """<admin>/gitdir: the file in the main repo's .git/worktrees/<name> where git records the
+    worktree's path. Found from the worktree's own .git file ("gitdir: <admin>")."""
+    line = (src / ".git").read_text(encoding="utf-8").strip()
+    if not line.startswith("gitdir:"):
+        raise MoveFailed("the worktree's .git file has no gitdir: line")
+    admin = Path(line[len("gitdir:"):].strip())
+    if not admin.is_absolute():
+        admin = src / admin
+    f = admin.resolve() / "gitdir"
+    st = os.lstat(f)
+    if is_link_stat(st) or not stat.S_ISREG(st.st_mode):
+        raise MoveFailed(f"{f} is not a plain file")
+    return f
+
+
+def restore_admin_record(f, saved):
+    """Put back the saved bytes of <admin>/gitdir (written to a fresh temp name next to it, then
+    os.replace). Returns None when done, else the error text. Writes nothing in the source; the
+    only file it may unlink is its own temp file, created exclusively ("xb") just before."""
+    tmp = f.with_name(f"{f.name}.cold-restore-{uuid.uuid4().hex}")
+    try:
+        with open(tmp, "xb") as h:
+            h.write(saved)
+        os.replace(tmp, f)
+    except OSError as e:
+        try:
+            if tmp.exists():
+                os.unlink(tmp)
+        except OSError:
+            pass
+        return str(e)
+    return None
+
+
+def copy_worktree(root, item):
+    """Cross-drive worktree move: copy, verify, repair, list, and only then remove the source.
+
+    On any failure before the removal: the source is untouched (nothing in it is written), the
+    copy this run made is removed, and once a repair was started git's record (<admin>/gitdir)
+    is first put back from the bytes saved before it (if that fails the copy is kept).
+    """
+    src, dst = item.src, item.dst
+    snap = snapshot_source(src)
+    if ".git" not in snap[1]:
+        raise MoveFailed("step check: no .git file in the worktree; nothing copied")
+    try:
+        # git's own record of where this worktree lives (<admin>/gitdir). Its bytes are saved
+        # so a failure after the repair can put them back without writing into the source
+        # (`git worktree repair <old path>` would rewrite the source's .git file).
+        admin_gitdir = admin_gitdir_file(src)
+        saved_record = admin_gitdir.read_bytes()
+    except (MoveFailed, OSError) as e:
+        raise MoveFailed(f"step check failed: cannot read git's record of the worktree ({e}); "
+                         "nothing copied")
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = new_temp_name(dst)
+    except OSError as e:
+        raise MoveFailed(f"step copy: cannot prepare the target folder ({e}); nothing copied")
+    made = tmp  # the one path this run created and may remove
+    repaired = False  # True once `git worktree repair <new path>` has been started
+    step = "copy"
+    try:
+        copy_item(src, tmp)
+        step = "verify"
+        verify_copy(src, tmp)
+        verify_gitfile(src, tmp)
+        step = "rename into place"
+        if exists_any(dst):
+            raise MoveFailed("target appeared during the copy; target untouched")
+        os.rename(tmp, dst)
+        made = dst
+        step = "repair"
+        repaired = True  # set before the call: a failed repair may still have changed the record
+        r = run_git(root, "worktree", "repair", str(dst))
+        if r.returncode != 0:
+            raise MoveFailed(f"git worktree repair exited {r.returncode}: {r.stderr.strip()}")
+        step = "list"
+        records = worktree_records(root)
+        if dst.resolve() not in records:
+            raise MoveFailed("git worktree list does not show the new path")
+        if src.resolve() in records:
+            raise MoveFailed("git worktree list still shows the old path")
+    except (MoveFailed, OSError, LinkFound, TreeChanged, Refusal) as e:
+        if repaired:
+            bad = restore_admin_record(admin_gitdir, saved_record)
+            if bad is not None:
+                # git may still point at the copy: keep it, so no git record points at nothing.
+                raise MoveFailed(
+                    f"step {step} failed: {e}; source kept untouched; putting back git's record "
+                    f"{admin_gitdir} also failed ({bad}): run `git worktree repair {src}` by "
+                    f"hand, then remove the copy at {made}"
+                )
+            note = "git pointed back at the source; " + drop_own_copy(made)
+        else:
+            note = drop_own_copy(made)
+        raise MoveFailed(f"step {step} failed: {e}; source kept untouched; {note}")
+    # Copied, verified, repaired and listed. Only now is the source removed.
+    remove_source(src, snap, f"the worktree is now at {dst} (copied, verified, repaired, listed)")
+
+
+def do_move(args, root, item, approved):
+    """Move one item. The class must be approved by the approval file (checked here as well as
+    when the run starts, so no caller can move an unapproved class)."""
+    if item.cls not in approved or item.cls not in args.classes:
+        raise MoveFailed(f"class {item.cls} is not approved for this run; nothing moved")
     if item.cls == "worktree":
         move_worktree(args, root, item)
     else:
@@ -483,6 +853,11 @@ def check_approval(root, state, rel, classes):
     f = rel_under(root, rel, "--approval-file")
     if not is_inside(f, state) or f == state:
         raise Refusal("--approval-file must be inside the state folder")
+    if ".used-" in f.name.lower():
+        raise Refusal(
+            f"refusing --yes: {rel} is a used-up approval (its name holds .used-); "
+            f"each run needs a new one. {REMINDER}"
+        )
     if f.is_symlink() or not f.is_file():
         raise Refusal(f"refusing --yes: approval file {rel} does not exist. {REMINDER}")
     lines = [l for l in f.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
@@ -506,7 +881,7 @@ def check_approval(root, state, rel, classes):
             f"refusing --yes: {rel} does not approve class {', '.join(missing)} "
             f"(it approves {', '.join(approved)}). {REMINDER}"
         )
-    return f
+    return f, frozenset(approved)
 
 
 def consume_approval(f):
@@ -608,9 +983,9 @@ def run_locked(args, out):
     if not target.is_dir():
         raise Refusal(f"--target {args.target!r} is not an existing folder (is the drive attached?)")
     state = rel_under(root, args.state_dir, "--state-dir")
-    approval = None
+    approval, approved = None, frozenset()
     if args.yes:
-        approval = check_approval(root, state, args.approval_file, args.classes)
+        approval, approved = check_approval(root, state, args.approval_file, args.classes)
     free = free_gb(root)
     if free >= args.trigger_gb and not args.force_list:
         raise Refusal(
@@ -620,7 +995,7 @@ def run_locked(args, out):
     items = build_plan(args, root, target, state)
     out.write(f"free space {free:.1f} GB, trigger {args.trigger_gb:g} GB\n")
     for it in items:
-        status = f"SKIP ({it.skip})" if it.skip else "move"
+        status = f"skipped: {it.skip}" if it.skip else "move"
         out.write(f"{it.cls}\t{it.size}\t{it.src}\t->\t{it.dst}\t{status}\n")
     todo = [i for i in items if not i.skip]
     if not args.yes:
@@ -631,11 +1006,11 @@ def run_locked(args, out):
     out.write(f"approval used up: {approval.name} -> {used.name}\n")
     moved = failed = 0
     for it in todo:
-        if it.cls not in args.classes:
-            out.write(f"not moved (class {it.cls} not named by --class): {it.src}\n")
+        if it.cls not in args.classes or it.cls not in approved:
+            out.write(f"not moved (class {it.cls} not named by --class and approved): {it.src}\n")
             continue
         try:
-            do_move(args, root, it)
+            do_move(args, root, it, approved)
             moved += 1
             out.write(f"moved {it.src} -> {it.dst}\n")
         except MoveFailed as e:
