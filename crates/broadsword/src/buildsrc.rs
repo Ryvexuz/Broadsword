@@ -40,21 +40,25 @@
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
 //! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
 //!
-//! Main's binaries survive another folder's clean (found 2026-11-20: a worktree's bench build cleaned `crash-sim` and deleted
-//! `build/release/crash-sim.exe` that Lazlo had just built from projects/crash-sim; render's drive tests then found no
-//! binary). Before a job of a folder that is not its project's main checkout cleans a package, every exe of that package's bin
-//! targets whose note names the main checkout (plain or `run:`) is copied, per profile, to `<build_dir>/main.bins/<profile>/`
-//! with the note beside it (`<exe>.source`). After the clean, any job of that project puts the kept copy back in cargo's place
-//! if the clean removed it. The clean still removed cargo's fingerprint, so a cargo step that needs the target rebuilds it from
-//! the job's own source; one that does not (an example, a bench) leaves main's exe for people and other projects' tests. The
-//! kept copy itself is written only from an exe whose note names the main checkout, so a worktree's exe never lands there.
-//! Limits: the kept copy is refreshed only when another folder's job cleans the package, so right after a main build it can be
-//! older than the exe in cargo's place (which is then main's, and its bin note says so); and a worktree job whose cargo step
-//! builds the target itself leaves its own exe in cargo's place until the next job of that package (its bin note names the
-//! worktree; main's exe is still in `main.bins`). The package and bin notes stay conservative: after a restore they name the
-//! job's folder, so the next job of another folder cleans again and `install` still refuses. So a command of that worktree
-//! that runs the exe by its path WITHOUT cargo building it gets main's restored exe while the bin note names the worktree
-//! (cargo itself never mistakes it for the worktree's: its fingerprint is gone).
+//! Main's binaries: THE stable place is `<build_dir>/main.bins/<debug|release>/<bin><exe>` (found 2026-11-20: a worktree's
+//! bench build cleaned `crash-sim` and deleted `build/release/crash-sim.exe` that Lazlo had just built from projects/crash-sim;
+//! render's drive tests then found no binary). People and other projects' tests run main's binaries from there, NEVER from
+//! cargo's own `<build_dir>/<profile>/`: that is a cache which any checkout's build may overwrite or clean. A file beside each
+//! kept exe (`<exe>.source`) holds the build-source note it was kept under (`projects/<p>`, `.`, or a `run:` note of one).
+//! It is written in exactly two places, both under the build lock and both from an exe whose note names the main checkout
+//! (so a worktree's exe never lands there):
+//! - after every SUCCESSFUL cargo step or `run` command of the main checkout itself (`refresh_main_bins`, called by job.rs
+//!   after a build or run step and after the test step's compile), so it always holds main's newest build;
+//! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), as a second guard.
+//!
+//! After a clean, any job of that project also puts the kept copy back in cargo's place if the clean removed it
+//! (`restore_main_bins`), for readers that still look there; the clean removed cargo's fingerprint, so a cargo step that needs
+//! the target still rebuilds it from the job's own source. The package and bin notes stay conservative: after a restore they
+//! name the job's folder, so the next job of another folder cleans again and `install` still refuses.
+//! Limits: a main `build`/`check`/`run` that FAILS refreshes nothing (main.bins keeps the last good build, the cache may hold the
+//! failed attempt's leftovers); a `run` of the main checkout counts (its command may build anything there, so its kept note is
+//! `run:<folder>`, never `.`); a `run` whose packages cannot be listed refreshes nothing (its line says so); cargo-sweep never
+//! touches main.bins (it only deletes hash-named files in folders that hold a `.fingerprint`: test in cleanup.rs).
 //!
 //! Deleting: `cargo clean -p` is the ONLY deletion of build output here. It is built in one function (`clean_command`) that always passes
 //! `-p <package>` (a bare `cargo clean` would wipe the whole folder), always points cargo at `build_dir` through both
@@ -355,7 +359,8 @@ pub fn note_folder(note: &str) -> &str {
 
 // ---- main's binaries survive another folder's clean -----------------------------------------
 
-/// The folder under `build_dir` that holds the KEPT copy of each binary the main checkout built: `<build_dir>/main.bins/<profile
+/// THE stable place of main's binaries (people and other projects run these, never cargo's own profile folders): the KEPT copy of
+/// each binary the main checkout built: `<build_dir>/main.bins/<profile
 /// dir>/<bin><exe suffix>`, with `<that file>.source` holding the build-source note it was kept under. Cargo does not build
 /// there: a profile's folder carries the profile's name, and cargo allows only letters, digits, `-` and `_` in one, so no
 /// profile maps to a name with a `.`; `cargo clean -p` removes the named package's artifacts, which live in the profile folders.
@@ -436,12 +441,13 @@ fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     r
 }
 
-/// Before a job of ANOTHER folder cleans package `pkg` (whose binary targets are `bins`): every exe of those targets whose note
-/// (the bin note, else the package note for builds from before bin notes) names `main` (plain or `run:`) is copied to its kept
-/// place, with that note beside it. Nothing is cleaned until this succeeded (Err refuses the job, nothing deleted). An unchanged
-/// copy is not rewritten. The note beside the copy is removed first and written last, so a crash in between leaves a copy with no
+/// Copy main's exes of package `pkg` (whose binary targets are `bins`) to their kept place: every exe of those targets whose note
+/// (the bin note, else the package note for builds from before bin notes) names `main` (plain or `run:`), in each profile, with
+/// that note beside it. `when` ends the error message. Called after a successful main step (`refresh_main_bins`) and before a
+/// job of ANOTHER folder cleans `pkg` (`prepare_packages`: nothing is cleaned until this succeeded; Err refuses the job, nothing
+/// deleted). The caller holds the build lock. An unchanged copy is not rewritten (and gets no line). The note beside the copy is removed first and written last, so a crash in between leaves a copy with no
 /// note, which is never restored.
-fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String]) -> Result<Vec<String>, String> {
+fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &str) -> Result<Vec<String>, String> {
     guard_build_dir(cfg, "refusing to keep main's binaries")?;
     let mut lines = Vec::new();
     for b in bins {
@@ -457,16 +463,36 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String]) -> Resul
             let same = read_kept_note(cfg, profile, b).as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
             if !same {
                 let side = kept_note(&to);
-                let fail = |e: std::io::Error| format!("cannot keep main's `{b}` ({}) at {} before cleaning `{pkg}`: {e}\nnothing was built or cleaned. If a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
+                let fail = |e: std::io::Error| format!("cannot keep main's `{b}` ({}) at {} {when}: {e}\nIf a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
                 match std::fs::remove_file(&side) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail(e)),
                     _ => {}
                 }
                 copy_atomic(&from, &to).map_err(fail)?;
                 write_atomic(&side, &note).map_err(fail)?;
+                lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
             }
-            lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
         }
+    }
+    Ok(lines)
+}
+
+/// After a SUCCESSFUL cargo step (or `run` command) of the main checkout `source` itself, with the build lock still held: every
+/// bin target exe of `dir`'s packages whose note names `source` is copied to its kept place (`keep_main_bins`), so `main.bins`
+/// always holds main's newest build. Any other folder (a worktree, an unknown one) refreshes nothing. A `run` whose packages
+/// cannot be listed refreshes nothing and says so. Err = the copy failed (the caller fails the job: its output was built, but
+/// `main.bins` does not hold it).
+pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
+    if main_folder(cfg, source).as_deref() != Some(source) {
+        return Ok(Vec::new());
+    }
+    let targets = match bins_of(cfg, dir) {
+        Ok(t) => t,
+        Err(e) => return Ok(vec![format!("main's binaries: not kept (the packages cannot be listed: {e})")]),
+    };
+    let mut lines = Vec::new();
+    for (p, bins) in &targets {
+        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)")?);
     }
     Ok(lines)
 }
@@ -741,7 +767,7 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let main = main_folder(cfg, source);
     for (p, was) in &stale {
         if let Some(m) = main.as_deref().filter(|m| *m != source) {
-            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p))?);
+            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (nothing was built or cleaned)"))?);
         }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };

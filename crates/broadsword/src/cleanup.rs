@@ -222,6 +222,63 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// `build/main.bins` is THE stable place of main's binaries (buildsrc.rs): no cleanup may touch it, cargo-sweep included.
+    /// cargo-sweep only deletes hash-named files in folders that hold a `.fingerprint`, so an aged decoy artifact in
+    /// `build/debug` (an old fingerprint, an rlib with the same hash) IS swept in the same pass, which proves the sweep ran over
+    /// the build folder, while the aged kept copies survive. Without cargo-sweep the pass says so and still leaves them.
+    #[test]
+    fn cleanup_and_cargo_sweep_never_touch_mains_kept_binaries() {
+        let root = tmp("keptbins");
+        fs::create_dir_all(root.join("scratch")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        // cargo-sweep finds the target folder through `cargo metadata` in root
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"sweepfix\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let c = cfg(&root);
+        let old = SystemTime::now() - Duration::from_secs((c.sweep_older_than_days + 30) * 24 * 3600);
+        let set_old = |p: &Path| {
+            let f = File::options().write(true).open(p).unwrap();
+            f.set_times(fs::FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
+        };
+        // a decoy cargo artifact that a sweep removes
+        let fp = c.build_dir.join("debug/.fingerprint/decoy-0123456789abcdef");
+        fs::create_dir_all(&fp).unwrap();
+        fs::write(fp.join("lib-decoy"), "x").unwrap();
+        set_old(&fp.join("lib-decoy"));
+        // cargo's own profile layout (cargo-sweep 0.8 fails a profile that lacks `build` or `deps`)
+        fs::create_dir_all(c.build_dir.join("debug/deps")).unwrap();
+        fs::create_dir_all(c.build_dir.join("debug/build")).unwrap();
+        let decoy = c.build_dir.join("debug/deps/libdecoy-0123456789abcdef.rlib");
+        fs::write(&decoy, "x").unwrap();
+        set_old(&decoy);
+        // main's kept copies, aged too
+        let mut kept = Vec::new();
+        for profile in [crate::buildsrc::Profile::Dev, crate::buildsrc::Profile::Release] {
+            let exe = crate::buildsrc::kept_exe(&c, profile, "markprobe");
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            fs::write(&exe, "main's exe").unwrap();
+            let note = PathBuf::from(format!("{}.source", exe.display()));
+            fs::write(&note, "projects/proj\n").unwrap();
+            set_old(&exe);
+            set_old(&note);
+            kept.push(exe);
+            kept.push(note);
+        }
+        let r = cleanup_pass(&c, SystemTime::now(), &mut || 100 * crate::config::GB, true);
+        let installed = crate::scrub::command(&c, "cargo").args(["sweep", "--version"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        if installed {
+            assert!(r.swept, "{}", r.sweep_note);
+            assert!(!decoy.exists(), "the sweep ran over the build folder and removed the aged decoy: {}", r.sweep_note);
+        } else {
+            assert!(!r.swept && r.sweep_note.contains("NOT installed"), "{}", r.sweep_note);
+        }
+        for k in &kept {
+            assert!(k.is_file(), "{} must survive every cleanup: {}", k.display(), r.sweep_note);
+        }
+        assert!(r.deleted.iter().all(|(p, _)| !p.starts_with(c.build_dir.join(crate::buildsrc::KEEP_DIR))));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn log_cap_keeps_tail() {
         let root = tmp("log");

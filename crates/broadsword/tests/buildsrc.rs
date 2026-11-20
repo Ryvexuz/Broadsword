@@ -287,7 +287,8 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_in_place_and_kept(
         assert_eq!(prints(&kept(profile)), "MARK-main", "and kept:\n{}", o.stdout);
         assert_eq!(kept_note(profile).as_deref(), Some("run:projects/proj"), "the kept copy names the last note of main's build (the release `run`)");
     }
-    assert!(o.stdout.contains("kept main's `markprobe`") && o.stdout.contains("restored main's `markprobe`"), "{}", o.stdout);
+    // main.bins already holds main's build (each main job refreshes it), so the clean copies nothing new; it puts main's exe back
+    assert!(o.stdout.contains("restored main's `markprobe`"), "{}", o.stdout);
     let example = r.dir.join("build/release/examples").join(format!("only{}", std::env::consts::EXE_SUFFIX));
     assert_eq!(prints(&example), "example MARK-t1", "the job's own cargo step built the worktree's example");
     // the notes stay conservative: they name the worktree, so `install`-style readers and the next foreign build never vouch
@@ -310,6 +311,66 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_in_place_and_kept(
     r.ok(&["build", "proj"]);
     assert_eq!(prints(&exe("debug")), "MARK-main");
     assert_eq!(r.bin_note().as_deref(), Some("projects/proj"));
+}
+
+/// Round 2 (review q-20261120-202642): `build/main.bins` is THE stable place of main's binaries, so every SUCCESSFUL job of the
+/// main checkout refreshes it (a build step, the test step's compile, a `run` command), and nothing a worktree builds ever
+/// replaces it. Checked by content: each main build prints a new marker. On round 1's code (9dd3171) the first assertion
+/// failed: a main build alone left no kept copy (only another folder's clean made one).
+#[test]
+fn every_successful_main_build_refreshes_main_bins_and_no_worktree_build_replaces_them() {
+    let r = Root::new("refresh", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let proj = r.dir.join("projects/proj");
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let kept = |profile: &str| r.dir.join("build/main.bins").join(profile).join(format!("markprobe{suffix}"));
+    let prints = |p: &Path| -> String {
+        let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let kept_note = |profile: &str| fs::read_to_string(format!("{}.source", kept(profile).display())).ok().map(|s| s.trim().to_string());
+
+    // a main build refreshes main.bins
+    let o = r.ok(&["build", "proj"]);
+    assert_eq!(prints(&kept("debug")), "MARK-main", "a main build keeps its binary:\n{}", o.stdout);
+    assert_eq!(kept_note("debug").as_deref(), Some("projects/proj"));
+    assert!(o.stdout.contains("kept main's `markprobe` (debug"), "{}", o.stdout);
+    // a second main build of new code refreshes it again, with no other folder's job in between
+    set_marker(&proj, "MARK-main2");
+    r.ok(&["build", "proj"]);
+    assert_eq!(prints(&kept("debug")), "MARK-main2", "main.bins holds main's NEWEST build");
+    // the same build again copies nothing (unchanged)
+    let o = r.ok(&["build", "proj"]);
+    assert!(!o.stdout.contains("kept main's"), "{}", o.stdout);
+
+    // a worktree builds the bin itself: cargo's cache holds its exe, main.bins is still main's
+    r.ok(&["build", "proj", "--task", &t1]);
+    assert_eq!(r.probe(), "MARK-t1", "cargo's own folder is a cache a worktree may overwrite");
+    assert_eq!(prints(&kept("debug")), "MARK-main2", "a worktree build never replaces main's kept binary");
+    r.ok(&["check", "proj", "--task", &t1]);
+    assert_eq!(prints(&kept("debug")), "MARK-main2", "nor does a worktree check");
+
+    // the test step's compile refreshes it too (a `test` job has no build step)
+    set_marker(&proj, "MARK-main3");
+    let o = r.ok(&["test", "proj"]);
+    assert!(o.stdout.contains("test: ok"), "{}", o.stdout);
+    assert_eq!(prints(&kept("debug")), "MARK-main3", "a main test job keeps what it compiled:\n{}", o.stdout);
+
+    // a main `run` that builds release refreshes the release copy; its note says it came from a `run`
+    let o = r.ok(&["run", "proj", "--", "cargo", "build", "--release", "--offline"]);
+    assert_eq!(prints(&kept("release")), "MARK-main3", "{}", o.stdout);
+    assert_eq!(kept_note("release").as_deref(), Some("run:projects/proj"));
+
+    // a FAILED main build refreshes nothing: main.bins keeps the last good build
+    fs::write(proj.join("src/lib.rs"), "pub const MARKER: &str = \"MARK-broken\" this does not compile;\n").unwrap();
+    let o = r.run(&["build", "proj"]);
+    assert_ne!(o.code, 0, "{}", o.stdout);
+    assert_eq!(prints(&kept("debug")), "MARK-main3", "a failed build never touches main.bins");
+
+    // a worktree release build after all that leaves the release copy main's
+    r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--release", "--offline"]);
+    assert_eq!(prints(&r.dir.join("build/release").join(format!("markprobe{suffix}"))), "MARK-t1");
+    assert_eq!(prints(&kept("release")), "MARK-main3", "a worktree release build never replaces main's kept release binary");
 }
 
 #[test]

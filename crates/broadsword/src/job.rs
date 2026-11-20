@@ -648,6 +648,18 @@ enum PoolEnd {
     DiskDropped(u64),
 }
 
+/// `buildsrc::refresh_main_bins` for this job, its lines printed and logged. The caller holds the build lock and calls it only
+/// after a successful cargo step or `run` command. Err = the job fails (main.bins does not hold what was built).
+fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log) -> Result<(), String> {
+    for l in buildsrc::refresh_main_bins(cfg, project_dir, source)? {
+        println!("{l}");
+        if let Ok(mut f) = log.lock() {
+            let _ = writeln!(f, "{l}");
+        }
+    }
+    Ok(())
+}
+
 /// The test step's context: everything `run_child` needs, borrowed from the job.
 struct TestStep<'a> {
     cfg: &'a Config,
@@ -696,6 +708,10 @@ impl TestStep<'_> {
         }
         let arts = parse_artifacts(&compiled.stdout)?;
         let envs = package_envs(self.cfg, self.project_dir)?;
+        // the compile succeeded: the main checkout's bins it built go to `build/main.bins` while the lock still holds
+        if hold.is_some() {
+            refresh_main_bins(self.cfg, self.project_dir, self.source, self.log)?;
+        }
         let mut kept = String::new();
         // 2. copy, then release the lock
         let dir = test_copies_dir(self.cfg, self.job_id);
@@ -1587,6 +1603,14 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         if !ok {
             all_ok = false;
             break; // check never tests a failed build
+        }
+        // a successful step of the main checkout refreshes `build/main.bins`, the stable place of main's binaries (buildsrc.rs),
+        // while the build lock still holds (the test step does it itself, before it releases the lock)
+        if build_hold.is_some() {
+            if let Err(e) = refresh_main_bins(cfg, &project_dir, &source, &log) {
+                eprintln!("broadsword: {e}");
+                return end(&mut rec, record::FAILED, EXIT_FAILED);
+            }
         }
     }
     info.summary = summary.clone();
