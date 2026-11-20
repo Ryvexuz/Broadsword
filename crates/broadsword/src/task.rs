@@ -288,7 +288,7 @@ pub const OPEN_QUEUE_STATUSES: [&str; 5] = [queue::QUEUED, queue::RUNNING, queue
 /// Every one of these is still open, so it counts for max_queued.
 pub const WAITING_QUEUE_STATUSES: [&str; 3] = [queue::QUEUED, queue::RUNNING, queue::APPROVED];
 /// The queue statuses in which an entry has ended: its task, if still running, is back with its coder (a fix round).
-pub const ENDED_QUEUE_STATUSES: [&str; 6] = [queue::MERGED, queue::CONFLICT, queue::CHECK_FAILED, queue::REJECTED, queue::MERGED_CHECK_FAILED, queue::CANCELLED];
+pub const ENDED_QUEUE_STATUSES: [&str; 7] = [queue::MERGED, queue::CONFLICT, queue::CHECK_FAILED, queue::PERF_FAILED, queue::REJECTED, queue::MERGED_CHECK_FAILED, queue::CANCELLED];
 
 /// One open merge-queue entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
