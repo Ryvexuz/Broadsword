@@ -952,5 +952,137 @@ class ReadOnly(Fixture):
         self.assertTrue(is_read_only(other))
 
 
+class Quarantine(Fixture):
+    """Review q-20261120-221758: a junction swapped in between the scan and the delete is never
+    followed, and a removal that fails part-way leaves a quarantined leftover, never a
+    half-deleted source at its own path."""
+
+    def setUp(self):
+        super().setUp()
+        self.ev1 = self.root / "evidence" / "ev1"
+        put(self.ev1 / "sub" / "f.txt", "inside data")
+        self.outside = Path(self.tmp.name).resolve() / "outside_sw"
+        put(self.outside / "f.txt", "outside data")  # same name as the file under sub/
+        self.dst = self.ext / "evidence" / "evidence" / "ev1"
+
+    def swap_sub_for_junction(self, tree):
+        """Replace tree/sub by a junction to outside_sw (which holds an f.txt of its own)."""
+        os.rename(tree / "sub", tree / "sub-moved-away")
+        if not junction(tree / "sub", self.outside):
+            self.skipTest("cannot make an NTFS junction here")
+
+    def leftovers(self):
+        return [p for p in self.ev1.parent.iterdir() if ".cold-quarantine-" in p.name]
+
+    def assert_outside_and_copy_untouched(self, out):
+        self.assertEqual((self.outside / "f.txt").read_text(), "outside data", out)
+        self.assertEqual((self.dst / "sub" / "f.txt").read_text(), "inside data", out)
+        self.assertEqual((self.dst / "e.txt").read_text(), "evidence", out)
+
+    def run_with_swap(self, when):
+        """Swap sub/ for a junction right after the scan_tree call that `when(path)` picks,
+        once the copy has been verified (so the swap lands between the scan and the delete)."""
+        real_scan, real_verify = cold_move.scan_tree, cold_move.verify_copy
+        state = {"verified": False, "done": False}
+
+        def verify(src, dst):
+            real_verify(src, dst)
+            state["verified"] = True
+
+        def scan(top):
+            result = real_scan(top)
+            if state["verified"] and not state["done"] and when(Path(top)):
+                state["done"] = True
+                self.swap_sub_for_junction(Path(top))
+            return result
+
+        self.approve(["evidence"])
+        with mock.patch.object(cold_move, "verify_copy", verify), \
+                mock.patch.object(cold_move, "scan_tree", scan):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertTrue(state["done"], out)
+        return code, out
+
+    def test_junction_swapped_in_after_the_source_scan_is_never_followed(self):
+        code, out = self.run_with_swap(lambda p: p == self.ev1)
+        self.assert_outside_and_copy_untouched(out)  # behaviour first, then the report
+        self.assertFalse(self.ev1.exists(), out)  # never half-live at the source path
+        self.assertEqual(len(self.leftovers()), 1, out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("at step remove: leftover kept at", out)
+
+    def test_junction_swapped_in_after_the_quarantine_scan_is_caught_by_the_ancestor_check(self):
+        code, out = self.run_with_swap(lambda p: ".cold-quarantine-" in p.name)
+        self.assertEqual(code, 1, out)
+        self.assertIn("at step remove: leftover kept at", out)
+        self.assert_outside_and_copy_untouched(out)
+        self.assertFalse(self.ev1.exists(), out)
+        (left,) = self.leftovers()
+        self.assertTrue(os.path.isjunction(left / "sub"), out)  # the junction itself is left too
+
+    def failing_unlink(self, name):
+        real_unlink = os.unlink
+
+        def unlink(p, *a, **k):
+            if Path(p).name == name:
+                raise PermissionError(13, "simulated: file is locked")
+            return real_unlink(p, *a, **k)
+
+        return mock.patch.object(cold_move.os, "unlink", unlink)
+
+    def test_removal_failing_part_way_leaves_a_quarantined_leftover(self):
+        self.approve(["evidence"])
+        with self.failing_unlink("f.txt"):  # e.txt (sorted first) is gone by then
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertFalse(self.ev1.exists(), out)  # no half-deleted source at its path
+        (left,) = self.leftovers()
+        self.assertEqual((left / "sub" / "f.txt").read_text(), "inside data")
+        self.assert_outside_and_copy_untouched(out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("at step remove: leftover kept at", out)
+        self.assertIn(str(left), out)
+
+    def test_held_open_file_never_leaves_a_half_deleted_source(self):
+        put(self.ev1 / "z.lock", "held open")  # sorts after e.txt: unlinked last
+        self.approve(["evidence"])
+        before = tree_state(self.ev1)
+        with open(self.ev1 / "z.lock", "rb"):  # Windows: no delete or rename while open
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual((self.dst / "z.lock").read_text(), "held open")
+        if self.ev1.exists():  # the quarantine rename was refused: nothing deleted
+            self.assertEqual(tree_state(self.ev1), before, out)
+            self.assertEqual(self.leftovers(), [], out)
+        else:  # renamed, then the delete failed: the leftover is under the quarantine name
+            self.assertEqual(len(self.leftovers()), 1, out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("at step remove", out)
+
+    def test_worktree_removal_failure_keeps_copy_and_git_record(self):
+        wt = self.root / "worktrees" / "proj" / "t-done"
+        new = self.ext / "worktree" / "worktrees" / "proj" / "t-done"
+        put(wt / "zz.txt", "x")  # untracked file would make it dirty: commit it in the worktree
+        git(wt, "add", "zz.txt")
+        git(wt, "commit", "-q", "-m", "zz")
+        real = cold_move.run_git
+
+        def fake(root, *args):
+            if args[:2] == ("worktree", "move"):
+                return subprocess.CompletedProcess(args, 128, "", "fatal: simulated cross-drive")
+            return real(root, *args)
+
+        self.approve(["worktree"])
+        with mock.patch.object(cold_move, "FORCE_WORKTREE_COPY", True, create=True), \
+                mock.patch.object(cold_move, "run_git", fake), self.failing_unlink("zz.txt"):
+            code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertFalse(wt.exists(), out)  # behaviour first, then the report
+        self.assertEqual(code, 1, out)
+        self.assertIn("at step remove: leftover kept at", out)
+        self.assertEqual((new / "zz.txt").read_text(), "x")
+        listing = git(self.root, "worktree", "list", "--porcelain").replace("\\", "/")
+        self.assertIn(new.as_posix(), listing)
+        self.assertEqual(git(new, "status", "--porcelain").strip(), "")
+        self.assertEqual(len([p for p in wt.parent.iterdir() if ".cold-quarantine-" in p.name]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

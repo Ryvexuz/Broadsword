@@ -57,11 +57,23 @@ with the step named. Right before
 either kind of move the board, git's lock flag, the clean status and the target are re-checked.
 
 Removal (delete_tree, the one place this script deletes a tree): the source must still match,
-path for path and by size and mtime, the snapshot taken before its copy, and hold no link; then
-only the files and folders of that snapshot are removed, bottom up, never through a link. A
-read-only attribute is cleared only on a file or folder inside the tree being removed, right
-before its removal (git objects are read-only). A partial copy is removed the same way, and only
-the temp name this run created.
+path for path and by size and mtime, the snapshot taken before its copy, and hold no link.
+Then it is renamed, in one atomic same-folder rename, to a quarantine name
+<name>.cold-quarantine-<pid>-<id>, the quarantine is scanned again against the same snapshot, and
+only the snapshot's files and folders are removed from it, deepest first. Before each entry is
+touched, the entry and every folder above it up to the quarantine root are lstat'ed and must be
+plain (no symlink, junction or reparse point), so a folder swapped for a junction stops the
+removal instead of being followed. A read-only attribute is cleared only on an entry inside the
+quarantine, right before its removal (git objects are read-only). "Source untouched" holds up to
+the remove step. If removal fails after the rename, what is left stays under the quarantine
+name, never half-live at the source path, and the item is reported
+"FAILED ...: at step remove: leftover kept at <quarantine path>"; the verified copy and, for a
+worktree, git's record (which already points at the copy) are never touched. A partial copy is
+removed the same way, and only the temp name this run created.
+Remaining race window (not closed): between the lstat checks of an entry's folders and the
+chmod/unlink call on that entry, and in the folders above the item (its parent is not checked),
+a swap could still redirect one call; the random quarantine name makes a swap aimed at the
+source path miss.
 With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
 exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
 name next to the target, is verified, then renamed into place; an error removes only that temp
@@ -116,6 +128,15 @@ class LinkFound(Exception):
 
 class TreeChanged(Exception):
     """The tree no longer matches the snapshot it was verified against; nothing was deleted."""
+
+
+class RemoveFailed(Exception):
+    """delete_tree failed after the quarantine rename; what is left is kept at `leftover`."""
+
+    def __init__(self, leftover, cause):
+        super().__init__(f"leftover kept at {leftover} ({cause})")
+        self.leftover = leftover
+        self.cause = cause
 
 
 # ---------------------------------------------------------------- tree walking and removal
@@ -187,33 +208,59 @@ def _plain_lstat(path, want_dir):
     return st
 
 
+def _plain_entry(q, rel, want_dir):
+    """lstat q/rel and every folder above it up to and including q; each must be plain (no link,
+    no reparse point). A folder swapped for a junction after the scan raises LinkFound here, so
+    no chmod or unlink is ever sent through it. Returns the entry's own lstat result."""
+    if rel is None:  # the quarantine root itself (its parent folder is not checked)
+        return _plain_lstat(q, want_dir)
+    p = q
+    _plain_lstat(p, True)
+    for part in rel.split("/")[:-1]:
+        p = p / part
+        _plain_lstat(p, True)
+    return _plain_lstat(q / rel, want_dir)
+
+
 def delete_tree(top, expected):
     """The one place this script deletes a file or tree.
 
-    expected is a scan_tree snapshot taken before the copy was made and verified. The tree is
-    scanned again (never following a link); if it holds a link (LinkFound) or differs from
-    expected in any path, size or mtime (TreeChanged), nothing is deleted. Otherwise only the
-    snapshot's own files and folders are removed, deepest first, each lstat'ed right before its
-    removal so a link that appears meanwhile stops the removal instead of being followed.
-    Read-only attributes are cleared only on these entries, inside top.
+    expected is a scan_tree snapshot taken before the copy was made and verified.
+      1. top is scanned again (never following a link). A link (LinkFound) or any difference
+         from expected in path, size or mtime (TreeChanged): nothing is renamed or deleted.
+      2. top is renamed (one atomic same-folder rename) to a fresh quarantine name. An OSError
+         here (for example a file held open) propagates: nothing was deleted, top is as it was.
+      3. The quarantine is scanned again against expected, then only the snapshot's files and
+         folders are removed from it, deepest first. Before each one, it and every folder above
+         it up to the quarantine root are lstat'ed and must be plain (_plain_entry).
+    Any failure in step 3 raises RemoveFailed(leftover=quarantine path): what is left stays
+    there under that name, never half-live at top. Read-only attributes are cleared only on
+    entries inside the quarantine, right before their removal.
     """
     top = Path(top)
-    now = scan_tree(top)
-    if now != expected:
+    if scan_tree(top) != expected:
         raise TreeChanged("the tree changed after it was verified; nothing deleted")
-    dirs, files = now
-    if "." in files:
-        _make_writable(top, _plain_lstat(top, False))
-        os.unlink(top)
-        return
-    for rel in sorted(files):
-        p = top / rel
-        _make_writable(p, _plain_lstat(p, False))
-        os.unlink(p)
-    for rel in sorted(dirs, key=lambda r: r.count("/"), reverse=True) + [None]:
-        p = top if rel is None else top / rel
-        _make_writable(p, _plain_lstat(p, True))
-        os.rmdir(p)  # only ever an empty folder: never recursive
+    q = top.parent / f"{top.name}.cold-quarantine-{os.getpid()}-{uuid.uuid4().hex}"
+    if exists_any(q):  # a uuid name: cannot happen, but never rename onto something
+        raise TreeChanged(f"quarantine name {q.name} already exists; nothing deleted")
+    os.rename(top, q)
+    try:
+        now = scan_tree(q)
+        if now != expected:
+            raise TreeChanged("the tree changed during the quarantine rename")
+        dirs, files = now
+        if "." in files:
+            _make_writable(q, _plain_entry(q, None, False))
+            os.unlink(q)
+            return
+        for rel in sorted(files):
+            _make_writable(q / rel, _plain_entry(q, rel, False))
+            os.unlink(q / rel)
+        for rel in sorted(dirs, key=lambda r: r.count("/"), reverse=True) + [None]:
+            _make_writable(q / rel if rel else q, _plain_entry(q, rel, True))
+            os.rmdir(q / rel if rel else q)  # only ever an empty folder: never recursive
+    except (LinkFound, TreeChanged, OSError) as e:
+        raise RemoveFailed(q, e)
 
 
 # ---------------------------------------------------------------- helpers
@@ -588,15 +635,20 @@ def new_temp_name(dst):
 
 
 def remove_source(src, snap, what):
-    """Remove the verified source through delete_tree only. Failure is reported, never forced."""
+    """Remove the verified source through delete_tree only. Failure is reported, never forced;
+    the verified copy (and git's record of a worktree) is never touched here."""
     try:
         delete_tree(src, snap)
+    except RemoveFailed as e:
+        raise MoveFailed(f"at step remove: {e}; {what}, untouched")
     except LinkFound as e:
-        raise MoveFailed(f"step remove source: {what}; source holds a link now ({e}), not removed")
+        raise MoveFailed(f"at step remove: source holds a link now ({e}); nothing deleted, "
+                         f"source kept at {src}; {what}")
     except TreeChanged as e:
-        raise MoveFailed(f"step remove source: {what}; {e}")
+        raise MoveFailed(f"at step remove: {e}; source kept at {src}; {what}")
     except OSError as e:
-        raise MoveFailed(f"step remove source: {what}; source could not be removed: {e}")
+        raise MoveFailed(f"at step remove: could not quarantine the source ({e}); nothing "
+                         f"deleted, source kept at {src}; {what}")
 
 
 def exists_any(p):
@@ -655,6 +707,8 @@ def drop_own_copy(path):
     try:
         delete_tree(path, scan_tree(path))
         return f"partial copy {path.name} removed"
+    except RemoveFailed as e:
+        return f"partial copy not fully removed: {e}"
     except (LinkFound, TreeChanged, OSError) as e:
         return f"partial copy left at {path} ({e})"
 
