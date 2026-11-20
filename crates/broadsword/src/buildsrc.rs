@@ -582,26 +582,8 @@ pub fn check_installable(cfg: &Config) -> Result<(), String> {
             unlisted_dir(cfg).display()
         ));
     }
-    // The package note says which checkout built the package; the bin note says whose exe is in the build folder (another
-    // package can build the same bin name over it). A missing bin note is accepted: builds from before bin notes existed
-    // left none, and every build since writes one for every bin target it builds. A bin note that exists but cannot be read
-    // (or is empty) is refused: something wrote it and nothing says what.
-    let bin_file = notes_dir(cfg).join(bin_note_file(pkg));
-    let bin_note = read_bin_note(cfg, pkg);
-    let bin_note_absent = matches!(std::fs::symlink_metadata(&bin_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-    if bin_note.is_none() && !bin_note_absent {
-        return Err(format!(
-            "refusing to install: the binary-target note {} exists but cannot be read or is empty, so nothing says which checkout built the `{pkg}` exe in the build folder. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built",
-            bin_file.display()
-        ));
-    }
-    if let Some(other) = bin_note.filter(|s| s != MAIN_SOURCE) {
-        return Err(format!(
-            "refusing to install: the binary target `{pkg}` in the build folder was last built from `{other}` (a package of that folder builds a binary with this name), not from the main checkout. Its package note may still say the main checkout built the package, but the exe `{pkg}` is not the main checkout's. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
-        ));
-    }
     match read_note(cfg, pkg) {
-        Some(s) if s == MAIN_SOURCE => Ok(()),
+        Some(s) if s == MAIN_SOURCE => check_bin_note(cfg, pkg),
         Some(run) if run.starts_with(RUN_NOTE_PREFIX) => Err(format!(
             "refusing to install: the last job to touch the `{pkg}` binary in the build folder was a `run` ({run}), and a `run` command may have built anything. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
         )),
@@ -611,6 +593,27 @@ pub fn check_installable(cfg: &Config) -> Result<(), String> {
         None => Err(format!(
             "refusing to install: there is no record of which checkout built the `{pkg}` binary in the build folder ({} is missing), so it could be a worktree's. Build the main checkout through Broadsword first (`broadsword build {pkg}`, with no --task), then run `install` from the binary it built",
             notes_dir(cfg).join(pkg).display()
+        )),
+    }
+}
+
+/// The second half of `check_installable`, once the package note says the main checkout built `pkg`: the bin note says whose
+/// exe is in the build folder (another package can build the same bin name over it). A missing bin note is accepted: builds
+/// from before bin notes existed left none, and every build since writes one for every bin target it builds. A bin note that
+/// exists but cannot be read (or is empty) is refused: something wrote it and nothing says what.
+fn check_bin_note(cfg: &Config, pkg: &str) -> Result<(), String> {
+    let bin_file = notes_dir(cfg).join(bin_note_file(pkg));
+    let bin_note = read_bin_note(cfg, pkg);
+    let absent = matches!(std::fs::symlink_metadata(&bin_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    match bin_note {
+        Some(s) if s == MAIN_SOURCE => Ok(()),
+        None if absent => Ok(()),
+        None => Err(format!(
+            "refusing to install: the binary-target note {} exists but cannot be read or is empty, so nothing says which checkout built the `{pkg}` exe in the build folder. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built",
+            bin_file.display()
+        )),
+        Some(other) => Err(format!(
+            "refusing to install: the binary target `{pkg}` in the build folder was last built from `{other}` (a package of that folder builds a binary with this name, or a `run` there may have), not from the main checkout. Its package note says the main checkout built the package, but the exe `{pkg}` is not the main checkout's. Build the main checkout first (`broadsword build {pkg}`, with no --task, run from the main checkout), then run `install` from the binary it built"
         )),
     }
 }
