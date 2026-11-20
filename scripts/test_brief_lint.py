@@ -241,6 +241,106 @@ class SecondDoneCheck(unittest.TestCase):
         self.assertIn("more than one Done check section", res["donecheck"][1])
 
 
+def gaps(text, root=None):
+    return [(r, lv, m) for r, lv, m in bl.claim_gaps(text, root)]
+
+
+def brief(claims, req, done="`python -I scripts/test_a.py` shows OK.", extra=""):
+    return (f"# Brief: x\n\n**Board:**\n- Claims: {claims}\n\n**Requirements:**\n{req}\n\n"
+            f"**Done check:**\n1. {done}\n{extra}")
+
+
+class ClaimGapRules(unittest.TestCase):
+    """R1-R5: one test per rule, each shown failing before the rule existed."""
+
+    def levels(self, text, root=None):
+        return {(r, lv) for r, lv, _ in gaps(text, root)}
+
+    def test_clean_brief_has_no_gap(self):
+        self.assertEqual(gaps(GOOD), [])
+
+    def test_r1_path_in_requirements_not_claimed_fails(self):
+        g = gaps(brief("`src/jobs.rs`", "- add an empty `src/jobs/graph.rs`"))
+        self.assertIn(("R1", "FAIL"), {(r, lv) for r, lv, _ in g})
+        self.assertIn("src/jobs/graph.rs", " ".join(m for _, _, m in g))
+
+    def test_r1_prefix_and_basename_cover(self):
+        text = brief("`src/` (folder), `crates/x/tests/y.rs`", "- edit `src/a/b.rs` and `y.rs`")
+        self.assertEqual(gaps(text), [])
+
+    def test_r1_other_task_clause_and_other_repo_paths_are_skipped(self):
+        req = "- n20-47 copies a summary into Broadsword's `docs/nodes/x.md` and updates `ROADMAP.md`"
+        self.assertEqual(gaps(brief("`src/a.rs`", req)), [])
+
+    def test_r1_bare_reference_names_and_prose_slashes_are_skipped(self):
+        self.assertEqual(gaps(brief("`src/a.rs`", "- see AGENTS.md; save/load round trip; `queue.lock`")), [])
+
+    def test_r1_done_check_command_paths_are_reads_not_edits(self):
+        self.assertEqual(gaps(brief("`src/a.rs`", "- x", done="`git check-attr -a tests/data/f.save` ok")), [])
+
+    def test_r1_docs_or_output_folder_only_warns(self):
+        self.assertEqual(self.levels(brief("`src/a.rs`", "- results saved in `state/out/`")), {("R1", "WARN")})
+
+    def test_r1c_claim_instruction_in_a_note_fails(self):
+        text = brief("`src/a.rs`", "- x") + "\n## Orchestrator note\nClaim src/collide.rs and src/main.rs here.\n"
+        g = gaps(text)
+        self.assertIn(("R1c", "FAIL"), {(r, lv) for r, lv, _ in g})
+        self.assertIn("src/collide.rs", g[0][2])
+        ok = text.replace("`src/a.rs`", "`src/a.rs`, `src/collide.rs`, `src/main.rs`")
+        self.assertEqual(gaps(ok), [])
+
+    def test_r1b_bench_example_without_examples_claim_warns(self):
+        text = brief("`src/a.rs`", "- measured in a bench example, not a test")
+        self.assertEqual(self.levels(text), {("R1b", "WARN")})
+        self.assertEqual(gaps(text.replace("`src/a.rs`", "`src/a.rs`, `examples/b.rs`")), [])
+
+    def test_r2_pub_mod_without_stub_fails(self):
+        g = self.levels(brief("`src/jobs.rs`", "- leave `pub mod graph;` declared"))
+        self.assertIn(("R2", "FAIL"), g)
+        self.assertNotIn(("R2", "FAIL"), self.levels(brief("`src/jobs.rs`, `src/jobs/graph.rs`",
+                                                          "- leave `pub mod graph;` declared")))
+
+    def test_r2_submodule_names_need_stubs(self):
+        req = "- leave a `binary` and a `migrate` submodule declared empty in `serial.rs`"
+        g = gaps(brief("`src/serial.rs`", req))
+        self.assertIn("binary, migrate", " ".join(m for r, _, m in g if r == "R2"))
+        self.assertNotIn("R2", {r for r, _, _ in gaps(brief("`src/serial.rs`, `src/serial/binary.rs`, "
+                                                            "`src/serial/migrate/mod.rs`", req))})
+
+    def test_r3_new_flag_without_tools_rs_fails_and_plain_flag_warns(self):
+        claims = "`crates/broadsword/src/queue.rs`"
+        self.assertEqual(self.levels(brief(claims, "- adds a new flag `--per-project` to queue run")),
+                         {("R3", "FAIL")})
+        self.assertEqual(self.levels(brief(claims, "- `recover --abandon <id>` is refused")), {("R3", "WARN")})
+        self.assertEqual(gaps(brief(claims + ", `crates/broadsword/src/tools.rs`",
+                                    "- adds a new flag `--per-project`")), [])
+        self.assertEqual(gaps(brief("`src/a.rs`", "- adds a new flag `--x`")), [])  # not a broadsword brief
+
+    def test_r4_new_required_key_needs_config_toml_and_support(self):
+        req = "- a new required setting turns it on"
+        g = gaps(brief("`crates/broadsword/src/queue.rs`", req))
+        self.assertIn(("R4", "FAIL"), {(r, lv) for r, lv, _ in g})
+        self.assertIn("config.rs, broadsword.toml, tests/support/mod.rs", " ".join(m for _, _, m in g))
+        full = ("`crates/broadsword/src/config.rs`, `broadsword.toml`, "
+                "`crates/broadsword/tests/support/mod.rs`")
+        self.assertNotIn("R4", {r for r, _, _ in gaps(brief(full, req))})
+
+    def test_r5_lists_unclaimed_files_that_use_a_symbol(self):
+        import subprocess
+        d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_r5_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "a.rs").write_text("fn guard_refusal() {}\n", encoding="utf-8")
+        (d / "b.rs").write_text("guard_refusal();\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(d), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(d), "add", "."], check=True)
+        text = brief("`a.rs`", "- change `guard_refusal()`")
+        g = gaps(text, str(d))
+        self.assertEqual([(r, lv) for r, lv, _ in g], [("R5", "WARN")])
+        self.assertIn("b.rs", g[0][2])
+        self.assertNotIn("a.rs", g[0][2])
+        self.assertEqual(gaps(text), [])  # no --root: R5 is skipped
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_"))
@@ -274,6 +374,16 @@ class Cli(unittest.TestCase):
         code, _, err = run_cli(self.FLAGS + [str(self.dir / "nope.md")])
         self.assertEqual(code, 2)
         self.assertIn("nope.md", err)
+
+    def test_claim_gap_fail_exits_1_and_warn_alone_exits_0(self):
+        fail = brief("`src/jobs.rs`", "- add `src/jobs/graph.rs`")
+        code, out, _ = run_cli(self.FLAGS + [self.write("f.md", fail)])
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL claimgap-R1", out)
+        warn = brief("`src/a.rs`", "- results in `state/out/`", extra="")
+        code, out, _ = run_cli(self.FLAGS + [self.write("w.md", warn)])
+        self.assertIn("WARN claimgap-R1", out)
+        self.assertEqual(code, 0, out)
 
     def test_limits_are_required_flags(self):
         with contextlib.redirect_stderr(io.StringIO()):

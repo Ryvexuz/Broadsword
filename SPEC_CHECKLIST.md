@@ -36,6 +36,7 @@ Start from `templates/brief.md` for the brief and `templates/coder-prompt.md` fo
 | Failing loudly | Non-finite or impossible state must give a nonzero exit, never a quiet success. | S1 m2 |
 | Paths | Everything stays relative to root. Check that a folder really is what the record says before acting on it (stray folders, junctions, `..`, case). | S1 m1; S3 m2 |
 | Shared build folder | Building the same package from two checkouts can leave the other checkout's binary in place. | S2 close-out |
+| Claim gaps | Run `scripts/brief_lint.py` (with `--root <repo>`) on the brief before task start; fix every FAIL; read every WARN. | 2026-11-20: 6 coder stops on claims in about 45 starts |
 
 ## Process
 
