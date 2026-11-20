@@ -1,5 +1,6 @@
 //! Tests for `wtgit::diff_since`: the review diff lists every changed file whose content it does not show, reads the reviewed
-//! commit's `.gitattributes` (not main's), and fails loudly. REAL Git repos in throwaway folders under the repo's `scratch/`.
+//! commit's `.gitattributes` (not main's), and fails loudly. And for the queue's checkout calls: no tip-chosen filter driver runs.
+//! REAL Git repos in throwaway folders under the repo's `scratch/`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -174,6 +175,105 @@ fn worktree_route_refuses_uncommitted_gitattributes() {
     assert!(e.contains(".gitattributes"), "untracked one: {e}");
     fs::remove_file(r.wt.join("sub/.gitattributes")).unwrap();
     assert!(diff_since_mode(&r.main, "main", &tip, AttrMode::Worktree).is_ok());
+}
+
+/// Configure `filter.evil.clean` and `filter.evil.smudge` (and `process`, `required`) in the repo's config, each running a script that
+/// appends to a marker file and passes stdin through. Returns the marker path.
+fn plant_filter(r: &Repo) -> PathBuf {
+    let marker = r.root.join("filter-ran.txt");
+    let m = marker.to_string_lossy().replace('\\', "/");
+    let script = r.root.join("filter.sh");
+    fs::write(&script, format!("#!/bin/sh\necho \"$0 $*\" >> \"{m}\"\ncat\n")).unwrap();
+    let cmd = format!("sh \"{}\"", script.to_string_lossy().replace('\\', "/"));
+    for (k, v) in [("filter.evil.clean", cmd.as_str()), ("filter.evil.smudge", cmd.as_str()), ("filter.evil.required", "true")] {
+        git(&r.main, &["config", k, v]);
+    }
+    marker
+}
+
+fn assert_no_filter(marker: &Path, step: &str) {
+    assert!(!marker.exists(), "{step}: a tip-chosen filter driver ran: {}", fs::read_to_string(marker).unwrap_or_default());
+}
+
+/// A tip whose `.gitattributes` maps `*.rs` to `filter=evil`, with the machine's config tying `filter.evil.*` to a script that writes
+/// a marker. Every queue-owned call that checks files out or hashes them (rebase, checkout --detach, checkout <branch>, merge
+/// --ff-only in the main checkout, status) must run no filter; the file content is the committed bytes. The filter is configured
+/// only AFTER the commits are made, so the test's own `git add` cannot run it.
+#[test]
+fn queue_checkouts_never_run_a_tip_chosen_filter_driver() {
+    let r = repo("filters");
+    fs::write(r.wt.join(".gitattributes"), "*.rs filter=evil\n").unwrap();
+    fs::write(r.wt.join("main.rs"), "fn main() {}\n").unwrap();
+    let tip = commit_all(&r.wt);
+    fs::write(r.main.join("b.txt"), "main moved\n").unwrap();
+    let main_head = commit_all(&r.main);
+    let marker = plant_filter(&r);
+
+    // control: a plain checkout with the same config runs the filter (proves the assertions below can fail)
+    git(&r.wt, &["checkout", "-q", "--detach", &main_head]);
+    git(&r.wt, &["checkout", "-q", "task"]);
+    assert!(marker.exists(), "control: the planted filter did not run on a plain checkout, so this test proves nothing");
+    fs::remove_file(&marker).unwrap();
+
+    assert!(matches!(wtgit::rebase(&r.wt, "main").unwrap(), wtgit::Rebase::Done));
+    assert_no_filter(&marker, "rebase");
+    let rebased = git(&r.wt, &["rev-parse", "HEAD"]);
+    assert_ne!(rebased, tip);
+    assert_eq!(fs::read_to_string(r.wt.join("main.rs")).unwrap(), "fn main() {}\n");
+
+    wtgit::checkout_detach(&r.wt, &main_head).unwrap();
+    assert_no_filter(&marker, "checkout --detach");
+    assert!(!r.wt.join("main.rs").exists());
+    wtgit::checkout_branch(&r.wt, "task").unwrap();
+    assert_no_filter(&marker, "checkout <branch>");
+    assert_eq!(fs::read_to_string(r.wt.join("main.rs")).unwrap(), "fn main() {}\n");
+
+    // status must hash a changed file without the clean filter
+    fs::write(r.wt.join("main.rs"), "fn main() { changed(); }\n").unwrap();
+    assert!(wtgit::status_porcelain_plain(&r.wt).unwrap().contains("main.rs"));
+    assert_no_filter(&marker, "status");
+    git(&r.wt, &["-c", "filter.evil.smudge=", "-c", "filter.evil.clean=", "-c", "filter.evil.required=false", "checkout", "--", "main.rs"]);
+
+    wtgit::merge_ff_only(&r.main, &rebased).unwrap();
+    assert_no_filter(&marker, "merge --ff-only in the main checkout");
+    assert_eq!(fs::read_to_string(r.main.join("main.rs")).unwrap(), "fn main() {}\n");
+    assert_eq!(wtgit::status_porcelain_plain(&r.main).unwrap(), "");
+    assert_no_filter(&marker, "status of the main checkout");
+}
+
+/// The conflict path: `rebase` stops, lists the unmerged files and runs `git rebase --abort`, which writes the branch's files back.
+/// None of those steps may run the tip-chosen filter.
+#[test]
+fn a_conflicting_rebase_and_its_abort_run_no_filter_driver() {
+    let r = repo("filterconflict");
+    fs::write(r.wt.join(".gitattributes"), "*.rs filter=evil\n").unwrap();
+    fs::write(r.wt.join("a.txt"), "task side\n").unwrap();
+    fs::write(r.wt.join("main.rs"), "fn main() {}\n").unwrap();
+    let tip = commit_all(&r.wt);
+    fs::write(r.main.join("a.txt"), "main side\n").unwrap();
+    commit_all(&r.main);
+    let marker = plant_filter(&r);
+    match wtgit::rebase(&r.wt, "main").unwrap() {
+        wtgit::Rebase::Conflict(files) => assert_eq!(files, vec!["a.txt".to_string()]),
+        wtgit::Rebase::Done => panic!("expected a conflict, the rebase succeeded"),
+        wtgit::Rebase::Failed(m) => panic!("expected a conflict, got: {m}"),
+    }
+    assert_no_filter(&marker, "conflicting rebase and abort");
+    assert_eq!(git(&r.wt, &["rev-parse", "HEAD"]), tip);
+    assert!(!wtgit::rebase_in_progress(&r.wt).unwrap());
+    assert_eq!(fs::read_to_string(r.wt.join("main.rs")).unwrap(), "fn main() {}\n");
+}
+
+/// A configured filter whose name cannot be written as a `-c` key (it holds `=`) cannot be disabled, so the checkout is refused.
+#[test]
+fn a_filter_name_that_cannot_be_disabled_is_refused() {
+    let r = repo("filtername");
+    fs::write(r.wt.join("b.txt"), "x\n").unwrap();
+    commit_all(&r.wt);
+    git(&r.main, &["config", "filter.a=b.smudge", "cat"]);
+    let e = wtgit::checkout_detach(&r.wt, "main").unwrap_err();
+    assert!(e.contains("a=b") && e.contains("refusing"), "{e}");
+    assert_eq!(wtgit::current_branch(&r.wt).unwrap().as_deref(), Some("task"));
 }
 
 #[test]

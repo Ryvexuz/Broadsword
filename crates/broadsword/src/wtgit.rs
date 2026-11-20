@@ -100,7 +100,7 @@ pub fn worktree_add(dir: &Path, branch: &str, path: &Path, base: &str) -> Result
 /// ignored too and Broadsword cannot tell them from build output, so any of them blocks removal. Why: removal must never
 /// throw away uncommitted, untracked or ignored files.
 pub fn status_porcelain(worktree: &Path) -> Result<String, String> {
-    ok(worktree, &["status", "--porcelain", "--ignored"])
+    files_ok(worktree, &["status", "--porcelain", "--ignored"])
 }
 
 /// `git rev-parse --verify refs/heads/<branch>`: the commit a local branch points at. Why: tell whether a branch is still
@@ -230,13 +230,74 @@ pub fn worktree_repair(dir: &Path, worktrees: &[&Path]) -> Result<String, String
 // Same hard rules as above: no `--force`, no `-D`, no `reset --hard`, no `push`. The two commands that move a branch are
 // `rebase` (only ever inside a task's own worktree, and always aborted on any failure) and `merge --ff-only` (only ever in
 // the main checkout, and it can only move HEAD forward along a line it already contains). Neither can drop a commit
-// without it staying reachable: queue.rs saves the pre-rebase tip under refs/broadsword/queue/ first.
+// without it staying reachable: queue.rs saves the pre-rebase tip under refs/broadsword/queue/ first. Every call here that reads
+// or writes working-tree files (status, rebase and its abort, the unmerged-file list, checkout, merge --ff-only) goes through
+// `files_run`/`files_ok`, which switch off every configured filter driver (see `no_filter_args`).
 
 /// `git status --porcelain` (NO `--ignored`): one line per modified, staged or untracked path; empty = clean. Why: the MAIN
 /// checkout must be clean before a merge; unlike a worktree about to be deleted, ignored files there (build folders,
-/// `.env`) are normal and not at risk.
+/// `.env`) are normal and not at risk. Runs through `files_ok`: status re-hashes changed files, which runs the clean filter.
 pub fn status_porcelain_plain(dir: &Path) -> Result<String, String> {
-    ok(dir, &["status", "--porcelain"])
+    files_ok(dir, &["status", "--porcelain"])
+}
+
+/// POLICY: no queue-owned git call that reads or writes working-tree files runs a filter driver. Which driver a file goes through
+/// is chosen by `.gitattributes` (`filter=<name>`), which comes from the untrusted branch being merged, and the machine's config ties
+/// that name to a program (`filter.<name>.clean`, `.smudge`, `.process`; git-lfs is one). So before every such call this lists every
+/// filter driver configured where the call runs (`git config -z --name-only --get-regexp ^filter\.`: all scopes, includes, and
+/// `-c`/`GIT_CONFIG_*` from the environment, i.e. exactly the config the call will see) and switches each one off with `-c
+/// filter.<name>.smudge= -c filter.<name>.clean= -c filter.<name>.process= -c filter.<name>.required=false`: Git runs no filter whose
+/// command is empty, and `required=false` lets the file pass through unchanged. Disabling by configured name, not by the names a
+/// `.gitattributes` uses, covers every attribute source (any `.gitattributes` in any commit a rebase replays, `info/attributes`,
+/// `core.attributesFile`, macros): a filter that is not configured runs nothing anyway. A name that cannot be written as a `-c` key
+/// (it holds `=` or a line break) is refused, so the call fails closed. Known limitation: in a project that really uses git-lfs, the
+/// queue's rebases and merges leave LFS pointer files, not their content, in the task worktree and the main checkout.
+/// Why: merging a branch must never run a program the branch chose. `review_args` holds the same rule for diffs.
+fn no_filter_args(dir: &Path) -> Result<Vec<String>, String> {
+    let o = run(dir, &["config", "-z", "--name-only", "--get-regexp", r"^filter\."])?;
+    match o.code {
+        0 => {}
+        1 => return Ok(Vec::new()), // no filter configured
+        c => return Err(format!("git config --get-regexp ^filter\\. failed (exit {c}): {}; refusing to check files out with unknown filter drivers", o.stderr)),
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for key in o.stdout.split('\0').filter(|k| !k.is_empty()) {
+        let rest = key.strip_prefix("filter.").ok_or_else(|| format!("git config listed `{key}` for ^filter\\.; refusing to check files out"))?;
+        let Some(dot) = rest.rfind('.') else { continue }; // `filter.<key>` with no driver name configures no driver
+        let name = &rest[..dot];
+        if name.contains(['=', '\n', '\r']) {
+            return Err(format!("filter driver `{name}` is configured, and its name cannot be switched off with `-c` (it holds `=` or a line break): refusing to check files out"));
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let mut args = Vec::new();
+    for n in names {
+        for (k, v) in [("smudge", ""), ("clean", ""), ("process", ""), ("required", "false")] {
+            args.push("-c".to_string());
+            args.push(format!("filter.{n}.{k}={v}"));
+        }
+    }
+    Ok(args)
+}
+
+/// The ONE runner for queue-owned git calls that read or write working-tree files: `git <no_filter_args> <args>`.
+fn files_run(dir: &Path, args: &[&str]) -> Result<Out, String> {
+    let pre = no_filter_args(dir)?;
+    let mut full: Vec<&str> = pre.iter().map(String::as_str).collect();
+    full.extend_from_slice(args);
+    run(dir, &full)
+}
+
+/// `files_run`, then exit code 0 -> trimmed stdout; anything else -> an error naming the command (without the `-c` list).
+fn files_ok(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let o = files_run(dir, args)?;
+    if o.code == 0 {
+        Ok(o.stdout)
+    } else {
+        Err(format!("git {} failed: {}", args.join(" "), without_force_hints(&o.stderr)))
+    }
 }
 
 /// `git rev-list --count <range>`: how many commits a range holds, e.g. `<base>..<branch>` = commits on the branch that
@@ -468,12 +529,12 @@ pub fn rebase_in_progress(worktree: &Path) -> Result<bool, String> {
 /// `git rebase --abort`: stop a rebase and put the branch back exactly where it was before it began. Why: a conflict (or
 /// any failure) must leave the branch as it was.
 pub fn rebase_abort(worktree: &Path) -> Result<(), String> {
-    ok(worktree, &["rebase", "--abort"]).map(|_| ())
+    files_ok(worktree, &["rebase", "--abort"]).map(|_| ())
 }
 
 /// `git diff --name-only --diff-filter=U`: the paths with unresolved conflicts. Why: the entry names them for the coder.
 fn unmerged_files(worktree: &Path) -> Result<Vec<String>, String> {
-    Ok(ok(worktree, &["diff", "--name-only", "--diff-filter=U"])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    Ok(files_ok(worktree, &["diff", "--name-only", "--diff-filter=U"])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
 }
 
 pub enum Rebase {
@@ -503,13 +564,13 @@ pub fn rebase_onto(worktree: &Path, onto: &str, upstream: &str) -> Result<Rebase
 /// branch. Why: the merge train must check an entry's own earlier commit; the branch still holds every commit and is put back by
 /// `checkout_branch`.
 pub fn checkout_detach(worktree: &Path, commit: &str) -> Result<(), String> {
-    ok(worktree, &["checkout", "--detach", commit]).map(|_| ())
+    files_ok(worktree, &["checkout", "--detach", commit]).map(|_| ())
 }
 
 /// `git checkout <branch>` in a task's worktree: put the worktree back on its branch after `checkout_detach`. Why: a task's
 /// worktree must always end on its own branch.
 pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<(), String> {
-    ok(worktree, &["checkout", branch]).map(|_| ())
+    files_ok(worktree, &["checkout", branch]).map(|_| ())
 }
 
 /// `git log --patch --reverse <range>` piped into `git patch-id --stable`: one patch id per commit of `range` that has a diff, oldest
@@ -532,7 +593,7 @@ pub fn patch_ids(dir: &Path, range: &str) -> Result<Vec<String>, String> {
 }
 
 fn rebase_with(worktree: &Path, args: &[&str], onto: &str) -> Result<Rebase, String> {
-    let o = run(worktree, args)?;
+    let o = files_run(worktree, args)?;
     if o.code == 0 {
         return Ok(Rebase::Done);
     }
@@ -554,5 +615,5 @@ fn rebase_with(worktree: &Path, args: &[&str], onto: &str) -> Result<Rebase, Str
 /// fast-forward (the branch tip is an ancestor of it); never a merge commit, git refuses otherwise. Why: the one way task
 /// work enters main, and it cannot rewrite or lose anything main already has.
 pub fn merge_ff_only(main_dir: &Path, commit: &str) -> Result<(), String> {
-    ok(main_dir, &["merge", "--ff-only", commit]).map(|_| ())
+    files_ok(main_dir, &["merge", "--ff-only", commit]).map(|_| ())
 }
