@@ -111,21 +111,26 @@ def lint(text, max_lines, max_bullets, max_files, max_done_lines):
     msg = f"{n} non-blank lines (max {max_lines}); done check {done_n} lines, first {max_done_lines} excluded"
     results.append(("lines", n <= max_lines, msg))
 
+    # Bullets in every section except Done check and Claims count (an unlisted section such as
+    # "Also" or "Notes" cannot hold bullets the limit never sees). A Requirements heading line that
+    # carries text counts as one bullet.
     reqs = [s for s in secs if s[0] == "requirements"]
     if not reqs:
         results.append(("bullets", False, "no Requirements section found (accepted forms: "
                         "'Requirements:', '## Requirements', '**Requirements**')"))
     else:
         bullets = 0
-        for _, a, b in reqs:
-            head = section_of(lines[a])[1]
-            if head:
+        for name, a, b in secs:
+            if name in ("done check", "claims"):
+                continue
+            if name == "requirements" and section_of(lines[a])[1]:
                 bullets += 1
             for ln in lines[a + 1:b]:
-                if ITEM_RE.match(ln) and not ln.startswith((" ", "\t")):
+                if ITEM_RE.match(ln) and not ln.startswith((" ", "	")):
                     bullets += 1
         results.append(("bullets", bullets <= max_bullets,
-                        f"{bullets} requirement bullets (max {max_bullets})"))
+                        f"{bullets} requirement bullets (max {max_bullets}; all sections but "
+                        "Claims and Done check count)"))
 
     claims = [s for s in secs if s[0] == "claims"]
     if not claims:
@@ -138,7 +143,10 @@ def lint(text, max_lines, max_bullets, max_files, max_done_lines):
         else:
             block = [ln for ln in lines[a + 1:b] if ln.strip()]
         joined = "\n".join(block)
-        files = claim_paths(joined)
+        # Paths on any line outside the Done check count, so a bold line after Claims hides none.
+        in_done = {i for _, x, y in done for i in range(x, y)}
+        files = claim_paths(joined) | claim_paths(chr(10).join(
+            ln for i, ln in enumerate(lines) if i not in in_done))
         prose = " ".join(t for t in re.split(r"[\s,;()\[\]`'\"]+", joined)
                          if t.strip().rstrip(".:").replace("\\", "/") not in files).lower()
         has_reason = "reason" in prose or "because" in prose

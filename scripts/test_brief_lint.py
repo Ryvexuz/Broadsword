@@ -73,7 +73,7 @@ class Rules(unittest.TestCase):
         many = "".join(f"- requirement {i}\n" for i in range(9))
         res = lint(GOOD.replace("- does one thing\n- does another thing\n", many))
         self.assertFalse(res["bullets"][0])
-        self.assertIn("9 requirement bullets", res["bullets"][1])
+        self.assertIn("10 requirement bullets", res["bullets"][1])  # 9 + the Board title bullet
 
     def test_bullets_rule_allows_exactly_the_limit_and_skips_nested(self):
         eight = "".join(f"- requirement {i}\n  - nested {i}\n" for i in range(8))
@@ -151,9 +151,21 @@ class Bypasses(unittest.TestCase):
         self.assertTrue(res["bullets"][1].startswith("21 "), res["bullets"][1])
 
     def test_a_real_bold_header_does_end_requirements(self):
-        res = lint(HEAD + "**Requirements:**\n- one\n- two\n**Notes:**\n" + TWENTY + DONE)
+        # The header still ends the section (round-1 rule); its bullets are counted anyway (round 2).
+        res = lint(HEAD + "**Requirements:**\n- one\n- two\n**Notes:**\n- three\n- four\n" + DONE)
         self.assertTrue(res["bullets"][0], res["bullets"][1])
-        self.assertTrue(res["bullets"][1].startswith("2 "), res["bullets"][1])
+        self.assertTrue(res["bullets"][1].startswith("4 "), res["bullets"][1])
+
+    def test_bullets_under_an_also_section_count_toward_the_limit(self):
+        nine = "".join(f"- extra {i}\n" for i in range(9))
+        res = lint(HEAD + "**Requirements:**\n- one\n**Also:**\n" + nine + DONE)
+        self.assertFalse(res["bullets"][0], res["bullets"][1])
+        self.assertTrue(res["bullets"][1].startswith("10 "), res["bullets"][1])
+
+    def test_paths_after_a_bold_line_following_claims_are_counted(self):
+        res = lint(HEAD + "**Also:**\n- `scripts/b.py`\n- `docs/c.md`\n" + DONE)
+        self.assertFalse(res["files"][0], res["files"][1])
+        self.assertTrue(res["files"][1].startswith("3 "), res["files"][1])
 
     def test_long_done_check_prose_cannot_hide_lines(self):
         res = lint(GOOD + "".join(f"prose line {i}\n" for i in range(200)))
