@@ -184,17 +184,19 @@ def shadow_only(entries: list) -> list:
 def judge(items: list, verdicts: dict) -> list:
     """[(item, verdict row or None, note)]. A verdict row closes a finding by its full key (`path:line#words`). A row that gives
     only `path:line` closes the finding at that location only when exactly one shadow-only finding sits there; with several it
-    closes none, and the open lines carry a note."""
+    closes none, and the open lines carry a note. When both forms resolve to one finding, the row written last wins."""
     at = {}
     for it in items:
         at.setdefault((it["entry"], it["loc"]), []).append(it)
     out = []
     for it in items:
         v, note = verdicts.get((it["entry"], it["key"])), ""
-        if v is None and it["key"] != it["loc"] and (it["entry"], it["loc"]) in verdicts:
+        if it["key"] != it["loc"] and (it["entry"], it["loc"]) in verdicts:
             if len(at[(it["entry"], it["loc"])]) == 1:
-                v = verdicts[(it["entry"], it["loc"])]
-            else:
+                b = verdicts[(it["entry"], it["loc"])]
+                if v is None or b.get("seq", 0) > v.get("seq", 0):  # the last row written wins, whatever its key form
+                    v = b
+            elif v is None:
                 note = f"verdict for bare {it['loc']} ignored: {len(at[(it['entry'], it['loc'])])} findings there; use the full key"
         out.append((it, v, note))
     return out
@@ -215,7 +217,7 @@ def load_verdicts(root: Path) -> dict:
         entry, key, verdict, evidence, judge, date = (c.strip() for c in cells[:6])
         if verdict not in VERDICTS:
             continue
-        out[(entry, norm_key(key))] = {"verdict": verdict, "evidence": evidence, "judge": judge, "date": date}
+        out[(entry, norm_key(key))] = {"verdict": verdict, "evidence": evidence, "judge": judge, "date": date, "seq": i}
     return out
 
 

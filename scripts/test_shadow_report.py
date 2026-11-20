@@ -233,6 +233,22 @@ class OpenTests(Base):
         self.assertEqual(self.add("q-A", sr.finding_id("a.py:10 - a second, different bug appears"), "false", "--evidence", "e", "--judge", "m")[0], 0)
         self.assertEqual(self.report("--open")[0], 0)
 
+    def test_last_row_wins_whatever_its_key_form(self):
+        self.put("q-A", entry("merged", "PASS", "", "a.py:10 - only one here"))
+        full = sr.finding_id("a.py:10 - only one here")
+
+        def verdict_of(*rows):
+            for k, v in rows:
+                self.assertEqual(self.add("q-A", k, v, "--evidence", "e", "--judge", "m")[0], 0)
+            (it, v, _), = sr.judge(sr.shadow_only(sr.load_entries(self.root)), sr.load_verdicts(self.root))
+            return v["verdict"]
+
+        self.assertEqual(verdict_of((full, "real"), ("a.py:10", "false")), "false")  # full key, then a later bare row
+        (self.root / "state" / "shadow-verdicts.tsv").unlink()
+        self.assertEqual(verdict_of(("a.py:10", "false"), (full, "real")), "real")  # bare row, then a later full key
+        (self.root / "state" / "shadow-verdicts.tsv").unlink()
+        self.assertEqual(verdict_of(("a.py:10", "false"), (full, "real"), ("a.py:10", "known")), "known")
+
     def test_bare_location_verdict_closes_a_lone_finding(self):
         self.put("q-A", entry("merged", "PASS", "", "a.py:10 - only one here"))
         self.hand_row("a.py:10")
