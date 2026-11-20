@@ -57,6 +57,7 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 34. **When a cheap reviewer keeps failing low-risk tooling with new, non-regression points, verify them against the code, and stop the loop.** The cost is the re-check time, not the review fee. [S4]
 35. **Judge a scale-up on throughput and failures.** Lock wait and test time are costs inside throughput, not a separate veto: record them as warnings, and step back only if merges per hour stop rising, failures rise, or memory runs out (RAM over 90%, swap growing). [S4 close]
 36. **A free slot is filled before any other work.** At the start of every step, list the board and start a coder on every ready task (dependencies merged, claims free) until running = max_agents; hand reviews, audits and records go to background agents so starts never wait. On 2026-11-19 the session averaged 3.2 running tasks of 6 to 10 slots: empty slots, not the slot limit, were the main loss. [S4 close]
+37. **A cap must count what it claims to limit.** When you change slot, queue or limit logic, check its effect on active workers with real numbers, not by assumption. On 2026-11-20 a board showed 14/14 slots used while 0 coders worked (every task was waiting in the merge queue), with RAM at 14% and CPU at 7%. [S4]
 
 ---
 
@@ -104,8 +105,19 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 close | Shadow reviewer through Codex with no tools offered (one-entry model catalog), proven by `scripts/shadow_canary.py` | No secret can be read by the shadow; shadow answers fast | Canary exit code after every codex update; shadow seconds per entry (144 s timeouts before, 3-21 s after) | A codex update re-adding a tool (the canary must be re-run; not yet enforced) | open |
 | S4 close | Fill free slots first (Lazlo, 2026-11-19 21:50Z); inbox read at least every 10 minutes | Merged/h | Average running tasks and merged/h from task times vs state/throughput/throughput-review-2026-11-19.md | Coders started on tasks whose dependencies are not really merged; claim collisions | open |
 | S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h; failed/retried jobs; RAM and swap (lock wait and test time as warnings, Lazlo 2026-11-19 21:32Z) | Failures or memory, not lock wait | re-judged under Lazlo's new rule: 2.82 -> 8.44 merged/h, 0 failures, RAM peak 14.8%, no swap = helped; lock-wait p90 26 -> 88 s and test median 82 -> 100 s recorded as warnings. The first verdict (hindered, reverted to 6) used the old rule that made lock wait a veto. Now 14, stepping +4 |
+| S4 close | Slot cap counts active coders: `task start` ignores tasks whose merge-queue entry is queued or running; required `max_queued`; `scripts/slot_check.py` logs board, waiting, active, ready, RAM and CPU every poll and prints FLAG when coders are idle while ready work waits (2026-11-20) | Active coders per poll and merges/h | Active coders per poll (slot_check) and merges/h vs the slots-14 pre-16 baseline | Queue depth (max_queued), RAM and CPU | open |
+| S4 close | Ahead-work compiles in `scratch/ahead-target` (CARGO_BUILD_JOBS=4), an exception to the one shared build folder (2026-11-20 00:27Z). Measured cost of the old rule: ahead patches stayed uncompiled (merge train +1521/-78 lines), and building into `build/` outside the lock broke two queue checks on 2026-11-19 at 23:51Z | Share of ahead patches that apply and pass on the first board run | That share, and disk used by `scratch/ahead-target` | Disk use; CPU taken from queue checks | open (revert: remove the exception; the scratch age cleanup wipes the folder) |
 
 ## Retros, newest first
+
+---
+
+## The slot cap counted the wrong thing (2026-11-20 00:18Z, PC session)
+
+- **Wrong:** `max_agents` counted every board task with status running, including finished work waiting in the single merge queue. At 00:16Z the board read 14/14 with 0 active coders, RAM 14% and CPU 7%, while 58 tasks were ready. Lazlo had already said that slots must never sit idle (lesson 36), and the counter quietly defeated that rule.
+- **Why:** the cap's meaning ("agents working") and what it counted ("tasks not yet merged") were never checked against each other with numbers. Each slot decision (14, then 16, then a ramp) assumed that running meant working.
+- **Change (enforced):** t-20261120-001621 changed `task start` to count only tasks without a queued or running queue entry, and added a required `max_queued` setting (merged as 51d3732). `scripts/slot_check.py` runs on every inbox poll and logs board, waiting, active, ready, RAM and CPU, printing a FLAG when coders are idle while ready work waits. Ledger rows added for it and for the ahead-target exception.
+- **Portable lesson:** 37, "A cap must count what it claims to limit."
 
 ---
 
