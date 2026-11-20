@@ -1020,6 +1020,66 @@ fn a() {
     assert!(log.contains("TRUNCATED") && log.contains("a started a grandchild"), "the cut is said, never silent, and what was read is kept: {log}");
 }
 
+/// Working set of process `pid` in bytes (Windows: `tasklist`'s "Mem Usage"), or `None` if it is gone or cannot be read.
+fn working_set(pid: u32) -> Option<u64> {
+    let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output().ok()?;
+    let line = text(&out.stdout);
+    let kb = line.trim().rsplit("\",\"").next()?.trim_matches('"').trim_end_matches(" K").replace([',', '.', '\u{a0}', ' '], "");
+    kb.parse::<u64>().ok().map(|k| k * 1024)
+}
+
+#[test]
+fn after_a_truncation_a_grandchild_that_keeps_writing_never_grows_the_jobs_memory() {
+    if !cfg!(windows) {
+        return; // the memory reading uses tasklist
+    }
+    let r = Root::new("sideflood", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    // a re-runs its own executable as a grandchild that inherits a's stdout, waits until a's output was cut (wait 2 s), then
+    // writes 400 MB into it; b keeps the job (and its pool) alive meanwhile, so the job's memory can be watched
+    let a = r#"
+#[test]
+fn a() {
+    if std::env::var("FLOOD_GRANDCHILD").is_ok() {
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    std::process::Command::new(exe).args(["flood", "--exact", "--test-threads=1"]).env("FLOOD_GRANDCHILD", "1").spawn().unwrap();
+}
+#[test]
+fn flood() {
+    if std::env::var("FLOOD_GRANDCHILD").is_err() {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let chunk = vec![b'x'; 1 << 16];
+    for _ in 0..6400 {
+        if std::io::Write::write_all(&mut std::io::stdout(), &chunk).is_err() {
+            return;
+        }
+    }
+}
+"#;
+    let b = "#[test] fn b() { std::thread::sleep(std::time::Duration::from_secs(14)); }\n";
+    bin_project(&r, "sideflood", "0.1.0", "pub fn f() {}\n", &[("a.rs", a), ("b.rs", b)]);
+    let (so_f, se_f) = (r.dir.join("scratch/so.txt"), r.dir.join("scratch/se.txt"));
+    let mut child = r.cmd(&["test", "sideflood"]).stdout(fs::File::create(&so_f).unwrap()).stderr(fs::File::create(&se_f).unwrap()).spawn().unwrap();
+    let mut peak = 0u64;
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        peak = peak.max(working_set(child.id()).unwrap_or(0));
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let (so, se) = (fs::read_to_string(&so_f).unwrap(), fs::read_to_string(&se_f).unwrap());
+    assert_eq!(status.code(), Some(0), "{so}{se}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("TRUNCATED"), "a's output was cut: {log}");
+    assert!(peak > 0, "the job's memory was read");
+    assert!(peak < 150 << 20, "the job kept what a grandchild wrote after its output was cut: peak working set {} MB", peak >> 20);
+}
+
 #[test]
 fn a_failing_python_test_beside_others_fails_the_job_and_is_named() {
     let r = Root::new("sidepy", 1, 0);

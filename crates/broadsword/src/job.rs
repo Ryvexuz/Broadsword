@@ -922,23 +922,30 @@ impl TestStep<'_> {
     /// still holds a pipe after `test_output_wait_seconds`, its output is taken as far as it got and marked TRUNCATED (the
     /// reader threads are left to end on their own). The disk poll and the other children go on meanwhile.
     fn run_pool(&mut self, items: Vec<PoolItem>, kept: &mut String) -> Result<PoolEnd, String> {
+        /// A child's collected stdout or stderr. `None` once closed (its output was taken at a cut, or the pool gave up on it):
+        /// the reader thread then reads and DISCARDS until EOF, so a process that keeps writing never grows memory.
+        type Buf = Arc<Mutex<Option<Vec<u8>>>>;
+        /// Close `b` and return what it held.
+        fn close(b: &Buf) -> Vec<u8> {
+            b.lock().map(|mut v| v.take().unwrap_or_default()).unwrap_or_default()
+        }
         struct Live {
             idx: usize,
             child: std::process::Child,
-            out: Arc<Mutex<Vec<u8>>>,
-            err: Arc<Mutex<Vec<u8>>>,
+            out: Buf,
+            err: Buf,
             readers: Vec<std::thread::JoinHandle<()>>,
             from: f64,
         }
         /// An exited child whose output may still be arriving.
         struct Draining {
             idx: usize,
-            out: Arc<Mutex<Vec<u8>>>,
-            err: Arc<Mutex<Vec<u8>>>,
+            out: Buf,
+            err: Buf,
             readers: Vec<std::thread::JoinHandle<()>>,
             exited: Instant,
         }
-        fn reader(mut src: impl Read + Send + 'static, into: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+        fn reader(mut src: impl Read + Send + 'static, into: Buf) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 8192];
                 while let Ok(k) = src.read(&mut chunk) {
@@ -946,16 +953,27 @@ impl TestStep<'_> {
                         break;
                     }
                     if let Ok(mut b) = into.lock() {
-                        b.extend_from_slice(&chunk[..k]);
+                        if let Some(b) = b.as_mut() {
+                            b.extend_from_slice(&chunk[..k]);
+                        } // closed: discarded
                     }
                 }
             })
         }
-        fn kill_all(live: &mut Vec<Live>) {
+        /// Kill every running child and close every buffer (running and draining), so readers left to end on their own (never
+        /// block on orphaned pipes) keep nothing.
+        fn kill_all(live: &mut Vec<Live>, draining: &mut Vec<Draining>) {
             for l in live.iter_mut() {
                 kill_tree(&mut l.child);
+                close(&l.out);
+                close(&l.err);
             }
-            live.clear(); // after a kill the readers are left to finish on their own: never block on orphaned pipes
+            for d in draining.iter() {
+                close(&d.out);
+                close(&d.err);
+            }
+            live.clear();
+            draining.clear();
         }
         let n = items.len();
         let width = self.parallel.max(1);
@@ -979,12 +997,12 @@ impl TestStep<'_> {
                 let mut child = match spawned {
                     Ok(c) => c,
                     Err(e) => {
-                        kill_all(&mut live);
+                        kill_all(&mut live, &mut draining);
                         (self.on_live)(&[]);
                         return Err(format!("cannot start `{}`: {e}", cmd.get_program().to_string_lossy()));
                     }
                 };
-                let (out, err) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+                let (out, err): (Buf, Buf) = (Arc::new(Mutex::new(Some(Vec::new()))), Arc::new(Mutex::new(Some(Vec::new()))));
                 let readers = vec![reader(child.stdout.take().expect("piped"), Arc::clone(&out)), reader(child.stderr.take().expect("piped"), Arc::clone(&err))];
                 live.push(Live { idx: next, child, out, err, readers, from: start.elapsed().as_secs_f64() });
                 lines.push((title, fail_line, counts));
@@ -997,7 +1015,7 @@ impl TestStep<'_> {
                 let status = match live[i].child.try_wait() {
                     Ok(s) => s,
                     Err(e) => {
-                        kill_all(&mut live);
+                        kill_all(&mut live, &mut draining);
                         (self.on_live)(&[]);
                         return Err(format!("waiting for a test child failed: {e}"));
                     }
@@ -1027,14 +1045,15 @@ impl TestStep<'_> {
                         let _ = r.join(); // already finished: returns at once
                     }
                 }
-                let text = |b: &Arc<Mutex<Vec<u8>>>| self.secrets.redact(&String::from_utf8_lossy(&b.lock().map(|v| v.clone()).unwrap_or_default()));
+                // closing takes the bytes so far; after a cut the readers keep reading but discard (memory stays bounded)
+                let text = |b: &Buf| self.secrets.redact(&String::from_utf8_lossy(&close(b)));
                 let (out, mut err) = (text(&d.out), text(&d.err));
                 if !done {
                     if !err.is_empty() && !err.ends_with('\n') {
                         err.push('\n');
                     }
                     err.push_str(&format!(
-                        "broadsword: TRUNCATED: this test child exited, but a process it started still held its output open {} s later (test_output_wait_seconds); its output above is as far as it got, and the rest is not read\n",
+                        "broadsword: TRUNCATED: this test child exited, but a process it started still held its output open {} s later (test_output_wait_seconds); its output above is as far as it got, and the rest is read and discarded\n",
                         wait.as_secs()
                     ));
                 }
@@ -1056,7 +1075,7 @@ impl TestStep<'_> {
             if Instant::now() >= next_poll {
                 let f = (self.free)();
                 if pause::below_floor(f, self.cfg.floor_bytes()) {
-                    kill_all(&mut live);
+                    kill_all(&mut live, &mut draining);
                     (self.on_live)(&[]);
                     return Ok(PoolEnd::DiskDropped(f));
                 }
