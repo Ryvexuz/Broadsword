@@ -1,0 +1,8 @@
+# Settings for bench/drift. Every key is required; the scripts never fall back to a default.
+
+step_count = 55                 # steps in one run (the task has a step for every number; 50+ so the last checkpoint has a tail)
+checkpoints = [5, 20, 50]       # report windows: 1-5, 6-20, 21-50, 51-step_count ("50+"); every step is checked either way
+model_timeout_seconds = 1200    # one step's model call (the CLI's whole agentic turn) is killed after this; the step is an ERROR and the run ends
+grade_timeout_seconds = 900     # one hidden-test grading (`broadsword test` of the grader crate) is killed after this
+results_subdir = "bench-results/drift"   # real runs: raw results go to <state_dir>/<this>/<run id>/ (state_dir from broadsword.toml)
+dry_run_subdir = "drift-dry"             # fake runs: work folder and results go to <scratch_dir>/<this>/<run id>/
