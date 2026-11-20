@@ -58,6 +58,12 @@ These are the lessons from the retros and the stage lessons in `LAB_LOG.md`, wit
 35. **Judge a scale-up on throughput and failures.** Lock wait and test time are costs inside throughput, not a separate veto: record them as warnings, and step back only if merges per hour stop rising, failures rise, or memory runs out (RAM over 90%, swap growing). [S4 close]
 36. **A free slot is filled before any other work.** At the start of every step, list the board and start a coder on every ready task (dependencies merged, claims free) until running = max_agents; hand reviews, audits and records go to background agents so starts never wait. On 2026-11-19 the session averaged 3.2 running tasks of 6 to 10 slots: empty slots, not the slot limit, were the main loss. [S4 close]
 37. **A cap must count what it claims to limit.** When you change slot, queue or limit logic, check its effect on active workers with real numbers, not by assumption. On 2026-11-20 a board showed 14/14 slots used while 0 coders worked (every task was waiting in the merge queue), with RAM at 14% and CPU at 7%. [S4]
+38. **For a safety check, prefer an exact match or an allow-list over a parser of an open format.** A hand-written YAML checker failed four review rounds, each with a new bypass; an exact byte pin of the approved file plus a self-test of the pin had 0 of 20 bypasses where the parsers passed 20, 16, 12 and 9. [S6]
+39. **A baseline built from the same reviews that produced the labels is biased.** The labels were REAL by construction for that reviewer (20 of 20); a fresh run of the unchanged prompt caught 7 of 20. Re-run the baseline arm under the same conditions before setting a floor, and run each arm twice to see the noise. [S6]
+40. **A rule that cuts wrong rejections can also cut real catches.** A 7-rule reviewer prompt block lowered wrong rejects from 6 to 2 but caught real bugs 5 of 20 times instead of 20 of 20; keep a recall guard next to every false-reject fix. [S6]
+41. **When a check rejects with new points every round, change the design or escalate once; do not patch the same check a fourth time.** Adjudicate each finding against the code first (REAL, FALSE or KNOWN, with a quote). [S6]
+42. **Agents that write files write outside any checkout the merge queue uses,** and a queue priority only counts if the queue enforces the order itself: one stray untracked file blocked 8 entries for about 30 minutes, and a priority file was never read mid-drain. [S6]
+43. **A brief for a new CLI flag or required setting claims the parser and every place the type is built** (grep for the struct literal). Three briefs in one day stopped before code on a missing claim. [S6]
 
 ---
 
@@ -107,6 +113,15 @@ A change can help one thing and hurt another, for example faster reviews but mor
 | S4 close | max_agents 6 -> 10 tried with baselines (`scripts/baseline.py`) | Throughput | merged/h; failed/retried jobs; RAM and swap (lock wait and test time as warnings, Lazlo 2026-11-19 21:32Z) | Failures or memory, not lock wait | re-judged under Lazlo's new rule: 2.82 -> 8.44 merged/h, 0 failures, RAM peak 14.8%, no swap = helped; lock-wait p90 26 -> 88 s and test median 82 -> 100 s recorded as warnings. The first verdict (hindered, reverted to 6) used the old rule that made lock wait a veto. Now 14, stepping +4 |
 | S4 close | Slot cap counts active coders: `task start` ignores tasks whose merge-queue entry is queued or running; required `max_queued`; `scripts/slot_check.py` logs board, waiting, active, ready, RAM and CPU every poll and prints FLAG when coders are idle while ready work waits (2026-11-20) | Active coders per poll and merges/h | Active coders per poll (slot_check) and merges/h vs the slots-14 pre-16 baseline | Queue depth (max_queued), RAM and CPU | open |
 | S4 close | Ahead-work compiles in `scratch/ahead-target` (CARGO_BUILD_JOBS=4), an exception to the one shared build folder (2026-11-20 00:27Z). Measured cost of the old rule: ahead patches stayed uncompiled (merge train +1521/-78 lines), and building into `build/` outside the lock broke two queue checks on 2026-11-19 at 23:51Z | Share of ahead patches that apply and pass on the first board run | That share, and disk used by `scratch/ahead-target` | Disk use; CPU taken from queue checks | open (revert: remove the exception; the scratch age cleanup wipes the folder) |
+| S6 | Experimental code mode for coders, trialled on 4 comparable task pairs (state/codemode-trial.tsv) | First-pass review results, wall time, tokens | First-pass pass 0 of 4 (code mode) vs 1 of 4 (normal); wall 8.3 vs 9.1 min; input 2.15M vs 3.86M tokens (not like-for-like: session history), output 40k vs 51k | Needs a person to paste prompts: headless `claude -p` and the SDK session have no REPL tool | NOT adopted. Revert: nothing in force; revisit if headless code mode ships, with a fresh session per task |
+| S6 | Loop breaker: `scripts/slot_check.py` prints LOOP for any running task with 3 or more failed queue rounds; `state/priority.md` rule: adjudicate, then split or escalate once, then flag Lazlo | Rounds per merged task (some tasks took 3 or more rounds with new points each time) | Rounds per merged task and the share of tasks with 3 or more rounds, from `queue list` | Tasks split or escalated too eagerly; escalation to Opus holding the serial queue | open. It worked once by redesign (the CI checker). Revert: delete the rule in priority.md; the LOOP line is report-only |
+| S6 | Review-gate trial: diffs over 300 changed lines or on queue, job, buildsrc, task, worktree, secrets or deletion paths go `--risk high`; Opus-coded high-risk goes to the Sonnet fallback gate (`state/review-gate-trial.md`, rows in `state/review-gate-trial.tsv`) | False-reject rate per gate model; rounds per merged task | Rounds, false rejects (REAL/FALSE/KNOWN), reviewer dollars and queue minutes per merged task, over about 20 merges; the tsv has 8 rows and no merged_at, usd or fix_usd filled yet | Opus review minutes holding the serial queue; merges per hour falling | open. Revert: route by risk only, as before 04:12Z |
+| S6 | Gate-only reviewer prompt block (B2: 4 rules, merged as 5f8c50a and 62b7515; low-risk gating call only, shadow prompt unchanged) | Wrong rejections by the Haiku gate | Replay: wrong rejects 1.0 vs 4.0 per arm, recall 7.5 vs 8.0 of 20 (2 runs each, about $3.5 total). Live: false-reject rate and shadow-detected gate misses over the next 20 merges | Gate misses rise (the Haiku gate catches about 35% of known real points already) | open. Revert if misses rise: remove `gate_block!` from `SYSTEM_PROMPT_GATE` in reviewer.rs. Sol replay with this block due 2026-11-21 |
+| S6 | Train mode: the queue writes `check result: NOT RUN for this change alone` and block rule 2 tells the gate that CHECK RESULT covers only what the queue ran | Haiku rejects that cite missing check output | Haiku rejects citing NOT RUN, before and after (no after-number measured yet) | The gate trusting a check that never ran | open (partly in force: rule 2 does not name NOT RUN). Revert: remove rule 2 |
+| S6 | SPEC_CHECKLIST item: a new JobSpec or CLI field claims tools.rs plus every literal site (`grep -n "JobSpec {"`), and a new required setting claims config.rs, `broadsword.toml` and tests/support | Briefs that stop before code on a missing claim | Briefs abandoned for a claim gap (3 on 2026-11-20: F3, F5, F9), per day | Longer briefs that coders skim | NOT yet in force: staged in `state/staging/records/retro-pending.md`, no SPEC_CHECKLIST.md edit in this task's claims. Revert: delete the item |
+| S6 | Exact pin of `ci.yml` instead of a hand-written YAML checker (3ebd259, queued HIGH, not merged) | Bypasses of the CI workflow safety check | Bypass harness: old versions pass 20, 16, 12 and 9 of 20 bypasses, new 0 of 20 | A legitimate edit of ci.yml needing a pin update every time | open. Revert: back to a parser only with a harness that stays at 0 bypasses |
+| S6 | Merge train (`queue run --all`, `merge_train_max = 4`, merged as da44a47) | Merges per hour | Merged/h after the driver started (16 in 1.83 h = 8.7/h) vs 6.0/h last hour and 4.33/h last 3 hours before (small sample, merged = queue entries) | Check failures bisected, wrong merges, RAM above 90% | open. Revert: `merge_train_max = 1` |
+| S6 | Fallback reviewer with `--effort high` for high-risk gating (7926e52) | Opus-coded high-risk work gets a strong gate; Opus not stuck as its own gate | First fallback-gated merge 723cdd6; one Opus-high review stalled about 15 min (06:50Z, a safeguards false positive, cancelled and requeued) | Effort high hanging calls and holding the serial queue | open. Revert: `reviewer_effort_high = "low"` in `broadsword.toml` |
 
 ## Retros, newest first
 
@@ -118,6 +133,50 @@ A change can help one thing and hurt another, for example faster reviews but mor
 - **Why:** the cap's meaning ("agents working") and what it counted ("tasks not yet merged") were never checked against each other with numbers. Each slot decision (14, then 16, then a ramp) assumed that running meant working.
 - **Change:** t-20261120-001621 changed `task start` to count only tasks without a queued or running queue entry, and added a required `max_queued` setting (merged as 51d3732). That part is enforced in code. `scripts/slot_check.py` logs board, waiting, active, ready, RAM and CPU and prints a FLAG when coders are idle while ready work waits, and a LOOP line when a running task has 3 or more failed queue rounds. Mechanism: run on every orchestrator inbox poll via the poll prompt (session-only, not yet a hook or a broadsword step), reports only, does not block starts. Status: partly in force. Follow-up: a broadsword step or a hook is the real enforcement. Ledger rows added for it and for the ahead-target exception.
 - **Portable lesson:** 37, "A cap must count what it claims to limit."
+
+---
+
+## Merge train live, gate quality study (2026-11-20, PC session)
+
+Written from `state/pc-progress.md`, the queue and board listings and `git log`. The 00:18Z slot-cap entry and lesson 37 are already above; the staged copy in `state/staging/records/retro-pending.md` of that entry and of the ahead-work row was dropped as a duplicate.
+
+### Did the last changes work?
+
+- **Slot cap counting active coders (4358f30 and the task start change):** it removed the false 14/14, but `max_queued` then became the limit: at 05:10Z and 05:19Z no coder could start because 30 entries waited in the serial queue (about 6 merges/h, so about 5 hours of backlog). Not raised on purpose (more coders would only add finished work waiting). The merge train was the fix.
+- **Loop breaker (slot_check LOOP, priority rule):** it flagged the right tasks (171333-19, 223123, 223123-2, the train). It worked by redesign for the CI checker. It only reports; the escalation is still the orchestrator's decision.
+- **Code mode:** tried, not adopted (ledger row).
+
+### What went wrong
+
+- **Haiku as the gate on a 1,700-line safety change (the train, rounds 4 to 6).** *Why:* a cheap gate with a long diff re-raises settled points and misreads recovery paths (Haiku 11 of 27 entries false-rejected; patterns: settled brief points 10, evidence mismatch 6, hedged findings 5, misread recovery paths 5). Sonnet judged B1, B2 and the minors FALSE with code quotes; one rejected point contradicted the passing 4-entry train test. *Change:* route large (over 300 lines) or safety-path diffs to a strong gate (review-gate trial, fallback reviewer for Opus-coded work); the B2 block for the Haiku gate.
+- **A biased replay baseline.** *Why:* the 18 of 20 recall floor came from labels written from the same Haiku reviews. *Change:* lesson 39; a fresh arm A and two runs per arm before any keep or drop decision.
+- **A rule set that demoted real findings (B1).** Recall 5 of 20; the recall guard caught it. Lesson 40.
+- **My brief wrote an evidence file into the main checkout (04:46Z)**, blocking the fallback entry and 8 others until 05:16Z. *Change:* briefs for non-coder agents name scratch/ or state/staging/ only (to be added to the brief template: not yet in force).
+- **The queue priority file is not honoured mid-drain** (a plain `queue run` drains everything). *Change:* reorder by cancel and re-add; priority must be enforced by queue order, not a file between drains. A code follow-up is not boarded.
+- **Claim gaps in three briefs** (F3, F5, F9) plus CARGO_INCREMENTAL: the coders stopped before code. *Change:* SPEC_CHECKLIST item (staged, not yet in force; see the ledger).
+- **A hand-written YAML safety parser failed four rounds.** Replaced by an exact pin (lesson 38).
+- **The GPT daily cap was reached at 04:24Z** ($20.16 of $20, 37 calls). *Why:* the Sol study, canaries and shadows share the same cap. *Change:* the Sol replay waits for 2026-11-21; the B2 block shipped gate-only.
+
+### Speed
+
+- Merges per hour with the train: 16 merged in 1.83 h = 8.7/h (pc-progress 07:28Z), against 6.0/h (last hour) and 4.33/h (last 3 hours) before it. Small sample, not controlled; merged counts queue entries.
+- Cost of wrong rejects before the block, from pc-progress 04:23Z: 22 rejected rounds in 3 hours = 7.3/h at 4.8 queue-minutes each = 35 queue-minutes/h; at a 29 to 41% wrong share that is 10 to 14 queue-minutes/h, about 1.8 to 2.5 merges/h at 5.7 minutes per merge (ESTIMATE, the orchestrator's arithmetic), plus a coder fix round each.
+- One Opus-high review stalled about 15 minutes (06:50Z). Watch it as the harm signal for `reviewer_effort_high`.
+
+### Cost
+
+- Haiku replays: arms $0.74 to $0.76 each; calls average $0.036, not the $0.006 estimated, because the prompts are 22 to 237 KB; total about $3.5 (pc-progress 05:31Z).
+- GPT: $20.16 of the $20/day cap by 04:24Z. The Sol replay (16 entries) is estimated at $7 to $9.5 (ESTIMATE from pc-progress 04:26Z).
+- Code-mode trial: input 2.15M vs 3.86M tokens, output 40k vs 51k (not like-for-like).
+- Fable 5.2: one tie-break (03:24Z); tokens and dollars were not recorded.
+
+### Carry into the next milestone
+
+1. Add the SPEC_CHECKLIST item on claims for a new CLI flag or required setting, and the brief-template rule that non-coder agents write only under scratch/ or state/staging/.
+2. After 20 merges, measure the B2 block (false rejects and shadow-found gate misses) and the review-gate trial (rounds, false rejects, dollars per merged task); fill `state/review-gate-trial.tsv`.
+3. After 2026-11-21 00:00Z: start the GPT gate t-20261120-041456, then the Sol replay.
+4. Check `max_queued` against the train: if active coders stay low while ready work waits, say why before raising anything.
+5. Make queue priority enforced by queue order (a follow-up task is not yet boarded).
 
 ---
 

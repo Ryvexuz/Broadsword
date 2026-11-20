@@ -1,88 +1,55 @@
 # Progress
 
-## PAUSE HANDOFF 2 (2026-11-19, about 23:45 UTC, restart to try Claude Code's experimental code mode: read this first)
+Rewritten at the end of each session. Last updated 2026-11-20, about 08:00 UTC, on the EVO-X3 PC (the PC session, task t-20261120-075215, written by the housekeeper from `state/pc-progress.md`, the queue and board listings and `git log`). Step-by-step log: `state/pc-progress.md` (outside Git). Main was at 705de5f when this was written; a sha below counts as merged only if `git log` in this worktree (HEAD 705de5f, equal to main) contains it.
 
-Paused by Lazlo's choice via the coordinator (option 1: try code mode in the desktop app). Before restarting, Lazlo sets the user env var himself (this session's `setx` was refused by its permission check): `setx CLAUDE_CODE_EXPERIMENTAL_CODE_MODE 1`; undo: `reg delete HKCU\Environment /v CLAUDE_CODE_EXPERIMENTAL_CODE_MODE /f`.
-
-State at pause: queue idle (the last running entry finished; 10 queued entries cancelled), no coder or ahead agent running, inbox poll deleted, queue driver exited. max_agents = 14. The RAM/CPU sampler (scratch/scale/sys-14-resume.csv) dies with the session.
-
-**First check after restart:** is code mode active in the new session (env var visible to claude.exe; the session reports code mode)? Log the answer in state/pc-progress.md. Then the code-mode trial step 2 (before/after on a few comparable coder tasks: tokens, wall time, context size, review pass rate, bugs; keep only if better).
-
-**Resume in this order:**
-1. Log `RESUMED <UTC>` in state/pc-progress.md; read state/pc-inbox.md.
-2. Re-add the queue entries in order from state/staging/records/pause-requeue-2026-11-19-b.tsv (entry, task, risk, coder) with `queue add <task> --risk <risk> --coder <coder> --brief scratch/briefs/<task>.md`. If scratch/briefs was wiped, copy from state/staging/records/pause-briefs-b/ (those copies carry the appended review verdicts for nb-21 and tp3). nb-33 plastic beams t-20261119-171333-32 MERGED at 23:46Z (af05500) during pause 3, so it is no longer in the list; t-20261119-215207 (src/main.rs) is now ready. Then start ONE driver: scratch/queue-driver.ps1 (sets BROADSWORD_REVIEWER_CLI itself).
-3. Restart the 5-minute inbox poll and the sampler (scratch/scale/sampler.ps1 -Out scratch/scale/sys-14-resume2.csv).
-4. Ahead-work paused (resume oldest first): t-20261119-232113 at state/staging/t-20261119-232113/pc-ahead (canary part done; openai_review.py gate + $20/day cap written, untested; tests to write are in its NOTES.md) and t-20261119-232113-2 at state/staging/t-20261119-232113-2/on-32797d3 (config/toml done, queue.rs half, uncompiled; add tests/support/mod.rs to its claims).
-5. t-20261119-215207 (crash-sim stdout write) is ready once nb-33 frees src/main.rs.
-
-**Decisions since the last handoff (all in state/pc-progress.md):** full GPT reviews use gpt-6.1-sol, not astra (Lazlo); GPT reviews may use up to $20/day of overflow credits (Lazlo), enforced by t-20261119-232113 part 2 once merged; gpt-6.1-sol second-gate trial boarded (t-20261119-232113-2), ships off, on after the credit reset; scrub follow-up t-20261119-233612 boarded; shadow canary re-run 23:20Z PASS on codex-cli 0.170.0.
-**Merged this session:** t-20261119-215214 (bcbe897), nb-32 t-20261119-171333-30 (f37e17a), n20-03 t-20261119-223123-3 (60d2300), n20-01 t-20261119-223123 was REJECTED at 23:41Z by haiku (q-20261119-231529-4); its Opus fix round started and paused before any edit: plan in the brief's Paused section (state/backlog/t-20261119-223123.md).
-**Camry reference:** another session downloaded reference/camry-2013/ccsa/2012-toyota-camry-detailed-v5a.zip (58.5 MB, complete) and was fetching 2015-toyota-camry-bm-v1.zip (.part); check whether the .part finished or was cut by the restart.
-
----
-
-## PAUSE HANDOFF (2026-11-19, about 23:02 UTC, Lazlo's restart: read this first)
-
-Paused by the inbox item 2026-11-19T22:56Z. State at pause: queue idle (0 queued, 0 running), no broadsword/cargo/rustc process, no build or recover lock held, no coder or ahead agent running, the inbox loop deleted, the queue driver and the RAM/CPU sampler stopped. max_agents = 14 (step 2 of the slot climb; not stepped to 18: about 7 merges/h vs 8.44/h at 10, see state/pc-progress.md).
-
-**Resume in this order:**
-1. Log `RESUMED <UTC>` in state/pc-progress.md, mark the 22:56Z PAUSE item [x] in state/pc-inbox.md, read the inbox.
-2. Re-add the 9 queue entries cancelled for the pause, in this order (list in state/staging/records/pause-requeue-2026-11-19.tsv: entry, task, risk, coder): `broadsword queue add <task> --risk <risk> --coder <coder> --brief scratch/briefs/<task>.md` (if scratch/briefs was wiped, copy state/backlog/<task>.md there first). Then start ONE queue driver (set BROADSWORD_REVIEWER_CLI per command).
-3. Resume the two paused coders from their briefs' "## Paused (2026-11-19)" sections: tp3 fix round t-20261118-095350-3 (WIP 32797d3: scrub via one cargo factory, cargo test order; next: full suite twice, lock-wait re-measure, then queue --risk high, Opus) and n20-23 menu t-20261119-223123-9 (WIP c769207; next: fails-before, full suite, final commit).
-4. Fix round for nb-21 t-20261119-171333-19 (rejected 23:00Z by haiku, q-20261119-222244: claim-breach path when codex errors; read the .review/.shadow.review, apply rule 34 if the points refute).
-5. Restart the inbox loop (every 5 min) and the sampler (scratch/scale/sampler.ps1 -> a new sys-*.csv).
-
-**Approved by Lazlo, not yet acted on:** the n20-02 follow-up may read public pages (Euro NCAP, IIHS, SAE, OLC papers, steel data; no accounts or fees, report anything paywalled) to verify the 9 unverified V-figures; Lazlo is checking the NHTSA public-domain wording in a browser.
-
-**Waiting work:** about 17 patches staged as ahead-work in state/staging/ (ledger state/staging/AHEAD.md); most sit on tp3's first tip d30c74e and need porting onto tp3's fixed tip. The merge train (t-20261119-222633) waits for tp3, tp4, nb-17, nb-18. Trial T1 boarded (t-20261119-222633-2); T2-T5 wait for T1's verdict. Six GPT trial-coder batch tasks wait for nb-21. 8 roadmap briefs boarded, not started. state/cleanup-pending.md (32 lines) awaits Lazlo's yes; scratch/autoclean.py runs every 2 h.
-
----
-
-Rewritten at the end of each session. Last updated 2026-11-19, about 21:30 UTC, on the EVO-X3 PC (the PC session). The session covered: the work-ahead batch (46 briefs boarded), Lazlo's model routing, the Stage 4 v1 audit and close, a Secrets fix to the Codex shadow, the secret-file rule, the max_agents scale-up test, and many tooling merges. Step by step log: `state/pc-progress.md` (outside Git). Lazlo steers through `state/pc-inbox.md`: read it after every step.
+The earlier "PAUSE HANDOFF" sections (2026-11-19, 22:56Z and 23:45Z) are replaced: `state/pc-progress.md` shows the session resumed and the 2026-11-20 work below superseded them. The old text is in Git history.
 
 ## Moving to another drive or PC
 
-Read `docs/MOVING.md` (also in `state/MOVING.md`). On this PC: `broadsword` is not on PATH; use `build/bin/broadsword.exe`. `BROADSWORD_REVIEWER_CLI` is not set system-wide; queue runs set it per command to `C:\Users\MrComputer\.local\bin\claude.exe`. Claude's notes were restored from `state/claude-memory/` into this PC's memory folder.
+Read `docs/MOVING.md` (also in `state/MOVING.md`). On this PC `broadsword` is not on PATH; use `build/bin/broadsword.exe`. `BROADSWORD_REVIEWER_CLI` is not set system-wide; queue runs set it per command to `C:\Users\MrComputer\.local\bin\claude.exe`. Claude's notes were restored from `state/claude-memory/` into this PC's memory folder on 2026-11-19.
 
-**Backups:** pushed to the private repo `Ryvexuz/Broadsword` on 2026-11-19 (Lazlo's explicit OK): `main` at c248537 then, `crash-sim-main`, `render-master`, tags `stage-4-v1-done` and `render/stage-4-v1-done`. Main has moved since (the allow-lists and nb-19); push again only with Lazlo's OK. `scripts/backup_status.py --map <map>` reports what is unpushed (read-only).
+**Backups:** pushed to the private repo `Ryvexuz/Broadsword` on 2026-11-19 (Lazlo's OK; main fast-forwarded to 9ac8810 at 21:38Z). Main has moved a lot since. `scripts/backup_status.py --map <map>` reports what is unpushed (read-only).
 
-## Where things stand
+## What works now (evidence quoted)
 
-- **Stages 1, 2, 3 and 4 v1 done and tagged** (`stage-4-v1-done` on main 4d49571 and render 9e1060b). Evidence: `evidence/stage-4-v1-done.md`. Milestone 1 shown in an on-screen window (window-only captures); milestone 2 re-measured: 6.05 ms per frame through the present path (about 165 fps, target 60). Stage 0 tag still needs a fresh app session.
-- **Stage 4 audit:** Fable (28 findings), gpt-6.2-astra twice (220, 228), five Opus 5.5 high judges, merged: `evidence/stage-4-v1-audit-verdicts.md` (477 ids, each once). Two REAL BLOCKING, both resolved (A1 on-screen evidence, A6 shadow could read files). 8 REAL SERIOUS listed in section 6 as follow-ups (not yet filed as board tasks).
-- **Model routing (Lazlo, 2026-11-19):** main coders Sonnet 5.5 and Opus 5.5 high; trial coders gpt-6.1-terra ultra, gpt-6.2-astra, gpt-6.2-sol (short, tight tasks; nb-22, also gpt-6.1-sol high per the project thread; check terra "ultra" is not a paid tier first); shadow reviewers gpt-6.1-sol, gpt-6.2-astra, gpt-6.2-sol (never gating; every shadow finding gets REAL/FALSE/KNOWN from the gating reviewer, REAL ones become tasks); Sonnet, astra, 6.1-sol, 6.2-sol compete for the reviewer slot in nb-24; Lazlo approves promotions. **Fable only as a rare one-off**, reason logged.
-- **Shadow reviewer:** back on, gpt-6.1-sol only (the multi-shadow task t-20261118-142614 is open). Codex now runs with no tools offered (model catalog + flags, `codex_command()` in clients/openai_review.py); `scripts/shadow_canary.py` proves it (offline leg + one real call). Re-run the canary after every Codex update (not yet enforced). Shadow tally so far: 13 REAL, 12 KNOWN, 3 FALSE (`state/shadow-verdicts.tsv`, plus 2 later).
-- **Secret files (Lazlo's set):** `.env`, `.envrc`, `.env.<name>`, `.env-*`, `.env_*` (bare `.env-`/`.env_` too), any case, trailing dots/spaces dropped, plus 8.3 short names and NTFS streams of these; `.envoy.yaml`, `.environment`, files in a `.env/` folder are ordinary. One rule (`git::is_secret_in`, merged 62f458d); records escape `|`; recover names every secret it leaves alone.
-- **max_agents:** 6. A step to 10 raised merges/h 2.82 -> 8.44 but lock-wait p90 26 -> 88 s and test median 82 -> 100 s (baseline.py: WORSE), so reverted by Lazlo's rule. Retry after tp3. Evidence draft: `state/staging/scale-up/scale-up-2026-11.md`.
-
-## Merged today (main, queue unless noted)
-
-- Tooling: scripts/baseline.py (nb-06, direct merge on Fable PASS, Lazlo), codex wrapper minors (nb-16), codex time budget from env (t-...175203), codex no-tools sandbox + canary (t-...190059), backup_status.py (nb-14), archive_evidence.py (nb-15), main_provenance.py (nb-10; allow-list `docs/direct-merges.txt`, 19 unaccounted older commits remain), roadmap_status.py + ROADMAP.md (nb-45), shared-core ADR draft (nb-46, Proposed, Lazlo decides), secret-file rule (nb-19, direct merge on six Sonnet security reviews, Lazlo).
-- Benchmarks: hard1 reviewer case (scorer anchored by file; decoys never credit bugs), coding bench (Myers reference, no spec leaks, forge-proof harness), instruction-following bench (Haiku 19/20).
-- Crash sim: Stage 6 done checks `docs/STAGE6.md` (nb-30), Solver trait (nb-31), `.bsn` format + `.gitattributes` LF (nb-33).
-- Render: near-plane shared-edge clip and OBJ normals (nb-04).
-- Direct records/safety commits: cfadd9e (shadow off, safety stop), Stage 4 close 4d49571, merge of GitHub main c248537, allow-lists.
+- **Stages 1, 2, 3 and 4 v1 done and tagged** (`stage-4-v1-done`, evidence `evidence/stage-4-v1-done.md`). Stage 6 (crash sim) is in progress: plans and reference data are merged or queued, see Unfinished.
+- **Merge train is live.** Merged as da44a47 ("queue tests: an Opus-coded high-risk entry in a merge train (queue run --all) is gated by sonnet ...") on top of the train commits a1e23e6, c93e3ff and 553ab22, all present in `git log`. The driver (`scratch/queue-driver-train.ps1`, `queue run --all`, `merge_train_max = 4` in `broadsword.toml`) started at 05:38Z. State/pc-progress.md records five trains merged (merged total 90, 94, 98, 102, 106). `queue list` today: 106 merged, 3 merged_check_failed, 139 rejected, 7 approved, 15 queued.
+- **Throughput, measured from the log (small sample, not a controlled test):** "16 merged in 1.83 h = 8.7/h" since the train driver started (pc-progress 07:28Z). Baseline before it, from the 04:08Z entry: 6.0/h over the last hour and 4.33/h over the last 3 hours (single-entry queue). First reading was 4 merged in 0.40 h = 9.9/h (06:02Z). "Merged" counts queue entries, not tasks.
+- **Fallback reviewer with effort high merged as 7926e52** ("queue: reviewer_effort_high setting; a high-risk gating call passes --effort ..."), after 3acd834 (the `gating_model` rule: an entry coded by the high reviewer's family is reviewed by `reviewer_model_high_fallback`). `broadsword.toml` has `reviewer_effort_high = "high"`. First fallback-gated merge: 215215 buildsrc notes as 723cdd6 (pc-progress 05:16Z); the train itself (da44a47) and the worktree hook fix (2dd9483) also passed the Sonnet fallback gate.
+- **Gate prompt block (B2) merged** as 5f8c50a and 62b7515: four BLOCKING rules for LOW-risk gating calls only (shadow prompt unchanged; high keeps the old prompt; test included). The four rules are in `crates/broadsword/src/reviewer.rs` (`gate_block!`).
+- **Fresh-clone PASS:** `scratch/fresh-clone-20261120T073618Z.txt` (clone of main at 8bdb1e2, bootstrap, then the README one command): the file ends `build: ok (1.4 s)` and `test: ok — 266 passed, 0 failed`. The file has no literal "PASS" word. The script that produced it is `scripts/fresh_clone_check.py` (6ff48e2 and fixes 43dd81b, 863c89c are on main), but it ran with the bootstrap step from the branch b60ff75, which is QUEUED, not merged (see Unfinished). The README "One command:" line is merged (217eabc).
+- **Also merged today (shas present in `git log`):** slot-cap counting and `scripts/slot_check.py` with the LOOP report (4358f30, 8050a47), `roadmap --plans` (0f7ea3a), `debug = "line-tables-only"` (8bdb1e2), backup_status (6c98f09), session_end_check (76dc757, 6f7768a, b73eb12), deprule (6d2ee9e), affected.rs (5a760ea), coder prompt template (7e38765, 2d51287), SCALING.md, ADR 0003, REFERENCE_DATA.md, node plans 1.2, 1.5, 1.6, 1.7, 1.1 (docs/nodes), node_check.py, baseline_extras, worktree undo helper (705de5f). Merged in the nested repos or not in this worktree's history: crash-sim bin-path fix 13b1f46 (the NotFound root cause; the crash-sim repo, not this one), per pc-progress only.
+- **Reviewer study (staged, `state/staging/reviewer-patterns/`):** Haiku false-reject 11 of 27 entries (41%; 6 of 21 = 29% on the replay set), Opus 0 of 14, GPT shadow 9 of 30 (30%). gpt-6.1-sol: 23 REAL, 12 KNOWN, 0 FALSE of 35 adjudicated findings, and it missed 2 REAL gate points (one in the secrets scrub). Prompt-block replay: B1 dropped, B2 kept (recall 7.5 vs 8.0 of 20, wrong rejects 1.0 vs 4.0 per arm, 2 runs each). Haiku's own run-to-run recall is about 35%, so the first 18 of 20 floor used a biased baseline.
+- Experimental code mode for coders: tried and NOT adopted (`state/codemode-trial.tsv`).
 
 ## Unfinished
 
-- **Open board tasks:** 45 (`broadsword task list --status open`); briefs in `state/backlog/`. Ready next for crash sim: nb-32 (settle report), then nb-34..36 (milestone 2). Codex coder route nb-21 before the nb-22 trial.
-- **Follow-ups boarded today:** t-20261119-200000 (secret content check for staged blobs), t-20261119-185546 (queue passes the shadow time budget; drop legacy defaults), t-20261119-192623 (backup_status minors: URL credentials, real no-force guard), t-20261119-193538 (archive_evidence minors), t-20261119-203616 (flaky queue kill test). Not yet boarded: nb-33's format minors (rest overflow, CR in comments), nb-10's minors, the 8 SERIOUS audit findings.
-- **tp1** (scoped queue checks) is abandoned to free config.rs; its branch, worktree and staged patch are kept for a restart. tp2-tp6 still open.
-- **Leftover worktrees** kept because an ignored file blocks removal (deleting outside scratch needs Lazlo): nb-06 (t-20261119-170109, a .pyc), nb-19 (t-20261119-171333-17).
+- **Queue (live `queue list`, 2026-11-20 about 08:00Z):** 7 approved, waiting for a train: q-20261120-053816 (t-20261119-223123), -054957 (012157-2), -063307 (012212), -063538 (171333-33 beam breaking m2), -063818 (225022), -065521 (015828), -065525 (043438). 15 queued: 070847 (032819 train follow-ups), 070952 and 070952-2 (002929 tools.rs, 215209 task.rs), 070953 (215212 config.rs), 071518 (015700), 072808 (215517 codex bench provider), 072902 (015654), 073528 (060502 node_check named nodes), 074314, 074314-2 (050721 fresh-clone bootstrap), 074314-3 (015634 SCALING disk addendum), 074753 (223123-12 CI checker), 075011 (015828-8), 075013 (171333-24 drift bench harness), 075016 (015653). Board: 121 done, 78 abandoned, 54 open, 28 running (`task list`).
+- **CI checker (t-20261119-223123-12):** redesigned after a 4th REAL bypass as an exact byte pin of `ci.yml` plus a substring self-test (3ebd259, 29 tests; the bypass harness shows the old versions passing 20, 16, 12 and 9 of 20 bypasses and the new one 0 of 20). It is queued HIGH, not merged. **The one approved push is still waiting for it:** Lazlo's OK (2026-11-20 00:37Z, via the coordinator) covers ONE normal push of main to the existing GitHub remote after the CI workflow merges. Before pushing: confirm the remote is Ryvexuz/Broadsword, the branch is main and the commit count; never `--force`; verify the `actions/checkout` SHA; report the first Actions run. Open minors for that step: `toJSON(secrets)` pass-through, and whether `ci.yml` works from the repo root.
+- **Held tasks:** `state/staging/queue-after-deps.tsv` holds t-20261120-020149 (baseline v2 default, d248a17): queue only after t-20261119-220412 (baseline_extras) merges, then check that `record_v2` does not double-apply v2. `state/staging/queue-after-fallback.tsv` lists 215215 and 215211; both are now merged (723cdd6, 2dd9483), so that file is stale and can be dropped.
+- **GPT gate t-20261120-041456: NOT STARTED.** Opus-coded high-risk work goes to gpt-6.1-sol with the Sonnet fallback when the daily cap skips it (Lazlo 04:14Z). It is useless until the GPT cap resets at 00:00Z (see Failed).
+- **Sol replay of the B2 block: due 2026-11-21** (arm B only, 16 entries, about $7 to $9.5 of the $20/day cap according to pc-progress 04:26Z; fall back to a gate-only prompt if Sol drops below 14 of 15). Plan: `state/staging/reviewer-patterns/replay-plan.md`. B2 shipped gate-only, so Sol (which shares `SYSTEM_PROMPT`) is unaffected until then.
+- **Re-boarded tasks (each abandoned at once because the brief missed a claim):** F5 `check --affected` t-20261120-071548 (needs tools.rs, queue.rs, recover.rs; after 032819 and 002929 merge), F9 t-20261120-073528 (needs config.rs, `broadsword.toml`, tests/support; after F0 and 215212), CARGO_INCREMENTAL=0 t-20261120-070953 (needs queue.rs and recover.rs; after 032819). F3 was re-boarded as t-20261120-040054 and waits for Lazlo's yes on the Disk rule. The merge train t-20261120-014651 was abandoned and re-boarded as t-20261120-050046 (merged as da44a47).
+- **Open follow-ups:** `tests/cli_output.rs` still uses `env!` (after the stdout task); cold-data mover `state/evidence-archive` is refused under `state/` and cross-volume worktree moves fail on Windows (t-20261120-055123); `deprule` is not wired into main.rs (binary-only crate); the staged broadsword lock fix t-20261120-014818 is defence in depth only (decide after watching for a new NotFound); stage-close audit sequence (Astra high, fix REAL, Fable medium confirm); `gpt-6.1-astra` failed its canary (INCONCLUSIVE), `gpt-6.2-astra` passed.
+- **Open from earlier handoffs, not re-checked today:** ahead-work patches in `state/staging/` (ledger `state/staging/AHEAD.md`), tp2 to tp6, the Camry reference download (`reference/camry-2013/`), leftover worktrees nb-06 and nb-19 (an ignored file blocks removal; deleting outside scratch needs Lazlo).
 
-## Failed (all recorded in RETRO.md, 2026-11-19 entry)
+## Failed (raw evidence in `state/pc-progress.md`, details in RETRO.md)
 
-- A6: the Codex shadow could read any file (canary); fixed and proven.
-- The orchestrator's safety-stop commit broke a test on main (no full suite before a direct commit).
-- A `prove.py` run nested `broadsword run` and deadlocked builds for 15 minutes.
-- Board claim edits silently failed (Python through a shell heredoc; playbook rule 23).
-- Fable used by default twice (about 990k avoidable tokens).
-- Haiku loops on Python tooling (nb-06, nb-25, the allow-lists): rule 34 applied each time.
+- **Merge train rejected 6 times by Haiku** (rounds 4 to 6 raised new points each time; Sonnet judged them FALSE with code quotes, one contradicting the passing 4-entry test). The train was abandoned on the board (03:54Z) to free queue.rs, then re-boarded after the fallback reviewer landed and merged under the Sonnet gate.
+- **Prompt-block replay B1 (7 rules): DROP**, recall 5 of 20 against a floor of 18. The floor itself came from a biased baseline (the REAL labels came from the same Haiku reviews); a fresh arm A scored 7 of 20.
+- **GPT daily cap reached at 04:24Z ($20.16 of $20, 37 calls).** Shadow reviews have been skipped since, as designed.
+- **My error (the orchestrator's, 04:46Z):** the replay brief told an agent to write `evidence/reviewer-prompt-block-2026-11.md` in the MAIN checkout; the untracked file blocked the fallback entry and 8 entries sat BLOCKED until 05:16Z. Moved with `mv` to `state/staging/reviewer-patterns/`.
+- **Queue priority file ignored mid-drain:** plain `queue run` drains the whole queue, so the priority entry was never picked until the entries were cancelled and re-added in order.
+- **Opus-high review stall** on F1 (about 15 min, a safeguards false positive, no verdict): cancelled and requeued once (06:55Z).
+- **Briefs with claim gaps, 3 times today** (F3 04:01Z, F5 07:15Z, F9 07:35Z), plus an earlier CARGO_INCREMENTAL one.
+- **Code-mode trial:** first-pass review 0 of 4 (code mode) vs 1 of 4 (normal); no gain; headless `claude -p` has no REPL tool.
+- Earlier failures (A6 shadow file read, safety-stop commit broke a test, nested `prove.py` deadlock, heredoc claim edits, Fable used by default) are in RETRO.md, 2026-11-19.
 
 ## Next step
 
-1. Read `state/pc-inbox.md`; run open items.
-2. File the 8 SERIOUS Stage 4 audit findings as board tasks (`evidence/stage-4-v1-audit-verdicts.md` section 6) and the unboarded minors above.
-3. Carry items from RETRO (2026-11-19): enforce the canary after Codex updates; a full check before any direct commit; the coder-prompt line about nested broadsword runs; the SPEC_CHECKLIST line about on-screen evidence; retry max_agents 10 after tp3.
-4. Crash sim, Stage 6 milestone 1: nb-32 settle report next (STAGE6.md check 1.3-1.5), then milestone 2.
-5. The tp chain (tp2, tp3, tp4, tp6) and t-20261119-185546 (claims config.rs/tests/toml; run them one after another).
+1. Read `state/pc-inbox.md`; run open items. Check `queue list` for the 7 approved and 15 queued entries: the train driver should drain them; if it stopped, restart `scratch/queue-driver-train.ps1` (one driver only).
+2. When t-20261119-223123-12 (CI checker, entry q-20261120-074753) merges: do the approved push exactly as written under Unfinished, then report the first Actions run.
+3. After 2026-11-21 00:00Z (GPT cap reset): start t-20261120-041456 (the GPT gate), then run the Sol replay of the B2 block (`replay-plan.md`).
+4. After 032819, 002929 and 215212 merge: start F5 (t-20261120-071548), the CARGO_INCREMENTAL task (t-20261120-070953) and F9 (t-20261120-073528). Add "a new JobSpec/CLI field claims tools.rs plus every literal site" to `SPEC_CHECKLIST.md` (staged in `state/staging/records/retro-pending.md`, enforced by the RETRO row below).
+5. After the retro entry merges, the orchestrator runs `python -I scripts/sync_playbook.py` (the housekeeper does not).
+6. Crash sim, Stage 6: continue from `docs/STAGE6.md` (beam breaking m2 is approved in the queue as 171333-33).

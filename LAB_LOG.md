@@ -2,6 +2,27 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-20 — PC session: Stage 6, merge train, fallback reviewer, reviewer-quality study
+
+- **Stage:** 6 (crash sim; plans, reference data and process work for it). Written from `state/pc-progress.md` (00:00Z to 07:52Z), the queue and board listings and `git log`; nothing here is claimed merged unless it is in this worktree's `git log`.
+- **Models:** Opus 5.5 orchestrator and Opus coders (merge-train rebase, CI checker redesign, hook fix). Sonnet 5.5: most coders, fix rounds, adjudication and research agents, the code-mode trial. Queue gates: Haiku 5.5 (low risk), Opus 5.5 (high risk, effort high from 7926e52 on), Sonnet as the fallback gate for Opus-coded high-risk work. Fable 5.2: one tie-break on the merge train (03:24Z; tokens and cost not recorded, the row in `state/fable-usage.tsv` is empty). gpt-6.1-sol: shadow reviewer until the cap. Canary calls: gpt-6.1-astra failed (no answer, INCONCLUSIVE), gpt-6.2-astra, gpt-6.1-terra and gpt-6-astra answered.
+- **Result:** merge train merged (da44a47), 16 merged in 1.83 h = 8.7/h after it started against 6.0/h (last hour) and 4.33/h (last 3 hours) before it (pc-progress 04:08Z and 07:28Z; small sample). Fallback reviewer with effort high merged (7926e52). Fresh-clone check ended `test: ok — 266 passed, 0 failed` (`scratch/fresh-clone-20261120T073618Z.txt`; the bootstrap that made it work is queued, not merged).
+- **What went wrong and what fixed it:**
+  - Haiku rejected the 1,700-line merge train in rounds 4 to 6 with new points each time; Sonnet judged them FALSE with code quotes. Fix: loop breaker (adjudicate, then escalate once), a Fable tie-break, then the train was re-boarded after the fallback reviewer landed and gated by Sonnet. It merged.
+  - The replay baseline for the reviewer prompt block was biased: its REAL labels came from the same Haiku reviews, so Haiku scored 20 of 20 by construction. A fresh run of the current prompt caught 7 of 20. Fix: a second run per arm and a keep rule; B2 kept.
+  - My brief sent a research agent to write an evidence file in the main checkout. The untracked file blocked the queue and 8 entries sat BLOCKED from about 04:4xZ to 05:16Z. Fix: moved with `mv`; briefs for non-coder agents now name scratch/ or state/staging/ only.
+  - Plain `queue run` drains the whole queue, so the priority file was never read mid-drain. Fix: cancelled and re-added the entries in order.
+  - A hand-written YAML checker for the CI workflow failed four review rounds with a new bypass each time. Fix: an exact byte pin of the approved file (the harness shows 0 of 20 bypasses; the old versions 20, 16, 12 and 9).
+  - Briefs missed claims three times (F3, F5, F9); each coder stopped before code and was re-boarded.
+  - The GPT cap was reached at 04:24Z; shadows were skipped after that and the Sol replay moved to 2026-11-21.
+- **Git commands beyond a plain commit:**
+  - `git cherry-pick fefe8b1..45c155d` (Opus coder, train re-board): replays the 11 train commits onto the new main so they could be resolved against the fallback reviewer.
+  - `git clone` of main into `scratch/` (fresh_clone_check): proves the documented one command works from nothing but the repo.
+  - `git merge-base --is-ancestor <sha> HEAD` and `git rev-list --count`: used by the housekeeper to check that a sha is really on main before the records call it merged (read-only).
+  - `git worktree remove` (queue, after each merge): deletes the merged task's worktree.
+- **Rough cost and time:** about 8 hours of session. GPT overflow: $20.16 of the $20 cap on 37 calls (to 04:24Z, pc-progress). Haiku prompt-block replay about $3.5 in total (pc-progress: arms $0.74 to $0.76 each, second runs about $0.22 each). Code-mode trial: input 2.15M tokens vs 3.86M, output 40k vs 51k (not like-for-like). Coder, orchestrator and Fable cost not measured here (no figure available to the housekeeper).
+- **One lesson about AI development:** a baseline built from the same reviews that created the labels is biased: it made the Haiku gate look 100% accurate, and only a fresh run of the unchanged prompt (7 of 20) showed that the "recall floor" was set against a ceiling the reviewer never reached.
+
 ## 2026-11-19 — PC session: Stage 4 v1 close, shadow sandbox, secret files, scale-up test
 
 - **Stage:** 4 v1 closed and tagged; Stage 6 milestone 1 started (crash sim).
