@@ -294,8 +294,18 @@ fn kill_tree(c: &mut Child) {
     let _ = c.wait();
 }
 
+/// Every wait ceiling in this file is multiplied by this. At 97-100% CPU the unchanged code failed only here, on ceilings of 60 to 240 s
+/// (scratch/logs/jobs/20261120-183343-broadsword-check.log: 6 failed; scratch/main-recheck-748bd33.txt: 83 passed, 9 failed in 632.50 s).
+/// A passing test returns as soon as its condition is true, so this costs nothing on a pass; a real hang still fails, only later.
+const WAIT_CEILING_FACTOR: u64 = 5;
+
+/// A wait ceiling of `secs` seconds, scaled by `WAIT_CEILING_FACTOR`.
+fn ceiling(secs: u64) -> Duration {
+    Duration::from_secs(secs * WAIT_CEILING_FACTOR)
+}
+
 fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(secs);
+    let end = Instant::now() + ceiling(secs);
     while !ok() {
         assert!(Instant::now() < end, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
@@ -1393,7 +1403,7 @@ fn per_project_lock_lets_two_projects_drain_at_once_and_refuses_a_second_driver_
     let mut a = r.spawn(&["queue", "run", "--all", "--project", "p"], &env);
     wait_for("p's drain to reach the reviewer", 120, || r.calls() == 1);
     let mut b = r.spawn(&["queue", "run", "--all", "--project", "q"], &env);
-    let end = Instant::now() + Duration::from_secs(180);
+    let end = Instant::now() + ceiling(180);
     while r.calls() < 2 {
         if let Some(st) = b.try_wait().unwrap() {
             kill_tree(&mut a);
@@ -1520,7 +1530,7 @@ impl Mcp {
         let s = self.stdin.as_mut().unwrap();
         writeln!(s, r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#).unwrap();
         s.flush().unwrap();
-        let end = Instant::now() + Duration::from_secs(300);
+        let end = Instant::now() + ceiling(300);
         loop {
             let line = self.rx.recv_timeout(end.saturating_duration_since(Instant::now())).expect("no response");
             let v = parse(&line).unwrap();
@@ -2373,7 +2383,7 @@ fn killed_during_main_check(name: &str) -> (Root, [(String, String); 3], String)
     fs::write(&flag, "1").unwrap();
     let mut child = r.spawn(&["queue", "run", "--all"], &[]);
     // the train's check is check job 1, the main check job 2: kill once the main check job exists
-    let end = Instant::now() + Duration::from_secs(240);
+    let end = Instant::now() + ceiling(240);
     while !(r.field(&c.1, "step") == "main_check" && jobs_of(&r, "check") >= 2) {
         assert!(Instant::now() < end, "timed out waiting for the train's main check to start; check jobs {}; last entry: {}", jobs_of(&r, "check"), r.show(&c.1));
         std::thread::sleep(Duration::from_millis(100));
@@ -2430,7 +2440,7 @@ fn a_train_killed_while_its_culprit_is_checked_alone_gets_its_worktree_back_on_i
     let mut child = r.spawn(&["queue", "run", "--all"], &[]);
     // combined check (1), bisect check of e1 (2), then e2's own commit checked alone in its detached worktree (3)
     let wt2 = r.wt(&t2);
-    let end = Instant::now() + Duration::from_secs(240);
+    let end = Instant::now() + ceiling(240);
     while !(git_out(&wt2, &["symbolic-ref", "-q", "HEAD"]).code != 0 && jobs_of(&r, "check") >= 3) {
         assert!(Instant::now() < end, "timed out waiting for the check alone; check jobs {}; e2: {}", jobs_of(&r, "check"), r.show(&e2));
         std::thread::sleep(Duration::from_millis(100));
