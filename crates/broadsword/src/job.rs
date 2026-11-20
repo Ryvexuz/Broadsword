@@ -16,6 +16,16 @@
 //! (each copy's modified time is set to the copy time).
 //! Every cargo child (including `cargo metadata`) is made by `buildsrc::cargo`, which applies the scrubbed environment.
 //!
+//! SIDE BY SIDE. With the required setting `test_parallel_binaries` above 1, the copies run up to that many at once, and the
+//! project's Python tests run in the SAME pool, after the copies (children start in list order, so every copy has started before
+//! any script). Each child's stdout and stderr are collected apart from the others' and printed whole, redacted, in list order
+//! (cargo's order, then the declared script order), each with its time; so the log and the summary line read as a serial run's.
+//! After any failure nothing new starts; the running children finish and are printed, and a note says how many never started.
+//! A failing executable fails the step with exit 101 as before; a failing script fails it as `test: FAILED (python ...)` (the
+//! first failing script in the declared order is named). The disk floor is polled for the whole pool and a drop kills every
+//! running child's tree. The record names every running child: `child_pid`/`child_start` the first, `child_pids` all of them
+//! (`pid:start|...`). At 1, everything runs one after another and streams, exactly as before (the first failure stops the rest).
+//!
 //! PYTHON TESTS (SCALING F9). When cargo's tests pass, the test step (of `test` and `check`) runs the scripts the required setting
 //! `python_tests` declares for the project, in order, each as `python -I -B <script>` in the project folder (the task's worktree
 //! with `--task`), after the build lock is released. They are ordinary job children: the same disk poll, log, redaction, recorded
@@ -608,6 +618,34 @@ struct Copied {
     env: Vec<(String, String)>,
 }
 
+/// Makes a pool child's `error: ...` failure line from its exit text.
+type FailLine = Box<dyn Fn(&str) -> String>;
+
+/// One child the side-by-side pool runs (a copied test executable or a Python test script).
+struct PoolItem {
+    /// The `     Running ...` line printed before its output.
+    title: String,
+    cmd: Command,
+    /// The `error: ...` line printed after its output when it fails, given its exit text.
+    fail_line: FailLine,
+    /// Its stdout counts toward the test results (`test result:` lines): true for cargo's executables, false for Python.
+    counts: bool,
+}
+
+/// How one pool child ended.
+struct Finished {
+    code: Option<i32>,
+    /// Seconds from the pool's start to this child's start and end.
+    from: f64,
+    to: f64,
+}
+
+/// How a pool run ended: every child that started, by index (`None` = never started, after a failure), or a disk-floor kill.
+enum PoolEnd {
+    Ran(Vec<Option<Finished>>),
+    DiskDropped(u64),
+}
+
 /// The test step's context: everything `run_child` needs, borrowed from the job.
 struct TestStep<'a> {
     cfg: &'a Config,
@@ -617,8 +655,12 @@ struct TestStep<'a> {
     log: &'a Log,
     free: &'a mut dyn FnMut() -> u64,
     poll: Duration,
-    on_spawn: &'a mut dyn FnMut(u32),
+    /// Called with the pids of the children running right now, each time that set changes (one child, or the pool's), so the
+    /// record names every live child.
+    on_live: &'a mut dyn FnMut(&[u32]),
     secrets: &'a Arc<Secrets>,
+    /// `test_parallel_binaries`: how many test executables (and Python scripts) run at once. 1 = one after another, streamed.
+    parallel: usize,
 }
 
 impl TestStep<'_> {
@@ -629,18 +671,26 @@ impl TestStep<'_> {
         }
     }
 
+    /// One child, streamed, through `run_child` (the disk poll, the log, redaction, the recorded pid).
+    fn child(&mut self, cmd: Command) -> Result<StepRun, String> {
+        let on_live = &mut *self.on_live;
+        run_child(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut |pid| on_live(&[pid]), self.secrets)
+    }
+
     /// The test step (see the module comment). `cmd` is the prepared `cargo test --offline` (scrubbed environment, shared build
     /// folder); `hold` is the job's build lock, released here once the executables are copied. Returns one `StepRun` that reads
-    /// like the old single `cargo test`: the kept stdout of every executable, cargo's exit code, the whole step's time.
-    fn run(&mut self, mut cmd: Command, hold: &mut Option<BuildHold>) -> Result<StepRun, String> {
+    /// like the old single `cargo test`: the kept stdout of every executable, cargo's exit code, the whole step's time; and the
+    /// result of the project's Python tests `scripts` (SCALING F9), `None` when cargo's tests did not pass (then none counts).
+    fn run(&mut self, mut cmd: Command, hold: &mut Option<BuildHold>, scripts: &[String]) -> Result<(StepRun, Option<PyTests>), String> {
         let start = Instant::now();
         let done = |outcome: Outcome, stdout: String| StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() };
         // 1. compile (under the lock)
         cmd.args(["--no-run", "--message-format=json-render-diagnostics"]);
-        let compiled = run_child_opts(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets, false)?;
+        let on_live = &mut *self.on_live;
+        let compiled = run_child_opts(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut |pid| on_live(&[pid]), self.secrets, false)?;
         match compiled.outcome {
             Outcome::Exited(Some(0)) => {}
-            o => return Ok(done(o, String::new())),
+            o => return Ok((done(o, String::new()), None)),
         }
         let arts = parse_artifacts(&compiled.stdout)?;
         let envs = package_envs(self.cfg, self.project_dir)?;
@@ -664,13 +714,20 @@ impl TestStep<'_> {
                 let _ = writeln!(f, "{line}");
             }
         }
-        // 3. run the copies, in cargo's order; the first failure stops the step with cargo's exit code (and, as in cargo, no
-        // doc-test runs after a failure)
-        let result = self.run_copies(&copied, &mut kept);
+        // 3. run the copies, in cargo's order; a failure stops the step with cargo's exit code (and, as in cargo, no doc-test
+        // runs after a failure). Side by side (parallel > 1), the Python tests run in the same pool, after the copies.
+        let (result, side_py) = if self.parallel > 1 {
+            match self.run_side_by_side(&copied, scripts, &mut kept) {
+                Ok((o, py)) => (Ok(o), Some(py)),
+                Err(e) => (Err(e), None),
+            }
+        } else {
+            (self.run_copies(&copied, &mut kept), None)
+        };
         let _ = std::fs::remove_dir_all(&dir);
         match result? {
             Outcome::Exited(Some(0)) => {}
-            o => return Ok(done(o, kept)),
+            o => return Ok((done(o, kept), None)),
         }
         // 4. doc-tests, last, as cargo runs them. rustdoc builds them from the shared folder's library as it runs them, so they
         // need the build lock again, and the source note re-checked (another job may have rebuilt the folder from its own source).
@@ -689,13 +746,20 @@ impl TestStep<'_> {
             let mut doc = cargo_command(self.cfg, self.project_dir, "test");
             doc.arg("--doc");
             doc.env("CARGO_TARGET_DIR", &self.cfg.build_dir);
-            let r = run_child(self.cfg, doc, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets);
+            let r = self.child(doc);
             drop(lock);
             let r = r?;
             kept.push_str(&r.stdout);
-            return Ok(done(r.outcome, kept));
+            if !matches!(r.outcome, Outcome::Exited(Some(0))) {
+                return Ok((done(r.outcome, kept), None));
+            }
         }
-        Ok(done(Outcome::Exited(Some(0)), kept))
+        // 5. the Python tests: already run beside the copies, or now, one after another
+        let py = match side_py {
+            Some(py) => py,
+            None => self.run_python(scripts)?,
+        };
+        Ok((done(Outcome::Exited(Some(0)), kept), Some(py)))
     }
 
     fn copy_all(&self, arts: &Artifacts, envs: &[(PathBuf, Vec<(String, String)>)], dir: &Path) -> Result<Vec<Copied>, String> {
@@ -759,7 +823,7 @@ impl TestStep<'_> {
             }
             self.note(&format!("     Running {shown}"));
             let cmd = python_command(self.cfg, self.project_dir, s);
-            let r = run_child(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
+            let r = self.child(cmd)?;
             match r.outcome {
                 Outcome::Exited(Some(0)) => {}
                 Outcome::DiskDropped(f) => return Ok(PyTests::Killed(f)),
@@ -776,7 +840,7 @@ impl TestStep<'_> {
         for c in copied {
             self.note(&format!("     Running {} ({})", c.art.src_path, c.copy.display()));
             let cmd = self.command_for(c);
-            let r = run_child(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
+            let r = self.child(cmd)?;
             kept.push_str(&r.stdout);
             match r.outcome {
                 Outcome::Exited(Some(0)) => {}
@@ -788,6 +852,209 @@ impl TestStep<'_> {
             }
         }
         Ok(Outcome::Exited(Some(0)))
+    }
+
+    /// The copies and then the Python tests, up to `parallel` at once, in one pool (`run_pool`). Children start in list order,
+    /// so every copy has started before any script: a failing script can stop later scripts from starting, never a copy, and
+    /// cargo's counts are always whole. Returns the copies' outcome (101 if any failed, as `run_copies`) and the scripts' result
+    /// (only read when the copies passed).
+    fn run_side_by_side(&mut self, copied: &[Copied], scripts: &[String], kept: &mut String) -> Result<(Outcome, PyTests), String> {
+        let mut items: Vec<PoolItem> = Vec::new();
+        for c in copied {
+            let (rerun, src) = (rerun_arg(&c.art), c.art.src_path.clone());
+            items.push(PoolItem {
+                title: format!("     Running {} ({})", c.art.src_path, c.copy.display()),
+                cmd: self.command_for(c),
+                fail_line: Box::new(move |why| format!("error: test failed, to rerun pass `{rerun}` ({why}, {src})")),
+                counts: true,
+            });
+        }
+        // a declared script that is not a file fails the Python tests before any runs (the copies still run)
+        let missing = scripts.iter().find(|s| !self.project_dir.join(s).is_file());
+        let mut py = if scripts.is_empty() {
+            self.note("python tests: none (this project is not named in python_tests)");
+            PyTests::NoneDeclared
+        } else if let Some(s) = missing {
+            self.note(&format!("error: python test `{PYTHON} -I -B {s}`: {s} is not a file in {}", self.project_dir.display()));
+            PyTests::Failed { script: s.clone(), why: "script not found".into() }
+        } else {
+            for s in scripts {
+                let shown = format!("{PYTHON} -I -B {s}");
+                items.push(PoolItem {
+                    title: format!("     Running {shown}"),
+                    cmd: python_command(self.cfg, self.project_dir, s),
+                    fail_line: Box::new(move |why| format!("error: python test failed: `{shown}` ({why})")),
+                    counts: false,
+                });
+            }
+            PyTests::Ok { count: scripts.len(), secs: 0.0 }
+        };
+        let ran = match self.run_pool(items, kept)? {
+            PoolEnd::DiskDropped(f) => return Ok((Outcome::DiskDropped(f), PyTests::Killed(f))),
+            PoolEnd::Ran(r) => r,
+        };
+        let (cargo, python) = ran.split_at(copied.len());
+        if cargo.iter().any(|f| f.as_ref().is_none_or(|f| f.code != Some(0))) {
+            return Ok((Outcome::Exited(Some(101)), py));
+        }
+        if let PyTests::Ok { secs, .. } = &mut py {
+            // the first script that failed, in the declared order, names the failure; otherwise the scripts' wall time
+            if let Some((s, f)) = scripts.iter().zip(python).find(|(_, f)| f.as_ref().is_some_and(|f| f.code != Some(0))) {
+                let code = f.as_ref().and_then(|f| f.code);
+                return Ok((Outcome::Exited(Some(0)), PyTests::Failed { script: s.clone(), why: exit_text(code) }));
+            }
+            let from = python.iter().flatten().map(|f| f.from).fold(f64::INFINITY, f64::min);
+            let to = python.iter().flatten().map(|f| f.to).fold(0.0, f64::max);
+            *secs = if from.is_finite() { (to - from).max(0.0) } else { 0.0 };
+        }
+        Ok((Outcome::Exited(Some(0)), py))
+    }
+
+    /// Run `items` up to `parallel` at once, in list order. Each child's stdout and stderr are collected apart from the others,
+    /// redacted, and printed whole (and written to the log) in LIST order, each as soon as every item before it has been printed,
+    /// so the output reads like a serial run. `counts` items add their stdout to `kept`. After a failure nothing new starts; the
+    /// running ones finish and are printed. The disk floor is polled every `poll` and a drop kills every running child's tree;
+    /// the record names every running child (`on_live`). A start or wait error kills every running child.
+    fn run_pool(&mut self, items: Vec<PoolItem>, kept: &mut String) -> Result<PoolEnd, String> {
+        struct Live {
+            idx: usize,
+            child: std::process::Child,
+            out: Arc<Mutex<Vec<u8>>>,
+            err: Arc<Mutex<Vec<u8>>>,
+            readers: Vec<std::thread::JoinHandle<()>>,
+            from: f64,
+        }
+        fn reader(mut src: impl Read + Send + 'static, into: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                while let Ok(k) = src.read(&mut chunk) {
+                    if k == 0 {
+                        break;
+                    }
+                    if let Ok(mut b) = into.lock() {
+                        b.extend_from_slice(&chunk[..k]);
+                    }
+                }
+            })
+        }
+        fn kill_all(live: &mut Vec<Live>) {
+            for l in live.iter_mut() {
+                kill_tree(&mut l.child);
+            }
+            live.clear(); // after a kill the readers are left to finish on their own: never block on orphaned pipes
+        }
+        let n = items.len();
+        let width = self.parallel.max(1);
+        self.note(&format!("broadsword: running {n} test child(ren), up to {width} at once (test_parallel_binaries)"));
+        let start = Instant::now();
+        let mut items: Vec<Option<PoolItem>> = items.into_iter().map(Some).collect();
+        let mut lines: Vec<(String, FailLine, bool)> = Vec::with_capacity(n);
+        let mut live: Vec<Live> = Vec::new();
+        let mut finished: Vec<Option<Finished>> = (0..n).map(|_| None).collect();
+        let mut outputs: Vec<Option<(String, String)>> = (0..n).map(|_| None).collect();
+        let (mut next, mut printed, mut failed) = (0usize, 0usize, false);
+        let mut next_poll = Instant::now() + self.poll;
+        loop {
+            // start what the width allows; after a failure nothing new starts
+            let mut changed = false;
+            while !failed && next < n && live.len() < width {
+                let PoolItem { title, mut cmd, fail_line, counts } = items[next].take().expect("each item starts once");
+                let spawned = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+                let mut child = match spawned {
+                    Ok(c) => c,
+                    Err(e) => {
+                        kill_all(&mut live);
+                        (self.on_live)(&[]);
+                        return Err(format!("cannot start `{}`: {e}", cmd.get_program().to_string_lossy()));
+                    }
+                };
+                let (out, err) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+                let readers = vec![reader(child.stdout.take().expect("piped"), Arc::clone(&out)), reader(child.stderr.take().expect("piped"), Arc::clone(&err))];
+                live.push(Live { idx: next, child, out, err, readers, from: start.elapsed().as_secs_f64() });
+                lines.push((title, fail_line, counts));
+                next += 1;
+                changed = true;
+            }
+            // reap what has ended
+            let mut i = 0;
+            while i < live.len() {
+                let status = match live[i].child.try_wait() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        kill_all(&mut live);
+                        (self.on_live)(&[]);
+                        return Err(format!("waiting for a test child failed: {e}"));
+                    }
+                };
+                let Some(status) = status else {
+                    i += 1;
+                    continue;
+                };
+                let mut l = live.swap_remove(i);
+                for r in l.readers.drain(..) {
+                    let _ = r.join(); // it ended: its pipes close (as in `cargo test`, a grandchild holding one is waited for)
+                }
+                let text = |b: &Arc<Mutex<Vec<u8>>>| self.secrets.redact(&String::from_utf8_lossy(&b.lock().map(|v| v.clone()).unwrap_or_default()));
+                outputs[l.idx] = Some((text(&l.out), text(&l.err)));
+                let code = status.code();
+                failed |= code != Some(0);
+                finished[l.idx] = Some(Finished { code, from: l.from, to: start.elapsed().as_secs_f64() });
+                changed = true;
+            }
+            if changed {
+                let pids: Vec<u32> = live.iter().map(|l| l.child.id()).collect();
+                (self.on_live)(&pids);
+            }
+            // print, in list order, everything whose predecessors are printed
+            while printed < n {
+                let Some((out, err)) = outputs[printed].take() else { break };
+                self.print_one(&lines[printed], finished[printed].as_ref(), &out, &err, kept);
+                printed += 1;
+            }
+            if live.is_empty() && (failed || next >= n) {
+                break;
+            }
+            if Instant::now() >= next_poll {
+                let f = (self.free)();
+                if pause::below_floor(f, self.cfg.floor_bytes()) {
+                    kill_all(&mut live);
+                    (self.on_live)(&[]);
+                    return Ok(PoolEnd::DiskDropped(f));
+                }
+                next_poll = Instant::now() + self.poll;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // after a failure: what finished behind a child that never started is printed now, in order
+        for idx in printed..n {
+            if let Some((out, err)) = outputs[idx].take() {
+                self.print_one(&lines[idx], finished[idx].as_ref(), &out, &err, kept);
+            }
+        }
+        if next < n {
+            self.note(&format!("broadsword: {} test child(ren) not started after a failure", n - next));
+        }
+        Ok(PoolEnd::Ran(finished))
+    }
+
+    /// Print one finished pool child: its `Running` line with its time, its stdout and stderr whole, and its failure line.
+    fn print_one(&self, line: &(String, FailLine, bool), f: Option<&Finished>, out: &str, err: &str, kept: &mut String) {
+        let (title, fail_line, counts) = line;
+        let secs = f.map(|f| f.to - f.from).unwrap_or(0.0);
+        self.note(&format!("{title} [{secs:.1} s]"));
+        print!("{out}");
+        let _ = std::io::stdout().flush();
+        eprint!("{err}");
+        if let Ok(mut l) = self.log.lock() {
+            let _ = l.write_all(out.as_bytes());
+            let _ = l.write_all(err.as_bytes());
+        }
+        if *counts {
+            kept.push_str(out);
+        }
+        if let Some(code) = f.map(|f| f.code).filter(|c| *c != Some(0)) {
+            self.note(&fail_line(&exit_text(code)));
+        }
     }
 }
 
@@ -890,6 +1157,7 @@ fn end(rec: &mut Record, status: &str, code: u8) -> u8 {
     rec.set("status", status);
     rec.set("child_pid", "");
     rec.set("child_start", "");
+    rec.set("child_pids", "");
     rec.set("ended", now_secs().to_string());
     match save_record(rec) {
         Ok(()) => code,
@@ -1022,6 +1290,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     rec.set("pid_start", sys::start_time(me).map(|t| t.to_string()).unwrap_or_default());
     rec.set("child_pid", "");
     rec.set("child_start", "");
+    rec.set("child_pids", "");
     rec.set("started", secs.to_string());
     rec.set("step", steps.get(spec.first_step).copied().unwrap_or(steps[0]));
     rec.set("checkpoint", "pending");
@@ -1185,33 +1454,36 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         scrub::apply(&mut cmd, cfg);
         cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
         let mut spawn_err: Option<String> = None;
-        let mut on_spawn = |pid: u32| {
-            rec.set("child_pid", pid.to_string());
-            rec.set("child_start", sys::start_time(pid).map(|t| t.to_string()).unwrap_or_default());
+        // The children this job has running right now (one, or the test step's side-by-side pool), recorded so recovery can find
+        // each orphan: `child_pid`/`child_start` name the first, `child_pids` all of them as `pid:start|pid:start...`.
+        let mut on_live = |pids: &[u32]| {
+            let starts: Vec<String> = pids.iter().map(|p| sys::start_time(*p).map(|t| t.to_string()).unwrap_or_default()).collect();
+            rec.set("child_pid", pids.first().map(|p| p.to_string()).unwrap_or_default());
+            rec.set("child_start", starts.first().cloned().unwrap_or_default());
+            rec.set("child_pids", pids.iter().zip(&starts).map(|(p, s)| format!("{p}:{s}")).collect::<Vec<_>>().join("|"));
             if let Err(e) = save_record(&rec) {
                 spawn_err = Some(e);
             }
-            if panic_hook {
+            if panic_hook && !pids.is_empty() {
                 panic!("test hook: panic in job after its child started");
             }
         };
         let mut py: Option<PyTests> = None;
         let ran = if *step == "test" && kind != "run" {
-            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_spawn: &mut on_spawn, secrets: &secrets };
-            match t.run(cmd, &mut build_hold) {
-                // cargo's tests passed (and the build lock is released): the project's Python tests run next (SCALING F9)
-                Ok(r) if matches!(r.outcome, Outcome::Exited(Some(0))) => match t.run_python(python_scripts(cfg, name)) {
-                    Ok(PyTests::Killed(f)) => Ok(StepRun { outcome: Outcome::DiskDropped(f), ..r }),
-                    Ok(p) => {
-                        py = Some(p);
-                        Ok(r)
-                    }
-                    Err(e) => Err(e),
-                },
-                other => other,
+            let parallel = cfg.test_parallel_binaries as usize;
+            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel };
+            // the project's Python tests (SCALING F9) run once cargo's tests pass (side by side: in the same pool, after the
+            // copies), always after the build lock is released
+            match t.run(cmd, &mut build_hold, python_scripts(cfg, name)) {
+                Ok((r, Some(PyTests::Killed(f)))) => Ok(StepRun { outcome: Outcome::DiskDropped(f), ..r }),
+                Ok((r, p)) => {
+                    py = p;
+                    Ok(r)
+                }
+                Err(e) => Err(e),
             }
         } else {
-            run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets)
+            run_child(cfg, cmd, &log, &mut *free_src, poll, &mut |pid| on_live(&[pid]), &secrets)
         };
         let run = match ran {
             Ok(r) => r,
@@ -1304,6 +1576,7 @@ fn recover_after_panic(rec: &mut Record, kind: &str, why: &str) {
         rec.set("pid", ""); // this process lives on only to report; the record must read as interrupted, not as a live job
         rec.set("child_pid", "");
         rec.set("child_start", "");
+        rec.set("child_pids", "");
         rec.set("panic", why);
         if let Err(e) = save_record(rec) {
             eprintln!("broadsword: ERROR: {e}");

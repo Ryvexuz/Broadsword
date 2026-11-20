@@ -782,3 +782,169 @@ fn a_python_test_gets_the_scrubbed_environment_and_runs_isolated() {
         "harmless=visible proves the facts come from the child's real environment; every *_seen must be False; -I and -B are passed"
     );
 }
+
+// ---- test executables and Python tests side by side (test_parallel_binaries) ------------------------------------------
+
+impl Root {
+    /// Set `key` (a key of `support::config`) to the raw TOML `value` in this root's broadsword.toml.
+    fn set(&self, key: &str, value: &str) {
+        let path = self.dir.join("broadsword.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.lines().any(|l| l.starts_with(&format!("{key} = "))), "{key} not in {text}");
+        let new: String = text.lines().map(|l| if l.starts_with(&format!("{key} = ")) { format!("{key} = {value}\n") } else { format!("{l}\n") }).collect();
+        fs::write(&path, new).unwrap();
+    }
+}
+
+/// An integration test `name` that marks itself started in GATE, waits (at most 60 s) until `want` tests have, and then until
+/// the job record (in JOBS) names its own pid in `child_pids`. Run one after another it would time out: it proves the
+/// executables run at once and that the record names every running one.
+fn gated_test(name: &str, gate: &Path, jobs: &Path, want: usize) -> String {
+    r#"
+use std::time::{Duration, Instant};
+#[test]
+fn NAME() {
+    let gate = std::path::Path::new(r"GATE");
+    std::fs::create_dir_all(gate).unwrap();
+    std::fs::write(gate.join("NAME"), "").unwrap();
+    let t = Instant::now();
+    while std::fs::read_dir(gate).unwrap().count() < WANT {
+        assert!(t.elapsed().as_secs() < 60, "the other test executables never started beside this one");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::io::Write::write_all(&mut std::io::stdout(), b"NAME saw WANT running\n").unwrap(); // not println!: libtest captures that
+    let me = format!("{}:", std::process::id());
+    loop {
+        let named = std::fs::read_dir(r"JOBS").unwrap().flatten().any(|e| {
+            std::fs::read_to_string(e.path()).is_ok_and(|s| s.lines().any(|l| l.starts_with("child_pids = ") && l["child_pids = ".len()..].split('|').any(|p| p.starts_with(&me))))
+        });
+        if named {
+            break;
+        }
+        assert!(t.elapsed().as_secs() < 60, "the job record never named this running test executable in child_pids");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+"#
+    .replace("NAME", name)
+    .replace("GATE", &gate.display().to_string())
+    .replace("JOBS", &jobs.display().to_string())
+    .replace("WANT", &want.to_string())
+}
+
+/// The position in `log` of the `Running` line of the target whose source ends with `tail`.
+fn running_at(log: &str, tail: &str) -> usize {
+    log.lines()
+        .scan(0usize, |at, l| {
+            let here = *at;
+            *at += l.len() + 1;
+            Some((here, l))
+        })
+        .find(|(_, l)| l.trim_start().starts_with("Running ") && l.contains(tail))
+        .unwrap_or_else(|| panic!("no Running line for {tail} in {log}"))
+        .0
+}
+
+#[test]
+fn test_executables_and_python_tests_run_side_by_side_and_print_in_a_stable_order() {
+    let r = Root::new("side", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    let (gate, jobs) = (r.dir.join("scratch/gate"), r.dir.join("state/jobs"));
+    let sep = std::path::MAIN_SEPARATOR;
+    let tests: Vec<(String, String)> = ["a", "b", "c"].iter().map(|n| (format!("{n}.rs"), gated_test(n, &gate, &jobs, 3))).collect();
+    let tests: Vec<(&str, &str)> = tests.iter().map(|(f, s)| (f.as_str(), s.as_str())).collect();
+    bin_project(&r, "side", "0.1.0", "pub fn f() {}\n#[cfg(test)] mod t { #[test] fn in_lib() {} }\n", &tests);
+    r.py("side", "py/test_one.py", &marker_py("one", 0));
+    r.py("side", "py/test_two.py", &marker_py("two", 0));
+    r.python_tests("\"side: py/test_one.py py/test_two.py\"");
+    let out = r.run(&["test", "side"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    // one summed line: in_lib + in_bin + a + b + c, and the scripts
+    assert!(so.contains("test: ok — 5 passed, 0 failed; python: 2 script(s) ok ("), "{so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("up to 4 at once (test_parallel_binaries)"), "{log}");
+    // printed whole, in cargo's order and then the declared script order, whatever order they ended in
+    let at: Vec<usize> = [format!("src{sep}lib.rs"), format!("src{sep}main.rs"), format!("tests{sep}a.rs"), format!("tests{sep}b.rs"), format!("tests{sep}c.rs"), "py/test_one.py".into(), "py/test_two.py".into()]
+        .iter()
+        .map(|t| running_at(&log, t))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "Running lines out of order {at:?}: {log}");
+    for n in ["a", "b", "c"] {
+        let seen = log.find(&format!("{n} saw 3 running")).unwrap_or_else(|| panic!("{n}'s output is in the log: {log}"));
+        let next_running = log[running_at(&log, &format!("tests{sep}{n}.rs")) + 1..].find("     Running ").map(|i| i + running_at(&log, &format!("tests{sep}{n}.rs")) + 1).unwrap_or(log.len());
+        assert!(seen > running_at(&log, &format!("tests{sep}{n}.rs")) && seen < next_running, "{n}'s output sits under its own Running line: {log}");
+    }
+    let mut ran = ran(&r, "side");
+    ran.sort();
+    assert_eq!(ran, ["one", "two"]);
+    let rec = r.records();
+    assert!(rec.lines().any(|l| l.trim_end() == "child_pids =") && !rec.lines().any(|l| l.starts_with("child_pid") && l.contains(':') && l.chars().any(|c| c.is_ascii_digit())), "the record names no child once the job ended: {rec}");
+}
+
+#[test]
+fn a_failing_test_executable_among_side_by_side_ones_fails_the_job() {
+    let r = Root::new("sidefail", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    let gate = r.dir.join("scratch/gate");
+    // b dies (exit 3, so no `test result:` line: only its exit code can fail the job) while a is still running; a must
+    // finish and be printed
+    let a = r#"
+#[test]
+fn a() {
+    let gate = std::path::Path::new(r"GATE");
+    std::fs::create_dir_all(gate).unwrap();
+    std::fs::write(gate.join("a"), "").unwrap();
+    let t = std::time::Instant::now();
+    while !gate.join("b").exists() {
+        assert!(t.elapsed().as_secs() < 60, "b never started beside a");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::io::Write::write_all(&mut std::io::stdout(), b"a finished after b died\n").unwrap();
+}
+"#
+    .replace("GATE", &gate.display().to_string());
+    let b = r#"
+#[test]
+fn b() {
+    let gate = std::path::Path::new(r"GATE");
+    std::fs::create_dir_all(gate).unwrap();
+    std::fs::write(gate.join("b"), "").unwrap();
+    let t = std::time::Instant::now();
+    while !gate.join("a").exists() {
+        assert!(t.elapsed().as_secs() < 60, "a never started beside b");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::process::exit(3);
+}
+"#
+    .replace("GATE", &gate.display().to_string());
+    bin_project(&r, "sidefail", "0.1.0", "pub fn f() {}\n", &[("a.rs", &a), ("b.rs", &b), ("c.rs", "#[test] fn c() {}\n")]);
+    let out = r.run(&["test", "sidefail"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "a failing executable fails the job: {so}{se}");
+    assert!(so.contains("test: FAILED (exit 101)"), "{so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("error: test failed, to rerun pass `--test b` (exit 3"), "{log}");
+    assert!(log.contains("a finished after b died"), "the executable still running at the failure finished and was printed: {log}");
+    assert!(r.records().contains("status = failed"), "{}", r.records());
+}
+
+#[test]
+fn a_failing_python_test_beside_others_fails_the_job_and_is_named() {
+    let r = Root::new("sidepy", 1, 0);
+    r.set("test_parallel_binaries", "4");
+    r.project("p", TWO_TESTS, None);
+    r.py("p", "py/test_ok.py", &marker_py("ok", 0));
+    r.py("p", "py/test_fail.py", &marker_py("fail", 1));
+    r.py("p", "py/test_ok2.py", &marker_py("ok2", 0));
+    r.python_tests("\"p: py/test_ok.py py/test_fail.py py/test_ok2.py\"");
+    let out = r.run(&["check", "p"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{so}{se}");
+    assert!(so.contains("test: FAILED (python py/test_fail.py: exit 1) — 2 passed, 0 failed"), "{so}");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("error: python test failed: `python -I -B py/test_fail.py` (exit 1)"), "{log}");
+    assert!(r.records().contains("python_tests = failed: py/test_fail.py (exit 1)"), "{}", r.records());
+}
