@@ -29,7 +29,12 @@ the board cannot be read); a symlink or a folder holding one; a folder holding a
 (.env*); anything whose target already exists. Files and folders are copied, the size and
 SHA-256 of every file are verified, and only then is the source removed. A retired worktree is
 moved with `git worktree move`, then `git worktree repair`.
-Exit codes: 0 ok, 1 some item failed or was kept, 2 usage error or refusal.
+With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
+exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
+name next to the target, is verified, then renamed into place; an error removes only that temp
+name, never a target this run did not create.
+Exit codes: 0 ok (skipped items are listed, not errors), 1 some item failed to move, 2 usage error
+or refusal.
 """
 import argparse
 import hashlib
@@ -38,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 GIT_TIMEOUT = 120
@@ -45,6 +51,7 @@ BOARD_TIMEOUT = 60
 CLASSES = ("build-cache", "evidence", "reference", "worktree")
 FINISHED = ("done", "abandoned", "failed")
 APPROVAL_PREFIX = "APPROVED"
+LOCK_NAME = "cold-move.lock"
 REMINDER = (
     "The first real run (--yes) needs Lazlo's yes in chat for every class. "
     "The orchestrator writes the approval file only after that yes."
@@ -251,6 +258,8 @@ def plan_worktrees(args, root, target, state):
                     skip = f"git status failed: {st.stderr.strip()}"
                 elif st.stdout.strip():
                     skip = "dirty (uncommitted changes)"
+                elif (why := tree_has_symlink_or_secret(wt)) is not None:
+                    skip = why
                 elif dst.exists() or dst.is_symlink():
                     skip = "target already exists"
                 else:
@@ -303,17 +312,40 @@ def verify_copy(src, dst):
         raise MoveFailed(f"copy does not match the source (size or SHA-256), first difference: {bad[0]}")
 
 
+def exists_any(p):
+    return p.exists() or p.is_symlink()
+
+
 def move_copy(item):
+    """Copy to a fresh temp name next to dst, verify, rename to dst, then remove the source.
+
+    Only the temp path (a unique name this run checked was absent) is ever removed on error;
+    dst is never deleted, because this run never created it.
+    """
+    if not exists_any(item.src):
+        raise MoveFailed("source is gone; nothing copied")
+    if exists_any(item.dst):
+        raise MoveFailed("target appeared after planning; nothing copied, nothing removed")
+    tmp = item.dst.parent / f"{item.dst.name}.cold-tmp-{os.getpid()}-{uuid.uuid4().hex}"
     try:
-        copy_item(item.src, item.dst)
-        verify_copy(item.src, item.dst)
-    except MoveFailed:
-        remove_partial(item.dst)
-        raise
+        item.dst.parent.mkdir(parents=True, exist_ok=True)
+        if exists_any(tmp):  # a uuid name: cannot happen, but then it is not ours to remove
+            raise MoveFailed(f"temp path {tmp.name} already exists; nothing copied")
+        try:
+            copy_item(item.src, tmp)
+            verify_copy(item.src, tmp)
+            if exists_any(item.dst):
+                raise MoveFailed("target appeared during the copy; temp copy dropped, target untouched")
+            os.rename(tmp, item.dst)  # fails if dst exists on Windows; the check above covers POSIX
+        except MoveFailed:
+            remove_partial(tmp)
+            raise
+        except OSError as e:
+            remove_partial(tmp)
+            raise MoveFailed(f"copy failed: {e}")
     except OSError as e:
-        remove_partial(item.dst)
         raise MoveFailed(f"copy failed: {e}")
-    # Verified. Only now is the source removed.
+    # Verified and in place. Only now is the source removed.
     try:
         if item.src.is_file():
             item.src.unlink()
@@ -401,8 +433,42 @@ def validate(args):
         raise Refusal("worktree class needs exactly one of --board-file or --broadsword")
 
 
+def acquire_lock(state):
+    """Exclusive-create the run lock in the state folder. Refuse when it exists (never removed here)."""
+    if not state.is_dir():
+        raise Refusal("--state-dir is not an existing folder; cannot take the run lock")
+    lock = state / LOCK_NAME
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise Refusal(
+            f"run lock {lock.name} is held: another run is moving, or one was killed. "
+            "Check, then remove the file by hand."
+        )
+    except OSError as e:
+        raise Refusal(f"cannot take the run lock: {e}")
+    with os.fdopen(fd, "w") as f:
+        f.write(f"pid {os.getpid()}\n")
+    return lock
+
+
 def run(args, out):
     validate(args)
+    lock = None
+    try:
+        root = Path(args.root).resolve()
+        if args.yes and root.is_dir():
+            lock = acquire_lock(rel_under(root, args.state_dir, "--state-dir"))
+        return run_locked(args, out)
+    finally:
+        if lock is not None:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def run_locked(args, out):
     root = Path(args.root).resolve()
     if not root.is_dir():
         raise Refusal(f"--root {args.root!r} is not a folder")

@@ -210,6 +210,95 @@ class Moves(Fixture):
         self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
 
 
+class Safety(Fixture):
+    """Deletion safety: a run only ever removes what it created itself."""
+
+    EV_DST = ("evidence", "evidence", "ev1")
+
+    def ev_dst(self):
+        return self.ext.joinpath(*self.EV_DST)
+
+    def test_dst_created_after_planning_is_never_removed(self):
+        self.approve()
+        real_plan = cold_move.build_plan
+
+        def plan_then_other_run_wins(*a, **k):
+            items = real_plan(*a, **k)
+            put(self.ev_dst() / "e.txt", "other run's verified copy")
+            return items
+
+        with mock.patch.object(cold_move, "build_plan", plan_then_other_run_wins):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual((self.ev_dst() / "e.txt").read_text(), "other run's verified copy")
+        self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
+        self.assertIn("FAILED", out)
+
+    def test_copy_error_removes_only_its_own_temp_path(self):
+        self.approve()
+        real_copy = cold_move.copy_item
+
+        def other_run_creates_dst_then_copy_fails(src, dst):
+            real_copy(src, dst)  # our partial copy, at whatever name the mover chose
+            put(self.ev_dst() / "e.txt", "other run's verified copy")
+            raise OSError("disk went away")
+
+        with mock.patch.object(cold_move, "copy_item", other_run_creates_dst_then_copy_fails):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 1, out)
+        self.assertEqual((self.ev_dst() / "e.txt").read_text(), "other run's verified copy")
+        self.assertTrue((self.root / "evidence" / "ev1" / "e.txt").is_file())
+        # our own partial copy is gone: only the other run's folder is left beside it
+        self.assertEqual([p.name for p in self.ev_dst().parent.iterdir()], ["ev1"])
+
+    def test_source_gone_before_copy_is_failed_and_touches_no_target(self):
+        self.approve()
+        real_plan = cold_move.build_plan
+
+        def plan_then_source_vanishes(*a, **k):
+            items = real_plan(*a, **k)
+            import shutil
+            shutil.rmtree(self.root / "evidence" / "ev1")
+            return items
+
+        with mock.patch.object(cold_move, "build_plan", plan_then_source_vanishes):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAILED", out)
+        self.assertFalse(self.ev_dst().exists())
+
+    def test_held_run_lock_refuses_and_is_left_alone(self):
+        self.approve()
+        lock = self.root / "state" / cold_move.LOCK_NAME
+        put(lock, "pid of another run\n")
+        before = self.snapshot()
+        code, out = self.go(*self.YES, *self.ALL)
+        self.assertEqual(code, 2, out)
+        self.assertIn("lock", out)
+        self.assertTrue(lock.is_file())
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(list(self.ext.iterdir()), [])
+
+    def test_lock_is_released_after_a_run(self):
+        self.approve()
+        code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.root / "state" / cold_move.LOCK_NAME).exists())
+        code, out = self.go(*self.YES, "--class", "reference")  # a second run is not blocked
+        self.assertEqual(code, 0, out)
+
+    def test_retired_worktree_with_gitignored_env_is_never_moved(self):
+        with open(self.root / ".git" / "info" / "exclude", "a", encoding="utf-8") as f:
+            f.write("\n.env\n")
+        put(self.root / "worktrees" / "proj" / "t-done" / ".env", "KEY=1")
+        self.assertEqual(git(self.root / "worktrees" / "proj" / "t-done", "status", "--porcelain").strip(), "")
+        self.approve()
+        code, out = self.go(*self.YES, "--class", "worktree")
+        self.assertEqual(code, 0, out)
+        self.assertIn("secret file", out)
+        self.assertTrue((self.root / "worktrees" / "proj" / "t-done" / ".env").is_file())
+        self.assertFalse((self.ext / "worktree").exists())
+
+
 class Skips(Fixture):
     def test_active_and_unknown_worktrees_are_skipped(self):
         git(self.root, "worktree", "add", "-q", "-b", "t-ghost", "worktrees/proj/t-ghost")
