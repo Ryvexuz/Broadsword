@@ -1790,6 +1790,8 @@ fn one_bad_entry_in_a_train_of_four_is_found_by_bisection_and_the_other_three_me
     let (_, e3) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
     let (_, e4) = queued_claim(&r, "src/c.txt", "src/c.txt", "x\n", "task: c");
     let o = r.run(&["queue", "run", "--all"]);
+    // The done check's 4-entry demo: run this test with `--nocapture` to see the real `queue run --all` output and the bisect.
+    eprintln!("---- demo: queue run --all, 4 entries, the 2nd broken (exit {}) ----\n{}{}---- end of demo ----", o.code, o.stdout, o.stderr);
     assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
     for e in [&e1, &e3, &e4] {
         assert_eq!(r.status(e), "merged", "{e}: reason = {}", r.field(e, "reason"));
