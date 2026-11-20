@@ -418,6 +418,71 @@ The pipeline that scales is four levels, each owned by a different role, each wi
 - State: 37 MB for 238 tasks = 155 KB per task, so 4.3 GB at 28k tasks and 32 GB at 208k: fine on disk; the cost is the
   read time in section 7, not the space.
 
+#### Disk strategy: hot data internal, cold data on the 4 TB external drive (proposal; nothing moves now)
+
+Lazlo has a 4 TB external drive (his message of 2026-11-20 01:56Z, recorded in `state/backlog/t-20261120-015634.md`; model,
+interface and speed are not known and not measured here). The rule: **hot data stays on the internal SSD, cold data moves
+to the external drive when internal free space nears the limits below.** Any move is a separate task that needs Lazlo's yes
+(AGENTS.md, Ask first: deleting the internal copy is a deletion outside scratch). Moving means copy, verify, then Lazlo
+approves the delete; nothing is ever deleted to make room.
+
+**The numbers.** All GB are decimal. Measured 2026-11-20 about 07:40Z with `Get-PSDrive C` (PowerShell): used
+395,077,189,632 B, free 1,571,434,819,584 B, so C: is 1,966.5 GB in total and 79.9% free. (Section 0 says "1.8 TB": the
+same disk counted in binary TB, 1,966.5e9 / 2^40 = 1.79 TiB.)
+
+| Limit | Value | Source |
+| --- | --- | --- |
+| Hard floor | `disk_floor_gb` = 20 GB. A job also refuses to start when free space minus `job_disk_reserve_gb` (2) is under the floor, i.e. free under 22 GB. Below the floor the cleanup runs and agents pause | `broadsword.toml` lines 6 and 28 |
+| 20% free line | 20% of 1,966.5 GB = **393.3 GB free**. Today's headroom to it: 1,571.4 - 393.3 = 1,178.1 GB | the rule is the SSD >= 20% free condition in `state/backlog/t-20261119-235500.md` (scale-up); arithmetic above |
+| Enforcement | **Not yet in force.** No setting or code checks a percent free: `config.rs` has `ram_warn_percent` and `cpu_warn_percent` only, and the 20% line appears only in two briefs (that one and this task's). A follow-up would add a required key such as `disk_free_warn_percent` and a warning in `status` (proposal, not boarded) | `grep percent crates/broadsword/src/config.rs` |
+
+**Trigger.** Plan a cold move when free space falls under the 20% line (393 GB), and ask Lazlo before it reaches the hard
+floor (22 GB at which jobs refuse). The 20% line gives hours or days to copy; the floor does not, because a copy of a few
+hundred GB takes longer than a build step (copy speed to the external drive: not measured).
+
+**Does it get there?** Used today 395.1 GB. Projected peak use, all **ESTIMATE** (inputs are the section 8 figures above and the
+brief's measurements of 2026-11-20 02:02Z: 295 MB for 38,626 Rust lines = 7.6 KB per line; with debug line-tables-only
+(t-20261120-020035) and `CARGO_INCREMENTAL=0` for queue checks (t-20261120-020035-2), 2.7-3.8 KB per line):
+
+| Case | Arithmetic | Used | Free (share of 1,966.5 GB) |
+| --- | --- | --- | --- |
+| Managed, low | 395.1 + build 70e6 x 2.7 KB = 189 GB + worktrees 81 GB + state 4.3 GB | 669.4 GB (ESTIMATE) | 1,297.1 GB (66.0%): above the line |
+| Managed, high | 395.1 + build 125e6 x 3.8 KB = 475 GB + worktrees 81 GB + state 32 GB | 983.1 GB (ESTIMATE) | 983.4 GB (50.0%): above the line |
+| Build output as measured today, no levers | 395.1 + 125e6 x 25.8 KB = 3,225 GB | 3,620 GB (ESTIMATE) | does not fit on C: at all |
+
+So with the levers in section 8 the 20% line is probably not reached even at 125M lines, and the external drive is
+insurance plus a home for data that is large but rarely read. Without them, a single unmanaged build folder crosses the
+line at (1,571.4 - 393.3) GB / 25.8 KB = 1,178.1e9 / 25.8e3 = 45.7M lines (ESTIMATE, linear extrapolation).
+The managed figure "about 0.1-0.5 TB hot" in the brief is these rows rounded outward (0.19-0.48 TB from the per-line
+arithmetic); its 0.1 TB low end additionally assumes affected-only builds keep about half of the 0.19 TB hot, which is an
+assumption.
+
+**Each data class, its place and when it moves.**
+
+| Class | Size today (2026-11-20 `du -sh`) | Place | Moves when |
+| --- | --- | --- | --- |
+| Active source: the three Git repos (`.git` 17 MB, `projects/` 8.8 MB), checked-out main | tens of MB | internal, always | never |
+| Worktrees of tasks that are running or queued | `worktrees/` 215 MB (full checkout at 100M lines: 5.78 GB each, section 8) | internal | never while the task is live: every check and rebuild reads it |
+| Hot build folders: `build/` and, after F3, the subfolders of shards with merges in the last `sweep_older_than_days` = 7 days | `build/` 861 MB | internal | never while hot: the queue's check time (median 109 s, section 0) is on every merge |
+| Cold build caches: shard subfolders untouched for more than 7 days | part of the 0.19-0.48 TB above (ESTIMATE) | external | trigger above. First `cargo sweep` (0.8.0 installed on this machine, `cargo sweep --version`); then move what is left. A cold cache is reproducible, so a lost copy costs one rebuild |
+| Archived evidence: `state/evidence-archive/` (its own Git repo, `scripts/archive_evidence.py`) and `state/queue/` | `state/` 45 MB (4.3 GB at 28k tasks, 32 GB at 208k, section 8) | external copy; the internal copy stays until Lazlo approves its deletion | trigger above, or the archive repo passes 10 GB (a proposal, ESTIMATE: no measurement picked it); never deleted (AGENTS.md, Resources) |
+| Old worktrees: tasks paused or merged long ago | part of the worktree line above | merged ones: `git worktree remove`, as today. Unmerged and old: commit, then `git worktree move <worktree> <path on the external drive>`, then `git worktree repair` | trigger above and Lazlo's yes. Committed work is already safe in Git (the branch), so the checkout itself is disposable |
+| Reference data: `reference/camry-2013` (excluded from Git via `.git/info/exclude`) | 317 MB | external | first, when asked: it is large, read-only and not on any build path. Verify with its own `SHA256SUMS.txt` after the copy |
+| Scratch: `scratch/` | 4.1 GB | internal, never moved | wiped by the hourly cleanup after `scratch_max_age_hours` = 24; nothing important lives there |
+
+**How a move stays consistent.** It uses what `docs/MOVING.md` already gives. Every path in `broadsword.toml` is relative to
+`root` and `worktrees_dir`, `install_dir` and the build folder must stay inside `root`, so a cold folder is **not** pointed at
+by a setting; it is moved as a copy outside `root` (for example `<external drive>\broadsword-cold\<class>\`) and recorded in
+`PROGRESS.md`. Moving a worktree needs `git worktree repair` afterwards (MOVING.md, "On the new PC", step 2), the same step
+as for a whole-project move. If a cold build cache must stay reachable at its old relative path, a directory junction from
+`build/<shard>` to the external folder would do it without changing a setting; that is **untested here** and would be
+its own task with a test. The whole-project move to the external drive (MOVING.md, "Before unplugging" checklist) is a
+different operation and stays available.
+
+**Not decided here.** What happens when the external drive is not plugged in: a cold class is by definition not read by
+a build, but a coder who asks for old evidence must be told it is on the external drive, not that it is missing. A
+follow-up would write a one-line `COLD.md` note listing what moved (proposal).
+
 ### CPU
 
 - One full check at size: 98-175 h on this PC (section 0). Affected checks inside the 50k-line budget: about 251 s.
@@ -570,3 +635,4 @@ command itself runs.
 4. Per-shard audits in place of one whole-project audit at size (section 8).
 5. Installing cargo-sweep (section 8, disk).
 6. A C ABI (`-capi`) boundary for the shared core, alongside the Rust API (section 3).
+7. The hot and cold disk strategy and its 20% free trigger, and any first move to the external drive (section 8, Disk strategy).
