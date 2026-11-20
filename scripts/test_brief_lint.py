@@ -332,6 +332,33 @@ class ClaimGapRules(unittest.TestCase):
                                     "- adds a new flag `--per-project`")), [])
         self.assertEqual(gaps(brief("`src/a.rs`", "- adds a new flag `--x`")), [])  # not a broadsword brief
 
+    def _parser_repo(self, source):
+        d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_r3_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        f = d / "crates" / "broadsword" / "src" / "tools.rs"
+        f.parent.mkdir(parents=True)
+        f.write_text(source, encoding="utf-8")
+        return str(d)
+
+    def test_r3_with_root_a_flag_absent_from_the_parser_is_new_whatever_the_wording(self):
+        claims = "`crates/broadsword/src/recover.rs`"
+        root = self._parser_repo('["recover", "--all"] => ...')
+        # no new/add word at all, as in the recovery brief: still FAIL because the parser has no --abandon
+        req = "- `recover --abandon <id>` of a dead job must not be refused"
+        self.assertEqual(self.levels(brief(claims, req), root), {("R3", "FAIL")})
+        # a flag the parser already has stays advisory, even when the sentence says "add"
+        self.assertEqual(self.levels(brief(claims, "- add a check to `recover --all`"), root), {("R3", "WARN")})
+        # without --root the wording decides, as before
+        self.assertEqual(self.levels(brief(claims, req)), {("R3", "WARN")})
+        # an unreadable parser file is reported, not silently trusted
+        g = gaps(brief(claims, req), str(pathlib.Path(root) / "nowhere"))
+        self.assertIn("could not read", " ".join(m for _, _, m in g))
+
+    def test_r3_and_r2_ignore_negated_sentences(self):
+        claims = "`crates/broadsword/src/queue.rs`"
+        self.assertEqual(self.levels(brief(claims, "- do not add a `--force` flag")), {("R3", "WARN")})  # not FAIL
+        self.assertEqual(gaps(brief("`src/a.rs`", "- no new `foo` submodule is needed")), [])
+
     def test_r4_new_required_key_needs_config_toml_and_support(self):
         req = "- a new required setting turns it on"
         g = gaps(brief("`crates/broadsword/src/queue.rs`", req))
@@ -352,7 +379,7 @@ class ClaimGapRules(unittest.TestCase):
         text = brief("`a.rs`", "- change `guard_refusal()`")
         g = gaps(text, str(d))
         self.assertEqual([(r, lv) for r, lv, _ in g], [("R5", "WARN")])
-        self.assertIn("b.rs", g[0][2])
+        self.assertIn("b.rs:1", g[0][2])  # git grep -n: file and line
         self.assertNotIn("a.rs", g[0][2])
         self.assertEqual(gaps(text), [])  # no --root: R5 is skipped
 

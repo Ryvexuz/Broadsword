@@ -48,6 +48,7 @@ A brief with no Claims line or no Done check section fails (fail closed).
 Exit codes: 0 every brief passes, 1 some rule failed, 2 usage error or unreadable file.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -230,6 +231,7 @@ OTHER_TASK_RE = re.compile(r"\bn\d+-\d+[a-z]?\s+(?:copies|updates|edits|creates|
 OTHER_REPO_RE = re.compile(r"Broadsword's\s+`?[^\s`]+`?")
 FLAG_RE = re.compile(r"(?<![\w-])--[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
 NEW_WORD_RE = re.compile(r"\b(?:new|add|adds|adding|added|introduce|introduces|accept|accepts)\b", re.I)
+NEGATED_RE = re.compile(r"\b(?:no|not|never|without)\b|n't\b", re.I)
 CONFIG_KEY_RE = re.compile(r"\bnew\s+required\s+(?:config(?:uration)?\s+)?(?:setting|key)s?\b", re.I)
 SYMBOL_RE = re.compile(r"^[A-Za-z_]\w*(?:::\w+)*(?:\(\))?$")
 SENT_RE = re.compile(r"(?<=[.!?])\s+|;\s+|\n")
@@ -338,7 +340,7 @@ def claim_gaps(text, root=None):
 
     names = set(re.findall(r"\bpub\s+mod\s+(\w+)\s*;", req))
     for sent in SENT_RE.split(req):
-        if re.search(r"\bsubmodules?\b", sent, re.I):
+        if re.search(r"\bsubmodules?\b", sent, re.I) and not NEGATED_RE.search(sent):
             names |= {t for t in TICKS_RE.findall(sent) if re.fullmatch(r"\w+", t)}
     miss = sorted(n for n in names
                   if not any(re.search(rf"(?:^|/){re.escape(n)}(?:/mod)?\.\w+$", c) for c in claims))
@@ -347,15 +349,34 @@ def claim_gaps(text, root=None):
                     + ", ".join(miss)))
 
     if any(c.startswith("crates/broadsword/") for c in claims) and not covers(claims, TOOLS_RS):
-        fresh, old = [], []
+        flags = []
+        word_new = set()
         for sent in SENT_RE.split(req):
             for f in FLAG_RE.findall(sent):
-                (fresh if NEW_WORD_RE.search(sent) else old).append(f)
+                if f not in flags:
+                    flags.append(f)
+                if NEW_WORD_RE.search(sent) and not NEGATED_RE.search(sent):
+                    word_new.add(f)
+        parser = None
+        if root and flags:
+            try:
+                with open(os.path.join(root, TOOLS_RS), encoding="utf-8") as fh:
+                    parser = fh.read()
+            except (OSError, UnicodeDecodeError) as e:
+                res.append(("R3", "WARN", f"could not read {TOOLS_RS} under --root to tell new flags from "
+                            f"existing ones, judging by wording only: {e}"))
+        if parser is not None:
+            # With the parser source at hand, "new" means "not in it today", whatever the wording.
+            fresh = [f for f in flags if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", parser)]
+        else:
+            fresh = sorted(word_new)
+        old = [f for f in flags if f not in fresh]
         if fresh:
-            res.append(("R3", "FAIL", f"new flag(s) {', '.join(sorted(set(fresh)))} but {TOOLS_RS} "
+            how = "absent from the current parser" if parser is not None else "worded as new"
+            res.append(("R3", "FAIL", f"new flag(s) {', '.join(sorted(fresh))} ({how}) but {TOOLS_RS} "
                         "(the parser) is not claimed"))
-        elif old:
-            res.append(("R3", "WARN", f"flag(s) {', '.join(sorted(set(old)))} named in Requirements; "
+        if old:
+            res.append(("R3", "WARN", f"flag(s) {', '.join(sorted(old))} named in Requirements; "
                         f"{TOOLS_RS} (the parser) is not claimed: does a parser or call site there change?"))
 
     if CONFIG_KEY_RE.search(req):
@@ -374,7 +395,7 @@ def claim_gaps(text, root=None):
                     syms.append(s)
         for s in syms:
             try:
-                r = subprocess.run(["git", "-C", root, "grep", "-l", "-w", "-F", "--", s],
+                r = subprocess.run(["git", "-C", root, "grep", "-n", "-w", "-F", "--", s],
                                    capture_output=True, text=True, encoding="utf-8")
             except OSError as e:
                 res.append(("R5", "WARN", f"git grep for `{s}` could not run: {e}"))
@@ -382,9 +403,14 @@ def claim_gaps(text, root=None):
             if r.returncode > 1:
                 res.append(("R5", "WARN", f"git grep for `{s}` failed: {r.stderr.strip()[:80]}"))
                 continue
-            files = [f for f in r.stdout.split() if not covers(claims, f)]
-            if files:
-                res.append(("R5", "WARN", f"`{s}` is defined or used in unclaimed: " + ", ".join(files)))
+            hits = {}
+            for ln in r.stdout.splitlines():
+                m = re.match(r"(.+?):(\d+):", ln)
+                if m and not covers(claims, m.group(1)):
+                    hits.setdefault(m.group(1), m.group(2))
+            if hits:
+                res.append(("R5", "WARN", f"`{s}` is defined or used in unclaimed: "
+                            + ", ".join(f"{f}:{n}" for f, n in hits.items())))
     return res
 
 
