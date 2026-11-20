@@ -27,7 +27,9 @@ Two gates sit at the lowest level every GPT call passes through: the cap and led
 
 1. Daily spend cap (Lazlo 2026-11-19: GPT reviews may draw on the OpenAI overflow credits, at most $20 a day). Every call that gets
    past the gates is appended as one row to <state_dir>/gpt-spend/<UTC date>.tsv (utc, caller, model, input_tokens, output_tokens,
-   est_usd, plan_or_credits) under an OS lock. Before a call (a codex attempt and an API fallback are each a call), if today's est_usd sum is >= the cap, no model is called: the result
+   est_usd, plan_or_credits, call_type) under an OS lock. Older files have 7 columns (no call_type); they are never rewritten and
+   still sum correctly, and scripts/usage_sum.py reads their rows as call_type "unknown". `call_type` comes from OPENAI_REVIEW_CALL_TYPE
+   (gate, shadow, full or bench; "unknown" if unset or blank). Before a call (a codex attempt and an API fallback are each a call), if today's est_usd sum is >= the cap, no model is called: the result
    is is_error with codex_error "daily_cap_reached: <sum> of <cap>" (callers record SKIPPED), and CAP-REACHED-<date>.txt is written
    once. THE ESTIMATE IS CONSERVATIVE: tokens x list price from bench/models.json, and calls the ChatGPT plan answered are counted
    at list price too, so the sum can only over-state what the credits were charged. A model with no listed price counts at the
@@ -407,7 +409,7 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
 GPT_DAILY_CAP_USD = 20.0
 # USD per million tokens, used only when bench/models.json lists NO price for any model (it holds none today). Deliberately high.
 UNPRICED_USD_PER_MTOK = {"input": 30.0, "output": 120.0}
-LEDGER_COLUMNS = ("utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits")
+LEDGER_COLUMNS = ("utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits", "call_type")
 CANARY_SHARE = 0.5  # the offline canary may use at most this part of what is left of the deadline, so codex keeps the rest
 LEDGER_LOCK_WAIT = 10.0  # seconds to wait for the ledger's OS lock
 
@@ -560,8 +562,9 @@ def record_spend(root: Path, environ, model: str, result: dict, backend: str) ->
             pin, pout = model_prices(root, str(name))
             tin, tout, est = tin + i, tout + o, est + (i * pin + o * pout) / 1e6
     caller = (environ.get("OPENAI_REVIEW_CALLER") or "unlabelled").replace("\t", " ").replace("\n", " ")
+    call_type = " ".join((environ.get("OPENAI_REVIEW_CALL_TYPE") or "").split()) or "unknown"  # one line, one cell, never empty
     label = ("codex-plan" if backend == "codex" else "api-credits") + ("" if not result.get("is_error") else "-failed")
-    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), caller, model, str(tin), str(tout), f"{est:.6f}", label])
+    row = "\t".join([datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), caller, model, str(tin), str(tout), f"{est:.6f}", label, call_type])
     folder = spend_dir(root)
     day = utc_today()
     with ledger_lock(folder / f"{day}.lock"):

@@ -571,13 +571,65 @@ class ReviewTests(unittest.TestCase):
         j2 = json.loads(self.run_script(codex="ok", root=root).stdout)
         self.assertEqual(j2["backend"], "codex")
         lines = self.ledger_lines(root)
-        self.assertEqual(lines[0].split("\t"), ["utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits"])
+        self.assertEqual(lines[0].split("\t"), ["utc", "caller", "model", "input_tokens", "output_tokens", "est_usd", "plan_or_credits", "call_type"])
         self.assertEqual(len(lines), 3, "one header and one row per call")
         first = lines[1].split("\t")
         self.assertEqual(first[1:5], ["shadow", "gpt-5.6-sol", "50", "7"])
         self.assertAlmostEqual(float(first[5]), (50 * 30 + 7 * 120) / 1e6, places=6, msg="no price listed anywhere: the built-in high price, never 0")
         self.assertEqual(first[6], "codex-plan")
         self.assertEqual(lines[2].split("\t")[1], "unlabelled")
+
+    OLD_HEADER = "utc\tcaller\tmodel\tinput_tokens\toutput_tokens\test_usd\tplan_or_credits\n"
+
+    def plant_raw(self, root, text):
+        d = root / "state" / "gpt-spend"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{self.today()}.tsv").write_text(text, encoding="utf-8")
+
+    def test_a_new_row_has_a_call_type_from_the_environment_and_unknown_when_unset_or_blank(self):
+        root = self.make_root()
+        for env in ({"OPENAI_REVIEW_CALL_TYPE": "gate"}, {}, {"OPENAI_REVIEW_CALL_TYPE": "  "}, {"OPENAI_REVIEW_CALL_TYPE": "a\tb\nc"}):
+            self.run_script(codex="ok", root=root, env=env)
+        rows = [l.split("\t") for l in self.ledger_lines(root)[1:]]
+        self.assertEqual([len(r) for r in rows], [8, 8, 8, 8])
+        self.assertEqual([r[7] for r in rows], ["gate", "unknown", "unknown", "a b c"])
+
+    def test_an_old_seven_column_file_gives_the_same_cap_sum_and_is_not_rewritten(self):
+        root = self.make_root()
+        old = self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t19.99\tcodex-plan\n"
+        self.plant_raw(root, old)
+        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertEqual(j["backend"], "codex", j)
+        text = (root / "state" / "gpt-spend" / f"{self.today()}.tsv").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(old), "the old header and row are untouched; the new row is only appended")
+        root2 = self.make_root()
+        self.plant_raw(root2, self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t20.0\tcodex-plan\n")
+        j = json.loads(self.run_script(codex="ok", root=root2).stdout)
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+
+    def test_a_mixed_file_sums_old_and_new_rows(self):
+        root = self.make_root()
+        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\told\tgpt-5.6-sol\t1\t1\t12.5\tcodex-plan\n"
+                       "2026-01-01T00:00:01Z\tnew\tgpt-5.6-sol\t1\t1\t7.5\tapi-credits\tshadow\n")
+        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.assertEqual(j["codex_error"], "daily_cap_reached: 20.0000 of 20")
+        self.assertFalse((self.codex_dir / "started").exists())
+        self.assertEqual(Fake.seen, [])
+
+    def test_a_malformed_row_still_fails_closed_in_old_new_and_mixed_files(self):
+        for name, body in (("old", "2026-01-01T00:00:00Z\tp\tm\t1\t1\tnot-a-number\tcodex-plan\n"),
+                           ("new", "2026-01-01T00:00:00Z\tp\tm\t1\t1\tnot-a-number\tcodex-plan\tgate\n"),
+                           ("short", "2026-01-01T00:00:00Z\tp\tm\n"),
+                           ("mixed", "2026-01-01T00:00:00Z\tp\tm\t1\t1\t0.5\tcodex-plan\n2026-01-01T00:00:00Z\tp\tm\t1\t1\t\tcodex-plan\tgate\n")):
+            with self.subTest(name=name):
+                Fake.seen = []
+                root = self.make_root()
+                self.plant_raw(root, self.OLD_HEADER + body)
+                j = json.loads(self.run_script(codex="ok", root=root).stdout)
+                self.assertTrue(j["is_error"], j)
+                self.assertIn("unreadable row", j["result"] + j.get("codex_error", ""))
+                self.assertFalse((self.codex_dir / "started").exists(), "no codex process")
+                self.assertEqual(Fake.seen, [], "no API call")
 
     def test_an_unpriced_model_counts_at_the_highest_listed_price(self):
         self.addCleanup(setattr, self, "models_json", MODELS_JSON)
@@ -704,7 +756,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(sum(1 for x in lines if x.startswith("utc\t")), 1)
         for who in "ABC":
             self.assertEqual(sum(1 for x in lines[1:] if x.split("\t")[1] == who), 40)
-        self.assertTrue(all(len(x.split("\t")) == 7 for x in lines), "no row is torn")
+        self.assertTrue(all(len(x.split("\t")) == 8 for x in lines), "no row is torn")
 
     def test_codex_failing_falls_back_and_records_why(self):
         for mode, needle in (("fail", "code 1"), ("empty", "empty")):
