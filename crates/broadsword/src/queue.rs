@@ -203,6 +203,15 @@ pub fn gating_model<'a>(cfg: &'a Config, risk: &str, coder: &str) -> Result<(&'a
     }
 }
 
+/// The `--effort` the gating call gets: `reviewer_effort_high` for `high` risk, none (empty) for `low`.
+fn effort_for<'a>(cfg: &'a Config, risk: &str) -> &'a str {
+    if risk == "high" {
+        &cfg.reviewer_effort_high
+    } else {
+        ""
+    }
+}
+
 /// Same model? Compared by family (`sonnet` and `claude-sonnet-4-5` are the same), case-insensitively.
 fn same_model(a: &str, b: &str) -> bool {
     reviewer::model_family(a) == reviewer::model_family(b)
@@ -796,7 +805,7 @@ impl<'a> Run<'a> {
         if ahead == 0 {
             return Err(self.blocked(&format!("nothing to merge: `{branch}` has no commit that `{main_branch}` lacks")));
         }
-        self.log("preconditions", &format!("ok: main `{main_branch}` clean, worktree clean, task running, {ahead} commit(s) to merge, reviewer `{model}`{why} differs from coder `{coder}`"))
+        self.log("preconditions", &format!("ok: main `{main_branch}` clean, worktree clean, task running, {ahead} commit(s) to merge, reviewer `{model}`{why}, effort `{}`, differs from coder `{coder}`", effort_for(self.cfg, self.e.get("risk"))))
     }
 
     fn abort_stale_rebase(&mut self) -> R<()> {
@@ -953,6 +962,8 @@ impl<'a> Run<'a> {
         }
         self.e.set("reviewed_tip", checked.clone());
         self.e.set("reviewer_model", model.clone());
+        let effort = effort_for(self.cfg, self.e.get("risk")).to_string();
+        self.e.set("reviewer_effort", effort.clone());
         self.e.set("reviewer_cli", cli.path.clone());
         self.e.set("test_hook", if cli.test_hook { "true" } else { "false" });
         // counted BEFORE the call, so a run that dies in the middle of it still paid for one
@@ -966,7 +977,7 @@ impl<'a> Run<'a> {
         let prompt = self.secrets.redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff));
         let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), self.cfg.redact_min_chars) } else { String::new() };
         self.log("review", &format!("calling the {} reviewer `{model}` through {}{} on {} (diff {} bytes, commit {}, call {} of at most {}); this spends money and uses the network{short_note}", backend.name(), cli.path, if cli.test_hook { " [TEST HOOK]" } else { "" }, if self.e.get("risk") == "high" { "a high-risk change" } else { "a low-risk change" }, diff.len(), short(&checked), calls + 1, self.cfg.reviewer_max_calls_per_entry))?;
-        let review = match backend.call(self.cfg, &cli, &model, &prompt) {
+        let review = match backend.call(self.cfg, &cli, &model, &effort, &prompt) {
             Ok(r) => r,
             Err(CallError::Timeout(s)) => return Err(self.blocked(&format!("the reviewer `{model}` gave no answer within {s} s (reviewer_timeout_seconds) and was killed: no verdict, nothing merged. Run `queue run --entry {}` to ask again", self.e.id()))),
             Err(CallError::Start(m) | CallError::Failed(m)) => return Err(self.blocked(&format!("the reviewer `{model}` could not be used: {m}. No verdict, nothing merged. Fix it, then `queue run --entry {}`", self.e.id()))),

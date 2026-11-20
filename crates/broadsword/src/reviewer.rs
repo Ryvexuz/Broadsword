@@ -327,7 +327,7 @@ pub trait ReviewBackend {
     fn name(&self) -> &'static str;
     /// Work out which program a call would run, and refuse a forbidden one, WITHOUT calling it.
     fn prepare(&self, cfg: &Config) -> Result<Cli, String>;
-    fn call(&self, cfg: &Config, cli: &Cli, model: &str, prompt: &str) -> Result<Review, CallError>;
+    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, prompt: &str) -> Result<Review, CallError>;
 }
 
 /// The backend `reviewer_backend` names (config validation already refused anything but `claude`).
@@ -410,10 +410,13 @@ impl ReviewBackend for ClaudeCli {
         resolve_cli(cfg)
     }
 
-    fn call(&self, cfg: &Config, cli: &Cli, model: &str, prompt: &str) -> Result<Review, CallError> {
+    fn call(&self, cfg: &Config, cli: &Cli, model: &str, effort: &str, prompt: &str) -> Result<Review, CallError> {
         let cwd = cfg.scratch_dir.join("review-cwd");
         std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
-        let args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
+        let mut args: Vec<String> = ["-p", "--system-prompt", SYSTEM_PROMPT, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()).collect();
+        if !effort.is_empty() {
+            args.extend(["--effort".to_string(), effort.to_string()]);
+        }
         let env: Vec<(String, String)> = std::env::vars().collect();
         let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
         let out = run_cli(&cli.path, &args, &cwd, &remove, prompt, Duration::from_secs(cfg.reviewer_timeout_seconds))?;

@@ -50,6 +50,7 @@ const BASE: &[(&str, &str)] = &[
     ("reviewer_model_low", "\"haiku\""),
     ("reviewer_model_high", "\"opus\""),
     ("reviewer_model_high_fallback", "\"sonnet\""),
+    ("reviewer_effort_high", "\"high\""),
     ("reviewer_timeout_seconds", "5"),
     ("reviewer_diff_max_kb", "200"),
     ("reviewer_brief_max_kb", "32"),

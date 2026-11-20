@@ -548,6 +548,7 @@ fn high_review(name: &str, coder: &str) -> (String, String) {
 fn an_opus_coded_high_entry_is_reviewed_by_sonnet() {
     let (calls, out) = high_review("hifb", "opus");
     assert!(calls.contains("--model\u{1f}sonnet") && !calls.contains("--model\u{1f}opus"), "{calls}");
+    assert!(calls.contains("--effort\u{1f}high") && out.contains("effort `high`"), "{calls}{out}");
     assert!(out.contains("fallback: coder is opus"), "{out}");
 }
 
@@ -992,6 +993,17 @@ fn a_task_with_a_blocked_or_stale_entry_cannot_be_queued_again() {
     assert!(o.stderr.contains(&e) && o.stderr.contains("stale"), "{}", o.stderr);
     assert_eq!(r.run(&["queue", "cancel", &e]).code, 0);
     assert_eq!(r.run(&["queue", "add", &id, "--risk", "low", "--coder", "sonnet"]).code, 0, "a cancelled entry does not block");
+}
+
+#[test]
+fn a_low_entry_passes_no_effort_flag_and_records_none() {
+    let r = Root::new("loweff", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    assert_eq!(r.run(&["queue", "run"]).code, 0);
+    assert!(!fs::read_to_string(r.fake_out.join("calls.log")).unwrap().contains("--effort"));
+    assert_eq!(r.field(&e, "reviewer_effort"), "");
 }
 
 #[test]
