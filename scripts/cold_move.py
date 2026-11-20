@@ -70,10 +70,15 @@ name, never half-live at the source path, and the item is reported
 "FAILED ...: at step remove: leftover kept at <quarantine path>"; the verified copy and, for a
 worktree, git's record (which already points at the copy) are never touched. A partial copy is
 removed the same way, and only the temp name this run created.
-Remaining race window (not closed): between the lstat checks of an entry's folders and the
-chmod/unlink call on that entry, and in the folders above the item (its parent is not checked),
-a swap could still redirect one call; the random quarantine name makes a swap aimed at the
-source path miss.
+Known residual race (accepted, not closed). The threat model is agents' mistakes, not a local
+attacker. delete_tree re-checks an entry and every folder above it immediately before each
+chmod, unlink and rmdir, and scan_tree re-checks each folder (link, reparse point, and the
+st_dev/st_ino it was first seen with) immediately before listing it. What is left: a concurrent
+process swapping a folder inside the quarantine, whose random name only this run knows, for a
+junction between that check and the call right after it (microseconds apart) could redirect
+that one call; and the folders above the item (its parent) are not checked. Closing it fully
+needs handle-relative deletion (FILE_FLAG_OPEN_REPARSE_POINT plus delete-by-handle), which this
+path-based script does not do.
 With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
 exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
 name next to the target, is verified, then renamed into place; an error removes only that temp
@@ -154,6 +159,11 @@ def scan_tree(top):
     (size, mtime_ns). A file top gives files {".": ...}. Raises LinkFound when top or anything
     under it is a link (symlink, junction, other reparse point), OSError when a folder cannot be
     read or an entry is neither a plain file nor a folder (fail closed, never skipped).
+
+    Each folder's (st_dev, st_ino) is recorded from an lstat when it is first seen, and the
+    folder is lstat'ed again immediately before its os.scandir: a link or reparse point, or a
+    different (st_dev, st_ino) (the folder was swapped while queued), raises LinkFound, so a
+    junction swapped in between queueing and listing is never listed through.
     """
     st = os.lstat(top)
     if is_link_stat(st):
@@ -163,9 +173,13 @@ def scan_tree(top):
     if not stat.S_ISDIR(st.st_mode):
         raise OSError(f"{top} is neither a plain file nor a folder")
     dirs, files = set(), {}
-    stack = [(Path(top), "")]
+    stack = [(Path(top), "", (st.st_dev, st.st_ino))]
     while stack:
-        folder, rel = stack.pop()
+        folder, rel, ident = stack.pop()
+        now = os.lstat(folder)  # immediately before the listing
+        if (is_link_stat(now) or not stat.S_ISDIR(now.st_mode)
+                or (now.st_dev, now.st_ino) != ident):
+            raise LinkFound(rel or ".")
         with os.scandir(folder) as it:
             entries = sorted(it, key=lambda e: e.name)
         for e in entries:
@@ -174,8 +188,11 @@ def scan_tree(top):
             if is_link_stat(est) or e.is_junction():
                 raise LinkFound(r)
             if stat.S_ISDIR(est.st_mode):
+                seen = os.lstat(e.path)  # DirEntry has no st_ino on Windows; lstat records it
+                if is_link_stat(seen) or not stat.S_ISDIR(seen.st_mode):
+                    raise LinkFound(r)
                 dirs.add(r)
-                stack.append((Path(e.path), r))
+                stack.append((Path(e.path), r, (seen.st_dev, seen.st_ino)))
             elif stat.S_ISREG(est.st_mode):
                 files[r] = (est.st_size, est.st_mtime_ns)
             else:

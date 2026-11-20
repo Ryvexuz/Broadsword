@@ -1084,5 +1084,74 @@ class Quarantine(Fixture):
         self.assertEqual(len([p for p in wt.parent.iterdir() if ".cold-quarantine-" in p.name]), 1)
 
 
+class ScanSwap(Fixture):
+    """Review q-20261120-224242: a folder swapped for a junction after scan_tree queued it and
+    before it is listed is never listed through."""
+
+    def setUp(self):
+        super().setUp()
+        self.ev1 = self.root / "evidence" / "ev1"
+        put(self.ev1 / "sub" / "f.txt", "inside data")
+        self.outside = Path(self.tmp.name).resolve() / "outside_ls"
+        put(self.outside / "o.txt", "outside data")
+
+    def swap_after_listing(self, parent):
+        """Patch os.scandir: the listing of `parent` is taken, then (once) parent/sub is swapped
+        for a junction to outside_ls, so sub is queued as a plain folder but is a junction by
+        the time it is listed."""
+        real_scandir = os.scandir
+        state = {"done": False}
+
+        @contextlib.contextmanager
+        def listed(entries):
+            yield iter(entries)
+
+        def scandir(path="."):
+            if not state["done"] and Path(path) == parent:
+                with real_scandir(path) as it:
+                    entries = list(it)
+                state["done"] = True
+                os.rename(parent / "sub", parent / "sub-moved-away")
+                if not junction(parent / "sub", self.outside):
+                    self.skipTest("cannot make an NTFS junction here")
+                return listed(entries)
+            return real_scandir(path)
+
+        return state, mock.patch.object(cold_move.os, "scandir", scandir)
+
+    def test_scan_tree_refuses_a_folder_swapped_after_it_was_queued(self):
+        state, patch = self.swap_after_listing(self.ev1)
+        with patch:
+            try:
+                result = cold_move.scan_tree(self.ev1)
+            except cold_move.LinkFound as e:
+                result = e
+        self.assertTrue(state["done"])
+        self.assertIsInstance(result, cold_move.LinkFound, f"listed through the junction: {result}")
+        self.assertEqual(result.where, "sub")
+
+    def test_folder_swapped_after_its_first_lstat_is_caught_before_listing(self):
+        """The swap lands after the lstat that records sub's (st_dev, st_ino) and before the
+        lstat right before its os.scandir, so only that pre-listing check can catch it."""
+        real_lstat = os.lstat
+        sub = self.ev1 / "sub"
+        state = {"done": False}
+
+        def lstat(path, *a, **k):
+            result = real_lstat(path, *a, **k)
+            if not state["done"] and Path(path) == sub:
+                state["done"] = True
+                os.rename(sub, self.ev1 / "sub-moved-away")
+                if not junction(sub, self.outside):
+                    self.skipTest("cannot make an NTFS junction here")
+            return result
+
+        with mock.patch.object(cold_move.os, "lstat", lstat):
+            with self.assertRaises(cold_move.LinkFound) as cm:
+                cold_move.scan_tree(self.ev1)
+        self.assertTrue(state["done"])
+        self.assertEqual(cm.exception.where, "sub")
+
+
 if __name__ == "__main__":
     unittest.main()
