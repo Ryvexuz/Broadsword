@@ -1331,12 +1331,31 @@ impl<'a> Run<'a> {
         if head != commit {
             return TrainCheck::Blocked(format!("the worktree of task {task_id} is at {} instead of {}: the interim check can only check a commit its worktree has checked out", short(&head), short(commit)));
         }
+        match wtgit::status_porcelain_plain(&self.wt) {
+            Ok(s) if s.is_empty() => {}
+            Ok(s) => return TrainCheck::Blocked(format!("the worktree of task {task_id} has uncommitted or untracked changes ({}); the check would not be of commit {} alone, so it did not run", some(&s), short(commit))),
+            Err(m) => return TrainCheck::Blocked(m),
+        }
         println!("queue entry {}: check {project} --task {task_id} ({what}; commit {})", self.e.id(), short(commit));
         let mut info = JobInfo::default();
-        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
+        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.clone()) }, &mut info);
         let summary = info.summary.join("\n");
         let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
         let job_id = info.id.clone().unwrap_or_default();
+        // The check is bound to `commit` only if the worktree still holds exactly that commit, with nothing else, when it ends (the
+        // single-entry path's "branch changed during the check" guard). Whatever the verdict, a changed worktree gives none.
+        let head_after = match wtgit::head_commit(&self.wt) {
+            Ok(h) => h,
+            Err(m) => return TrainCheck::Blocked(format!("the worktree of task {task_id} could not be read after the check (job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
+        };
+        if head_after != commit {
+            return TrainCheck::Blocked(format!("the worktree of task {task_id} changed during the check (job {}): it was at {} when the check started and is at {} now; the check is not of that commit, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, short(commit), short(&head_after)));
+        }
+        match wtgit::status_porcelain_plain(&self.wt) {
+            Ok(s) if s.is_empty() => {}
+            Ok(s) => return TrainCheck::Blocked(format!("the worktree of task {task_id} changed during the check (job {}): it got uncommitted or untracked changes ({}); the check is not of commit {} alone, nothing was merged", if job_id.is_empty() { "none" } else { job_id.as_str() }, some(&s), short(commit))),
+            Err(m) => return TrainCheck::Blocked(format!("the worktree of task {task_id} could not be read after the check (job {}): {m}", if job_id.is_empty() { "none" } else { job_id.as_str() })),
+        }
         match code {
             0 => TrainCheck::Pass { job: job_id, summary, tail },
             1 if !info.summary.is_empty() => TrainCheck::Fail { job: job_id, summary, tail },

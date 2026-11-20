@@ -1947,6 +1947,32 @@ fn a_train_killed_mid_check_leaves_main_unmoved_and_the_next_drain_merges_all_th
     assert!(git(&r.p(), &["rev-list", "--merges", "HEAD"]).is_empty());
 }
 
+/// The train's check runs in the last member's worktree. A file left there while the check runs (an agent still editing) means the
+/// check was not of the recorded commit alone: the check gives no verdict, nothing merges and main does not move.
+#[test]
+fn a_train_whose_checked_worktree_changes_during_the_check_merges_nothing() {
+    let r = train_root("traindirty", 4);
+    let hang = "\n#[cfg(test)]\nmod hang {\n    #[test]\n    fn waits_while_the_flag_exists() {\n        let flag = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"../../../train-hang.flag\");\n        for _ in 0..600 {\n            if !flag.exists() {\n                break;\n            }\n            std::thread::sleep(std::time::Duration::from_millis(100));\n        }\n    }\n}\n";
+    let (_, e1) = queued_claim(&r, "src/a.txt", "src/a.txt", "x\n", "task: a");
+    let (_, e2) = queued_claim(&r, "src/b.txt", "src/b.txt", "x\n", "task: b");
+    let (t3, e3) = queued_claim(&r, "src/lib.rs", "src/lib.rs", &lib_with(hang), "task: c with a hanging test");
+    let before = r.head();
+    let flag = r.dir.join("train-hang.flag");
+    fs::write(&flag, "1").unwrap();
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    wait_for("the train's check to start", 240, || !r.field(&e3, "position in the train").is_empty() && jobs_of(&r, "check") >= 1);
+    fs::write(r.wt(&t3).join("stray.txt"), "written while the check ran\n").unwrap();
+    fs::remove_file(&flag).unwrap();
+    let status = child.wait().unwrap();
+    assert_ne!(status.code(), Some(0), "the drain must not report success");
+    assert_eq!(r.head(), before, "main did not move");
+    for e in [&e1, &e2, &e3] {
+        assert_eq!(r.status(e), "approved", "{e}: reason = {}", r.field(e, "reason"));
+    }
+    assert!(r.field(&e3, "reason").contains("changed during the check"), "reason = {}", r.field(&e3, "reason"));
+    assert!(r.field(&e3, "reason").contains("stray.txt"), "reason = {}", r.field(&e3, "reason"));
+}
+
 #[test]
 fn an_approved_entry_run_on_its_own_is_checked_first_and_never_merges_unchecked() {
     let (r, es, before) = killed_train("trainsolo");
