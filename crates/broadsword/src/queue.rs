@@ -61,7 +61,9 @@
 //! MERGE TRAIN (`merge_train_max` > 1, only in `queue run --all`; 1 = off, every entry as before). The per-entry review is unchanged
 //! (own diff, own brief, own gate reviewer, own shadow). What changes is what comes after it: an entry does NOT run its own check
 //! (the review prompt says so) and stops at `approved` when its review PASSes. Approved entries of one project whose task claims do not
-//! overlap form a train of up to merge_train_max entries (a lone one at the end of the drain too): their branches are chained one on
+//! overlap form a train of up to merge_train_max entries (a lone one at the end of the drain too; and a SHORT train, even of 1, as soon
+//! as no entry of that project is left for the drain to run, or its oldest approved entry has waited merge_train_wait_minutes, so one
+//! project's approved entries never wait behind another project's stream: see `short_train_why`): their branches are chained one on
 //! top of the other (rebase), ONE check runs on the chain tip, main is fast-forwarded ONCE and checked ONCE, and every entry is `merged`
 //! with its train id, position and the shared check job. A failing check is bisected (see `run_train`): an entry that fails alone is
 //! `check_failed`, the entries proven good merge; entries that only fail together are all held out and none merges (the first of them
@@ -830,7 +832,9 @@ struct Row {
 /// build on a main nobody has looked at. Prints a summary table; the exit code is the worst outcome (see `badness`).
 ///
 /// MERGE TRAIN (merge_train_max > 1): an entry stops at `approved` after its review PASSed (its own check deferred), and approved
-/// entries are merged in trains (see `run_train`): whenever a full train is ready, and at the end of the drain for whatever is left.
+/// entries are merged in trains (see `run_train`): whenever a full train is ready, whenever a project's short train is due
+/// (`short_train_why`: none of its entries left to run, or its oldest approved entry waited merge_train_wait_minutes), and at the
+/// end of the drain for whatever is left.
 pub fn cmd_run_all(cfg: &Config) -> ExitCode {
     let _q = match queue_lock(cfg) {
         Ok(l) => l,
@@ -870,7 +874,7 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
             Ok(None) => {
                 // MERGE TRAIN: nothing else to run: every approved entry left (even a single one) goes into a last train
                 if train && !approved.is_empty() {
-                    let code = run_trains(cfg, &mut approved, true, &mut rows);
+                    let code = run_trains(cfg, &mut approved, true, &taken, &mut rows);
                     if code == EXIT_ERROR || code == EXIT_MERGED_BAD {
                         stopped = train_stop_note(code);
                         stop_code = code;
@@ -921,7 +925,7 @@ pub fn cmd_run_all(cfg: &Config) -> ExitCode {
         // no new train while a half-finished merge is being finished (`resume_first` entries come first): a train only starts once
         // main's last merge has had its main check
         if train && start < STEP_MERGE && !approved.is_empty() && code != EXIT_ERROR && code != EXIT_MERGED_BAD {
-            train_code = run_trains(cfg, &mut approved, false, &mut rows);
+            train_code = run_trains(cfg, &mut approved, false, &taken, &mut rows);
         }
         let hard = if code == EXIT_ERROR || code == EXIT_MERGED_BAD { code } else { train_code };
         if hard == EXIT_ERROR || hard == EXIT_MERGED_BAD {
@@ -1181,6 +1185,8 @@ impl<'a> Run<'a> {
         let base = self.e.get("base_head").to_string();
         self.e.set("train_up", base);
         self.e.set("status", APPROVED);
+        // when it started to wait: the merge_train_wait_minutes rule (`short_train_why`) measures from here
+        self.e.set("approved_at", now_secs().to_string());
         self.e.set("reason", "the review PASSed; it waits for a merge train (nothing is merged yet)");
         println!("queue entry {}: approved (the review PASSed); it waits for a merge train", self.e.id());
         self.log("review", "approved: the entry joins the next merge train of its project (claims that do not overlap, at most merge_train_max entries)")?;
@@ -2131,7 +2137,15 @@ enum Alone {
 /// `items`. Entries of one project only; an entry whose claims overlap an entry already taken is left out (it waits for a later
 /// train); at most `max` entries. A train is ready when it is full, or when `flush` is set (nothing else is coming) and it holds at
 /// least one entry. Empty when no project has a ready train.
+#[cfg(test)]
 fn pick_train(items: &[(String, Vec<String>)], max: usize, flush: bool) -> Vec<usize> {
+    pick_train_when(items, max, &|_| flush)
+}
+
+/// `pick_train` with readiness per project: a project's train is ready when it is full, or when `ready(project)` and it holds at
+/// least one entry (the flush train of the drain's end is `ready` for every project; `short_train_projects` says which projects get
+/// a short train before the end). Projects are tried in queue order of their oldest approved entry.
+fn pick_train_when(items: &[(String, Vec<String>)], max: usize, ready: &dyn Fn(&str) -> bool) -> Vec<usize> {
     let mut seen: Vec<&str> = Vec::new();
     for (first, (project, _)) in items.iter().enumerate() {
         if seen.contains(&project.as_str()) {
@@ -2148,7 +2162,7 @@ fn pick_train(items: &[(String, Vec<String>)], max: usize, flush: bool) -> Vec<u
                 group.push(i);
             }
         }
-        if group.len() >= max || (flush && !group.is_empty()) {
+        if group.len() >= max || (!group.is_empty() && ready(project)) {
             return group;
         }
     }
@@ -2197,10 +2211,10 @@ fn left_train_text(main: &str, branch: &str, base: &str) -> String {
     format!("left a train: rebase your own commits onto main and queue again. `{branch}` is chained on {}, a commit of other entries of a merge train that is not on `{main}`, so a review or merge of it now would take their code as this entry's. In the task's worktree run `git rebase --onto {main} {base} {branch}`, then run the entry again (`queue run --entry <id>`, or `queue cancel` it and `queue add` the task). If those entries reach `{main}` first, the branch needs nothing and runs as it is", short(base))
 }
 
-/// Take the next train out of `approved` (see `pick_train`), in queue order; the others stay.
-fn take_group<'a>(approved: &mut Vec<(Run<'a>, std::time::Instant)>, max: usize, flush: bool) -> Option<Vec<(Run<'a>, std::time::Instant)>> {
+/// Take the next train out of `approved` (see `pick_train_when`), in queue order; the others stay.
+fn take_group<'a>(approved: &mut Vec<(Run<'a>, std::time::Instant)>, max: usize, ready: &dyn Fn(&str) -> bool) -> Option<Vec<(Run<'a>, std::time::Instant)>> {
     let items: Vec<(String, Vec<String>)> = approved.iter().map(|(r, _)| (r.e.get("project").to_string(), r.claims.clone())).collect();
-    let idx = pick_train(&items, max, flush);
+    let idx = pick_train_when(&items, max, ready);
     if idx.is_empty() {
         return None;
     }
@@ -2284,13 +2298,90 @@ fn settle_approved(cfg: &Config, approved: &mut Vec<(Run<'_>, std::time::Instant
     }
 }
 
-/// Run trains while `approved` holds a ready one (`flush`: any entry is ready). Returns 0, or EXIT_ERROR / EXIT_MERGED_BAD when the
-/// drain must stop.
-fn run_trains<'a>(cfg: &'a Config, approved: &mut Vec<(Run<'a>, std::time::Instant)>, flush: bool, rows: &mut Vec<Row>) -> u8 {
+/// An entry this drain may still run (so its project's approved entries may wait for it to fill their train): not taken by this
+/// drain yet (`taken`; a taken entry is never run again in the same drain, so waiting for it would be waiting for the end), and
+/// queued, running or stale, or a half-finished train merge (`resume_first`): what `next_for_all` can still pick.
+fn still_to_run(x: &Record, taken: &[String]) -> bool {
+    !taken.iter().any(|t| t == x.id()) && (resume_first(x) || matches!(x.status(), QUEUED | RUNNING | STALE))
+}
+
+/// STARVATION RULE, for one project with approved entries waiting: why it gets a train now although the train is not full and the
+/// drain has not ended, or None (it keeps waiting for more of its entries). `approved_at` holds each of its approved entries'
+/// approval time (unix seconds; None when the entry has none that can be read). A train is due when
+///   (a) `pending` is false: no entry of the project is left for this drain to run, so nothing more can join its train; or
+///   (b) its oldest approved entry has waited `wait_minutes` (merge_train_wait_minutes) by `now`.
+/// An entry with no readable approval time (approved before this rule recorded one) counts as having waited long enough: a short
+/// train only merges earlier, through the same chain, check, merge and main check as the flush train of the drain's end. A clock
+/// that went back counts as no wait.
+fn short_train_why(pending: bool, approved_at: &[Option<u64>], now: u64, wait_minutes: u64) -> Option<String> {
+    if approved_at.is_empty() {
+        return None;
+    }
+    if !pending {
+        return Some("no other entry of its project is left to run".into());
+    }
+    if approved_at.iter().any(|a| a.is_none()) {
+        return Some("an approved entry has no readable approval time (`approved_at`), so it counts as having waited merge_train_wait_minutes".into());
+    }
+    let oldest = approved_at.iter().flatten().min().copied().unwrap_or(now);
+    let waited = now.saturating_sub(oldest);
+    (waited >= wait_minutes.saturating_mul(60)).then(|| format!("its oldest approved entry has waited {} s (merge_train_wait_minutes = {wait_minutes})", waited))
+}
+
+/// The projects that get a short train now (`short_train_why`), each with the reason, in the order of `approved` (project, approval
+/// time). `all` is every queue entry (to see what is still to run), `taken` the entries this drain took.
+fn short_train_projects_in(all: &[Record], approved: &[(String, Option<u64>)], taken: &[String], now: u64, wait_minutes: u64) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (project, _) in approved {
+        if out.iter().any(|(p, _)| p == project) {
+            continue;
+        }
+        let times: Vec<Option<u64>> = approved.iter().filter(|(p, _)| p == project).map(|(_, a)| *a).collect();
+        let pending = all.iter().any(|x| x.get("project") == project && still_to_run(x, taken));
+        if let Some(why) = short_train_why(pending, &times, now, wait_minutes) {
+            out.push((project.clone(), why));
+        }
+    }
+    out
+}
+
+/// `short_train_projects_in` on the queue as it is now (read under entries.lock) and the clock.
+fn short_train_projects(cfg: &Config, approved: &[(Run<'_>, std::time::Instant)], taken: &[String]) -> Result<Vec<(String, String)>, String> {
+    let all = {
+        let _l = entries_lock(cfg).map_err(|c| format!("the queue's entries lock could not be taken (exit {})", code_num(c)))?;
+        load_entries(cfg)?
+    };
+    let items: Vec<(String, Option<u64>)> = approved.iter().map(|(r, _)| (r.e.get("project").to_string(), r.e.get_num("approved_at"))).collect();
+    Ok(short_train_projects_in(&all, &items, taken, now_secs(), cfg.merge_train_wait_minutes))
+}
+
+/// Run trains while `approved` holds a ready one. `flush` (the drain's end): every project is ready. Otherwise a project's train is
+/// ready when it is full, or when the starvation rule says so (`short_train_projects`: none of its entries is left to run, or its
+/// oldest approved entry waited merge_train_wait_minutes). A short train is exactly a flush train of that project. `taken`: the
+/// entries this drain took. Returns 0, or EXIT_ERROR / EXIT_MERGED_BAD when the drain must stop.
+fn run_trains<'a>(cfg: &'a Config, approved: &mut Vec<(Run<'a>, std::time::Instant)>, flush: bool, taken: &[String], rows: &mut Vec<Row>) -> u8 {
     let max = cfg.merge_train_max as usize;
     let mut hard = 0u8;
     while hard == 0 {
-        let Some(group) = take_group(approved, max, flush) else { break };
+        let short = if flush {
+            Vec::new()
+        } else {
+            match short_train_projects(cfg, approved, taken) {
+                Ok(s) => s,
+                Err(m) => {
+                    // fail closed: no train is started on a queue that could not be read; the entries stay approved
+                    eprintln!("broadsword: queue run --all: cannot tell which merge trains are due: {m}");
+                    return EXIT_ERROR;
+                }
+            }
+        };
+        let ready = |p: &str| flush || short.iter().any(|(s, _)| s == p);
+        let Some(group) = take_group(approved, max, &ready) else { break };
+        if !flush && group.len() < max {
+            let project = group[0].0.e.get("project").to_string();
+            let why = short.iter().find(|(s, _)| *s == project).map(|(_, w)| w.as_str()).unwrap_or("-");
+            println!("merge train for project {project}: {} of at most {max} entries, not waiting for more: {why}", group.len());
+        }
         hard = run_train(cfg, group, rows);
     }
     hard
@@ -2745,6 +2836,63 @@ mod tests {
             .collect();
         assert_eq!(pick_train(&items, 4, false), vec![0, 1, 2, 3]);
         assert_eq!(pick_train(&items, 1, false), vec![0], "1 = every entry on its own");
+    }
+
+    fn entry(id: &str, project: &str, status: &str) -> Record {
+        Record::parse(Path::new(&format!("{id}.entry")), &format!("id = {id}\nproject = {project}\nstatus = {status}\n"))
+    }
+
+    #[test]
+    fn a_project_with_no_entry_left_to_run_gets_a_short_train_while_another_project_still_has_queued_entries() {
+        // crash-sim has 2 approved entries and nothing left to run; broadsword has 1 approved and more queued (the 2026-11-20 case)
+        let all = vec![entry("q-c1", "crash-sim", APPROVED), entry("q-c2", "crash-sim", APPROVED), entry("q-b1", "broadsword", APPROVED), entry("q-b2", "broadsword", QUEUED)];
+        let approved = vec![("crash-sim".to_string(), Some(1000)), ("crash-sim".to_string(), Some(1010)), ("broadsword".to_string(), Some(1020))];
+        let taken: Vec<String> = ["q-c1", "q-c2", "q-b1"].iter().map(|s| s.to_string()).collect();
+        let short = short_train_projects_in(&all, &approved, &taken, 1030, 20);
+        assert_eq!(short.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["crash-sim"], "{short:?}");
+        assert!(short[0].1.contains("no other entry"), "{short:?}");
+        // the train that forms is BOTH crash-sim entries (a train of 2 of at most 4), not one, and broadsword's waits
+        let items = vec![item("crash-sim", &["a"]), item("crash-sim", &["b"]), item("broadsword", &["c"])];
+        let ready = |p: &str| short.iter().any(|(s, _)| s == p);
+        assert_eq!(pick_train_when(&items, 4, &ready), vec![0, 1]);
+        // what still counts as left to run: queued, stale, running (interrupted) and a half-finished train merge, never a taken entry
+        for (status, left) in [(QUEUED, true), (STALE, true), (RUNNING, true), (BLOCKED, false), (REJECTED, false), (MERGED, false), (APPROVED, false)] {
+            let all = vec![entry("q-c1", "crash-sim", APPROVED), entry("q-c3", "crash-sim", status)];
+            let got = short_train_projects_in(&all, &approved[..1], &["q-c1".to_string()], 1030, 20);
+            assert_eq!(got.is_empty(), left, "{status}: {got:?}");
+            let got = short_train_projects_in(&all, &approved[..1], &["q-c1".to_string(), "q-c3".to_string()], 1030, 20);
+            assert_eq!(got.len(), 1, "{status} but already taken by this drain: not waited for: {got:?}");
+        }
+        let mut half = entry("q-c3", "crash-sim", APPROVED);
+        half.set("step", "main_check");
+        assert!(short_train_projects_in(&[entry("q-c1", "crash-sim", APPROVED), half], &approved[..1], &["q-c1".to_string()], 1030, 20).is_empty(), "a half-finished train merge is still to run");
+        // another project's queued entry never holds a project back
+        assert_eq!(short_train_projects_in(&[entry("q-x", "other", QUEUED)], &approved[..1], &[], 1030, 20).len(), 1);
+        // no approved entry: no train
+        assert!(short_train_projects_in(&all, &[], &taken, 1030, 20).is_empty());
+    }
+
+    #[test]
+    fn the_wait_rule_fires_once_the_oldest_approved_entry_has_waited_merge_train_wait_minutes() {
+        // entries of the project are still queued, so only the wait rule can start its train; `now` is the injected clock
+        let at = [Some(10_000u64), Some(10_500)];
+        assert_eq!(short_train_why(true, &at, 10_000 + 20 * 60 - 1, 20), None, "one second short of 20 minutes");
+        let why = short_train_why(true, &at, 10_000 + 20 * 60, 20).expect("20 minutes after the OLDEST approval");
+        assert!(why.contains("1200 s") && why.contains("merge_train_wait_minutes = 20"), "{why}");
+        assert!(short_train_why(true, &at, 10_000 + 5 * 60, 5).is_some(), "the setting is read, not a constant");
+        assert!(short_train_why(true, &at, 10_000 + 5 * 60 - 1, 5).is_none());
+        assert_eq!(short_train_why(true, &[Some(10_000)], 9_000, 20), None, "a clock that went back is no wait");
+        assert!(short_train_why(true, &[Some(10_000), None], 10_001, 20).is_some(), "no readable approval time: counts as waited");
+        assert_eq!(short_train_why(true, &[], u64::MAX, 20), None, "nothing approved");
+        assert!(short_train_why(true, &[Some(0)], u64::MAX - 1, u64::MAX).is_none(), "a huge setting saturates instead of overflowing");
+        // through the projects function and the real decision: queued work of the same project, the wait elapsed
+        let all = vec![entry("q-c1", "crash-sim", APPROVED), entry("q-c2", "crash-sim", QUEUED)];
+        let approved = vec![("crash-sim".to_string(), Some(10_000))];
+        let taken = vec!["q-c1".to_string()];
+        assert!(short_train_projects_in(&all, &approved, &taken, 10_000 + 19 * 60, 20).is_empty());
+        let got = short_train_projects_in(&all, &approved, &taken, 10_000 + 20 * 60, 20);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].1.contains("has waited"), "{got:?}");
     }
 
     #[test]
