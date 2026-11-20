@@ -214,7 +214,7 @@ These are later parts of a node, not its first briefs, so they are listed here a
 - 0.1 -> 0.2 -> 0.3 -> 0.4 -> 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.7 -> 2.1 -> 2.2 -> 3.8 -> 4.3
 - 0.1 -> 0.2 -> 0.3 -> 0.4 -> 1.1 -> 1.2 -> 1.3 -> 1.4 -> 1.5 -> 1.7 -> 2.1 -> 2.2 -> 3.8 -> 4.4
 
-What makes it long is Tier 1 as a single file: 1.1 needs 0.1 to 0.4 (line 422), then 1.2 needs 1.1 (430), 1.3 needs 1.2 (438), 1.4 needs 1.3 (446), 1.5 needs 1.4 (454), 1.7 needs 1.5 (470), and 2.1 needs 1.7 (512). Counted in the plans' own brief rounds (section 4c, unlimited slots), the Tier 1 part of this chain alone, 1.1 to 1.5 then 1.7, is 6 + 6 + 5 + 7 + 7 + 5 = 36 rounds done one node after another.
+What makes it long is Tier 1 as a single file: 1.1 needs 0.1 to 0.4 (line 422), then 1.2 needs 1.1 (430), 1.3 needs 1.2 (438), 1.4 needs 1.3 (446), 1.5 needs 1.4 (454), 1.7 needs 1.5 (470), and 2.1 needs 1.7 (512). **Estimate:** counted in brief rounds, the Tier 1 part of this chain alone, 1.1 to 1.5 then 1.7, is about 36 rounds. The sum is 1.1: 6 (Depends-on column `1.1.md:284-293`: W1; W2, W3, W4; W5, W10; W6, W7; W8; W9; the plan's prose says "five or six rounds", `1.1.md:295`) + 1.2: 6 (Dep column `1.2.md:205-214`: G1; G2, G5, G6; G3, G4; G7, G8; G9; G10) + 1.3: 5 (`1.3.md:264-273`: V1; V2 to V5, V9; V6; V7, V8; V10) + 1.4: 7 (`1.4.md:264-273`: X1; X2, X6; X3; X4, X5; X7; X8; X9, X10) + 1.5: 7 ("seven rounds", `1.5.md:424`) + 1.7: 5 ("Five waves", `1.7.md:365`) = 36. It assumes unlimited slots inside each plan and that each node starts only once the node before it is done, which is what the Needs lines above require when no waiver is given. It is an estimate, not a measurement: the rounds are the plans' planned waves, and no brief has run.
 
 **Graph B (every Tier 1 waiver in section 2b accepted): 9 nodes, three ties.**
 
@@ -283,7 +283,7 @@ These are the only nodes with first briefs written. Each plan creates its own ne
 | 1.8 | `projects/timeline` | TL1 to TL10 | 4 ("four rounds", `1.8.md:363`) | 5 | `1.8.md:363` | new repo, Lazlo approves (`1.8.md:350`); waiver (`1.8.md:290`) |
 | sandbox | the 1.5 shell repo (edits P2's files) and `broadsword.toml` (X0) | X0 to X6 | 6 ("six rounds", `sandbox.md:380`) | 2 | `sandbox.md:380` | 1.5's P3 merged (`sandbox.md:283`); Lazlo's values (X0) and OK (X1) (`sandbox.md:372-373`) |
 
-**What this gives the board.** Round 1 is eight skeleton briefs (W1, G1, V1, X1, S1, R1, N1, TL1), one per repo. Round 2 offers 3 + 3 + 5 + 2 + 2 + 1 + 2 + 5 = 23 briefs (1.1 W2 to W4; 1.2 G2, G5, G6; 1.3 V2 to V5 and V9; 1.4 X2, X6; 1.5 S2, S5; 1.6 R2; 1.7 N2, N5; 1.8 TL2, TL3, TL4, TL6, TL7), more than the 14 slots `broadsword.toml` sets today (`max_agents = 14`). With the waivers, all eight Tier 1 plans finish in 7 rounds at unlimited slots (the longest are 1.4 and 1.5); the sandbox follows 1.5's P3 (round 5 of 1.5) and ends about round 11. Without the waivers, the same plans run one node after another along graph A (36 rounds for 1.1 to 1.5 and 1.7, section 3).
+**What this gives the board.** Round 1 is eight skeleton briefs (W1, G1, V1, X1, S1, R1, N1, TL1), one per repo. Round 2 offers 3 + 3 + 5 + 2 + 2 + 1 + 2 + 5 = 23 briefs (1.1 W2 to W4; 1.2 G2, G5, G6; 1.3 V2 to V5 and V9; 1.4 X2, X6; 1.5 S2, S5; 1.6 R2; 1.7 N2, N5; 1.8 TL2, TL3, TL4, TL6, TL7), more than the 14 slots `broadsword.toml` sets today (`max_agents = 14`). With the waivers, all eight Tier 1 plans finish in 7 rounds at unlimited slots (the longest are 1.4 and 1.5); the sandbox follows 1.5's P3 (round 5 of 1.5) and ends about round 11. Without the waivers, the same plans run one node after another along graph A (an estimated 36 rounds for 1.1 to 1.5 and 1.7; the sum and its sources are in section 3).
 
 **Suggested lane order when slots are short** (the orchestrator's call, from the facts above, not from the plans): 1.7 and 1.8 first, since they are the two compounders in decision 1 and 1.7 has no prerequisite in graph B; then 1.5 and 1.4 (7 rounds each, the longest lanes, and the sandbox waits on 1.5); then 1.1, 1.2, 1.3, 1.6.
 
@@ -307,6 +307,8 @@ Both are **Lazlo's decisions**. Nothing in `ROADMAP.md` or `CAPABILITY_ROADMAP.m
 
 The two suggestions cover 11 of the 20 (the first three lines).
 
+**Edges that cannot be compared.** One node has no stage: 1.7 (`ROADMAP.md:26`, stage `none`). An edge whose prerequisite has no stage is counted above as against the order (the six 1.7 edges). An edge whose dependent node has no stage cannot be placed in the build order at all, so it is not in the 20 and is listed here instead: 1.5 (stage 1) -> 1.7, 1.6 (stage 1) -> 1.7, 0.6 (stage 1) -> 1.7 (`CAPABILITY_ROADMAP.md:470`). If 1.7 moved into stage 1 (decision 1), these three would sit inside one stage and none would run against the order.
+
 ### Decision 1 for Lazlo: move 1.7 (node graph) and 1.8 (timeline) into Foundation (stage 1)
 
 **What the files say.**
@@ -329,7 +331,12 @@ The two suggestions cover 11 of the 20 (the first three lines).
 - 1.7 is on graph A's longest path (section 3), and every one of its 6 direct dependents is an edge against the stage order, because 1.7 has no stage. 1.8 has one such edge (2.6, stage 5, built before stage 9).
 - Moving both into stage 1 creates no new edge against the order for the lanes the plans propose, since their first briefs need only 0.1 (1.8) or nothing (1.7). Under the roadmap's Needs lines it would: 1.7 and 1.8 need 1.5 and 0.6, and 1.5 needs 1.4 (stage 4).
 
-**Recommendation (Lazlo's decision).** Move both into Foundation as their headless frameworks, as their plans scope them (graph data, evaluation or edits, the versioned file format, the C ABI), with the waivers `1.7.md:273` and `1.8.md:290` ask for; keep the in-window panel and widget with 1.5 and ADR 0002. Reasons: each is about half a stage, neither needs other nodes' code by its plan, both fix a file format other modes will store, and as lanes they fill 4 and 5 slots at their peaks. Give 1.7 the earlier slot: its case is stronger by the graph (5 stages, on the longest path), while 1.8's dependents sit in stages 5 and 9 only.
+**Recommendation (Lazlo's decision).** Move both into Foundation as their headless frameworks, as their plans scope them (graph data, evaluation or edits, the versioned file format, the C ABI), with the waivers `1.7.md:273` and `1.8.md:290` ask for; keep the in-window panel and widget with 1.5 and ADR 0002. Per node:
+
+- **1.7:** briefs N1 to N10 (graph model, evaluator, math and image kinds, file format, subgraphs, editor model and text view, C ABI; `1.7.md:354-363`) move to Foundation; the later brief that hosts the editor in a real dockable panel, which "starts only after 1.5 exists" (`1.7.md:270`), stays with 1.5 and needs ADR 0002 (`1.7.md:394`).
+- **1.8:** briefs TL1 to TL10 (time and curves, edits and undo, file format, the three drivers, the headless `TimelineView`, C API; `1.8.md:350-359`) move to Foundation; putting the widget on screen with a painter and live input, which "1.5 must later supply" (`1.8.md:282`), stays with 1.5 and needs ADR 0002 (`1.8.md:388`).
+
+Reasons: each is about half a stage, neither needs other nodes' code by its plan, both fix a file format other modes will store, and as lanes they fill 4 and 5 slots at their peaks. Give 1.7 the earlier slot: its case is stronger by the graph (5 stages, on the longest path), while 1.8's dependents sit in stages 5 and 9 only.
 
 ### Decision 2 for Lazlo: move 2.8 (numerics core) up to Graphics or earlier
 
