@@ -215,6 +215,42 @@ with:
 - **a deprecation path**: an API item is marked deprecated, consumers migrate, and it is removed only when no crate in the
   repo uses it (the removal's own check proves it). Section 5 is that path.
 
+### A language-neutral core boundary
+
+Lazlo may write the upper layers (modes, views, tools) in languages other than Rust once the foundation exists
+(coordinator, 2026-11-20). AGENTS.md already allows this with a one-line reason per language in LAB_LOG.md ("Languages").
+So the core's API must not be Rust-only:
+
+- **A C ABI boundary**: the core `-api` crate has a `-capi` twin (`extern "C"` functions, `#[repr(C)]` plain data, opaque
+  handles, explicit ownership, error codes rather than panics across the boundary), and a generated C header is checked in.
+  Rust modes may use the Rust API. Other languages use the header, and so does any mode that must hot-reload as a plugin
+  (node 0.7), because Rust has no stable ABI between compiler versions.
+- **Serializable data**: core data also crosses as versioned text and binary formats. The crash sim's `.bsn` is the
+  pattern: plain text, one record per line, `bsn 1` on line 1 as the version
+  (`projects/crash-sim/docs/FORMAT.md`). Any language can read and write such a format without linking the core.
+- **ABI compatibility tests at the boundary**: the checked-in header is compared with the one generated from the code
+  (a change marks the entry as a core API change, section 5); a C test program built against the **previous** released
+  header must still link and pass against the new library; every format version's golden files must load from both Rust
+  and one non-Rust client.
+
+### Multi-language shards in the queue and tests
+
+- **One job interface, one runner per language**: `broadsword build|test|check <project>` stays the only entry point. A
+  shard names its language(s) in the shard map, and each language has a runner behind that interface (cargo for Rust; for
+  example pytest or `python -I` for Python, CMake/ctest for C/C++) with the same disk guard, job record, log, lock and
+  exit codes. Evidence that this is needed now: the 13,522 Python lines are tested today by running `python -I scripts/test_*.py`
+  directly; job.rs never starts Python (`grep -ci python crates/broadsword/src/job.rs` = 0), so the queue's check never
+  runs those tests.
+- **An affected-only graph that crosses languages**: section 2's graph gets nodes for non-Rust packages too. Their edges
+  come from their own manifests (for example `pyproject.toml`) plus one declared edge from each non-Rust package to the core
+  `-capi` header or format version it uses. A change to the header or to a format makes every package that declares it
+  affected. A non-Rust package with no manifest or no declared edges makes the check run in full (fail closed).
+- **Review routing by language**: the shard map gives each language a reviewer list, and the queue picks the reviewer from
+  the entry's languages (still never the coder's model; still high risk for anything touching the boundary). An entry that
+  touches two languages, for example a C ABI change and its Python binding, gets the boundary's high-risk review.
+- **Dependency rule across languages**: the rule 2 check also reads the declared edges, so a Python mode importing another
+  mode's package is rejected just like a Rust one.
+
 ## 4. Merge train, perf gate and reviews per shard
 
 ### Merge train (staged as t-20261119-222633, not reviewed yet)
@@ -247,6 +283,8 @@ perf runs take a machine-wide perf lock in exclusive mode while every build take
 - The review prompt per shard adds the shard's README (its API and rules) and the affected-set report from section 2, so the
   reviewer sees what the check did and did not cover (lesson 8: give the reviewer the test output).
 - Risk tier comes from the shard map: core, harness, locks, deletion and secrets shards are high; mode shards default to low.
+- The reviewer is also routed by the entry's language(s) from the shard map; an entry that touches the core's C ABI boundary
+  is always high risk (section 3, "Multi-language shards").
 - The shadow reviewer's daily cap (`GPT daily spend cap of 20 USD`, commit 27c24e2) is one budget for all shards; its OS-locked
   ledger already serializes writers, so many drivers can share it. Section 8 shows when the cap binds.
 
@@ -488,9 +526,18 @@ on main fefe8b1.
   than 2 files without a stated reason; require a done check whose lines are commands; print each failed rule.
 - Done check: `python -I scripts/test_brief_lint.py` passes, with one test per rule shown failing once.
 
+### F9. Python tests behind the job interface (first multi-language runner)
+- Claim: `crates/broadsword/src/job.rs`, `crates/broadsword/tests/jobs.rs`. After F5 (same file), or before it if F5 waits.
+- Requirements: a project can declare a Python test command in its settings table (a required key when present); `test` and
+  `check` run it after cargo, with the same disk guard, log, job record and exit codes; a Python failure fails the job; the
+  scrubbed environment applies (no secrets in the child); Broadsword itself declares `python -I scripts/...` tests.
+- Done check: `broadsword test broadsword` ends `test: ok`; a test with a failing Python test shows the job fails; shown
+  failing once.
+
 ### Decisions for Lazlo named in this document
 1. Move toward ADR 0001 option (d2) for the shared core (section 1).
 2. Per-shard build subfolders inside `build/` (section 1, F3).
 3. Claims on a `broadsword.toml` table (section 3, rule 6).
 4. Per-shard audits in place of one whole-project audit at size (section 8).
 5. Installing cargo-sweep (section 8, disk).
+6. A C ABI (`-capi`) boundary for the shared core, alongside the Rust API (section 3).
