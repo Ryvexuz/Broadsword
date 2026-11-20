@@ -238,6 +238,83 @@ So the core's API must not be Rust-only:
   header must still link and pass against the new library; every format version's golden files must load from both Rust
   and one non-Rust client.
 
+### Public extension API: the mode/plugin boundary opened to third parties (addendum, t-20261120-020355)
+
+Product intent (Lazlo, 2026-11-20 02:03Z, brief `state/backlog/t-20261120-020355.md`): "every build tool in one" at its
+base, with UI polish later, and "a base they can add on". The boundary this document already draws (a mode depends only on
+the core API, section 1) is therefore also a **public extension API**: third parties add crate groups and plugins the same
+way first-party modes are added. Nothing here is built; every claim cites roadmap node 0.7 (CAPABILITY_ROADMAP.md, "0.7
+Plugin/module system: Runtime-loaded modules behind a stable API") or the 1.5 plan (`docs/nodes/1.5.md`, "Public extension
+API: plugins (second product intent)").
+
+**1. One registration path, public by construction** (node 0.7; 1.5 plan, checks d22 and d23). Third-party crate groups
+register modes, panel kinds and tools through the same descriptors a built-in mode uses, so the public API is never a
+second-class copy. A third party's crate group is its own shard in the sense of section 1 and depends only on the core
+`-api` or `-capi` crate (rule 2, section 3). Ids are namespaced `<vendor>.<plugin>.<name>` and the first owner of an id
+keeps it (1.5 plan, ABI summary; a hijack is refused as `id_owned`, d24).
+
+**2. A stable, versioned interface over the C ABI** (node 0.7 prompt in CAPABILITY_ROADMAP.md, Done when: "an incompatible module version is refused
+cleanly"; 1.5 plan, "A stable, versioned plugin interface", checks d20 and
+d21). Rust has no stable ABI between compiler versions (section 3 above), so plugins cross a C ABI and can be written in
+any language that exports C functions. Shape, as the 1.5 plan states it: one exported entry `bs_plugin_entry`; every
+struct starts with `abi_major, abi_minor, struct_size`; same major required, minor features negotiated, structs only grow
+at the end; only fixed-width integers, byte pointers and function pointers cross; panel-protocol bytes carry the data.
+Enforcement (1.5 plan, d20 and d21): a version-negotiation test and a layout-freeze test (size, alignment and every field
+offset, plus the checked-in header `include/broadsword_plugin.h`). **Deprecation policy (proposal, Lazlo decides):** an
+item is marked deprecated in a minor version and keeps working for at least the stated period; only a new major removes
+it; the previous major is supported alongside the new one for that period (1.5 plan, risk R12: "allow a v2 major with
+both supported for a stated period"). The period itself is not chosen here. The ABI is labelled **preview** until node 0.7
+and the first real external plugin have used it (R12), because once someone builds against v1 a change costs them.
+
+**3. Isolation: a bad plugin cannot corrupt core data** (1.5 plan, "Isolation", checks d23 to d25).
+- **Data:** a plugin never holds a pointer or mutable reference into the core. It reads and edits only by sending messages,
+  and every edit passes the one **checked operation** (validate the whole batch, then apply all or nothing, with a named
+  error). This is playbook lesson 9 applied to the API: the guard sits at the single lowest point every caller
+  passes through. Test d25: 1000 seeded random batches each with one invalid edit leave the core's content hash and
+  revision unchanged and `validate()` passing.
+- **Crash and panic:** two options, with the trade-off stated.
+
+| | Out-of-process host (the 1.5 plan's choice) | Caught boundary in the shell's process |
+|---|---|---|
+| A panic or access violation in the plugin | Kills only the plugin's host process; the shell reports the plugin by name; the core is untouched | A Rust panic reaching an `extern "C"` boundary aborts the whole process; an access violation cannot be caught portably. So a "caught boundary" only holds for panics caught on the plugin's side, which a third party's code does not promise |
+| A plugin that hangs | Killed after a deadline (d24 uses 500 ms) | Cannot be killed without killing the shell |
+| Cost | A process spawn per plugin and a pipe copy per call. At 60 frames per second a frame has 1000 / 60 = 16.7 ms, so a panel call must fit well inside that. **Not measured**; the 1.5 plan's bench (d24 and the shell bench) is where it gets measured | No copy, lowest latency |
+| Security | **Not a sandbox** (1.5 plan, R13) | Not a sandbox either |
+
+  The plan chooses out-of-process for anything loaded through the C ABI, and an in-process caught boundary only for the
+  repo's own Rust code (d23 `in_process_panic_contained_core_valid`).
+- **Process isolation is not security isolation.** The 1.5 plan states it plainly (R13, and the "Running third-party
+  plugins" row): a plugin is someone else's code running with Lazlo's rights and can still read files or use the network.
+
+**Hard gate: no third-party plugin code runs until the OS sandbox node is done and Lazlo approves it.** Until then only the
+repo's own test plugins are ever loaded, nothing is downloaded (AGENTS.md, "Ask first"), and the shell loads plugins only
+from a folder its caller names (1.5 plan, R13). The sandbox (a Windows job object with limits, a restricted token or an
+AppContainer, plus a policy for where plugins come from) is Lazlo's decision and is not planned here. Its design doc
+`docs/nodes/sandbox.md` is **not on main** as of c51305d (`git log main -- docs/nodes/sandbox.md` prints nothing, and
+`ls docs/nodes` lists no such file), so nothing here points at it; when it merges, this paragraph should link to it.
+
+**4. The harness side: compatibility tests and a misbehaving-plugin test** (1.5 plan, d20 to d26; section 3 above for the
+shared-core protections).
+- **Compatibility per core version.** For every supported core version, run each reference plugin built against each
+  supported ABI major, and a C test program built against the **previous** released header (section 3, ABI tests at the
+  boundary). A header or layout change marks the entry as a core API change, so it takes the cross-shard path (section 5)
+  and the high-risk review. ESTIMATE of the matrix size: the 1.5 plan has 1 good and 7 bad plugins (d24), so 8 plugins;
+  with 2 supported majors that is 8 x 2 = 16 loads per core version. The one hanging plugin waits the 500 ms deadline per
+  load, so 2 x 0.5 s = 1.0 s of waiting; the spawn time per load is not measured, so no total is claimed. P3 of the 1.5
+  plan is where it is measured; the number then goes into `scripts/baseline.py` output.
+- **A misbehaving-plugin test.** The 1.5 plan's seven bad plugins (wrong ABI major, panic, null write, hang, malformed
+  bytes, invalid edits, hijacked id) must each be refused or contained with the core hash and `validate()` unchanged
+  (d24), and a negative control must fail when it is told to expect the good plugin to be refused (d26), so the check
+  cannot pass vacuously (playbook 10). The `good` plugin runs last in the same core, so "contained" cannot mean "the shell
+  stopped loading plugins".
+- **Cost of building it (from the 1.5 plan, Size paragraph):** 13 briefs, about 3,200 changed lines, about 16 merged tasks
+  to reach the Done-when, and on the harness's own measure of about 20 merged tasks per delivered stage that is about 0.8
+  of a stage (16 / 20 = 0.8). The real sandbox (R13) is 1 to 3 more briefs and is not counted.
+
+**Overlap to settle (1.5 plan, ROADMAP row "0.7 Plugin/module system"):** ADR 0004 (Proposed) assigns the plugin mechanism
+to node 0.7 in core, while the 1.5 plan builds the shell's plugin path to 0.7's likely shape. Lazlo decides whether the
+plan's P1 to P3 are 0.7's first part or wait for it (listed in the decisions below).
+
 ### Multi-language shards in the queue and tests
 
 - **One job interface, one runner per language**: `broadsword build|test|check <project>` stays the only entry point. A
@@ -647,3 +724,5 @@ command itself runs.
 5. Installing cargo-sweep (section 8, disk).
 6. A C ABI (`-capi`) boundary for the shared core, alongside the Rust API (section 3).
 7. The hot and cold disk strategy and its 20% free trigger, and any first move to the external drive (section 8, Disk strategy).
+8. The public extension API, its deprecation period, and whether the 1.5 plan's P1 to P3 are node 0.7's first part (section 3, addendum).
+9. The OS sandbox node and approving it: the hard gate before any third-party plugin code runs (section 3, addendum).
