@@ -269,7 +269,10 @@ def covers(claims, tok):
     t = tok.rstrip("/")
     for c in claims:
         c2 = c.rstrip("/")
-        if c2 == t or t.startswith(c2 + "/") or c2.endswith("/" + t) or (tok.endswith("/") and c2.startswith(t + "/")):
+        # Equal, or under a claimed folder, or (a bare file name only) the name of a claimed file.
+        # A folder named in a brief is never covered by a file inside it, and a path with a folder
+        # is never covered by a different path that merely ends the same way.
+        if c2 == t or t.startswith(c2 + "/") or ("/" not in t and c2.endswith("/" + t)):
             return True
     return False
 
@@ -281,7 +284,13 @@ def named_paths(text):
         sent = OTHER_REPO_RE.sub("", sent)
         m = OTHER_TASK_RE.search(sent)
         if m:
-            sent = sent[:m.start()]
+            before = sent[:m.start()]
+            close = sent.find(")", m.start())
+            if before.rfind("(") > before.rfind(")") and close != -1:
+                # The marker sits inside parentheses: skip only up to the closing one.
+                sent = before + sent[close + 1:]
+            else:
+                sent = before
         for p in sorted(claim_paths(sent)):
             # A bare name (no folder) counts only for source and config files: "AGENTS.md" and
             # "queue.lock" in prose are references, not edits.
@@ -350,7 +359,7 @@ def claim_gaps(text, root=None):
                         f"{TOOLS_RS} (the parser) is not claimed: does a parser or call site there change?"))
 
     if CONFIG_KEY_RE.search(req):
-        miss = [n for n in CONFIG_NEEDS if not covers(claims, n)]
+        miss = [n for n in CONFIG_NEEDS if not any(c == n or c.endswith("/" + n) for c in claims)]
         if miss:
             res.append(("R4", "FAIL", "a new required config key needs these claimed too: " + ", ".join(miss)))
 

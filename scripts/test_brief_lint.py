@@ -268,6 +268,22 @@ class ClaimGapRules(unittest.TestCase):
         text = brief("`src/` (folder), `crates/x/tests/y.rs`", "- edit `src/a/b.rs` and `y.rs`")
         self.assertEqual(gaps(text), [])
 
+    def test_r1_folder_is_not_covered_by_a_file_inside_it(self):
+        text = brief("`src/jobs/mod.rs`", "- add the stubs under `src/jobs/`")
+        self.assertIn(("R1", "FAIL"), self.levels(text))
+        self.assertEqual(gaps(brief("`src/jobs/`", "- add the stubs under `src/jobs/`")), [])
+        self.assertEqual(gaps(brief("`src/`", "- add the stubs under `src/jobs/`")), [])
+
+    def test_r1_a_path_with_a_folder_is_not_covered_by_a_longer_claim_ending_the_same_way(self):
+        self.assertIn(("R1", "FAIL"), self.levels(brief("`crates/x/src/jobs.rs`", "- edit `src/jobs.rs`")))
+
+    def test_r1_text_after_a_parenthesised_other_task_marker_is_still_checked(self):
+        req = "- Update the mod list (n20-47 updates `ROADMAP.md`) and add `src/jobs/graph.rs`"
+        g = gaps(brief("`src/jobs.rs`", req))
+        self.assertIn(("R1", "FAIL"), {(r, lv) for r, lv, _ in g})
+        self.assertIn("src/jobs/graph.rs", g[0][2])
+        self.assertNotIn("ROADMAP", g[0][2])
+
     def test_r1_other_task_clause_and_other_repo_paths_are_skipped(self):
         req = "- n20-47 copies a summary into Broadsword's `docs/nodes/x.md` and updates `ROADMAP.md`"
         self.assertEqual(gaps(brief("`src/a.rs`", req)), [])
