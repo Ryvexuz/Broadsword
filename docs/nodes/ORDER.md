@@ -288,3 +288,65 @@ These are the only nodes with first briefs written. Each plan creates its own ne
 **Suggested lane order when slots are short** (the orchestrator's call, from the facts above, not from the plans): 1.7 and 1.8 first, since they are the two compounders in decision 1 and 1.7 has no prerequisite in graph B; then 1.5 and 1.4 (7 rounds each, the longest lanes, and the sandbox waits on 1.5); then 1.1, 1.2, 1.3, 1.6.
 
 **Tier 0 lane, beside the plans.** Graph B's longest paths all start 0.1 -> 0.2 -> 0.3 and then 0.4 or 0.5 (section 3), so Tier 0 work (now started in `projects/foundation`) is on the critical path in both graphs and should keep a slot of its own. No Tier 0 node other than 0.1 has a plan in `docs/nodes/`.
+
+## 5. Part 4's two open suggestions: decisions for Lazlo
+
+Both are **Lazlo's decisions**. Nothing in `ROADMAP.md` or `CAPABILITY_ROADMAP.md` changes here; `ROADMAP.md:92-97` lists both as "Open decisions for Lazlo (not applied)". Each part below gives what the files say (quoted, with file and line), what the graph of section 2 adds, and a recommendation that is only that.
+
+### Stage order today, and edges that run against it
+
+`DEVELOPMENT_PLAN.md:21-36` builds the stages in this order: 0, 1, 2, 3, 4, 6, 7, 5, (4 again), 11, 9, 8, 10, 12. Using each node's stage from `ROADMAP.md` (first build position where a node has two stages), these 20 graph A edges have a prerequisite whose stage is built later than the node that needs it, or has no stage:
+
+- 1.7 (stage none) -> 2.1 (4), 2.7 (9), 3.6 (5), 3.15 (9), 3.22 (10), 4.2 (7)
+- 1.8 (stage 9) -> 2.6 (5)
+- 2.8 (stage 10) -> 2.9 (8), 3.1 (6), 3.3 (6), 3.10 (8)
+- 1.4 (stage 4) -> 1.5 (1), 2.10 (3)
+- 2.3 (stage 5) -> 3.2 (6), 3.4 (6)
+- 2.4 (stage 5) -> 2.5 (4), 4.1 (7)
+- 2.6 (stage 5) -> 4.1 (7); 2.7 (stage 9) -> 4.1 (7); 2.9 (stage 8) -> 3.9 (5)
+
+The two suggestions cover 11 of the 20 (the first three lines).
+
+### Decision 1 for Lazlo: move 1.7 (node graph) and 1.8 (timeline) into Foundation (stage 1)
+
+**What the files say.**
+
+- The suggestion: "**Move 1.7 (node graph) and 1.8 (timeline) into Foundation.** They feed at least four later stages each. Built late, they end up rebuilt three times in slightly different forms." (`CAPABILITY_ROADMAP.md:303`)
+- Both are "big compounders": 1.7 serves "about 9 tools" and 1.8 "about 8 tools" (`CAPABILITY_ROADMAP.md:108-109`).
+- Today: "Today 1.7 is in no stage and 1.8 is in stage 9." (`ROADMAP.md:96`); stage 1 is "Tier 0; 1.1, 1.5, 1.6" (`CAPABILITY_ROADMAP.md:288`) and stage 9 lists 1.8 (`CAPABILITY_ROADMAP.md:296`).
+- 1.7's plan: "Broadsword stage: none." (`1.7.md:5`). It is "a **framework under many modes**, not a mode" (`1.7.md:7`), and "A later mode (procedural geometry, node 3.6; compositor, 3.15; block simulation, 3.22) adds a kind and nothing else." (`1.7.md:13`).
+- 1.8's plan: "Broadsword stage (ROADMAP.md): 9." and "Later nodes that need it: 2.6 (animation core), 3.16 (nonlinear video editing), 3.17 (motion graphics), 3.18 (DAW features)." (`1.8.md:5`); "a **shared framework under several modes**, not a mode" (`1.8.md:7`).
+- Both can start without their roadmap prerequisites if Lazlo waives them: `1.7.md:273` and `1.8.md:290` (section 2b).
+- Both version their file format from the first commit, because other modes will store it: `1.7.md:13` ("its file form (section 5, check n10) is versioned from the first commit") and `1.8.md:7` ("that is why the file form ... is versioned from the first commit").
+- Size: 1.7 is "10 briefs (N1 to N10), roughly 250 lines each, about 2,500 changed lines" and "about half of one stage" (`1.7.md:396`); 1.8 is "about 2,800 lines in all" and "a little over half a stage of work" (`1.8.md:393`).
+- What stays tied to 1.5 and ADR 0002 either way: "ADR 0002 must be decided before 1.5 can host the graph editor." (`1.7.md:394`); "a live editor cannot embed the Rust view without ADR 0002" (`1.8.md:388`); the Done-when's "UI" may need the later panel brief (`1.7.md:384`, risk R1), and "the roadmap's "one timeline widget" is only fully true when 1.5 hosts it" (`1.8.md:382`).
+- ADR 0004 (Proposed) puts both in `W/shell` as frameworks (`docs/adr/0004-roadmap-repo-map.md:95-96`).
+
+**What the graph adds.**
+
+- 1.7 has 6 direct dependents (2.1, 2.7, 3.6, 3.15, 3.22, 4.2) in 5 stages (4, 5, 7, 9, 10), and 16 nodes downstream. The "at least four later stages" claim holds for 1.7.
+- 1.8 has 4 direct dependents (2.6, 3.16, 3.17, 3.18) in 2 stages (5 and 9), and 10 nodes downstream in 3 stages (5, 7, 9). By the Needs lines, the "at least four later stages" claim does **not** hold for 1.8.
+- 1.7 is on graph A's longest path (section 3), and every one of its 6 direct dependents is an edge against the stage order, because 1.7 has no stage. 1.8 has one such edge (2.6, stage 5, built before stage 9).
+- Moving both into stage 1 creates no new edge against the order for the lanes the plans propose, since their first briefs need only 0.1 (1.8) or nothing (1.7). Under the roadmap's Needs lines it would: 1.7 and 1.8 need 1.5 and 0.6, and 1.5 needs 1.4 (stage 4).
+
+**Recommendation (Lazlo's decision).** Move both into Foundation as their headless frameworks, as their plans scope them (graph data, evaluation or edits, the versioned file format, the C ABI), with the waivers `1.7.md:273` and `1.8.md:290` ask for; keep the in-window panel and widget with 1.5 and ADR 0002. Reasons: each is about half a stage, neither needs other nodes' code by its plan, both fix a file format other modes will store, and as lanes they fill 4 and 5 slots at their peaks. Give 1.7 the earlier slot: its case is stronger by the graph (5 stages, on the longest path), while 1.8's dependents sit in stages 5 and 9 only.
+
+### Decision 2 for Lazlo: move 2.8 (numerics core) up to Graphics or earlier
+
+**What the files say.**
+
+- The suggestion: "**Move 2.8 (numerics core) up to Graphics or earlier.** Physics, CAD and simulation all sit on it, and a solid numerics core makes stage 6 much faster." (`CAPABILITY_ROADMAP.md:304`)
+- Compounder: "**2.8 Numerics core**: all physics, FEM, CFD, MATLAB, Simulink, CAD constraint solving" (`CAPABILITY_ROADMAP.md:111`).
+- Today: "Today only its extensions are in stage 10." (`ROADMAP.md:97`); stage 10 lists "2.8 extensions" (`CAPABILITY_ROADMAP.md:297`). Its own needs: "Needs: 0.2, 0.4" (`CAPABILITY_ROADMAP.md:568`).
+- No node plan exists: there is no `docs/nodes/2.8.md`. The plans mention 2.8 only twice: "**Trigger 4** ("a numerics core is needed by two projects") is not fired: the math kind here is a handful of `f64` operations, not a numerics core." (`1.7.md:235`), and a reference-data row, "LAPACK/SciPy reference outputs for numerics", marked "UNVERIFIED (written from memory)" (`REFERENCE_DATA.md:105`).
+- ADR 0001 (Accepted): "**No, not for Stage 6 milestones 1 to 3.**" (`docs/adr/0001-shared-core.md:192`); it says line 304's claim "assumes an implicit or FEM solver, which is Stage 6 m5" (`docs/adr/0001-shared-core.md:195-196`), and "Decide it when the m4 or m5 done checks are written ... If only crash-sim uses it, it lives inside crash-sim (`src/numerics/`). It becomes shared code only when a second project needs it" (`docs/adr/0001-shared-core.md:198-200`).
+- ADR 0004 (Proposed) orders it fourth among the triggers, firing "when the second consumer's plan starts" (`docs/adr/0004-roadmap-repo-map.md:184`), with home `W/core` (`:112`).
+
+**What the graph adds.**
+
+- 2.8 has 8 direct dependents (2.9, 3.1, 3.3, 3.10, 3.19, 3.20, 3.22, 3.23) in stages 6, 8 and 10, and 22 nodes downstream in stages 5, 6, 7, 8 and 10.
+- 4 of its direct dependents are edges against the stage order today: 3.1 and 3.3 (stage 6) and 2.9 and 3.10 (stage 8) need a node mapped to stage 10. So the current mapping already asks stage 6 to use a stage 10 node.
+- No stage 4 (Graphics) node needs 2.8: stage 4 is 1.2, 1.3, 1.4, 1.11, 2.1, 2.2, 2.5 (`CAPABILITY_ROADMAP.md:291`), and none of their Needs lines names 2.8. "Graphics" is earlier than needed by the graph; stage 6 is the first stage that needs it.
+- 2.8 is on two of graph B's three longest paths (section 3), so once the Tier 1 waivers are given it becomes part of the critical path.
+
+**Recommendation (Lazlo's decision).** Move 2.8 into stage 6 (Physics), not stage 4: stage 6 is where the first nodes that need it (3.1, 3.3) are mapped, and no Graphics node needs it. Do not start its code ahead of a consumer, which agrees with ADR 0001: write `docs/nodes/2.8.md` as a plan now (low-priority ahead-work like the other plans), and start its first briefs when the crash-sim m4 or m5 done checks, or the first 3.1 plan, need linear algebra. Its prerequisites 0.2 and 0.4 are in the Tier 0 lane already.
