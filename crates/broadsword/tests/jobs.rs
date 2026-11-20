@@ -641,3 +641,144 @@ fn a_build_in_the_same_root_does_not_wait_while_another_jobs_tests_run() {
     assert_eq!(a_out.status.code(), Some(0), "job A: {}{}", text(&a_out.stdout), text(&a_out.stderr));
     assert!(text(&a_out.stdout).contains("test: ok — 1 passed, 0 failed"), "{}", text(&a_out.stdout));
 }
+
+// ---- Python tests behind the job interface (SCALING F9) ----------------------------------------
+
+impl Root {
+    /// Replace the value of `python_tests` in this root's broadsword.toml (a raw TOML value, quotes included).
+    fn python_tests(&self, value: &str) {
+        let path = self.dir.join("broadsword.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("python_tests = \"\""), "{text}");
+        fs::write(&path, text.replace("python_tests = \"\"", &format!("python_tests = {value}"))).unwrap();
+    }
+
+    /// Write `body` to the Python file `rel` inside project `project`.
+    fn py(&self, project: &str, rel: &str, body: &str) {
+        let p = self.dir.join("projects").join(project).join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    /// The text of every job record (state/jobs/*.rec).
+    fn records(&self) -> String {
+        fs::read_dir(self.dir.join("state/jobs")).map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "rec")).map(|e| fs::read_to_string(e.path()).unwrap()).collect()).unwrap_or_default()
+    }
+}
+
+/// A script that appends `name` to `<project>/ran.txt` (so a test sees which scripts ran, in order), then exits `code`.
+fn marker_py(name: &str, code: i32) -> String {
+    format!("import sys\nwith open('ran.txt', 'a') as f:\n    f.write('{name}\\n')\nprint('python says {name}')\nsys.exit({code})\n")
+}
+
+/// The names `marker_py` scripts of `project` wrote, in the order they ran.
+fn ran(r: &Root, project: &str) -> Vec<String> {
+    fs::read_to_string(r.dir.join("projects").join(project).join("ran.txt")).unwrap().lines().map(String::from).collect()
+}
+
+#[test]
+fn python_tests_run_after_cargo_and_the_first_failing_one_fails_the_job() {
+    // the done check of SCALING F9: a failing Python test makes the job exit non-zero, and the log names it
+    let r = Root::new("pyfail", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    r.py("p", "py/test_ok.py", &marker_py("ok", 0));
+    r.py("p", "py/test_fail.py", &marker_py("fail", 1));
+    r.py("p", "py/test_never.py", &marker_py("never", 0));
+    r.python_tests("\"p: py/test_ok.py py/test_fail.py py/test_never.py\"");
+    let out = r.run(&["check", "p"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "a failing Python test fails the job: {so}{se}");
+    assert!(so.contains("build: ok"), "{so}");
+    assert!(so.contains("test: FAILED (python py/test_fail.py: exit 1) — 2 passed, 0 failed"), "{so}");
+    assert_eq!(ran(&r, "p"), ["ok", "fail"], "in order; the first failure stops the rest");
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    assert!(log.contains("error: python test failed: `python -I -B py/test_fail.py` (exit 1)"), "the log names the failing script: {log}");
+    assert!(log.contains("python says ok") && log.contains("python says fail"), "the scripts' output is in the job log: {log}");
+    let rec = r.records();
+    assert!(rec.contains("status = failed") && rec.contains("python_tests = failed: py/test_fail.py (exit 1)"), "{rec}");
+    assert!(rec.contains("python -I -B py/test_ok.py"), "the record's command lists the Python tests: {rec}");
+}
+
+#[test]
+fn python_tests_pass_in_a_test_job_and_are_named_in_the_test_line() {
+    let r = Root::new("pyok", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    r.py("p", "py/test_a.py", &marker_py("a", 0));
+    r.py("p", "py/test_b.py", &marker_py("b", 0));
+    r.python_tests("\"P: py/test_a.py py/test_b.py\""); // project names match in any case
+    let out = r.run(&["test", "p"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    assert!(so.contains("test: ok — 2 passed, 0 failed; python: 2 script(s) ok ("), "{so}");
+    assert_eq!(ran(&r, "p"), ["a", "b"]);
+    // the build lock was released before the Python tests started (they never need the shared build folder)
+    let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
+    let released = log.find("build lock: released").expect("the test step releases the build lock");
+    let first_py = log.find("Running python -I -B py/test_a.py").expect("the log shows the Python test starting");
+    assert!(released < first_py, "{log}");
+    assert!(r.records().contains("python_tests = ok: 2 script(s)"), "{}", r.records());
+    assert!(!r.dir.join("projects/p/py/__pycache__").exists(), "-B: no .pyc files are written into the checkout");
+}
+
+#[test]
+fn no_python_test_runs_when_cargo_tests_fail_or_the_project_declares_none() {
+    let r = Root::new("pyskip", 1, 0);
+    r.project("bad", "#[cfg(test)] mod t { #[test] fn bad() { panic!(\"no\"); } }\n", None);
+    r.project("plain", TWO_TESTS, None);
+    r.py("bad", "py/test_a.py", &marker_py("a", 0));
+    r.py("plain", "py/test_a.py", &marker_py("a", 0));
+    r.python_tests("\"bad: py/test_a.py\"");
+    let out = r.run(&["test", "bad"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(text(&out.stdout).contains("test: FAILED (exit 101)"), "{}", text(&out.stdout));
+    assert!(!r.dir.join("projects/bad/ran.txt").exists(), "no Python test runs after a cargo test failure");
+    // a project not named in python_tests has none: the job says so and its summary is the plain cargo one
+    let out = r.run(&["test", "plain"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    assert!(so.contains("test: ok — 2 passed, 0 failed\n") || so.contains("test: ok — 2 passed, 0 failed\r\n"), "{so}");
+    assert!(se.contains("python tests: none (this project is not named in python_tests)"), "{se}");
+    assert!(!r.dir.join("projects/plain/ran.txt").exists());
+}
+
+#[test]
+fn a_declared_python_test_that_does_not_exist_fails_the_job() {
+    let r = Root::new("pymissing", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    r.python_tests("\"p: py/test_gone.py\"");
+    let out = r.run(&["test", "p"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "a missing script is a failure, never a skip: {so}{se}");
+    assert!(so.contains("test: FAILED (python py/test_gone.py: script not found)"), "{so}");
+}
+
+#[test]
+fn a_python_test_gets_the_scrubbed_environment_and_runs_isolated() {
+    let r = Root::new("pyscrub", 1, 0);
+    r.project("p", TWO_TESTS, None);
+    // a FAKE .env in this throwaway root (never the real one), and a parent environment carrying secrets
+    fs::write(r.dir.join(".env"), "FAKE_TOKEN=zzpysecret987\n").unwrap();
+    // the script reports FACTS about its environment, never the environment itself (a failure must not print a real variable)
+    let dump = r.dir.join("scratch/py-env.txt");
+    let script = format!(
+        "import os, sys\nenv = os.environ\nfacts = [\n    'harmless=' + env.get('HARMLESS_F9', 'MISSING'),\n    'secret_name_seen=' + str('PLANTED_API_KEY' in env),\n    'secret_value_seen=' + str(any('zzplantedkey456' in v for v in env.values())),\n    'dotenv_holder_seen=' + str('CONTAINS_IT' in env),\n    'dotenv_value_seen=' + str(any('zzpysecret987' in v for v in env.values())),\n    'isolated=' + str(sys.flags.isolated),\n    'no_bytecode=' + str(sys.dont_write_bytecode),\n]\nwith open({:?}, 'w') as f:\n    f.write(' '.join(facts))\n",
+        dump.display().to_string()
+    );
+    r.py("p", "py/test_env.py", &script);
+    r.python_tests("\"p: py/test_env.py\"");
+    let out = r
+        .cmd(&["test", "p"])
+        .env("PLANTED_API_KEY", "zzplantedkey456")
+        .env("CONTAINS_IT", "prefix-zzpysecret987-suffix")
+        .env("HARMLESS_F9", "visible")
+        .output()
+        .unwrap();
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    let facts = fs::read_to_string(&dump).expect("the Python test ran and wrote its facts");
+    assert_eq!(
+        facts,
+        "harmless=visible secret_name_seen=False secret_value_seen=False dotenv_holder_seen=False dotenv_value_seen=False isolated=1 no_bytecode=True",
+        "harmless=visible proves the facts come from the child's real environment; every *_seen must be False; -I and -B are passed"
+    );
+}

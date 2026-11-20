@@ -16,6 +16,13 @@
 //! (each copy's modified time is set to the copy time).
 //! Every cargo child (including `cargo metadata`) is made by `buildsrc::cargo`, which applies the scrubbed environment.
 //!
+//! PYTHON TESTS (SCALING F9). When cargo's tests pass, the test step (of `test` and `check`) runs the scripts the required setting
+//! `python_tests` declares for the project, in order, each as `python -I -B <script>` in the project folder (the task's worktree
+//! with `--task`), after the build lock is released. They are ordinary job children: the same disk poll, log, redaction, recorded
+//! child pid and scrubbed environment (`python_command`, through `scrub::command`). The first failing script fails the job (exit
+//! 1, `test: FAILED (python <script>: exit N) ...`, and the log names it); a pass adds `; python: N script(s) ok` to the test
+//! line. The record's `python_tests` field says what ran. A project not named in `python_tests` runs none and says so.
+//!
 //! Known limits:
 //! - Doc-tests are not copied: rustdoc builds them from the shared folder's library as it runs them. So the step takes the build
 //!   lock AGAIN for them (and re-checks the source note), after the copies; a package with slow doc-tests holds it meanwhile.
@@ -382,6 +389,65 @@ fn shell_command(project_dir: &Path, line: &str) -> Command {
     c
 }
 
+// ---- the Python tests of the test step (SCALING F9) -----------------------------------------
+
+/// The Python interpreter the test step runs, resolved on the child's `PATH` (as `cargo` is). Not a setting: like `cargo`, it is
+/// a program name, and a machine without it fails the job loudly ("cannot start `python`").
+pub const PYTHON: &str = "python";
+
+/// What the Python tests of one test step did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PyTests {
+    /// The project is not named in `python_tests`: it has no Python tests.
+    NoneDeclared,
+    /// Every declared script exited 0.
+    Ok { count: usize, secs: f64 },
+    /// The first script that failed (the rest were not run), and how.
+    Failed { script: String, why: String },
+    /// Free space fell below the floor while a script ran: it was killed (free bytes at the kill).
+    Killed(u64),
+}
+
+/// The scripts `python_tests` declares for `project`, matched case-insensitively (project names are); empty when it is not named.
+pub fn python_scripts<'a>(cfg: &'a Config, project: &str) -> &'a [String] {
+    cfg.python_tests.iter().find(|(p, _)| p.eq_ignore_ascii_case(project)).map(|(_, s)| s.as_slice()).unwrap_or(&[])
+}
+
+/// `python -I -B <script>` in `project_dir`, made by the ONE spawn helper, so the child gets the scrubbed environment (`scrub.rs`:
+/// no secret-named variable, nothing holding a `.env` value). `-I` (isolated: no `PYTHON*` variables, no user site, no script
+/// folder or current folder on `sys.path`) and `-B` (no `.pyc` files written into the checkout) are always passed.
+fn python_command(cfg: &Config, project_dir: &Path, script: &str) -> Command {
+    let mut c = scrub::command(cfg, PYTHON);
+    c.args(["-I", "-B", script]).current_dir(project_dir);
+    c
+}
+
+/// The test step's summary line with its Python tests added: `test: ok — ...; python: N script(s) ok (S s)` when cargo's tests
+/// and every script passed; `test: FAILED (python <script>: <why>) — ...` when a script failed (the job fails); unchanged when
+/// the project declares none, or when cargo's tests already failed (no script ran).
+pub fn step_line_python(line: String, ok: bool, py: &PyTests) -> (String, bool) {
+    match py {
+        _ if !ok => (line, false),
+        PyTests::NoneDeclared => (line, true),
+        PyTests::Ok { count, secs } => (format!("{line}; python: {count} script(s) ok ({secs:.1} s)"), true),
+        PyTests::Failed { script, why } => {
+            let rest = line.strip_prefix("test: ok").unwrap_or("");
+            (format!("test: FAILED (python {script}: {why}){rest}"), false)
+        }
+        PyTests::Killed(_) => ("test: KILLED (disk below floor)".into(), false),
+    }
+}
+
+/// The job record's `python_tests` field for a finished test step.
+fn python_record(py: &PyTests) -> String {
+    match py {
+        PyTests::NoneDeclared => "none declared".into(),
+        PyTests::Ok { count, secs } => format!("ok: {count} script(s), {secs:.1} s"),
+        PyTests::Failed { script, why } => format!("failed: {script} ({why})"),
+        PyTests::Killed(_) => "killed: disk below floor".into(),
+    }
+}
+
 // ---- the test step: compile under the lock, test from copies ------------------------------
 
 /// The folder (inside scratch) a job's copied test and bin executables live in while its test step runs.
@@ -675,6 +741,37 @@ impl TestStep<'_> {
         cmd
     }
 
+    /// The Python half of the test step (SCALING F9), run after cargo's tests passed and after the build lock is released (Python
+    /// tests never need the shared build folder): each declared script, in order, as `python -I -B <script>` in the project
+    /// folder, through `run_child` (so the disk poll, the log, redaction and the recorded child pid are those of every job
+    /// child) with the scrubbed environment (`python_command`). The first failing script stops the rest.
+    fn run_python(&mut self, scripts: &[String]) -> Result<PyTests, String> {
+        if scripts.is_empty() {
+            self.note("python tests: none (this project is not named in python_tests)");
+            return Ok(PyTests::NoneDeclared);
+        }
+        let start = Instant::now();
+        for s in scripts {
+            let shown = format!("{PYTHON} -I -B {s}");
+            if !self.project_dir.join(s).is_file() {
+                self.note(&format!("error: python test `{shown}`: {s} is not a file in {}", self.project_dir.display()));
+                return Ok(PyTests::Failed { script: s.clone(), why: "script not found".into() });
+            }
+            self.note(&format!("     Running {shown}"));
+            let cmd = python_command(self.cfg, self.project_dir, s);
+            let r = run_child(self.cfg, cmd, self.log, &mut *self.free, self.poll, &mut *self.on_spawn, self.secrets)?;
+            match r.outcome {
+                Outcome::Exited(Some(0)) => {}
+                Outcome::DiskDropped(f) => return Ok(PyTests::Killed(f)),
+                Outcome::Exited(code) => {
+                    self.note(&format!("error: python test failed: `{shown}` ({})", exit_text(code)));
+                    return Ok(PyTests::Failed { script: s.clone(), why: exit_text(code) });
+                }
+            }
+        }
+        Ok(PyTests::Ok { count: scripts.len(), secs: start.elapsed().as_secs_f64() })
+    }
+
     fn run_copies(&mut self, copied: &[Copied], kept: &mut String) -> Result<Outcome, String> {
         for c in copied {
             self.note(&format!("     Running {} ({})", c.art.src_path, c.copy.display()));
@@ -899,7 +996,13 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     // The record comes first: from here on a kill at any moment leaves something to recover from.
     let command_text = match &spec.command {
         Some(c) => c.clone(),
-        None => steps.iter().map(|s| format!("cargo {s} --offline")).collect::<Vec<_>>().join("; "),
+        None => {
+            let mut parts: Vec<String> = steps.iter().map(|s| format!("cargo {s} --offline")).collect();
+            if steps.contains(&"test") {
+                parts.extend(python_scripts(cfg, name).iter().map(|s| format!("{PYTHON} -I -B {s}")));
+            }
+            parts.join("; ")
+        }
     };
     let mut rec = match record::create(&record::jobs_dir(cfg), &format!("{}-{name}-{kind}", file_stamp(secs))) {
         Ok(r) => r,
@@ -1092,9 +1195,21 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                 panic!("test hook: panic in job after its child started");
             }
         };
+        let mut py: Option<PyTests> = None;
         let ran = if *step == "test" && kind != "run" {
             let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_spawn: &mut on_spawn, secrets: &secrets };
-            t.run(cmd, &mut build_hold)
+            match t.run(cmd, &mut build_hold) {
+                // cargo's tests passed (and the build lock is released): the project's Python tests run next (SCALING F9)
+                Ok(r) if matches!(r.outcome, Outcome::Exited(Some(0))) => match t.run_python(python_scripts(cfg, name)) {
+                    Ok(PyTests::Killed(f)) => Ok(StepRun { outcome: Outcome::DiskDropped(f), ..r }),
+                    Ok(p) => {
+                        py = Some(p);
+                        Ok(r)
+                    }
+                    Err(e) => Err(e),
+                },
+                other => other,
+            }
         } else {
             run_child(cfg, cmd, &log, &mut *free_src, poll, &mut on_spawn, &secrets)
         };
@@ -1130,6 +1245,13 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             "build" => step_line_build(&run),
             "run" => step_line_run(&run),
             _ => step_line_test(&run),
+        };
+        let (line, ok) = match &py {
+            Some(p) => {
+                rec.set("python_tests", python_record(p));
+                step_line_python(line, ok, p)
+            }
+            None => (line, ok),
         };
         summary.push(line);
         if !ok {
@@ -1295,6 +1417,27 @@ mod tests {
         assert!(ok && l.contains("no `test result:`") && !l.contains("0 passed"), "{l}");
         assert_eq!(step_line_build(&run(0, "")).0, "build: ok (1.0 s)");
         assert_eq!(step_line_build(&run(101, "")).0, "build: FAILED (exit 101)");
+    }
+
+    #[test]
+    fn python_line_joins_the_test_line() {
+        let ok = "test: ok — 11 passed, 0 failed".to_string();
+        assert_eq!(step_line_python(ok.clone(), true, &PyTests::NoneDeclared), (ok.clone(), true));
+        assert_eq!(step_line_python(ok.clone(), true, &PyTests::Ok { count: 2, secs: 1.25 }), ("test: ok — 11 passed, 0 failed; python: 2 script(s) ok (1.2 s)".to_string(), true));
+        let failed = PyTests::Failed { script: "scripts/test_x.py".into(), why: "exit 1".into() };
+        assert_eq!(step_line_python(ok.clone(), true, &failed), ("test: FAILED (python scripts/test_x.py: exit 1) — 11 passed, 0 failed".to_string(), false));
+        // a cargo failure stays a failure, whatever the Python result
+        let bad = "test: FAILED (exit 101) — 1 passed, 1 failed".to_string();
+        assert_eq!(step_line_python(bad.clone(), false, &PyTests::Ok { count: 1, secs: 0.0 }), (bad, false));
+        assert!(!step_line_python(ok, true, &PyTests::Killed(0)).1);
+    }
+
+    #[test]
+    fn python_scripts_match_the_project_case_insensitively() {
+        let mut cfg = Config::from_text(include_str!("../../../broadsword.toml"), Path::new("p")).unwrap();
+        cfg.python_tests = crate::config::parse_python_tests("Crash-Sim: t/test_a.py t/test_b.py").unwrap();
+        assert_eq!(python_scripts(&cfg, "crash-sim"), ["t/test_a.py", "t/test_b.py"]);
+        assert!(python_scripts(&cfg, "other").is_empty());
     }
 
     #[test]

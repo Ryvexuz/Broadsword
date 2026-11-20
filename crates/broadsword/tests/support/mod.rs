@@ -64,6 +64,8 @@ const BASE: &[(&str, &str)] = &[
     ("perf_gate", "\"on\""),
     ("perf_runs", "2"),
     ("queue_per_project", "\"off\""),
+    // no test project runs Python tests unless its test sets this (SCALING F9)
+    ("python_tests", "\"\""),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),

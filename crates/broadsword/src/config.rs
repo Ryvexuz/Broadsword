@@ -154,6 +154,42 @@ pub struct Config {
     /// A `.env` or secret-named value shorter than this many characters is not redacted from text (it would blank ordinary words);
     /// it is still kept out of every child's environment.
     pub redact_min_chars: u64,
+    /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
+    /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
+    pub python_tests: Vec<(String, Vec<String>)>,
+}
+
+/// Parse the `python_tests` setting: `"<project>: <script> <script> ...; <project>: ..."`, or `""` when no project has Python
+/// tests. A project that is not named runs no Python tests (that is how a project declares it has none: the key itself is still
+/// required). Every script is a relative `.py` path inside the project folder (no absolute path, no `..`, no whitespace); the
+/// job runs it as `python -I -B <script>`. A project named twice (any case), a project with no script, or a bad path is an error.
+pub fn parse_python_tests(v: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    use std::path::Component;
+    let bad = |why: String| format!("python_tests = \"{v}\": {why}");
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in v.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (project, scripts) = entry.split_once(':').ok_or_else(|| bad(format!("`{entry}` is not `<project>: <script> ...`")))?;
+        let project = project.trim();
+        if project.is_empty() || !project.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            return Err(bad(format!("`{project}` is not a project name")));
+        }
+        if out.iter().any(|(p, _)| p.eq_ignore_ascii_case(project)) {
+            return Err(bad(format!("project `{project}` is named twice")));
+        }
+        let scripts: Vec<String> = scripts.split_whitespace().map(String::from).collect();
+        if scripts.is_empty() {
+            return Err(bad(format!("project `{project}` names no script (leave a project with no Python tests out of the list)")));
+        }
+        for s in &scripts {
+            let p = Path::new(s);
+            let relative = p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) && p.components().any(|c| matches!(c, Component::Normal(_)));
+            if !relative || !s.ends_with(".py") || s.starts_with('-') {
+                return Err(bad(format!("`{s}` must be a relative `.py` path inside the project folder (no absolute path, no `..`, not starting with `-`)")));
+            }
+        }
+        out.push((project.to_string(), scripts));
+    }
+    Ok(out)
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -283,7 +319,9 @@ impl Config {
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
+        let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
         Ok(Config {
+            python_tests,
             shadow_reviewer,
             shadow_reviewer_model: model("shadow_reviewer_model")?,
             shadow_reviewer_timeout_seconds: positive("shadow_reviewer_timeout_seconds")?,
@@ -504,6 +542,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+python_tests = \"\"
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -613,6 +652,28 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn python_tests_is_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let shipped = Config::from_text(text, Path::new("p")).unwrap().python_tests;
+        let own = shipped.iter().find(|(p, _)| p == "broadsword").expect("Broadsword declares its own Python tests");
+        assert!(own.1.iter().all(|s| s.starts_with("scripts/test_") || s.starts_with("clients/test_")), "{own:?}");
+        let e = Config::from_text(&without_key(text, "python_tests"), Path::new("p")).unwrap_err();
+        assert!(e.contains("python_tests") && e.contains("missing"), "{e}");
+        assert_eq!(parse_python_tests("").unwrap(), vec![]);
+        assert_eq!(parse_python_tests("  ;  ").unwrap(), vec![]);
+        assert_eq!(
+            parse_python_tests("broadsword: scripts/test_a.py  clients/test_b.py; crash-sim: tests/t.py").unwrap(),
+            vec![("broadsword".to_string(), vec!["scripts/test_a.py".to_string(), "clients/test_b.py".to_string()]), ("crash-sim".to_string(), vec!["tests/t.py".to_string()])]
+        );
+        for bad in ["broadsword", "broadsword:", "p: a.py; P: b.py", "p: ../x.py", "p: /x.py", "p: C:/x.py", "p: a/../../x.py", "p: x.sh", "p: .", ": a.py", "a b: x.py", "p: x.py\" --evil", "p: -c.py", "p: -m.py"] {
+            assert!(parse_python_tests(bad).is_err(), "{bad}");
+        }
+        let with = |v: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "python_tests") { format!("python_tests = \"{v}\"") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&with("p: ../x.py"), Path::new("p")).unwrap_err().contains("python_tests"));
+        assert!(Config::from_text(&with(""), Path::new("p")).unwrap().python_tests.is_empty());
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 sweep_older_than_days = 7
@@ -630,6 +691,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+python_tests = \"\"
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -676,6 +738,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+python_tests = \"\"
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
