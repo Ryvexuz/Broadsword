@@ -36,8 +36,8 @@ class LastPassTests(unittest.TestCase):
         (self.root / "reviewer.rs").write_text(REVIEWER_RS, encoding="utf-8")
         self.last = self.root / "state" / "canary" / "last-pass.json"
 
-    def main(self, argv, a=0, b=0, version="codex-cli 9.9.9", checkout=None):
-        with mock.patch.object(canary, "CHECKOUT", checkout or self.root), mock.patch.object(canary, "REVIEWER_RS", self.root / "reviewer.rs"), \
+    def main(self, argv, a=0, b=0, version="codex-cli 9.9.9"):
+        with mock.patch.object(canary, "CHECKOUT", self.root), mock.patch.object(canary, "REVIEWER_RS", self.root / "reviewer.rs"), \
                 mock.patch.object(canary, "leg_offline", return_value=a), mock.patch.object(canary, "leg_real", return_value=b), \
                 mock.patch.object(canary, "codex_version", return_value=version), redirect_stdout(io.StringIO()):
             return canary.main(argv)
@@ -73,18 +73,42 @@ class LastPassTests(unittest.TestCase):
         self.assertEqual(self.main(["--offline-only"], version=None), canary.INCONCLUSIVE)
         self.assertFalse(self.last.exists())
 
-    def test_from_a_worktree_the_pass_is_recorded_at_the_root(self):
-        """A checkout in ROOT/worktrees/broadsword/wt (a `.git` file pointing at ROOT/.git/worktrees/wt) records in ROOT/state, the
-        one record openai_review.py reads, and writes nothing in the worktree's own state/."""
+    def make_worktree(self) -> Path:
+        """ROOT/worktrees/broadsword/wt, a linked worktree as Git lays it out: a `.git` FILE pointing at ROOT/.git/worktrees/wt."""
         gitdir = self.root / ".git" / "worktrees" / "wt"
         gitdir.mkdir(parents=True)
         wt = self.root / "worktrees" / "broadsword" / "wt"
         wt.mkdir(parents=True)
         (wt / "broadsword.toml").write_text(TOML, encoding="utf-8")
         (wt / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
-        self.assertEqual(self.main(["--offline-only"], checkout=wt), canary.REFUSED)
+        return wt
+
+    def test_from_a_worktree_a_pass_is_printed_but_recorded_nowhere(self):
+        """Unreviewed worktree code must never set the record the live queue honours: exit 0, the message, and no file written,
+        neither at the root nor in the worktree's own state/."""
+        wt = self.make_worktree()
+        for argv in (["--offline-only"], []):
+            with self.subTest(argv=argv):
+                with mock.patch.object(canary, "CHECKOUT", wt), mock.patch.object(canary, "REVIEWER_RS", self.root / "reviewer.rs"), \
+                        mock.patch.object(canary, "leg_offline", return_value=0), mock.patch.object(canary, "leg_real", return_value=0), \
+                        mock.patch.object(canary, "codex_version", return_value="codex-cli 9.9.9"), redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(canary.main(argv), canary.REFUSED)
+                self.assertIn("PASS (not recorded: run from a task worktree; only the main checkout's canary records)", out.getvalue())
+                self.assertFalse((self.root / "state").exists(), "nothing at the root")
+                self.assertFalse((wt / "state").exists(), "nothing in the worktree")
+
+    def test_write_last_pass_itself_refuses_from_a_worktree(self):
+        wt = self.make_worktree()
+        with mock.patch.object(canary, "CHECKOUT", wt):
+            with self.assertRaises(PermissionError):
+                canary.write_last_pass(self.root, "state", "codex-cli 9.9.9", ["A"], None)
+        self.assertFalse((self.root / "state").exists())
+
+    def test_the_root_checkout_records_the_pass(self):
+        """The main checkout (a `.git` FOLDER, with worktrees below it) is the one canary that records."""
+        self.make_worktree()
+        self.assertEqual(self.main(["--offline-only"]), canary.REFUSED)
         self.assertEqual(json.loads(self.last.read_text(encoding="utf-8"))["codex_version"], "codex-cli 9.9.9")
-        self.assertFalse((wt / "state").exists(), "no per-worktree record")
 
     def test_codex_version_never_raises(self):
         with mock.patch.object(canary, "run", side_effect=RuntimeError("boom")), mock.patch.object(canary.rv, "find_codex", return_value="codex"):

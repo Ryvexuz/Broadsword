@@ -26,7 +26,8 @@ Exit codes:
   2  INCONCLUSIVE: codex did not run or did not answer, or the setup failed; nothing was proven.
 
 On a full PASS (exit 0: leg A, and leg B when it ran) it writes <root>/<state_dir>/canary/last-pass.json atomically (<root> is the
-main Broadsword root, oc.find_main_root, also when the canary runs from a worktree; there is no per-worktree record):
+main Broadsword root, oc.find_main_root; there is no per-worktree record). Only the root checkout's own canary writes it: run from
+a task worktree, a PASS prints "PASS (not recorded: ...)", exits 0 and writes nothing anywhere. The record:
 {"codex_version", "utc", "legs", "model"}. Never on a FAIL. clients/openai_review.py compares codex_version with `codex --version`
 before it starts codex and runs `shadow_canary.py --offline-only` itself when they differ (an --offline-only pass is recorded with
 legs ["A"] and model null). If `codex --version` fails the legs cannot be recorded and the exit code is 2.
@@ -460,11 +461,22 @@ def codex_version(timeout: float = 20.0):
     return out if code == 0 and out else None
 
 
+NOT_RECORDED_FROM_WORKTREE = "PASS (not recorded: run from a task worktree; only the main checkout's canary records)"
+
+
+def is_root_checkout(root: Path) -> bool:
+    """True only when this script's checkout IS the main Broadsword root (the folder oc.find_main_root returns). A task worktree's
+    code is unreviewed, so it must never set the record the live queue honours."""
+    return os.path.normcase(str(CHECKOUT.resolve())) == os.path.normcase(str(Path(root).resolve()))
+
+
 def write_last_pass(root: Path, state_dir: str, version: str, legs: list, model) -> Path:
     """<root>/<state_dir>/canary/last-pass.json, written atomically (temp file, then replace). Only ever called on a full PASS.
-    `root` is the main Broadsword root (oc.find_main_root), never the checkout this script runs from: a worktree has no record of
-    its own, so there is exactly one record, the one openai_review.canary_state_file reads before it starts codex (it re-runs this
-    canary when the codex version differs)."""
+    `root` is the main Broadsword root (oc.find_main_root). There is exactly one record, the one openai_review.canary_state_file
+    reads before it starts codex (it re-runs this canary when the codex version differs), and only the root checkout's own canary
+    writes it: from a task worktree this raises PermissionError and writes nothing (record_pass checks first and says so)."""
+    if not is_root_checkout(root):
+        raise PermissionError("only the main checkout's canary writes last-pass.json")
     folder = root / state_dir / "canary"
     folder.mkdir(parents=True, exist_ok=True)
     final = folder / "last-pass.json"
@@ -479,7 +491,12 @@ def write_last_pass(root: Path, state_dir: str, version: str, legs: list, model)
 
 
 def record_pass(root: Path, state_dir: str, legs: list, model) -> int:
-    """REFUSED when the pass was recorded; INCONCLUSIVE when it could not be (no codex version): a pass nobody can find is not a pass."""
+    """REFUSED when the pass was recorded; INCONCLUSIVE when it could not be (no codex version): a pass nobody can find is not a pass.
+    From a task worktree the PASS is printed but NOT recorded anywhere (exit 0): openai_review.canary_gate then still refuses the call,
+    because it requires a record naming this codex version after the canary exits 0."""
+    if not is_root_checkout(root):
+        print(f"canary: {NOT_RECORDED_FROM_WORKTREE}")
+        return REFUSED
     version = codex_version()
     if version is None:
         print("INCONCLUSIVE: the legs passed but `codex --version` failed, so no pass was recorded")
