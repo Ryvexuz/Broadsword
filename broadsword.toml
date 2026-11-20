@@ -8,6 +8,7 @@ cleanup_every_hours = 1
 scratch_max_age_hours = 24
 max_agents = 14             # the most tasks with a working coder at once (task start refuses at the cap); a running task whose merge-queue entry is queued or running is not counted (blocked or stale entries count: their coder must act); scale-up (Lazlo 2026-11-19): +4 per step while merges/h rise with no more failures and RAM < 90%, no swap growth; lock wait and test time are warnings only (RETRO lesson 35)
 max_queued = 30             # task start refuses while this many merge-queue entries (any project) are open, so unmerged work cannot pile up
+queue_entry_read_wait_ms = 2000  # task start re-reads (with backoff) a queue entry file that is unreadable or incomplete for at most this long, then fails loudly: queue writes take milliseconds (atomic rename; on Windows a read can briefly hit a sharing violation or an antivirus hold), so 2 s is far above a real write and short next to task_lock_wait_seconds, since start holds the board meanwhile
 
 # Paths, relative to root
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time

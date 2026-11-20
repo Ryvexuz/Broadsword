@@ -285,9 +285,14 @@ fn entry_problem(r: &Record) -> Option<String> {
 }
 
 /// The open entries of `<state_dir>/queue/*.entry`, read WITHOUT the queue locks (records are saved atomically by rename).
-/// A file that cannot be read or is not a well-formed entry is retried briefly (the empty file `queue add` creates exists for
-/// milliseconds), then is an error naming the file: never skipped, never counted as closed. No queue folder is an empty queue.
+/// A file that cannot be read or is not a well-formed entry is re-read with backoff (10 ms doubling, at most 250 ms apart)
+/// until `queue_entry_read_wait_ms` has passed since the scan began (one budget for the whole scan, so a start never waits
+/// longer than that in total while it holds the board lock), then is an error naming the file: never skipped, never counted
+/// as closed. Why wait at all: a queue save is a temp file renamed over the entry, which takes milliseconds, but on Windows a
+/// read that meets the rename can briefly fail (sharing violation) and an antivirus scan can hold a new file for hundreds of
+/// milliseconds; a writer other than record.rs could also leave a short-lived partial file. No queue folder is an empty queue.
 pub fn open_queue_entries(cfg: &Config) -> Result<Vec<OpenEntry>, String> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(cfg.queue_entry_read_wait_ms);
     let dir = queue::queue_dir(cfg);
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
@@ -302,9 +307,16 @@ pub fn open_queue_entries(cfg: &Config) -> Result<Vec<OpenEntry>, String> {
         }
         let mut last = String::new();
         let mut good = None;
-        for n in 0..5 {
-            if n > 0 {
-                std::thread::sleep(Duration::from_millis(20));
+        let mut pause = Duration::from_millis(10);
+        loop {
+            if !last.is_empty() {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    last.push_str(&format!(" (still so after waiting queue_entry_read_wait_ms = {} ms)", cfg.queue_entry_read_wait_ms));
+                    break;
+                }
+                std::thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(Duration::from_millis(250));
             }
             match record::load(&p) {
                 Ok(r) => match entry_problem(&r) {
@@ -502,11 +514,24 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             return fail(EXIT_CONFLICT, format!("cannot start {id}: {} tasks are running with a working coder, the max_agents cap in broadsword.toml is {} (running tasks whose merge-queue entry is queued or running are not counted; {} are): {}
 start it after one of them is queued, done, failed or abandoned (`task abandon` frees the slot of a task whose agent died)", working.len(), cfg.max_agents, queued.len(), ids.join(", ")));
         }
-        // The queue cap: so finished-but-unmerged work cannot pile up without limit.
+        // The queue cap: so finished-but-unmerged work cannot pile up without limit. An ORPHAN entry (open, but its task is no
+        // longer `running`: open, abandoned, done, failed, or not on the board) still counts: it is real open queue work that
+        // `queue run` would act on, so skipping it would fail open. The refusal names each orphan and the command that clears it.
         if open_entries.len() as u64 >= cfg.max_queued {
             let ids: Vec<String> = open_entries.iter().map(|e| format!("{} (task {}, {})", e.id, e.task, e.status)).collect();
+            let orphans: Vec<String> = open_entries
+                .iter()
+                .filter_map(|e| {
+                    match all.iter().find(|o| o.id() == e.task).map(|o| o.status()) {
+                        Some(RUNNING) => None,
+                        Some(s) => Some(format!("entry {} is open but its task {} is {s}: clear it with `broadsword queue cancel {}`", e.id, e.task, e.id)),
+                        None => Some(format!("entry {} is open but its task {} is not on the board: clear it with `broadsword queue cancel {}`", e.id, e.task, e.id)),
+                    }
+                })
+                .collect();
+            let orphan_text = if orphans.is_empty() { String::new() } else { format!("\n{}", orphans.join("\n")) };
             return fail(EXIT_CONFLICT, format!("cannot start {id}: {} merge-queue entries are open, the max_queued cap in broadsword.toml is {}: {}
-start it after the queue has merged or ended some of them", open_entries.len(), cfg.max_queued, ids.join(", ")));
+start it after the queue has merged or ended some of them{orphan_text}", open_entries.len(), cfg.max_queued, ids.join(", ")));
         }
         let conflicts = find_conflicts(t.get("project"), &claims_of(&t), &all, Some(id));
         if !conflicts.is_empty() {

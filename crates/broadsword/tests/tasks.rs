@@ -706,6 +706,45 @@ fn start_refuses_at_max_queued_open_entries() {
 }
 
 #[test]
+fn an_orphan_open_entry_counts_for_max_queued_and_the_refusal_says_how_to_clear_it() {
+    let r = Root::new("qorph");
+    set_key(&r, "max_queued", 1);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    put_entry(&r, "q-orph", &a, "queued");
+    // a is abandoned while its entry is still open: the entry is an orphan, but still real open queue work (fail closed).
+    assert_eq!(r.run(&["task", "abandon", &a]).code, 0);
+    let o = r.start(&b, "coder-2");
+    assert_eq!(o.code, 3, "the orphan entry still counts for max_queued: {}", o.stderr);
+    assert!(o.stderr.contains("max_queued"), "{}", o.stderr);
+    assert!(o.stderr.contains(&format!("entry q-orph is open but its task {a} is abandoned")), "the orphan is named with its task's status: {}", o.stderr);
+    assert!(o.stderr.contains("broadsword queue cancel q-orph"), "the message names the command that clears it: {}", o.stderr);
+    assert_eq!(r.status_of(&b), "open");
+    let c = r.run(&["queue", "cancel", "q-orph"]);
+    assert_eq!(c.code, 0, "{}", c.stderr);
+    let o = r.start(&b, "coder-2");
+    assert_eq!(o.code, 0, "after the cancel the start succeeds: {}", o.stderr);
+}
+
+#[test]
+fn start_waits_for_a_queue_entry_that_is_still_being_written() {
+    let r = Root::new("qslow");
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let dir = r.dir.join("state/queue");
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("q-slow.entry");
+    fs::write(&p, "").unwrap(); // not yet complete
+    let w = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        fs::write(&p, "id = q-slow\ntask = t-x\nproject = p\nstatus = merged\ncreated = 1\n").unwrap();
+    });
+    let o = r.start(&a, "coder-1");
+    w.join().unwrap();
+    assert_eq!(o.code, 0, "an entry that becomes complete after ~300 ms does not fail the start: {}", o.stderr);
+}
+
+#[test]
 fn a_malformed_queue_entry_makes_start_fail_naming_the_file() {
     let r = Root::new("qbad");
     let a = r.add("p", "a", &["src/a.rs"]);

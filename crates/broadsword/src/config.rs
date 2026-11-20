@@ -120,6 +120,10 @@ pub struct Config {
     /// The most open merge-queue entries (any project) at which `task start` still starts a task; at or above it, it refuses,
     /// so finished-but-unmerged work cannot pile up without limit now that it no longer counts against max_agents.
     pub max_queued: u64,
+    /// How long `task start` keeps re-reading a merge-queue entry file that cannot be read or is not yet a complete entry
+    /// (with backoff) before it fails the start loudly. Well above a queue write (milliseconds), so a concurrent `queue add`
+    /// or `queue run` save never fails a legitimate start; short next to task_lock_wait_seconds, since start holds the board.
+    pub queue_entry_read_wait_ms: u64,
     /// How long `recover` (and `recover <id>`, `recover --abandon`) waits for the recover lock before it says another recover is running.
     pub recover_lock_wait_seconds: u64,
     /// `cargo sweep --time N`: build-folder files not used for N days are swept (by `cleanup`, and by the cleanup a low-disk kill runs).
@@ -236,6 +240,7 @@ impl Config {
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
+            queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
             recover_lock_wait_seconds: positive("recover_lock_wait_seconds")?,
             sweep_older_than_days: positive("sweep_older_than_days")?,
             redact_min_chars: positive("redact_min_chars")?,
@@ -367,6 +372,7 @@ shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
+queue_entry_read_wait_ms = 2000
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -394,7 +400,7 @@ install_dir=\"build/bin\"\n";
         assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
         for key in [
             "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
-            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued",
+            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms",
         ] {
             let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
 ");
@@ -412,6 +418,8 @@ install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&with("max_queued", "max_queued = 0"), Path::new("p")).is_err(), "max_queued = 0 would start nothing");
         assert!(c.max_agents >= 1);
         assert_eq!(c.max_queued, 30, "the shipped max_queued");
+        assert!(Config::from_text(&with("queue_entry_read_wait_ms", "queue_entry_read_wait_ms = 0"), Path::new("p")).is_err(), "0 would never wait for an entry being written");
+        assert_eq!(c.queue_entry_read_wait_ms, 2000, "the shipped queue_entry_read_wait_ms");
         assert!(valid_model_name("claude-haiku-4-5") && valid_model_name("opus[1m]") && !valid_model_name("") && !valid_model_name("-x"));
     }
 
@@ -446,6 +454,7 @@ shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
+queue_entry_read_wait_ms = 2000
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -486,6 +495,7 @@ shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
 max_agents = 50
 max_queued = 50
+queue_entry_read_wait_ms = 2000
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");

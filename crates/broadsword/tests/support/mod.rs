@@ -60,6 +60,7 @@ const BASE: &[(&str, &str)] = &[
     ("shadow_reviewer_timeout_seconds", "5"),
     ("max_agents", "50"),
     ("max_queued", "50"),
+    ("queue_entry_read_wait_ms", "2000"),
 ];
 
 /// `config` without the key `missing`, for the "a required key is missing" tests. Panics if `BASE` lacks it.
