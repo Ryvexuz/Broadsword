@@ -15,8 +15,10 @@
 Exit 0 PASS, 1 FAIL (command failed or timed out), 2 refused or could not run (nothing was judged).
 
 NEVER run this inside a Broadsword job (a nested run deadlocked builds for 15 minutes, PROGRESS.md). Broadsword
-sets no job marker of its own, so the script refuses when BROADSWORD_JOB is set or CARGO_TARGET_DIR is set (job.rs
-gives every child process CARGO_TARGET_DIR; a plain shell does not). The orchestrator runs it directly.
+sets no job marker variable. What job.rs does set in every job child is CARGO_TARGET_DIR = the shared build folder
+(build_dir in broadsword.toml, joined to the root). So the script refuses when CARGO_TARGET_DIR resolves to the
+build_dir of the --root, --repo or this checkout; a shell that sets CARGO_TARGET_DIR to some other folder is not refused.
+The orchestrator runs it directly.
 No network (the clone is local), no model calls.
 """
 import sys
@@ -32,6 +34,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tomllib
 
 DOC_FILES = ("README.md", "AGENTS.md")
 COMMAND_RE = re.compile(r"one[ -]command\s*:\s*`([^`]+)`", re.IGNORECASE)
@@ -42,8 +45,29 @@ class Refused(Exception):
     """Nothing was run or judged."""
 
 
-def in_job(env):
-    return bool(env.get("BROADSWORD_JOB") or env.get("CARGO_TARGET_DIR"))
+def norm(path):
+    return os.path.normcase(str(pathlib.Path(path).resolve()))
+
+
+def build_dir_of(root):
+    """The shared build folder broadsword.toml names for `root` (required key: no default), or None if unreadable."""
+    try:
+        cfg = tomllib.loads((pathlib.Path(root) / "broadsword.toml").read_text(encoding="utf-8"))
+        return pathlib.Path(root) / cfg["build_dir"]
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+
+
+def in_job(env, roots):
+    """The build folder a job gave this process (CARGO_TARGET_DIR), if it is the shared build folder of any of `roots`."""
+    target = env.get("CARGO_TARGET_DIR")
+    if not target:
+        return None
+    for r in roots:
+        b = build_dir_of(r)
+        if b is not None and norm(b) == norm(target):
+            return b
+    return None
 
 
 def documented_command(clone):
@@ -74,6 +98,47 @@ def run(argv, **kw):
     return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
 
 
+def kill_tree(proc):
+    """Kill `proc` and everything it started (a timeout must not leave a grandchild holding the clone)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_command(command, cwd, env, timeout, outfile):
+    """Run the documented command with its output going straight to `outfile` (no pipe, so a grandchild that outlives the
+    command can never block a read). Returns (exit code or 'timeout' or 'not started', error text)."""
+    # Windows takes the command line as written (so `python scripts\x.py` survives); elsewhere split it like a shell
+    argv = command if os.name == "nt" else shlex.split(command)
+    kw = {"start_new_session": True} if os.name != "nt" else {}
+    with open(outfile, "wb") as f:
+        try:
+            proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
+        except OSError as e:
+            return "not started", f"could not start: {e}\n"
+        try:
+            rc = proc.wait(timeout=timeout)
+            if os.name != "nt":  # its process group may still hold helpers; on Windows an exited pid has no tree (and may be reused)
+                kill_tree(proc)
+            return rc, ""
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            return "timeout", f"timed out after {timeout} s; the command and its child processes were killed\n"
+
+
 def main(argv=None, env=None):
     env = dict(os.environ) if env is None else env
     here_root = pathlib.Path(__file__).resolve().parent.parent
@@ -82,8 +147,12 @@ def main(argv=None, env=None):
     ap.add_argument("--root", default=str(here_root), help="Broadsword root whose scratch/ gets the clone")
     ap.add_argument("--timeout", type=int, default=3600, help="seconds for the one command (default 3600)")
     args = ap.parse_args(argv)
-    if in_job(env):
-        print("fresh_clone_check: refusing to run inside a Broadsword job (nested runs deadlock the build lock)")
+    args.repo, args.root = str(pathlib.Path(args.repo).resolve()), str(pathlib.Path(args.root).resolve())  # the command runs elsewhere: no relative paths
+    shared = in_job(env, [args.root, args.repo, here_root])
+    if shared:
+        print(f"fresh_clone_check: refusing to run: CARGO_TARGET_DIR is {shared}, the shared build folder a Broadsword job "
+              "gives its child, so this looks like a job (nested runs deadlock the build lock). Run it directly, not through "
+              "broadsword run/test, or unset CARGO_TARGET_DIR if this is a plain shell.")
         return 2
     scratch = pathlib.Path(args.root) / "scratch"
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -109,13 +178,8 @@ def main(argv=None, env=None):
         print(f"one command (from {doc}): {command}")
         child_env = dict(env)
         child_env["CARGO_TARGET_DIR"] = str(clone / "target")
-        try:
-            p = run(shlex.split(command), cwd=clone, env=child_env, timeout=args.timeout)
-            out, rc = p.stdout.decode("utf-8", "replace"), p.returncode
-        except subprocess.TimeoutExpired:
-            out, rc = f"timed out after {args.timeout} s\n", "timeout"
-        except OSError as e:
-            out, rc = f"could not start: {e}\n", "not started"
+        rc, note = run_command(command, clone, child_env, args.timeout, outfile)
+        out = outfile.read_text(encoding="utf-8", errors="replace") + note
         outfile.write_text(out, encoding="utf-8")
         print(out, end="" if out.endswith("\n") or not out else "\n")
         code = 0 if rc == 0 else 1
@@ -125,8 +189,8 @@ def main(argv=None, env=None):
         if clone.exists():
             try:
                 safe_delete(clone, scratch)
-            except Refused as e:  # cannot happen for a clone made above, but never delete on doubt
-                print(f"fresh_clone_check: {e}")
+            except (Refused, OSError) as e:  # never delete on doubt; a locked file must not hide the verdict already printed
+                print(f"fresh_clone_check: clone NOT deleted: {e}")
 
 
 if __name__ == "__main__":

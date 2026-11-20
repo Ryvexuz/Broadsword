@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 
@@ -44,6 +45,24 @@ def rmtree(path):
     shutil.rmtree(path, onerror=onerror)
 
 
+def pid_alive(pid):
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], stdout=subprocess.PIPE).stdout.decode(errors="replace")
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill_pid(pid):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif pid_alive(pid):
+        os.kill(pid, 9)
+
+
 def git(cwd, *args):
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, check=True,
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -60,12 +79,14 @@ class Base(unittest.TestCase):
         self.addCleanup(rmtree, self.tmp)
         self.root = self.tmp / "root"
         (self.root / "scratch").mkdir(parents=True)
+        (self.root / "broadsword.toml").write_text('root = "."\nbuild_dir = "build"\n', encoding="utf-8")
         self.repo = self.tmp / "repo"
 
     def make_repo(self, files, branch="main"):
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", branch)
         for name, text in files.items():
+            (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / name).write_text(text, encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "init")
@@ -150,15 +171,95 @@ class Run(Base):
         self.assertEqual(self.leftovers(), [])
 
 
-class Refusals(Base):
-    def test_refused_inside_a_job_and_nothing_is_cloned(self):
+    def test_relative_root_still_gives_the_clone_an_absolute_target_folder(self):
+        n, t = doc("python -I check.py")
+        self.make_repo({n: t, "check.py": "import os\nprint('TARGET=' + os.environ['CARGO_TARGET_DIR'])\n"})
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = fc.main(["--repo", "repo", "--root", "root"], env={})
+        finally:
+            os.chdir(old)
+        target = [l for l in buf.getvalue().splitlines() if l.startswith("TARGET=")][0][7:]
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertTrue(os.path.isabs(target), target)
+        self.assertEqual(pathlib.Path(target).parent.parent.resolve(), (self.root / "scratch").resolve())
+
+    def test_backslash_paths_in_the_documented_command_survive_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("backslash paths are a Windows form")
+        n, t = doc("python -I sub\\check.py")
+        self.make_repo({n: t, "sub/check.py": "print('ran sub check')\n"})
+        code, out = self.go()
+        self.assertEqual(code, 0, out)
+        self.assertIn("ran sub check", out)
+
+    def test_timeout_kills_a_grandchild_that_would_hang_the_script_and_keeps_the_output(self):
+        pidfile = self.tmp / "grandchild.pid"
+        n, t = doc("python -I check.py")
+        check = (
+            "import subprocess, sys, time\n"
+            "print('before hang', flush=True)\n"
+            f"g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            f"open({str(pidfile)!r}, 'w').write(str(g.pid))\n"
+            "time.sleep(120)\n"
+        )
+        self.make_repo({n: t, "check.py": check})
+        start = time.monotonic()
+        code, out = self.go(None, "--timeout", "3")
+        took = time.monotonic() - start
+        self.addCleanup(lambda: kill_pid(int(pidfile.read_text())) if pidfile.exists() else None)
+        self.assertEqual(code, 1, out)
+        self.assertLess(took, 60, f"took {took:.0f} s: the script waited for the grandchild")
+        self.assertIn("FAIL:", out)
+        self.assertIn("timed out", out)
+        self.assertIn("before hang", out)
+        self.assertEqual(self.leftovers(), [])
+        time.sleep(1)
+        self.assertFalse(pid_alive(int(pidfile.read_text())), "the grandchild survived the timeout")
+
+    def test_a_clone_that_cannot_be_deleted_is_reported_without_a_traceback(self):
         n, t = doc("python -I check.py")
         self.make_repo({n: t, "check.py": "print('ok')\n"})
-        for env in ({"BROADSWORD_JOB": "20261120-1"}, {"CARGO_TARGET_DIR": "build"}):
-            code, out = self.go(env)
-            self.assertEqual(code, 2)
-            self.assertIn("inside a Broadsword job", out)
+        real = fc.safe_delete
+        fc.safe_delete = lambda *a, **k: (_ for _ in ()).throw(PermissionError("locked file"))
+        try:
+            code, out = self.go()
+        finally:
+            fc.safe_delete = real
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS:", out)
+        self.assertIn("clone NOT deleted: locked file", out)
+
+
+class Refusals(Base):
+    def test_refused_when_cargo_target_dir_is_the_shared_build_folder_a_job_sets(self):
+        n, t = doc("python -I check.py")
+        self.make_repo({n: t, "check.py": "print('ok')\n"})
+        build = self.root / "build"
+        # job.rs sets CARGO_TARGET_DIR to root.join(build_dir); spelled with .. and mixed case it is still that folder
+        for target in (str(build), str(self.root / "x" / ".." / "build"), str(build).upper()):
+            code, out = self.go({"CARGO_TARGET_DIR": target})
+            self.assertEqual(code, 2, target)
+            self.assertIn("shared build folder", out)
+            self.assertIn("CARGO_TARGET_DIR", out)
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+    def test_not_refused_for_a_plain_shell_or_an_unrelated_target_dir_or_the_invented_marker(self):
+        n, t = doc("python -I check.py")
+        self.make_repo({n: t, "check.py": "print('ok')\n"})
+        for env in ({}, {"CARGO_TARGET_DIR": str(self.tmp / "my-own-target")}, {"BROADSWORD_JOB": "20261120-1"}):
+            with self.subTest(env=env):
+                code, out = self.go(env)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(self.leftovers(), [])
+                self.assertFalse(fc.in_job(env, [self.root]))
+
+    def test_unreadable_broadsword_toml_never_refuses_by_guessing(self):
+        (self.root / "broadsword.toml").write_text("not = [valid", encoding="utf-8")
+        self.assertIsNone(fc.in_job({"CARGO_TARGET_DIR": str(self.root / "build")}, [self.root]))
 
     def test_safe_delete_only_removes_fresh_clone_folders_directly_in_scratch(self):
         scratch = self.root / "scratch"
