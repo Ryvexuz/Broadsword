@@ -112,15 +112,29 @@ EXPLICIT_KEY = re.compile(r"^\s*(-\s+)*\?(\s|$)")
 TAG = re.compile(r"(^\s*(-\s+)*|:\s+)!\S*")
 KEY_LINE = re.compile(r"^(\s*)((?:-\s+)*)[\w.-]+\s*:(\s|$)")
 BLOCK_SCALAR = re.compile(r":\s*[|>][+-]?\d*[+-]?$")
+DOUBLE_QUOTED = re.compile(r'^"(?:[^"\\]|\\.)*"\s*$')
+SINGLE_QUOTED = re.compile(r"^'(?:[^']|'')*'\s*$")
+
+
+def unclosed_quote(value):
+    """True when `value` opens a double or single quoted scalar that does not close on the same line."""
+    value = value.strip()
+    if value[:1] == '"':
+        return not DOUBLE_QUOTED.match(value)
+    if value[:1] == "'":
+        return not SINGLE_QUOTED.match(value)
+    return False
 
 
 def steps_problems(lines):
     """Every line under a `steps:` key must be a plain `key: value` line (optionally after `- `) or the body of a `|` / `>` block
-    scalar; explicit `? key` entries and `!tag`s are refused anywhere. Anything else is `unrecognised form`: the checker cannot say
+    scalar; a quoted value must close on its own line and a key line indented deeper than a key that already has a value is a
+    continuation of that value (both refused); explicit `? key` entries and `!tag`s are refused anywhere. Anything else is `unrecognised form`: the checker cannot say
     what it runs, so it fails instead of passing it."""
     problems = []
     steps_indent = None
     body_above = None  # indent a line must exceed to be the body of the block scalar just opened
+    prev_has_value, prev_col = False, 0  # the previous key line carried a value, and its key's column
     for n, raw in enumerate(lines, 1):
         line = re.sub(r"\$\{\{.*?\}\}", "", strip_comment(raw))
         if not line.strip():
@@ -131,6 +145,7 @@ def steps_problems(lines):
         if steps_indent is not None and ind <= steps_indent:
             steps_indent = None
             body_above = None
+            prev_has_value = False
         if steps_indent is None:
             if re.match(r"^\s*(-\s+)*steps\s*:\s*$", line):
                 steps_indent = ind
@@ -143,10 +158,20 @@ def steps_problems(lines):
         if not m:
             problems.append(f"line {n}: unrecognised form inside steps (not a plain `key: value` line): {line.strip()}")
             continue
+        key_col = len(m.group(1)) + len(m.group(2))
+        value = strip_comment(raw).split(":", 1)[1].strip()
+        if prev_has_value and key_col > prev_col:
+            problems.append(f"line {n}: unrecognised form inside steps (continuation of the previous line's value; refused): {line.strip()}")
+        if unclosed_quote(value):
+            problems.append(f"line {n}: unrecognised form inside steps (quoted value does not close on its own line; refused): {line.strip()}")
         if BLOCK_SCALAR.search(line):
             body_above = len(m.group(1)) + 2 * m.group(2).count("-")  # the key's own column, so any deeper line is the body
             if m.group(2):
                 body_above = len(m.group(1)) + len(m.group(2)) - 1
+            prev_has_value = False
+        else:
+            prev_has_value = bool(value)
+        prev_col = key_col
     return problems
 
 

