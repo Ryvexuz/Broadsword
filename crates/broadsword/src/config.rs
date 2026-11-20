@@ -114,7 +114,8 @@ pub struct Config {
     /// A shadow review that runs longer than this is killed and recorded as `ERROR`; the merge goes on.
     pub shadow_reviewer_timeout_seconds: u64,
     /// The most tasks with a working coder at once, across all projects (`task start` refuses at the cap): a `running` task
-    /// whose branch has an open merge-queue entry (queued, running, blocked, stale) waits for the queue and is not counted.
+    /// whose branch has a `queued` or `running` merge-queue entry waits for the queue and is not counted; one whose entry is
+    /// `blocked` or `stale` needs its coder, so it counts.
     pub max_agents: u64,
     /// The most open merge-queue entries (any project) at which `task start` still starts a task; at or above it, it refuses,
     /// so finished-but-unmerged work cannot pile up without limit now that it no longer counts against max_agents.

@@ -658,9 +658,33 @@ fn tasks_waiting_in_the_merge_queue_do_not_count_against_max_agents() {
     assert!(o.stderr.contains("max_agents") && o.stderr.contains(&format!("{a} (")) && o.stderr.contains(&format!("{c} (")), "{}", o.stderr);
     assert!(!o.stderr.contains(&format!("{b} (")), "b waits in the queue, it is not listed as counted: {}", o.stderr);
     assert_eq!(r.status_of(&d), "open");
-    // Blocked and stale entries are still open in queue.rs (`queue run --entry` resumes them): they do not count either.
+    // A stale entry is still open in queue.rs, but its coder must act (move the branch back or re-check it): a counts.
     put_entry(&r, "q-1", &a, "stale");
-    assert_eq!(r.start(&d, "coder-4").code, 0, "a stale entry is still in the queue");
+    let o = r.start(&d, "coder-4");
+    assert_eq!(o.code, 3, "a task whose entry is stale needs its coder, so it counts: {}", o.stderr);
+    assert!(o.stderr.contains(&format!("{a} (")) && !o.stderr.contains(&format!("{b} (")), "{}", o.stderr);
+    // Back to queued: a waits again and d can start.
+    put_entry(&r, "q-1", &a, "queued");
+    assert_eq!(r.start(&d, "coder-4").code, 0, "a queued entry waits in the queue");
+}
+
+#[test]
+fn tasks_with_blocked_or_stale_entries_count_against_max_agents() {
+    let r = Root::new("qbs");
+    set_cap(&r, 2);
+    let a = r.add("p", "a", &["src/a.rs"]);
+    let b = r.add("q", "b", &["src/b.rs"]);
+    let c = r.add("p", "c", &["src/c.rs"]);
+    assert_eq!(r.start(&a, "coder-1").code, 0);
+    assert_eq!(r.start(&b, "coder-2").code, 0);
+    // Blocked (dirty worktree, changes after review) and stale (branch moved, no checked commit) entries are open, but
+    // each needs its coder to act, so both coders are at work: a third start would exceed max_agents.
+    put_entry(&r, "q-1", &a, "blocked");
+    put_entry(&r, "q-2", &b, "stale");
+    let o = r.start(&c, "coder-3");
+    assert_eq!(o.code, 3, "two running tasks with blocked/stale entries fill cap 2: {}", o.stderr);
+    assert!(o.stderr.contains("max_agents") && o.stderr.contains(&format!("{a} (")) && o.stderr.contains(&format!("{b} (")), "{}", o.stderr);
+    assert_eq!(r.status_of(&c), "open", "a refused start changes nothing");
 }
 
 #[test]
