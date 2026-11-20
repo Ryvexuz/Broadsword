@@ -15,6 +15,7 @@ import os
 import pathlib
 import shutil
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 
@@ -79,6 +80,16 @@ class Parse(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertEqual(problems[0][0], 5)
 
+    def test_ids_differing_only_in_case_are_duplicates(self):
+        checks, problems = nc.parse(block("A", "x", "r") + block("a", "y", "r"))
+        self.assertEqual([c["id"] for c in checks], ["A"])
+        self.assertEqual(len(problems), 1)
+
+    def test_windows_device_names_are_not_ids(self):
+        for cid in ("nul", "CON", "com1", "aux.v2"):
+            checks, problems = nc.parse(block(cid, "x", "r"))
+            self.assertEqual((checks, len(problems)), ([], 1), cid)
+
     def test_malformed_block_does_not_hide_the_next_good_one(self):
         checks, problems = nc.parse(f"{F}check a\n{F}\n" + block("b", "x", "r"))
         self.assertEqual([c["id"] for c in checks], ["b"])
@@ -98,6 +109,25 @@ class Judge(unittest.TestCase):
     def test_free_text_is_not_judged(self):
         self.assertIsNone(nc.judge("the picture looks right", "anything"))
         self.assertIsNone(nc.judge("last line equals ok", "ok"))
+
+
+class Verdict(unittest.TestCase):
+    def test_nonzero_exit_always_fails_even_with_the_expected_text(self):
+        for rule in ("last line == ok", "contains ok", "looks fine to me"):
+            self.assertIs(nc.verdict(rule, "ok\n", 1), False, rule)
+        self.assertIs(nc.verdict("contains ok", "ok\n", "timeout"), False)
+        self.assertIs(nc.verdict("contains ok", "ok\n", "not started"), False)
+
+    def test_zero_exit_defers_to_the_rule(self):
+        self.assertIs(nc.verdict("last line == ok", "ok\n", 0), True)
+        self.assertIs(nc.verdict("last line == ok", "no\n", 0), False)
+        self.assertIsNone(nc.verdict("looks fine", "x", 0))
+
+    def test_exit_nonzero_rule_expects_a_failure(self):
+        self.assertIs(nc.verdict("exit != 0", "", 3), True)
+        self.assertIs(nc.verdict("exit != 0", "", 0), False)
+        self.assertIs(nc.verdict("exit != 0", "", "timeout"), False)
+        self.assertIs(nc.verdict("exit != 0", "", "not started"), False)
 
 
 class Refusals(unittest.TestCase):
@@ -120,6 +150,12 @@ class Refusals(unittest.TestCase):
         self.assertEqual(nc.build_argv("broadsword test crash-sim > scratch/o.txt 2>&1", root)[1:], ["test", "crash-sim"])
         self.assertEqual(nc.build_argv("build/bin/broadsword.exe check p 2>&1", root)[1:], ["check", "p"])
 
+    def test_quoted_arguments_stay_one_argument(self):
+        root = SCRATCH / "nowhere"
+        self.assertEqual(nc.build_argv('python -I "scripts/my check.py" a', root)[1:], ["-I", "scripts/my check.py", "a"])
+        self.assertEqual(nc.build_argv(r"python -I C:\x\a.py", root)[1:], ["-I", r"C:\x\a.py"])
+        self.refused('python -I "unclosed.py')
+
     def test_job_detection(self):
         self.assertTrue(nc.in_job({"BROADSWORD_JOB": "20261120-1"}))
         self.assertTrue(nc.in_job({"CARGO_TARGET_DIR": "build"}))
@@ -132,12 +168,17 @@ class Cli(unittest.TestCase):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="test-node-check-", dir=SCRATCH))
         (self.root / "docs" / "nodes").mkdir(parents=True)
         (self.root / "emit.py").write_text("import sys\nprint('line one')\nprint(sys.argv[1])\n", encoding="utf-8")
+        (self.root / "crash.py").write_text("print('ok')\nraise SystemExit(3)\n", encoding="utf-8")
         (self.root / "docs" / "nodes" / "1.2.md").write_text(
             "# 1.2\n"
             + block("pass-last", "python -I emit.py ok", "last line == ok")
             + block("fail-last", "python -I emit.py nope", "last line == ok")
             + block("has", "python -I emit.py x", "contains line one")
             + block("hand", "python -I emit.py x", "it looks fine")
+            + block("crash-after-ok", "python -I crash.py", "last line == ok")
+            + block("crash-free", "python -I crash.py", "it looks fine")
+            + block("expect-fail", "python -I crash.py", "exit != 0")
+            + block("expect-fail-but-ok", "python -I emit.py ok", "exit != 0")
             + block("redir", "python -I emit.py ok > scratch/ignored.txt 2>&1", "last line == ok"),
             encoding="utf-8",
         )
@@ -157,7 +198,7 @@ class Cli(unittest.TestCase):
     def test_list_prints_every_check(self):
         code, out = self.cli("--list")
         self.assertEqual(code, 0)
-        for s in ("pass-last", "command: python -I emit.py ok", "PASS: last line == ok", "5 checks, 0 problems"):
+        for s in ("pass-last", "command: python -I emit.py ok", "PASS: last line == ok", "9 checks, 0 problems"):
             self.assertIn(s, out)
 
     def test_list_flags_a_malformed_block_and_exits_1(self):
@@ -180,6 +221,53 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("result: FAIL", out)
 
+    def test_exit_code_decides_even_when_the_output_matches(self):
+        code, out = self.cli("--run", "crash-after-ok")
+        self.assertEqual(code, 1)
+        self.assertIn("exit: 3", out)
+        self.assertIn("result: FAIL", out)
+        self.assertEqual(self.cli("--run", "crash-free")[0], 1)  # free text does not rescue a crash
+        code, out = self.cli("--run", "expect-fail")
+        self.assertEqual((code, "result: PASS" in out), (0, True), out)
+        self.assertEqual(self.cli("--run", "expect-fail-but-ok")[0], 1)
+
+    def test_timeout_fails_and_kills_the_whole_process_tree(self):
+        marker = self.root / "grandchild-alive.txt"
+        (self.root / "tree.py").write_text(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-I', 'grand.py'])\n"
+            "print('ok', flush=True)\ntime.sleep(60)\n", encoding="utf-8")
+        (self.root / "grand.py").write_text(
+            "import time\ntime.sleep(4)\nopen('grandchild-alive.txt', 'w').write('x')\n", encoding="utf-8")
+        p = self.root / "docs" / "nodes" / "1.2.md"
+        p.write_text(block("tree", "python -I tree.py", "contains ok"), encoding="utf-8")
+        code, out = self.cli("--run", "tree", "--timeout", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("exit: timeout", out)
+        self.assertIn("result: FAIL", out)
+        time.sleep(4.5)
+        self.assertFalse(marker.exists(), "the grandchild survived the timeout")
+
+    def test_run_all_refuses_while_a_block_is_malformed_and_runs_nothing(self):
+        p = self.root / "docs" / "nodes" / "1.2.md"
+        p.write_text(p.read_text(encoding="utf-8") + f"\n{F}check broken\ncmd\n{F}\n", encoding="utf-8")
+        code, out = self.cli("--run", "--all")
+        self.assertEqual(code, 2)
+        self.assertIn("1.2.md line", out)
+        self.assertIn("refusing --run --all", out)
+        self.assertFalse((self.root / "scratch" / "node-checks").exists())
+
+    def test_run_all_with_no_usable_check_is_refused(self):
+        (self.root / "docs" / "nodes" / "1.2.md").write_text("# nothing here\n", encoding="utf-8")
+        self.assertEqual(self.cli("--run", "--all")[0], 2)
+
+    def test_run_one_warns_about_malformed_blocks_but_runs(self):
+        p = self.root / "docs" / "nodes" / "1.2.md"
+        p.write_text(p.read_text(encoding="utf-8") + f"\n{F}check broken\ncmd\n{F}\n", encoding="utf-8")
+        code, out = self.cli("--run", "pass-last")
+        self.assertEqual(code, 0)
+        self.assertIn("warning: 1.2.md line", out)
+
     def test_free_text_rule_is_left_to_the_human(self):
         code, out = self.cli("--run", "hand")
         self.assertEqual(code, 0)
@@ -189,8 +277,8 @@ class Cli(unittest.TestCase):
     def test_run_all_runs_every_check_and_fails_if_any_fails(self):
         code, out = self.cli("--run", "--all")
         self.assertEqual(code, 1)
-        self.assertEqual(sum(l.startswith("== ") for l in out.splitlines()), 5)
-        self.assertEqual((out.count("result: PASS"), out.count("result: FAIL")), (3, 1))
+        self.assertEqual(sum(l.startswith("== ") for l in out.splitlines()), 9)
+        self.assertEqual((out.count("result: PASS"), out.count("result: FAIL")), (4, 4))
         self.assertTrue((self.root / "scratch" / "node-checks" / "1.2" / "redir.txt").is_file())
 
     def test_refused_inside_a_job_and_nothing_runs(self):
