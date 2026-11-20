@@ -265,6 +265,26 @@ impl Drop for Root {
     }
 }
 
+/// The pids of the direct children of `pid` (the reviewer the queue run started). Empty if there are none.
+fn child_pids(pid: u32) -> Vec<u32> {
+    let o = if cfg!(windows) {
+        Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}').ProcessId")]).stdin(Stdio::null()).output().unwrap()
+    } else {
+        Command::new("pgrep").args(["-P", &pid.to_string()]).stdin(Stdio::null()).output().unwrap()
+    };
+    String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+/// Kill a `queue run` the way a crash does: the run process dies and nothing in it gets to react. Its reviewer child is NOT killed
+/// with it (it is left to leave when the test removes the hang file): `taskkill /T` kills the tree in no fixed order, and when the
+/// reviewer dies first the run, which polls its child every 25 ms, sees the death and ends the entry `blocked` before it is killed
+/// itself (more often under load, when the kill of the parent lags). That is correct behaviour for a reviewer that dies on its
+/// own, but it is not a crash of the run (see `a_reviewer_that_dies_while_its_run_lives_blocks_the_entry`).
+fn kill_run_only(c: &mut Child) {
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
 /// Kill a process and everything it started (the reviewer child too).
 fn kill_tree(c: &mut Child) {
     if cfg!(windows) {
@@ -754,7 +774,7 @@ fn a_commit_added_between_check_and_review_is_never_reviewed_or_merged() {
     // the run dies in the middle of the review step: the check already passed on `checked`
     let mut child = r.spawn(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
     wait_for("the reviewer to start", 120, || r.calls() == 1);
-    kill_tree(&mut child);
+    kill_run_only(&mut child);
     assert_eq!(r.field(&e, "step"), "review");
     assert_eq!(r.field(&e, "checked commit"), checked);
     // a commit that does not even compile lands on the branch before the resume: it was never checked
@@ -1072,6 +1092,29 @@ fn a_check_that_fails_on_main_after_the_merge_is_loud_and_main_is_not_reset() {
 
 // ---- crash and resume ---------------------------------------------------------------------
 
+/// The cause of the flaky `a_run_killed_mid_review_is_resumed_by_the_next_queue_run`: a reviewer that dies while its run is alive
+/// ends the entry `blocked` (a reviewer failure, retried by the next run), not `running`. A killed tree can show exactly this.
+#[test]
+fn a_reviewer_that_dies_while_its_run_lives_blocks_the_entry() {
+    let r = Root::new("reviewerdies", 120);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x
+", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let mut run = r.spawn(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    wait_for("the reviewer to start", 120, || r.calls() == 1);
+    let kids = child_pids(run.id());
+    assert_eq!(kids.len(), 1, "the run has exactly one child, the reviewer: {kids:?}");
+    // the reviewer is killed first and the run is slow to follow, as when the machine is loaded
+    let _ = Command::new(if cfg!(windows) { "taskkill" } else { "kill" }).args(if cfg!(windows) { vec!["/F".to_string(), "/PID".to_string(), kids[0].to_string()] } else { vec!["-9".to_string(), kids[0].to_string()] }).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    wait_for("the run to notice and end", 60, || matches!(run.try_wait(), Ok(Some(_))));
+    assert_eq!(r.status(&e).split(' ').next().unwrap(), "blocked", "{}", r.show(&e));
+    kill_run_only(&mut run);
+    fs::remove_file(&hang).unwrap();
+}
+
 #[test]
 fn a_run_killed_mid_review_is_resumed_by_the_next_queue_run() {
     let r = Root::new("crash", 120);
@@ -1082,7 +1125,7 @@ fn a_run_killed_mid_review_is_resumed_by_the_next_queue_run() {
     fs::write(&hang, "1").unwrap();
     let mut child = r.spawn(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
     wait_for("the reviewer to start", 120, || r.calls() == 1);
-    kill_tree(&mut child); // the process dies in the middle of the review step
+    kill_run_only(&mut child); // the process dies in the middle of the review step, with no chance to react to its reviewer
     assert_eq!(r.status(&e).split(' ').next().unwrap(), "running");
     assert!(r.status(&e).contains("interrupted"), "{}", r.status(&e));
     assert_eq!(r.field(&e, "step"), "review");
