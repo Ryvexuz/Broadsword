@@ -14,6 +14,7 @@ import io
 import os
 import pathlib
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -304,6 +305,36 @@ class Cli(unittest.TestCase):
         with redirect_stdout(buf):
             self.assertEqual(nc.main(["../x", "--root", str(self.root), "--list"], env={}), 2)
             self.assertEqual(nc.main(["9.9", "--root", str(self.root), "--list"], env={}), 2)
+
+
+class PipeEncoding(unittest.TestCase):
+    def test_non_console_characters_survive_a_pipe_under_dash_I(self):
+        """A check whose output holds an arrow must not crash the tool when stdout is a pipe (cp1252 by default)."""
+        SCRATCH.mkdir(exist_ok=True)
+        root = pathlib.Path(tempfile.mkdtemp(prefix="test-node-check-", dir=SCRATCH))
+        try:
+            (root / "docs" / "nodes").mkdir(parents=True)
+            (root / "arrow.py").write_bytes(
+                b"import sys\nsys.stdout.buffer.write('a \\u2192 b\\n'.encode('utf-8'))\nsys.stdout.flush()\n")
+            (root / "docs" / "nodes" / "1.2.md").write_text(
+                "# 1.2\n" + block("arrow", "python -I arrow.py", "contains b") + block("after", "python -I arrow.py", "contains b"),
+                encoding="utf-8")
+            # This Python defaults to UTF-8 pipes, so model an older/locale-bound pipe: a strict cp1252 text stream.
+            raw = io.BytesIO()
+            pipe = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", write_through=True)
+            with redirect_stdout(pipe):
+                code = nc.main(["1.2", "--root", str(root), "--run", "--all"], env={})
+            pipe.flush()
+            text = raw.getvalue().decode("cp1252")
+            self.assertEqual(code, 0)
+            self.assertEqual(text.count("result: PASS"), 2)
+            # and the same through a real child process on a pipe, whatever this machine's default encoding
+            r = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "1.2", "--root", str(root), "--run", "--all"],
+                               capture_output=True, timeout=120)
+            self.assertNotIn("UnicodeEncodeError", r.stderr.decode("utf-8", "replace"))
+            self.assertEqual(r.returncode, 0)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

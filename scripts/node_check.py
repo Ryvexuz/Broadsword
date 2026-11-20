@@ -172,6 +172,13 @@ def run_command(argv, cwd, timeout):
 
 def main(argv=None, env=None):
     env = os.environ if env is None else env
+    # Check output can hold any character; a pipe on a legacy codepage must not crash the run mid-way.
+    reconf = getattr(sys.stdout, "reconfigure", None)
+    if reconf is not None:
+        try:
+            reconf(errors="replace")
+        except (ValueError, OSError):
+            pass
     ap = argparse.ArgumentParser(prog="node_check.py", description="List and run a node's done checks.")
     ap.add_argument("node")
     ap.add_argument("--root", default=str(pathlib.Path(__file__).resolve().parent.parent))
