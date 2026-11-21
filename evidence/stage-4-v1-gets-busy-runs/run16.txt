@@ -1,0 +1,19 @@
+job 20261121-002739-broadsword-run: still running (broadsword pid 30308), left alone
+job: run broadsword (id 20261121-002921-broadsword-run, log: C:\Users\MrComputer\Desktop\Broadsword\scratch\logs\jobs\20261121-002921-broadsword-run.log)
+source: worktrees/broadsword/t-20261121-001109-8 (task t-20261121-001109-8)
+checkpoint: refs/broadsword/checkpoints/20261121-002921-broadsword-run (01525812d4)
+build lock: taken after waiting 2.8 s
+build source: worktrees/broadsword/t-20261121-001109-8 (packages: broadsword)
+cleaned `broadsword` in the shared build folder (it was last built from worktrees/broadsword/t-20261119-171333-10); its other packages and all dependencies were kept
+   Compiling broadsword v0.1.0 (C:\Users\MrComputer\Desktop\Broadsword\worktrees\broadsword\t-20261121-001109-8\crates\broadsword)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.52s
+     Running tests\queue.rs (C:\Users\MrComputer\Desktop\Broadsword\build\debug\build\broadsword/0ea317000b9676c8\out\queue-0ea317000b9676c8.exe)
+
+running 1 test
+test a_second_queue_run_gets_busy_while_one_is_running has been running for over 60 seconds
+test a_second_queue_run_gets_busy_while_one_is_running ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 92.58s
+
+--- summary ---
+run: ok (98.4 s)
