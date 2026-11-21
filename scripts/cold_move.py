@@ -57,28 +57,41 @@ with the step named. Right before
 either kind of move the board, git's lock flag, the clean status and the target are re-checked.
 
 Removal (delete_tree, the one place this script deletes a tree): the source must still match,
-path for path and by size and mtime, the snapshot taken before its copy, and hold no link.
-Then it is renamed, in one atomic same-folder rename, to a quarantine name
+path for path and by size, mtime and file id, the snapshot taken before its copy, and hold no
+link. Then it is renamed, in one atomic same-folder rename, to a quarantine name
 <name>.cold-quarantine-<pid>-<id>, the quarantine is scanned again against the same snapshot, and
-only the snapshot's files and folders are removed from it, deepest first. Before each entry is
-touched, the entry and every folder above it up to the quarantine root are lstat'ed and must be
-plain (no symlink, junction or reparse point), so a folder swapped for a junction stops the
-removal instead of being followed. A read-only attribute is cleared only on an entry inside the
-quarantine, right before its removal (git objects are read-only). "Source untouched" holds up to
-the remove step. If removal fails after the rename, what is left stays under the quarantine
-name, never half-live at the source path, and the item is reported
+only the snapshot's files and folders are removed from it, deepest first. "Source untouched"
+holds up to the remove step. If removal fails after the rename, what is left stays under the
+quarantine name, never half-live at the source path, and the item is reported
 "FAILED ...: at step remove: leftover kept at <quarantine path>"; the verified copy and, for a
 worktree, git's record (which already points at the copy) are never touched. A partial copy is
 removed the same way, and only the temp name this run created.
-Known residual race (accepted, not closed). The threat model is agents' mistakes, not a local
-attacker. delete_tree re-checks an entry and every folder above it immediately before each
-chmod, unlink and rmdir, and scan_tree re-checks each folder (link, reparse point, and the
-st_dev/st_ino it was first seen with) immediately before listing it. What is left: a concurrent
-process swapping a folder inside the quarantine, whose random name only this run knows, for a
-junction between that check and the call right after it (microseconds apart) could redirect
-that one call; and the folders above the item (its parent) are not checked. Closing it fully
-needs handle-relative deletion (FILE_FLAG_OPEN_REPARSE_POINT plus delete-by-handle), which this
-path-based script does not do.
+
+Windows: handle-relative (ctypes, no extra dependency). scan_tree, copy_item, manifest and the
+removal open every entry as itself (FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS for
+the item, NtCreateFile with FILE_OPEN_REPARSE_POINT relative to the handle of its already
+verified parent folder for everything under it), check on that handle (GetFileInformationByHandle)
+that it is no reparse point and, for the removal, that its file id, size and mtime are the
+snapshot's, and then act on that handle: list the folder from it, read the file from it, delete
+it through it (SetFileInformationByHandle, FileDispositionInfoEx with POSIX semantics and
+FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, so no chmod; a folder must be empty). The item
+itself is opened by name, and its handle's final path must equal the item's path. Closed by
+this, on Windows: following a folder swapped for a junction while a tree is scanned, copied,
+hashed or removed (the handle in use is the original folder's, and an entry swapped before it is
+opened opens as the junction itself and is refused); removing an entry swapped between its check
+and its delete (the check and the delete are on one handle, and Windows refuses to rename a
+folder while a handle to something inside it is open); removing a file replaced after the scan
+(file id); clearing read-only anywhere. What stays: the item's own path is resolved by name once
+(a swap of a folder above the item is caught by the final-path check, not prevented); the
+quarantine rename acts on whatever is at the item's name at that moment (a swapped-in link is
+renamed, never followed, and the re-scan then refuses it); the copy's destination, this run's own
+fresh temp folder, is written by path with exclusive creates (a swap there can only add new files
+elsewhere, never overwrite or delete); on a file system without POSIX delete (FAT, exFAT) the
+read-only attribute is cleared through the same handle before the delete.
+Elsewhere (not Windows): the same steps run path-based (_scan_tree_path, _copy_item_path,
+_delete_snapshot_path): each folder is lstat'ed again right before it is listed, and each entry
+and every folder above it right before each chmod, unlink and rmdir; a swap in the moment
+between such a check and the call after it is not caught there.
 With --yes the run takes an exclusive lock file (cold-move.lock in --state-dir) and refuses while it
 exists; a killed run leaves it behind and it is removed by hand. Each copy goes to a fresh temp
 name next to the target, is verified, then renamed into place; an error removes only that temp
@@ -91,11 +104,17 @@ import hashlib
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes
 
 # Test hook. It may only make the guard stricter (lesson 11): True forces every worktree move
 # through the verified copy path (copy, verify, repair, list, then remove), never the reverse.
@@ -144,6 +163,10 @@ class RemoveFailed(Exception):
         self.cause = cause
 
 
+class PathMoved(OSError):
+    """A path opened by name resolves somewhere else (a folder above it was swapped for a link)."""
+
+
 # ---------------------------------------------------------------- tree walking and removal
 def is_link_stat(st):
     """True for a symlink, an NTFS junction or any other reparse point (an lstat result)."""
@@ -155,24 +178,33 @@ def is_link_stat(st):
 def scan_tree(top):
     """Snapshot top without ever following a link: (dirs, files).
 
-    dirs is a set of relative posix paths of folders; files maps each relative posix path to
-    (size, mtime_ns). A file top gives files {".": ...}. Raises LinkFound when top or anything
-    under it is a link (symlink, junction, other reparse point), OSError when a folder cannot be
-    read or an entry is neither a plain file nor a folder (fail closed, never skipped).
+    dirs maps each relative posix path of a folder to its file id; files maps each relative
+    posix path of a file to (size, mtime_ns, file id). A file top gives files {".": ...}.
+    Raises LinkFound when top or anything under it is a link (symlink, junction, other reparse
+    point), OSError when a folder cannot be read or an entry is neither a plain file nor a
+    folder (fail closed, never skipped). On Windows the walk is handle-relative
+    (_scan_tree_win); elsewhere it is path-based (_scan_tree_path).
+    """
+    return _scan_tree_win(top) if WINDOWS else _scan_tree_path(top)
+
+
+def _scan_tree_path(top):
+    """The non-Windows scan (path-based; also callable on Windows, which tests do).
 
     Each folder's (st_dev, st_ino) is recorded from an lstat when it is first seen, and the
     folder is lstat'ed again immediately before its os.scandir: a link or reparse point, or a
     different (st_dev, st_ino) (the folder was swapped while queued), raises LinkFound, so a
-    junction swapped in between queueing and listing is never listed through.
+    junction swapped in between queueing and listing is never listed through. A swap between
+    that lstat and the os.scandir right after it is not caught (path-based residual race).
     """
     st = os.lstat(top)
     if is_link_stat(st):
         raise LinkFound(".")
     if stat.S_ISREG(st.st_mode):
-        return set(), {".": (st.st_size, st.st_mtime_ns)}
+        return {}, {".": (st.st_size, st.st_mtime_ns, (st.st_dev, st.st_ino))}
     if not stat.S_ISDIR(st.st_mode):
         raise OSError(f"{top} is neither a plain file nor a folder")
-    dirs, files = set(), {}
+    dirs, files = {}, {}
     stack = [(Path(top), "", (st.st_dev, st.st_ino))]
     while stack:
         folder, rel, ident = stack.pop()
@@ -191,10 +223,10 @@ def scan_tree(top):
                 seen = os.lstat(e.path)  # DirEntry has no st_ino on Windows; lstat records it
                 if is_link_stat(seen) or not stat.S_ISDIR(seen.st_mode):
                     raise LinkFound(r)
-                dirs.add(r)
+                dirs[r] = (seen.st_dev, seen.st_ino)
                 stack.append((Path(e.path), r, (seen.st_dev, seen.st_ino)))
             elif stat.S_ISREG(est.st_mode):
-                files[r] = (est.st_size, est.st_mtime_ns)
+                files[r] = (est.st_size, est.st_mtime_ns, (est.st_dev, est.st_ino))
             else:
                 raise OSError(f"{r} is neither a plain file nor a folder")
     return dirs, files
@@ -210,7 +242,8 @@ def link_reason(path):
 
 
 def _make_writable(path, st):
-    """Clear the read-only attribute of one entry. Called only from delete_tree, on an entry of
+    """Clear the read-only attribute of one entry. Called only from _delete_snapshot_path (the
+    non-Windows removal; the Windows removal never chmods), on an entry of
     the tree being removed that was just lstat'ed as a plain file or folder (never a link)."""
     if not st.st_mode & stat.S_IWRITE:
         os.chmod(path, stat.S_IMODE(st.st_mode) | stat.S_IWRITE)
@@ -244,15 +277,21 @@ def delete_tree(top, expected):
 
     expected is a scan_tree snapshot taken before the copy was made and verified.
       1. top is scanned again (never following a link). A link (LinkFound) or any difference
-         from expected in path, size or mtime (TreeChanged): nothing is renamed or deleted.
+         from expected in path, size, mtime or file id (TreeChanged): nothing is renamed or
+         deleted.
       2. top is renamed (one atomic same-folder rename) to a fresh quarantine name. An OSError
          here (for example a file held open) propagates: nothing was deleted, top is as it was.
       3. The quarantine is scanned again against expected, then only the snapshot's files and
-         folders are removed from it, deepest first. Before each one, it and every folder above
-         it up to the quarantine root are lstat'ed and must be plain (_plain_entry).
+         folders are removed from it, deepest first.
+         - Windows (_delete_snapshot_win): every entry is opened as itself, relative to the
+           handle of its verified parent folder, its handle must show no reparse point and the
+           snapshot's file id, size and mtime, and it is deleted through that handle (POSIX
+           delete, read-only ignored: no chmod). Nothing is done by path.
+         - Elsewhere (_delete_snapshot_path): before each entry, it and every folder above it up
+           to the quarantine root are lstat'ed and must be plain (_plain_entry); read-only is
+           cleared on the entry, then it is removed by path.
     Any failure in step 3 raises RemoveFailed(leftover=quarantine path): what is left stays
-    there under that name, never half-live at top. Read-only attributes are cleared only on
-    entries inside the quarantine, right before their removal.
+    there under that name, never half-live at top.
     """
     top = Path(top)
     if scan_tree(top) != expected:
@@ -265,19 +304,398 @@ def delete_tree(top, expected):
         now = scan_tree(q)
         if now != expected:
             raise TreeChanged("the tree changed during the quarantine rename")
-        dirs, files = now
-        if "." in files:
-            _make_writable(q, _plain_entry(q, None, False))
-            os.unlink(q)
-            return
-        for rel in sorted(files):
-            _make_writable(q / rel, _plain_entry(q, rel, False))
-            os.unlink(q / rel)
-        for rel in sorted(dirs, key=lambda r: r.count("/"), reverse=True) + [None]:
-            _make_writable(q / rel if rel else q, _plain_entry(q, rel, True))
-            os.rmdir(q / rel if rel else q)  # only ever an empty folder: never recursive
+        if WINDOWS:
+            _delete_snapshot_win(q, expected)
+        else:
+            _delete_snapshot_path(q, now)
     except (LinkFound, TreeChanged, OSError) as e:
         raise RemoveFailed(q, e)
+
+
+def _delete_snapshot_path(q, snap):
+    """The non-Windows removal: path-based, with _plain_entry right before each call. A swap
+    between that check and the chmod/unlink/rmdir right after it is not caught (residual race of
+    path-based deletion; closed on Windows by _delete_snapshot_win)."""
+    dirs, files = snap
+    if "." in files:
+        _make_writable(q, _plain_entry(q, None, False))
+        os.unlink(q)
+        return
+    for rel in sorted(files):
+        _make_writable(q / rel, _plain_entry(q, rel, False))
+        os.unlink(q / rel)
+    for rel in sorted(dirs, key=lambda r: r.count("/"), reverse=True) + [None]:
+        _make_writable(q / rel if rel else q, _plain_entry(q, rel, True))
+        os.rmdir(q / rel if rel else q)  # only ever an empty folder: never recursive
+
+
+# ---------------------------------------------------------------- Windows, handle-relative
+# Every entry is opened as itself (FILE_FLAG_OPEN_REPARSE_POINT / FILE_OPEN_REPARSE_POINT: a
+# link is never followed), children relative to the handle of their already verified parent
+# (NtCreateFile with RootDirectory), so a path swapped after a check can never redirect the
+# handle actually used. Reads, listing and deletion all act on that handle.
+_W_READ_DATA = 0x0001  # FILE_READ_DATA, = FILE_LIST_DIRECTORY on a folder
+_W_READ_ATTRIBUTES = 0x0080
+_W_WRITE_ATTRIBUTES = 0x0100
+_W_DELETE = 0x00010000
+_W_SYNCHRONIZE = 0x00100000
+_W_ACCESS_READ = _W_SYNCHRONIZE | _W_READ_ATTRIBUTES | _W_READ_DATA
+_W_ACCESS_DELETE = _W_ACCESS_READ | _W_DELETE | _W_WRITE_ATTRIBUTES
+_W_SHARE_ALL = 0x7
+_W_ATTR_READONLY = 0x1
+_W_ATTR_DIRECTORY = 0x10
+_W_ATTR_NORMAL = 0x80
+_W_EPOCH_100NS = 116444736000000000
+
+if WINDOWS:
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _nt = ctypes.WinDLL("ntdll")
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", ctypes.c_void_p)]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                    ("ObjectName", ctypes.POINTER(_UnicodeString)), ("Attributes", wintypes.ULONG),
+                    ("SecurityDescriptor", ctypes.c_void_p),
+                    ("SecurityQualityOfService", ctypes.c_void_p)]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    class _ByHandleInfo(ctypes.Structure):
+        _fields_ = [("attrs", wintypes.DWORD), ("ctime", wintypes.FILETIME),
+                    ("atime", wintypes.FILETIME), ("mtime", wintypes.FILETIME),
+                    ("volume", wintypes.DWORD), ("size_hi", wintypes.DWORD),
+                    ("size_lo", wintypes.DWORD), ("links", wintypes.DWORD),
+                    ("index_hi", wintypes.DWORD), ("index_lo", wintypes.DWORD)]
+
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _k32.CreateFileW.restype = wintypes.HANDLE
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _k32.CloseHandle.restype = wintypes.BOOL
+    _k32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleInfo)]
+    _k32.GetFileInformationByHandle.restype = wintypes.BOOL
+    _k32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                  wintypes.DWORD]
+    _k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD]
+    _k32.SetFileInformationByHandle.restype = wintypes.BOOL
+    _k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _k32.ReadFile.restype = wintypes.BOOL
+    _k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                               wintypes.DWORD]
+    _k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _nt.NtCreateFile.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG,
+                                 ctypes.POINTER(_ObjectAttributes),
+                                 ctypes.POINTER(_IoStatusBlock), ctypes.c_void_p, wintypes.ULONG,
+                                 wintypes.ULONG, wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p,
+                                 wintypes.ULONG]
+    _nt.NtCreateFile.restype = ctypes.c_long
+    _nt.RtlNtStatusToDosError.argtypes = [wintypes.ULONG]
+    _nt.RtlNtStatusToDosError.restype = wintypes.ULONG
+    _W_INVALID = wintypes.HANDLE(-1).value
+
+
+def _w_error(what, err=None):
+    err = ctypes.get_last_error() if err is None else err
+    e = ctypes.WinError(err)
+    return OSError(e.errno, f"{what}: {e.strerror}", None, err)
+
+
+def _w_close(h):
+    _k32.CloseHandle(h)
+
+
+class _WInfo:
+    """What one handle refers to, from GetFileInformationByHandle."""
+
+    def __init__(self, raw):
+        self.attrs = raw.attrs
+        self.is_dir = bool(raw.attrs & _W_ATTR_DIRECTORY)
+        self.is_link = bool(raw.attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+        self.size = (raw.size_hi << 32) | raw.size_lo
+        ft = (raw.mtime.dwHighDateTime << 32) | raw.mtime.dwLowDateTime
+        self.mtime_ns = (ft - _W_EPOCH_100NS) * 100
+        self.fid = (raw.volume, (raw.index_hi << 32) | raw.index_lo)
+
+
+def _w_info(h, what):
+    raw = _ByHandleInfo()
+    if not _k32.GetFileInformationByHandle(h, ctypes.byref(raw)):
+        raise _w_error(f"cannot read the attributes of {what}")
+    return _WInfo(raw)
+
+
+def _w_final_path(h):
+    buf = ctypes.create_unicode_buffer(32768)
+    n = _k32.GetFinalPathNameByHandleW(h, buf, len(buf), 0)
+    if n == 0 or n >= len(buf):
+        raise _w_error("cannot read the final path of a handle")
+    p = buf.value
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    return p[4:] if p.startswith("\\\\?\\") else p
+
+
+def _w_open_root(path, access):
+    """Open path itself (a link opens as the link, never followed). Returns (handle, info).
+
+    A link raises LinkFound("."). The handle's final path must equal path: if a folder above it
+    resolves elsewhere (was swapped for a link), PathMoved is raised and nothing is done.
+    """
+    full = os.path.abspath(str(path))
+    long = ("\\\\?\\UNC\\" + full[2:]) if full.startswith("\\\\") else ("\\\\?\\" + full)
+    flags = 0x02000000 | 0x00200000  # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    h = _k32.CreateFileW(long, access, _W_SHARE_ALL, None, 3, flags, None)  # 3 = OPEN_EXISTING
+    if h is None or h == _W_INVALID:
+        raise _w_error(f"cannot open {path}")
+    try:
+        info = _w_info(h, path)
+        if info.is_link:
+            raise LinkFound(".")
+        final = _w_final_path(h)
+        if os.path.normcase(final) != os.path.normcase(full):
+            raise PathMoved(f"{path} resolves to {final}: a folder above it is a link; nothing done")
+    except BaseException:
+        _w_close(h)
+        raise
+    return h, info
+
+
+def _w_open_child(parent, name, access, what):
+    """Open the entry `name` of the folder handle `parent` as itself (FILE_OPEN_REPARSE_POINT),
+    relative to that handle (NtCreateFile RootDirectory), never by a full path."""
+    if not name or name in (".", "..") or "\\" in name or "/" in name:
+        raise TreeChanged(f"bad entry name {name!r} under {what}")
+    raw = name.encode("utf-16-le")
+    buf = ctypes.create_string_buffer(raw + b"\0\0")
+    us = _UnicodeString(len(raw), len(raw) + 2, ctypes.cast(buf, ctypes.c_void_p))
+    oa = _ObjectAttributes(ctypes.sizeof(_ObjectAttributes), parent, ctypes.pointer(us),
+                           0x40, None, None)  # OBJ_CASE_INSENSITIVE, as Win32 names are
+    iosb = _IoStatusBlock()
+    h = wintypes.HANDLE()
+    # FILE_OPEN (1); FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT
+    status = _nt.NtCreateFile(ctypes.byref(h), access, ctypes.byref(oa), ctypes.byref(iosb), None,
+                              0, _W_SHARE_ALL, 1, 0x00200000 | 0x20 | 0x4000, None, 0)
+    if status < 0:
+        raise _w_error(f"cannot open {what}", _nt.RtlNtStatusToDosError(status & 0xFFFFFFFF))
+    return h.value
+
+
+def _w_listdir(h, what):
+    """Names in the folder handle h (FileFullDirectoryInfo on the handle, never a path)."""
+    names = []
+    buf = ctypes.create_string_buffer(65536)
+    cls = 15  # FileFullDirectoryRestartInfo, then FileFullDirectoryInfo (14)
+    while True:
+        if not _k32.GetFileInformationByHandleEx(h, cls, buf, len(buf)):
+            err = ctypes.get_last_error()
+            if err == 18:  # ERROR_NO_MORE_FILES
+                return names
+            raise _w_error(f"cannot list {what}", err)
+        cls = 14
+        raw = buf.raw
+        off = 0
+        while True:
+            nxt, = struct.unpack_from("<I", raw, off)
+            nlen, = struct.unpack_from("<I", raw, off + 60)
+            name = raw[off + 68: off + 68 + nlen].decode("utf-16-le")
+            if name not in (".", ".."):
+                names.append(name)
+            if nxt == 0:
+                break
+            off += nxt
+
+
+def _w_read_chunks(h, what):
+    buf = ctypes.create_string_buffer(1 << 20)
+    got = wintypes.DWORD()
+    while True:
+        if not _k32.ReadFile(h, buf, len(buf), ctypes.byref(got), None):
+            raise _w_error(f"cannot read {what}")
+        if got.value == 0:
+            return
+        yield buf.raw[:got.value]
+
+
+def _w_delete(h, what):
+    """Delete the entry the handle h refers to, through the handle: POSIX semantics (the name
+    goes when the handle closes) and FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE (no chmod).
+    A folder must be empty (never recursive). On a file system without that call (FAT, exFAT)
+    the read-only attribute is cleared on the same handle and the plain disposition is set."""
+    flags = ctypes.c_ulong(0x1 | 0x2 | 0x10)  # DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+    if _k32.SetFileInformationByHandle(h, 21, ctypes.byref(flags), 4):  # FileDispositionInfoEx
+        return
+    err = ctypes.get_last_error()
+    if err not in (1, 50, 87):  # not "unsupported" on this file system: a real refusal
+        raise _w_error(f"cannot delete {what}", err)
+    info = _w_info(h, what)
+    if info.attrs & _W_ATTR_READONLY:
+        attrs = (info.attrs & ~_W_ATTR_READONLY) or _W_ATTR_NORMAL
+        basic = struct.pack("<qqqqI4x", 0, 0, 0, 0, attrs)  # FILE_BASIC_INFO, times unchanged
+        bbuf = ctypes.create_string_buffer(basic, len(basic))
+        if not _k32.SetFileInformationByHandle(h, 0, bbuf, len(basic)):  # FileBasicInfo
+            raise _w_error(f"cannot clear read-only on {what}")
+    yes = ctypes.c_ubyte(1)
+    if not _k32.SetFileInformationByHandle(h, 4, ctypes.byref(yes), 1):  # FileDispositionInfo
+        raise _w_error(f"cannot delete {what}")
+
+
+def _scan_tree_win(top):
+    h, info = _w_open_root(top, _W_ACCESS_READ)
+    try:
+        if not info.is_dir:
+            return {}, {".": (info.size, info.mtime_ns, info.fid)}
+        dirs, files = {}, {}
+        _w_scan_dir(h, Path(top), "", dirs, files)
+        return dirs, files
+    finally:
+        _w_close(h)
+
+
+def _w_scan_dir(h, top, rel, dirs, files):
+    for name in sorted(_w_listdir(h, top / rel if rel else top)):
+        r = f"{rel}/{name}" if rel else name
+        ch = _w_open_child(h, name, _W_ACCESS_READ, top / r)
+        try:
+            info = _w_info(ch, top / r)
+            if info.is_link:
+                raise LinkFound(r)
+            if info.is_dir:
+                dirs[r] = info.fid
+                _w_scan_dir(ch, top, r, dirs, files)
+            else:
+                files[r] = (info.size, info.mtime_ns, info.fid)
+        finally:
+            _w_close(ch)
+
+
+def _w_check(info, expected, what):
+    if info.is_link:
+        raise LinkFound(str(what))
+    if (info.size, info.mtime_ns, info.fid) != expected:
+        raise TreeChanged(f"{what} is not the verified file (size, mtime or file id); not deleted")
+
+
+def _delete_snapshot_win(q, expected):
+    """Delete the quarantine q through handles only (see delete_tree, step 3)."""
+    dirs, files = expected
+    h, info = _w_open_root(q, _W_ACCESS_DELETE)
+    try:
+        if "." in files:
+            _w_check(info, files["."], q)
+            _w_delete(h, q)
+            return
+        if not info.is_dir:
+            raise TreeChanged(f"{q} is no longer a folder; not deleted")
+        _w_delete_dir(h, q, "", dirs, files)
+        _w_delete(h, q)
+    finally:
+        _w_close(h)
+
+
+def _w_delete_dir(h, q, rel, dirs, files):
+    for name in sorted(_w_listdir(h, q / rel if rel else q)):
+        r = f"{rel}/{name}" if rel else name
+        if r not in files and r not in dirs:
+            raise TreeChanged(f"{q / r} appeared after the verify; not deleted")
+        ch = _w_open_child(h, name, _W_ACCESS_DELETE, q / r)
+        try:
+            info = _w_info(ch, q / r)
+            if info.is_link:
+                raise LinkFound(r)
+            if info.is_dir:
+                if dirs.get(r) != info.fid:
+                    raise TreeChanged(f"{q / r} is not the verified folder (file id); not deleted")
+                _w_delete_dir(ch, q, r, dirs, files)
+            else:
+                _w_check(info, files.get(r), q / r)
+            _w_delete(ch, q / r)
+        finally:
+            _w_close(ch)
+
+
+def _w_copy_file(h, out, info, what):
+    """Copy the file behind the verified handle h to out (a new file, exclusive create in this
+    run's own temp copy), then set its mtime and, if the source is read-only, its read-only
+    attribute (on the copy only)."""
+    with open(out, "xb") as f:
+        for chunk in _w_read_chunks(h, what):
+            f.write(chunk)
+    os.utime(out, ns=(info.mtime_ns, info.mtime_ns))
+    if info.attrs & _W_ATTR_READONLY:
+        os.chmod(out, stat.S_IREAD)
+
+
+def _copy_item_win(src, dst):
+    h, info = _w_open_root(src, _W_ACCESS_READ)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not info.is_dir:
+            _w_copy_file(h, dst, info, src)
+            return
+        os.mkdir(dst)  # fails if dst exists: never copies into something this run did not make
+        _w_copy_dir(h, Path(src), dst, "")
+    finally:
+        _w_close(h)
+
+
+def _w_copy_dir(h, src, dst, rel):
+    for name in sorted(_w_listdir(h, src / rel if rel else src)):
+        r = f"{rel}/{name}" if rel else name
+        ch = _w_open_child(h, name, _W_ACCESS_READ, src / r)
+        try:
+            info = _w_info(ch, src / r)
+            if info.is_link:
+                raise LinkFound(r)
+            if info.is_dir:
+                os.mkdir(dst / r)
+                _w_copy_dir(ch, src, dst, r)
+            else:
+                _w_copy_file(ch, dst / r, info, src / r)
+        finally:
+            _w_close(ch)
+
+
+def _manifest_win(path):
+    h, info = _w_open_root(path, _W_ACCESS_READ)
+    try:
+        if not info.is_dir:
+            return {".": (info.size, _w_sha256(h, path))}
+        out = {}
+        _w_manifest_dir(h, Path(path), "", out)
+        return out
+    finally:
+        _w_close(h)
+
+
+def _w_sha256(h, what):
+    d = hashlib.sha256()
+    for chunk in _w_read_chunks(h, what):
+        d.update(chunk)
+    return d.hexdigest()
+
+
+def _w_manifest_dir(h, top, rel, out):
+    for name in sorted(_w_listdir(h, top / rel if rel else top)):
+        r = f"{rel}/{name}" if rel else name
+        ch = _w_open_child(h, name, _W_ACCESS_READ, top / r)
+        try:
+            info = _w_info(ch, top / r)
+            if info.is_link:
+                raise LinkFound(r)
+            if info.is_dir:
+                out[r] = None
+                _w_manifest_dir(ch, top, r, out)
+            else:
+                out[r] = (info.size, _w_sha256(ch, top / r))
+        finally:
+            _w_close(ch)
 
 
 # ---------------------------------------------------------------- helpers
@@ -333,7 +751,7 @@ def tree_has_symlink_or_secret(path):
         return str(e)
     if "." in files:
         return "is a secret file" if path.name.lower().startswith(".env") else None
-    for rel in sorted(dirs | set(files)):
+    for rel in sorted(set(dirs) | set(files)):
         n = rel.rsplit("/", 1)[-1]
         if n.lower().startswith(".env"):
             return f"holds a secret file ({n})"
@@ -343,8 +761,8 @@ def tree_has_symlink_or_secret(path):
 def size_and_newest(path):
     """Total size and newest mtime (seconds) of path, from scan_tree (links are never followed)."""
     _dirs, files = scan_tree(path)
-    total = sum(s for s, _m in files.values())
-    newest = max((m for _s, m in files.values()), default=0) / 1e9
+    total = sum(v[0] for v in files.values())
+    newest = max((v[1] for v in files.values()), default=0) / 1e9
     if newest == 0.0:
         newest = os.lstat(path).st_mtime
     return total, newest
@@ -589,25 +1007,41 @@ def build_plan(args, root, target, state):
 def manifest(path):
     """{relative path: (size, sha256) or None for a folder} of a file or tree.
 
-    Built on scan_tree, so a link anywhere raises LinkFound instead of being followed.
+    A link anywhere raises LinkFound instead of being followed. On Windows every file is hashed
+    from its own handle, opened relative to its verified parent folder (_manifest_win).
     """
+    if WINDOWS:
+        return _manifest_win(path)
     dirs, files = scan_tree(path)
     if "." in files:
         return {".": (files["."][0], sha256_file(path))}
     out = {d: None for d in dirs}
-    for rel, (size, _m) in files.items():
-        out[rel] = (size, sha256_file(Path(path) / rel))
+    for rel, v in files.items():
+        out[rel] = (v[0], sha256_file(Path(path) / rel))
     return out
 
 
 def copy_item(src, dst):
     """Copy a file or tree to dst, which must not exist, never through a link.
 
-    The tree is scanned first (LinkFound if it holds a link: nothing is copied), then only the
-    scanned folders and files are copied, each lstat'ed as a plain entry right before. Known
-    limit: a folder swapped for a junction between that lstat and the copy of a file inside it is
-    not caught here; the verify step re-scans the source and fails the item on it.
+    Windows (_copy_item_win): every folder and file is opened as itself relative to the handle
+    of its verified parent, and each file is read from its own handle, so a folder swapped for a
+    junction during the copy is never read through. Only the destination (this run's own fresh
+    temp copy) is written by path, with exclusive creates.
+    Elsewhere (_copy_item_path): path-based, see there.
     """
+    if WINDOWS:
+        _copy_item_win(src, dst)
+    else:
+        _copy_item_path(src, dst)
+
+
+def _copy_item_path(src, dst):
+    """The non-Windows copy: the tree is scanned first (LinkFound if it holds a link: nothing is
+    copied), then only the scanned folders and files are copied, each lstat'ed as a plain entry
+    right before. Residual race: a folder swapped for a junction between that lstat and the copy
+    of a file inside it is not caught here; the verify step re-scans the source and fails the
+    item on it (closed on Windows by _copy_item_win)."""
     dirs, files = scan_tree(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
     if "." in files:

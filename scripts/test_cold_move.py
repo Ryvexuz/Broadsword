@@ -5,6 +5,7 @@ Run: python -I -B scripts/test_cold_move.py   (or python -I -m unittest scripts/
 import contextlib
 import io
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cold_move  # noqa: E402
+
+WINDOWS = os.name == "nt"
 
 GIT_ENV = dict(
     os.environ,
@@ -1021,14 +1024,26 @@ class Quarantine(Fixture):
         self.assertTrue(os.path.isjunction(left / "sub"), out)  # the junction itself is left too
 
     def failing_unlink(self, name):
+        """Make the removal of the entry `name` fail: by path (os.unlink, the non-Windows and
+        older code) and by handle (_w_delete, the Windows code; create=True so the hook also
+        loads against a script without it)."""
         real_unlink = os.unlink
+        real_w_delete = getattr(cold_move, "_w_delete", None)
 
         def unlink(p, *a, **k):
             if Path(p).name == name:
                 raise PermissionError(13, "simulated: file is locked")
             return real_unlink(p, *a, **k)
 
-        return mock.patch.object(cold_move.os, "unlink", unlink)
+        def w_delete(h, what):
+            if Path(what).name == name:
+                raise PermissionError(13, "simulated: file is locked")
+            return real_w_delete(h, what)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(cold_move.os, "unlink", unlink))
+        stack.enter_context(mock.patch.object(cold_move, "_w_delete", w_delete, create=True))
+        return stack
 
     def test_removal_failing_part_way_leaves_a_quarantined_leftover(self):
         self.approve(["evidence"])
@@ -1086,7 +1101,9 @@ class Quarantine(Fixture):
 
 class ScanSwap(Fixture):
     """Review q-20261120-224242: a folder swapped for a junction after scan_tree queued it and
-    before it is listed is never listed through."""
+    before it is listed is never listed through. These test the path-based scan
+    (_scan_tree_path, the non-Windows code), called directly; the Windows handle scan has its
+    own test in RaceClosed."""
 
     def setUp(self):
         super().setUp()
@@ -1123,7 +1140,7 @@ class ScanSwap(Fixture):
         state, patch = self.swap_after_listing(self.ev1)
         with patch:
             try:
-                result = cold_move.scan_tree(self.ev1)
+                result = cold_move._scan_tree_path(self.ev1)
             except cold_move.LinkFound as e:
                 result = e
         self.assertTrue(state["done"])
@@ -1147,6 +1164,190 @@ class ScanSwap(Fixture):
             return result
 
         with mock.patch.object(cold_move.os, "lstat", lstat):
+            with self.assertRaises(cold_move.LinkFound) as cm:
+                cold_move._scan_tree_path(self.ev1)
+        self.assertTrue(state["done"])
+        self.assertEqual(cm.exception.where, "sub")
+
+
+class RaceClosed(Fixture):
+    """Lazlo's option 1 (2026-11-21): the path races are closed on Windows by handle-relative
+    operations. Each test swaps a folder for a junction at one point, in the existing hook
+    style, with hooks for both the older path code and the handle code (create=True where the
+    name is new), so each test runs against either script."""
+
+    def setUp(self):
+        super().setUp()
+        if not WINDOWS:
+            self.skipTest("the handle-relative code is Windows-only")
+        self.ev1 = self.root / "evidence" / "ev1"
+        put(self.ev1 / "sub" / "a.txt", "inside a")
+        put(self.ev1 / "sub" / "deeper" / "f.txt", "inside data")
+        self.outside = Path(self.tmp.name).resolve() / "outside_rc"
+        put(self.outside / "deeper" / "f.txt", "outside data")  # same names as under sub/
+        put(self.outside / "f.txt", "outside data")
+        self.dst = self.ext / "evidence" / "evidence" / "ev1"
+
+    def swap(self, folder):
+        """Move folder away and put a junction to outside_rc in its place."""
+        os.rename(folder, folder.parent / (folder.name + "-moved-away"))
+        if not junction(folder, self.outside):
+            self.skipTest("cannot make an NTFS junction here")
+
+    def assert_outside_untouched(self, out=""):
+        self.assertEqual((self.outside / "f.txt").read_text(), "outside data", out)
+        self.assertEqual((self.outside / "deeper" / "f.txt").read_text(), "outside data", out)
+
+    def test_ancestor_swapped_during_the_copy_is_never_read_through(self):
+        """sub/ is swapped for a junction after sub/a.txt was copied and before
+        sub/deeper/f.txt is: the copy must never hold outside data."""
+        state = {"done": False, "copied": None, "copying": False}
+        real_copy2 = shutil.copy2
+        real_open_child = getattr(cold_move, "_w_open_child", None)
+        real_verify = cold_move.verify_copy
+        real_copy_item = cold_move.copy_item
+
+        def copy_item(src, dst):  # gate: only the copy step, not the planning scans
+            state["copying"] = src == self.ev1
+            try:
+                return real_copy_item(src, dst)
+            finally:
+                state["copying"] = False
+
+        def copy2(src, dst, *a, **k):  # the older path code: right after sub/a.txt is copied
+            r = real_copy2(src, dst, *a, **k)
+            if state["copying"] and not state["done"] and Path(dst).name == "a.txt":
+                state["done"] = True
+                self.swap(self.ev1 / "sub")
+            return r
+
+        def open_child(parent, name, access, what):
+            # the handle code: after sub/a.txt was copied and its handle closed, right before
+            # sub/deeper is opened (Windows refuses to rename a folder while a handle to
+            # something inside it is open, so this is the remaining window)
+            if (state["copying"] and not state["done"] and name == "deeper"
+                    and Path(what).parent.parent == self.ev1):
+                state["done"] = True
+                self.swap(self.ev1 / "sub")
+            return real_open_child(parent, name, access, what)
+
+        def verify(src, dst):
+            f = dst / "sub" / "deeper" / "f.txt"
+            if src == self.ev1 and state["copied"] is None and f.is_file():
+                state["copied"] = f.read_text()
+            return real_verify(src, dst)
+
+        self.approve(["evidence"])
+        with mock.patch.object(cold_move, "copy_item", copy_item), \
+                mock.patch.object(cold_move.shutil, "copy2", copy2), \
+                mock.patch.object(cold_move, "_w_open_child", open_child, create=True), \
+                mock.patch.object(cold_move, "verify_copy", verify):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertTrue(state["done"], out)
+        self.assertEqual(state["copied"], "inside data", out)  # read from the original folder
+        self.assert_outside_untouched(out)
+        self.assertEqual(code, 1, out)  # the verify re-scan meets the junction: source kept
+        self.assertTrue((self.ev1 / "e.txt").is_file(), out)
+        self.assertTrue(os.path.isjunction(self.ev1 / "sub"), out)  # the swap did happen
+        self.assertFalse(self.dst.exists(), out)
+
+    def test_entry_swapped_between_its_check_and_its_delete_is_never_deleted_through(self):
+        """In the quarantine, sub/deeper/ is swapped for a junction (to a folder holding its own
+        f.txt) between the checks of sub/deeper/f.txt and its delete: the outside f.txt must
+        survive. The older path code is hooked after its _plain_entry check, right before its
+        unlink; the handle code right before f.txt is opened relative to the deeper/ handle it
+        already holds (once f.txt is open, Windows refuses to rename the folders above it)."""
+        state = {"done": False}
+        real_writable = cold_move._make_writable
+        real_open_child = getattr(cold_move, "_w_open_child", None)
+
+        def due(p):
+            return not state["done"] and p.name == "f.txt" and ".cold-quarantine-" in str(p)
+
+        def writable(path, st):  # the older path code
+            real_writable(path, st)
+            if due(Path(path)):
+                state["done"] = True
+                self.swap(Path(path).parent)  # <quarantine>/sub/deeper
+
+        def open_child(parent, name, access, what):  # the handle code, in its delete walk
+            if access & 0x00010000 and due(Path(what)):  # DELETE access: not the scan
+                state["done"] = True
+                self.swap(Path(what).parent)
+            return real_open_child(parent, name, access, what)
+
+        self.approve(["evidence"])
+        with mock.patch.object(cold_move, "_make_writable", writable), \
+                mock.patch.object(cold_move, "_w_open_child", open_child, create=True):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertTrue(state["done"], out)
+        self.assert_outside_untouched(out)
+        self.assertEqual((self.dst / "sub" / "deeper" / "f.txt").read_text(), "inside data")
+        self.assertEqual(code, 1, out)  # the junction left in the quarantine stops the last rmdir
+        self.assertIn("at step remove: leftover kept at", out)
+        (left,) = [p for p in self.ev1.parent.iterdir() if ".cold-quarantine-" in p.name]
+        self.assertTrue(os.path.isjunction(left / "sub" / "deeper"), out)  # the swap did happen
+
+    def test_read_only_source_is_deleted_without_any_chmod(self):
+        for f in (self.ev1 / "e.txt", self.ev1 / "sub" / "deeper" / "f.txt"):
+            read_only(f)
+        calls = []
+        real_chmod = os.chmod
+
+        def chmod(path, *a, **k):
+            if Path(path).resolve().is_relative_to(self.root):
+                calls.append(str(path))
+                raise PermissionError(13, "simulated: chmod inside the source is not allowed")
+            return real_chmod(path, *a, **k)  # the copy, on the external side, may set it
+
+        self.approve(["evidence"])
+        with mock.patch.object(cold_move.os, "chmod", chmod):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertEqual(calls, [], out)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.ev1.exists(), out)
+        self.assertEqual([p for p in self.ev1.parent.iterdir() if "cold-quarantine" in p.name], [])
+        self.assertTrue(is_read_only(self.dst / "e.txt"))
+
+    def test_file_replaced_after_the_quarantine_scan_is_not_deleted(self):
+        """After the quarantine scan, e.txt is replaced by another file with the same name and
+        content (a new file id, new mtime): the delete must refuse it, not remove it."""
+        state = {"done": False}
+        real_scan = cold_move.scan_tree
+
+        def scan(top):
+            result = real_scan(top)
+            p = Path(top)
+            if not state["done"] and ".cold-quarantine-" in p.name and p.parent == self.ev1.parent:
+                state["done"] = True
+                os.unlink(p / "e.txt")
+                put(p / "e.txt", "evidence")
+            return result
+
+        self.approve(["evidence"])
+        with mock.patch.object(cold_move, "scan_tree", scan):
+            code, out = self.go(*self.YES, "--class", "evidence")
+        self.assertTrue(state["done"], out)
+        left = [p for p in self.ev1.parent.iterdir() if ".cold-quarantine-" in p.name]
+        self.assertEqual(len(left), 1, out)
+        self.assertEqual((left[0] / "e.txt").read_text(), "evidence", out)  # kept, not deleted
+        self.assertEqual(code, 1, out)
+        self.assertIn("not the verified file", out)
+
+    def test_handle_scan_never_lists_a_folder_swapped_after_its_parent_was_listed(self):
+        """The Windows scan: sub/ is swapped after the root was listed and before sub is opened.
+        Opening sub relative to the root handle opens the junction itself, which is refused."""
+        real_listdir = cold_move._w_listdir
+        state = {"done": False}
+
+        def listdir(h, what):
+            names = real_listdir(h, what)
+            if not state["done"] and Path(what) == self.ev1:
+                state["done"] = True
+                self.swap(self.ev1 / "sub")
+            return names
+
+        with mock.patch.object(cold_move, "_w_listdir", listdir):
             with self.assertRaises(cold_move.LinkFound) as cm:
                 cold_move.scan_tree(self.ev1)
         self.assertTrue(state["done"])
