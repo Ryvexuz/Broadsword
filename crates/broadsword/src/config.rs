@@ -77,6 +77,8 @@ pub struct Config {
     pub install_dir: PathBuf,
     pub mcp_call_timeout_seconds: u64,
     pub mcp_output_max_kb: u64,
+    /// How long one `clients/codex_coder.py` run (a whole GPT coding task) may take before it is killed. Read by that Python client, which loads this key itself.
+    pub codex_coder_timeout_seconds: u64,
     pub checkpoint_ignored_max_mb: u64,
     pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
@@ -377,6 +379,7 @@ impl Config {
             install_dir,
             mcp_call_timeout_seconds,
             mcp_output_max_kb,
+            codex_coder_timeout_seconds: positive("codex_coder_timeout_seconds")?,
             checkpoint_ignored_max_mb: get_int(&m, "checkpoint_ignored_max_mb")?,
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
@@ -473,7 +476,7 @@ mod tests {
         assert_eq!(c.state_dir, Path::new("proj").join(".").join("state"));
         assert!(c.checkpoint_ignored_max_mb > 0 && c.max_resumes > 0);
         assert_eq!(c.install_dir, Path::new("proj").join(".").join("build/bin"));
-        assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
+        assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0 && c.codex_coder_timeout_seconds > 0);
         assert_eq!(c.worktrees_dir, Path::new("proj").join(".").join("worktrees"));
         assert!(c.build_lock_wait_seconds > 0);
     }
@@ -540,6 +543,7 @@ mod tests {
     #[test]
     fn worktrees_dir_is_required_and_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
@@ -720,6 +724,7 @@ install_dir=\"build/bin\"\n";
     #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
@@ -771,6 +776,7 @@ worktrees_dir = \"worktrees\"\n";
     #[test]
     fn rejects_paths_outside_root() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\ninstall_dir=\"build/bin\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
+codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
@@ -822,7 +828,7 @@ worktrees_dir = \"worktrees\"\n";
         let c = Config::from_text(text, Path::new("p")).unwrap();
         assert_eq!((c.recover_lock_wait_seconds, c.sweep_older_than_days, c.redact_min_chars), (5, 7, 6), "the shipped values are the old constants");
         // every setting that used to be clamped silently with `.max(1)`, or fed a loop, is refused at 0 at load
-        for key in ["recover_lock_wait_seconds", "sweep_older_than_days", "redact_min_chars", "job_disk_poll_seconds", "disk_check_every_seconds", "cleanup_every_hours", "scratch_max_age_hours", "log_max_mb"] {
+        for key in ["recover_lock_wait_seconds", "sweep_older_than_days", "redact_min_chars", "job_disk_poll_seconds", "disk_check_every_seconds", "cleanup_every_hours", "scratch_max_age_hours", "log_max_mb", "codex_coder_timeout_seconds"] {
             let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
             assert!(e.contains(key) && e.contains("missing"), "{key} is required: {e}");
             let zero = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
@@ -852,8 +858,17 @@ worktrees_dir = \"worktrees\"\n";
             if k == "job_disk_reserve_gb" { "reserve_bytes" } else { k }
         }
         let used = |name: &str| code.match_indices(&format!(".{name}")).any(|(i, _)| !code[i + 1 + name.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
-        let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k))).collect();
-        assert!(unused.is_empty(), "keys in broadsword.toml that no code outside config.rs uses as `.key`: {unused:?}");
+        // a key the Rust code never reads may be read by a Python client under clients/, by its exact quoted name
+        let mut py = String::new();
+        for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../clients")).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".py") && !name.starts_with("test_") {
+                py.push_str(&std::fs::read_to_string(e.path()).unwrap());
+            }
+        }
+        let used_by_python = |k: &str| py.contains(&format!("\"{k}\""));
+        let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k)) && !used_by_python(k)).collect();
+        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name: {unused:?}");
     }
 
     #[test]
