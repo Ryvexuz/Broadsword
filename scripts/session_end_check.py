@@ -3,11 +3,12 @@
 
 Gates, in order, one line each: `<name>: ok | FAIL | SKIPPED  <reason>`
   1. shadow_report      scripts/shadow_report.py --open      open shadow-only findings fail
-  2. ledger_check       scripts/ledger_check.py              the improvement ledger (nb-07)
-  3. main_provenance    scripts/main_provenance.py           commits on main that skipped the queue (nb-10)
-  4. sync_playbook      scripts/sync_playbook.py --check     the playbook copy is current
-  5. records_updated    PROGRESS.md and LAB_LOG.md changed since --since (committed: commit time; uncommitted: file mtime)
-  6. stale_tasks        no `running` task whose worktree had no commit and no job for longer than --stale-hours
+  2. shadow_spotcheck   scripts/shadow_spotcheck.py --check  open spot checks (exit 1) or a malformed tsv (exit 2) fail; rows are listed
+  3. ledger_check       scripts/ledger_check.py              the improvement ledger (nb-07)
+  4. main_provenance    scripts/main_provenance.py           commits on main that skipped the queue (nb-10)
+  5. sync_playbook      scripts/sync_playbook.py --check     the playbook copy is current
+  6. records_updated    PROGRESS.md and LAB_LOG.md changed since --since (committed: commit time; uncommitted: file mtime)
+  7. stale_tasks       no `running` task whose worktree had no commit and no job for longer than --stale-hours
 A child script that is missing is SKIPPED (not installed). shadow_report.py without an `--open` flag counts as not installed
 too. A child that crashes, times out or cannot be started is FAIL. Last line: `session-end: ok`, `session-end: ok (N skipped: names)` or `session-end: N failing[, M skipped]`.
 Exit 0 when nothing fails (SKIPPED does not fail), 1 otherwise, 2 for bad arguments.
@@ -84,7 +85,10 @@ def run_child(cmd, cwd, timeout):
         return code, out.read().decode("utf-8", "replace"), note
 
 
-def gate_script(root, name, extra, timeout, need_flag=None):
+SPOTCHECK_DETAIL_LINES = 200  # shadow_spotcheck lists every open row; show them all (up to this many), not just the tail
+
+
+def gate_script(root, name, extra, timeout, need_flag=None, detail_lines=6):
     path = os.path.join(root, "scripts", name)
     if not os.path.isfile(path):
         return SKIPPED, "not installed (scripts/%s missing)" % name, []
@@ -99,8 +103,8 @@ def gate_script(root, name, extra, timeout, need_flag=None):
     if code == 0:
         return OK, "", []
     if code is None:
-        return FAIL, note, tail(out)
-    return FAIL, f"exit {code}", tail(out)
+        return FAIL, note, tail(out, detail_lines)
+    return FAIL, f"exit {code}", tail(out, detail_lines)
 
 
 GIT_TIMEOUT = [None]  # set from --timeout-seconds in main; every git call is bounded by it
@@ -235,6 +239,8 @@ def main(argv=None):
     GIT_TIMEOUT[0] = t
 
     results = [("shadow_report", *gate_script(root, "shadow_report.py", ["--root", root, "--open"], t, "--open"))]
+    results.append(("shadow_spotcheck", *gate_script(root, "shadow_spotcheck.py", ["--check", "--root", root], t,
+                    "--check", SPOTCHECK_DETAIL_LINES)))
     results.append(("ledger_check", *gate_script(root, "ledger_check.py",
                     ["--since", since_date, "--max-pending-days", str(args.max_pending_days)], t)))
     code, base, err = git(root, "rev-list", "-1", f"--before={args.since}", "main")

@@ -48,8 +48,8 @@ class Case(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         for d in ("scripts", "state/tasks", "state/jobs"):
             os.makedirs(os.path.join(self.root, d))
-        for n in ("shadow_report", "ledger_check", "main_provenance", "sync_playbook"):
-            self.child(n, GOOD + ("# --open\n" if n == "shadow_report" else ""))
+        for n in ("shadow_report", "ledger_check", "main_provenance", "sync_playbook", "shadow_spotcheck"):
+            self.child(n, GOOD + {"shadow_report": "# --open\n", "shadow_spotcheck": "# --check\n"}.get(n, ""))
         subprocess.run(["git", "init", "-q", "-b", "main", self.root], check=True)
         self.write("README", "x")
         git(self.root, "add", "-A")
@@ -86,8 +86,55 @@ class Tests(Case):
         code, out, err = self.run_check()
         self.assertEqual(code, 0, out + err)
         self.assertEqual(out.splitlines()[-1], "session-end: ok")
-        for n in ("shadow_report", "ledger_check", "main_provenance", "sync_playbook", "records_updated", "stale_tasks"):
+        for n in ("shadow_report", "shadow_spotcheck", "ledger_check", "main_provenance", "sync_playbook",
+                  "records_updated", "stale_tasks"):
             self.assertTrue(self.line(out, n).endswith(": ok"), out)
+
+    def test_spotcheck_open_rows_fail_and_are_named(self):
+        self.child("shadow_spotcheck", "import sys\nprint('2 of 3 due spot check(s) open')\n"
+                   "for k in ('e1|k1', 'e2|k2'):\n    print(k)\nsys.exit(1)\n# --check\n")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL  exit 1", self.line(out, "shadow_spotcheck"))
+        self.assertIn("e1|k1", out)
+        self.assertIn("e2|k2", out)
+        self.assertEqual(out.splitlines()[-1], "session-end: 1 failing")
+
+    def test_spotcheck_many_open_rows_are_all_named(self):
+        self.child("shadow_spotcheck", "import sys\nfor i in range(20):\n    print(f'row{i}|k')\nsys.exit(1)\n# --check\n")
+        _, out, _ = self.run_check()
+        self.assertIn("row0|k", out)
+        self.assertIn("row19|k", out)
+
+    def test_spotcheck_all_recorded_passes_and_gets_the_right_args(self):
+        self.child("shadow_spotcheck", "import sys\nok = sys.argv[1] == '--check' and sys.argv[2] == '--root' and len(sys.argv) == 4\n"
+                   "print('0 of 3 due spot check(s) open')\nsys.exit(0 if ok else 1)\n# --check\n")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.line(out, "shadow_spotcheck").endswith(": ok"), out)
+
+    def test_spotcheck_malformed_file_fails_with_its_message(self):
+        self.child("shadow_spotcheck", "import sys\nprint('refused: bad header in spotchecks.tsv', file=sys.stderr)\n"
+                   "sys.exit(2)\n# --check\n")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL  exit 2", self.line(out, "shadow_spotcheck"))
+        self.assertIn("bad header in spotchecks.tsv", out)
+
+    def test_spotcheck_crash_and_timeout_fail_closed(self):
+        self.child("shadow_spotcheck", "raise SystemExit('boom')\n# --check\n")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL", self.line(out, "shadow_spotcheck"))
+        self.child("shadow_spotcheck", "import time\ntime.sleep(30)\n# --check\n")
+        code, out, _ = self.run_check(timeout="1")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL  timed out", self.line(out, "shadow_spotcheck"))
+
+    def test_spotcheck_script_without_check_flag_is_skipped(self):
+        self.child("shadow_spotcheck", GOOD)
+        _, out, _ = self.run_check()
+        self.assertIn("shadow_spotcheck: SKIPPED", self.line(out, "shadow_spotcheck"))
 
     def test_timeout_is_fail(self):
         self.child("ledger_check", "import time\ntime.sleep(30)\n")
