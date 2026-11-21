@@ -5,45 +5,54 @@ Approved as a process gap by Lazlo on 2026-11-21 04:39Z (cmsg_019Gy38ApTnA8WHdHw
 
 ## 1. Measurement: tasks that waited on the broadsword.toml claim
 
-Source: the task records in `state/tasks/*.task` (fields `created`, `started`, `ended`, `claims`, all epoch seconds; read-only), and the
-log lines in `state/pc-progress.md` that name `broadsword.toml`. I took every broadsword task whose `claims` list names
-`broadsword.toml` and that was created since 2026-11-20 09:00Z (the 092355 row below was created 09:23Z). The numbers come from a
-throw-away script, `scratch/tomlwait.py` (scratch, wipeable): it prints, per task, created, started, ended, wait (started, or now,
-minus created) and which other toml-claiming tasks were running during that wait.
+Source: the task records in `state/tasks/*.task` (fields `created`, `started`, `ended`, `claims`, epoch seconds; read-only) and the log
+lines in `state/pc-progress.md` that name `broadsword.toml`. Every figure below comes from the script `scratch/tomlwait.py` (scratch,
+wipeable; run from `state/tasks` as `python -I ../../scratch/tomlwait.py`), not from hand arithmetic. It takes every task whose `claims`
+list names `broadsword.toml` and that was created from 2026-11-20 09:00Z to 2026-11-21 04:40Z. Its output, pasted unchanged:
 
-| task | what it changed | created (Z) | started (Z) | ended (Z) | wait before start | held the toml claim |
-|---|---|---|---|---|---|---|
-| t-20261120-092355 codex coder route | a new required key | 11-20 09:23 | 11-21 00:02 (see note a) | 11-21 03:34, abandoned | 874 min (note a) | 232 min |
-| t-20261120-152939 | (claims the toml) | 11-20 15:29 | 11-20 15:29 | 11-20 16:26 | 0 | 57 min |
-| t-20261120-174501 parallel test binaries | `test_parallel_binaries` | 11-20 17:45 | 11-20 17:45 | 11-20 22:58 | 0 | 313 min |
-| t-20261120-170450 python tests in parallel | open, never started | 11-20 17:04 | - | - | 695 min and still open (note b) | 0 |
-| t-20261120-191952 GPT cap key | abandoned 1 min after creation | 11-20 19:19 | - | 11-20 19:20 | not a wait (note b) | 0 |
-| t-20261121-011525 S5 linear re-land | needs its keys | 11-21 01:15 | 11-21 04:36 | running | 201 min (note c) | 3 min so far |
-| t-20261121-034547 shadow switch to 6.2 | one value (line 75) | 11-21 03:45 | 11-21 03:45 | 11-21 04:32 | 0 | 47 min |
-| t-20261121-035022 codex re-land | a new required key | 11-21 03:50 | - | - | 50 min and open | 0 |
-| t-20261121-043519 live parallel-tests trial | `test_parallel_binaries` value | 11-21 04:35 | - | - | 5 min and open | 0 |
-| t-20261121-043809 fast-subset lane | queue lane keys | 11-21 04:38 | - | - | 2 min and open | 0 |
+```
+window 11-20 09:00:00 to 11-21 04:40:00 minutes 1180.0
+id | status | created | started | ended | wait_min(created->started or now) | hold_min(started->ended or now)
+t-20261120-092355 abandoned 11-20 09:23:55 11-20 23:42:33 11-21 03:34:41 wait=858.6 hold=232.1
+t-20261120-112230 open 11-20 11:22:30 - - wait=1037.5 hold=0.0
+t-20261120-152939 done 11-20 15:29:39 11-20 15:29:39 11-20 16:26:48 wait=0.0 hold=57.1
+t-20261120-170450 open 11-20 17:04:50 - - wait=695.2 hold=0.0
+t-20261120-174501 done 11-20 17:45:01 11-20 17:45:02 11-20 22:58:28 wait=0.0 hold=313.4
+t-20261120-191952 abandoned 11-20 19:19:52 - 11-20 19:20:15 wait=560.1 hold=0.0
+t-20261121-011525 running 11-21 01:15:25 11-21 04:36:37 - wait=201.2 hold=3.4
+t-20261121-034547 done 11-21 03:45:47 11-21 03:45:48 11-21 04:32:56 wait=0.0 hold=47.1
+t-20261121-035022 open 11-21 03:50:22 - - wait=49.6 hold=0.0
+t-20261121-043519 open 11-21 04:35:19 - - wait=4.7 hold=0.0
+t-20261121-043809 open 11-21 04:38:09 - - wait=1.9 hold=0.0
+tasks 11 started 5 abandoned_unstarted 1 open_unstarted 5
+total hold of started+ended tasks: 649.9 min = 55.1% of window
+```
+
+What each row is (from the task titles and the log): 092355 the codex coder route (a new required key); 152939 not opened, claims only;
+174501 parallel test binaries (`test_parallel_binaries`); 011525 the S5 linear re-land (needs its keys); 034547 the shadow switch to
+gpt-6.2-sol (one value); 035022 the codex re-land (a new required key); 043519 the live parallel-tests trial; 043809 the fast-subset lane;
+112230 the F7 archive task; 170450 Python tests in parallel; 191952 the GPT cap key.
 
 Notes.
-a. 092355 was created at 09:23Z with a gate on the 00:00Z GPT cap reset (log line 542), so most of its 874 minutes is that gate, not
-   the toml. I count it only as a holder: it held `broadsword.toml` for 232 minutes (11-21 00:02Z to 03:34Z), and the log says the S5
-   re-land and the queue.rs tasks waited for it (log lines 1178, 1182, 1262, 1264, 1311).
-b. 170450 and 191952 are not toml waits that I can prove from the record: one is an open backlog task, the other was abandoned at once.
-   I list them so the count is complete and exclude them from the totals.
-c. 011525 also claims `queue.rs`, which the Haiku-low refusal task held until its merge (log line 1313, 1346). Its 201 minutes are the
-   toml wait and the queue.rs wait added together. I cannot split them from the record. The log says that at 03:59Z the toml was the
-   blocker ("held by the queued shadow switch", line 1346), and at 04:03Z again (line 1350).
+a. 092355 started at 23:42:33Z and ended 03:34:41Z (hold 232.1 min). Its wait of 858.6 min is mostly its own gate on the 00:00Z GPT cap
+   reset (log line 542), not the toml. I count it only as a holder; the log says the S5 re-land and the queue.rs tasks waited for it
+   (log lines 1178, 1182, 1262, 1264, 1311).
+b. 112230 (open, 1037.5 min), 170450 (open, 695.2 min) and 191952 (abandoned 23 s after creation) are not toml waits I can prove from the
+   record. They are listed so the count is complete and are excluded from the toml-wait total.
+c. 011525 also claims `queue.rs`, which the Haiku-low refusal task held until its merge (log lines 1313, 1346). Its 201.2 minutes are the
+   toml wait and the queue.rs wait added together; the record cannot split them. The log says the toml was the blocker at 03:59Z ("held
+   by the queued shadow switch", line 1346) and at 04:03Z (line 1350).
 
-Totals (window 2026-11-20 09:00Z to 2026-11-21 04:40Z, 19.7 hours):
-- 10 tasks claimed the toml; 5 of them started (092355, 152939, 174501, 011525, 034547); 1 was abandoned at once (191952); 4 are still
-  open and waiting (035022, 043519, 043809 behind 011525 and earlier holders; 170450 for an unknown reason, note b).
-- Toml holding time: 232 + 57 + 313 + 47 = 649 minutes (11 hours of the 19.7), so the claim was busy more than half the window.
-- Waiting that the log or the record ties to the toml: S5 re-land up to 201 minutes (shared with queue.rs), codex re-land 50 minutes
-  so far, trial 5 and lane 2 minutes so far. Sum 258 minutes of coder-slot-time with a ready task, of which at most 201 is mixed with queue.rs.
-- Two of these holders (shadow switch, 47 minutes) changed one number. The same file blocked work that did unrelated things.
-- Earlier evidence: `docs/SCALING.md` line 176: 25 of 118 broadsword tasks (21 percent) claimed `broadsword.toml`. Tonight's share
-  is 10 of the 137 tasks of 11-20 (the count in log line 741), 7 percent, because the window is only the recent hours; I did not
-  count other projects' tasks, which do not claim it.
+Totals, derived from the output above (window 1180.0 min = 19.7 hours):
+- 11 tasks claimed the toml. 5 started (092355, 152939, 174501, 011525, 034547). 1 was abandoned unstarted (191952). 5 are open and
+  unstarted (112230, 170450, 035022, 043519, 043809).
+- Toml holding time of the four finished holders: 232.1 + 57.1 + 313.4 + 47.1 = 649.7 min by the rows; the script's own sum is 649.9 min
+  (it adds unrounded seconds). That is 10.8 hours, 55.1 percent of the window.
+- Waiting tied to the toml by the log or the record: 011525 201.2, 035022 49.6, 043519 4.7, 043809 1.9: 257.4 minutes, of which the
+  201.2 are mixed with queue.rs. 035022, 043519 and 043809 were still waiting when measured, so the figure grows.
+- The shadow switch (034547) changed one value and held the claim 47.1 minutes; the same file held back work that did unrelated things.
+- Earlier evidence: `docs/SCALING.md` line 176: 25 of 118 broadsword tasks (21 percent) claimed `broadsword.toml`. I do not compare a
+  share for tonight: the window is hours, the all-task count for it was not taken.
 
 What this does not show: how many ready tasks the orchestrator never started because it saw the claim taken (the log says it held
 the queue.rs tasks for the S5 re-land instead, line 1178). That cost is real but is not in the table.
@@ -89,7 +98,7 @@ Reasons:
 1. It uses what exists. Claims are paths (`task.rs`), the parser is flat (`parse_flat`), the Python readers keep working for root keys.
    B needs three subsystems changed before it helps; C needs the loader and the every-key test changed once.
 2. It stops the pattern seen tonight. The shadow switch (review area), the codex timeout key, the lane keys (queue area) and the
-   parallel-tests trial (test area) touch different areas. Of the tasks in the table with a real key change, only 174501 and 043519 (both
+   parallel-tests trial (test area) touch different areas. Of the tasks above with a real key change, only 174501 and 043519 (both
    `test_parallel_binaries`, test area) and 092355 and 035022 (both codex keys, same new area) would still share a file under the layout
    below; the shadow switch (review), the lane (queue) and S5 would not collide with them.
 3. It is cheap to undo: setting `config_files = ""` and moving the keys back restores the old state; every key stays required.
@@ -167,8 +176,9 @@ Measure (per 24 hours of orchestrator time, from `state/tasks/*.task`): for task
 file, (a) the number of such tasks, (b) the sum of `started - created` for those whose start was held by a toml-area claim holder (the
 overlap column of the script), (c) the hours a toml-area claim was held while another ready task wanted it.
 
-Baseline (section 1, window 2026-11-20 09:00Z to 2026-11-21 04:40Z): 10 tasks, 258 minutes of waiting tied to the toml (201 of them
-shared with queue.rs), 649 minutes of claim holding in 19.7 hours (55 percent of wall time), 4 tasks still waiting when measured.
+Baseline (section 1, window 2026-11-20 09:00Z to 2026-11-21 04:40Z): 11 tasks, 257.4 minutes of waiting tied to the toml (201.2 of
+them shared with queue.rs), 649.9 minutes of claim holding in the 1180-minute window (55.1 percent of wall time), 5 tasks open and
+unstarted when measured (3 of them with a wait tied to the toml).
 
 How the change is judged: after the move merges, take the next 20 toml-area tasks or the next 24 hours, whichever is longer, with the
 same script. Keep the split if the minutes of waiting behind a holder drop and no new class of failure appears. Revert (section 7 step 7)
