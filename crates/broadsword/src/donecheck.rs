@@ -28,15 +28,18 @@
 //! leave half a secret. Only the last `done_check_tail_lines` lines, and of those at most `reviewer_check_tail_kb` KB, are kept,
 //! and memory stays bounded while reading: a line longer than `reviewer_check_tail_kb` keeps only its start, with a note that it
 //! was cut (`pump`). A command still running after `done_check_timeout_seconds` is killed with its whole process tree
-//! (`sys::kill_tree`, then everything it started, `group`). A command that exits but leaves something running that still holds
-//! its output at that deadline did not finish: everything it started is killed and it FAILS (`Ended::LeftRunning`). Because
+//! (`sys::kill_tree`, then everything it started, `group`). A command has finished only when NOTHING it started is still running:
+//! after it exits, the queue waits (to the same deadline) until its output is closed AND its kill group is empty
+//! (`group::Group::running`), whether or not what is left holds its output. Something still running at the deadline did not
+//! finish: everything it started is killed and it FAILS (`Ended::LeftRunning`); if the group cannot be asked, everything is
+//! killed and it FAILS too (`Ended::CannotTell`). The group is killed before `run_one` returns on every path. Because
 //! `broadsword run` hands its command to the system shell, the shell characters `& | < > ^ % ; $ ` " ' ( )` and newlines are
 //! refused in every argument, so nothing in a brief can reach a shell as syntax.
 //!
 //! VERDICT. Commands run in order and stop at the first one that does not pass. Exit 0 passes. A non-zero exit FAILS when the job
 //! ran its step and printed its own `<build|run>: FAILED` summary line (a `run` passes its command's own exit code on, so the code
 //! alone cannot tell a failed command from a refusal); a timeout FAILS too, and so does a command that did not finish (it exited
-//! but something it started still held its output at the deadline), whatever its exit code: the queue ends the entry `rejected` before any reviewer
+//! but something it started was still running at the deadline, or that could not be told), whatever its exit code: the queue ends the entry `rejected` before any reviewer
 //! is called. Any other non-zero exit (a refusal: bad input, paused, busy, disk, which print no step summary), no exit code, or a
 //! program that could not start gives NO VERDICT: the queue ends the entry `blocked`.
 //!
@@ -253,9 +256,12 @@ impl Limits {
 pub enum Ended {
     Exited(Option<i32>),
     TimedOut,
-    /// The command itself exited (with this code), but something it started still held its output at the deadline: it did not
-    /// finish. Everything it started was then killed (`killed`: the kill call succeeded).
+    /// The command itself exited (with this code), but something it started was still running at the deadline (holding its
+    /// output or not): it did not finish. Everything it started was then killed (`killed`: the kill call succeeded).
     LeftRunning { code: Option<i32>, killed: bool },
+    /// The command itself exited (with this code), but whether something it started was still running could not be asked
+    /// (`why`): fail closed. Everything it started was then killed (`killed`: the kill call succeeded).
+    CannotTell { code: Option<i32>, why: String, killed: bool },
     NotStarted(String),
 }
 
@@ -279,7 +285,9 @@ impl Ran {
             Ended::Exited(Some(c)) if self.step_failed => Verdict::Fail(format!("exit {c}: the job ran and its step FAILED")),
             Ended::TimedOut => Verdict::Fail("timed out (killed)".into()),
             // never a pass, whatever the exit code: the done check had not finished at its deadline
-            Ended::LeftRunning { .. } => Verdict::Fail("did not finish: a process it started still held its output at the deadline (killed)".into()),
+            Ended::LeftRunning { .. } => Verdict::Fail("did not finish: a process it started was still running at the deadline (killed)".into()),
+            // never a pass either: nothing shows that what it started had ended
+            Ended::CannotTell { .. } => Verdict::Fail("could not tell whether a process it started was still running (killed)".into()),
             Ended::Exited(Some(c)) => Verdict::Inconclusive(format!("exit {c}: the command could not run to a verdict (bad input, refused, busy or disk)")),
             Ended::Exited(None) => Verdict::Inconclusive("ended without an exit code".into()),
             Ended::NotStarted(m) => Verdict::Inconclusive(format!("could not start: {m}")),
@@ -292,9 +300,14 @@ impl Ran {
             Ended::Exited(None) => "ended without an exit code".into(),
             Ended::TimedOut => format!("TIMED OUT after {} s (done_check_timeout_seconds): killed with its whole process tree", limits.timeout.as_secs()),
             Ended::LeftRunning { code, killed } => format!(
-                "DID NOT FINISH: the command exited ({}) but a process it started still held its output after {} s (done_check_timeout_seconds); {}",
+                "DID NOT FINISH: the command exited ({}) but a process it started was still running after {} s (done_check_timeout_seconds); {}",
                 code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into()),
                 limits.timeout.as_secs(),
+                if *killed { "everything it started was killed" } else { "killing what it started FAILED: it may still be running" }
+            ),
+            Ended::CannotTell { code, why, killed } => format!(
+                "NOT KNOWN TO HAVE FINISHED: the command exited ({}) but whether a process it started was still running could not be told ({why}); {}",
+                code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into()),
                 if *killed { "everything it started was killed" } else { "killing what it started FAILED: it may still be running" }
             ),
             Ended::NotStarted(m) => format!("could not start: {m}"),
@@ -494,12 +507,21 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
         }
         std::thread::sleep(tick);
     };
-    // The readers end when every holder of the pipes is gone. A command that exited while something it started still holds
-    // them has not finished: at its deadline everything it started is killed, and it FAILS (`LeftRunning`), never passes.
+    // A command has finished only when NOTHING it started is still running. The readers end when every holder of the pipes is
+    // gone, but a descendant that holds none of them (redirected, closed, detached) is seen only by asking the group. Until
+    // both are done it is waited for; at its deadline everything it started is killed, and it FAILS (`LeftRunning`), never
+    // passes. A group that cannot be asked fails closed (`CannotTell`), after killing everything in it.
     let ended = match ended {
         Ended::Exited(code) => loop {
             if readers.iter().all(|r| r.is_finished()) {
-                break Ended::Exited(code);
+                match group.running() {
+                    Ok(0) => break Ended::Exited(code),
+                    Ok(_) => {}
+                    Err(why) => {
+                        let killed = group.kill();
+                        break Ended::CannotTell { code, why, killed };
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 let killed = group.kill();
@@ -509,6 +531,8 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
         },
         other => other,
     };
+    // Belt and braces: whatever the ending, nothing the command started outlives this call (an empty group: a no-op).
+    group.kill();
     let secs = start.elapsed().as_secs_f64();
     let (lines, dropped, step_failed) = tail.lock().map(|t| (t.lines.iter().cloned().collect::<Vec<_>>(), t.dropped, t.marked)).unwrap_or_default();
     let (lines, cut) = fit(&lines, limits.tail_bytes, &secrets);
@@ -519,10 +543,12 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
 /// (its descendants then no longer form a tree `sys::kill_tree` can find from its pid: checked on Windows, where `taskkill /T`
 /// on an exited parent says "not found" and its grandchild runs on).
 /// Windows: the child is created suspended, put in a new Job Object, and only then resumed (`prepare`, `Group::start`), so it
-/// runs no instruction outside the job and everything it starts joins the job by itself. If the job cannot be made, joined or
-/// the child resumed, the still-suspended child is killed and the command does not run (NO VERDICT).
-/// Elsewhere: the child leads its own process group (`process_group(0)`), killed as a whole with `kill -9 -<pgid>` (not run
-/// on this machine; a process that leaves the group is not reached).
+/// runs no instruction outside the job and everything it starts joins the job by itself. The job is set to kill everything in
+/// it when its last handle closes (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), so a dropped `Group` never leaves a process alive. If
+/// the job cannot be made, limited, joined or the child resumed, the still-suspended child is killed and the command does not
+/// run (NO VERDICT). `running` asks the job how many processes in it are still alive (`ActiveProcesses`).
+/// Elsewhere: the child leads its own process group (`process_group(0)`), killed as a whole with `kill -9 -<pgid>` and asked
+/// with `kill -0 -<pgid>` (not run on this machine; a process that leaves the group is not reached).
 mod group {
     use std::process::{Child, Command};
 
@@ -558,12 +584,51 @@ mod group {
         flags: u32,
     }
 
+    /// `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION` (winnt.h), information class 1.
+    #[cfg(windows)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct Accounting {
+        total_user: i64,
+        total_kernel: i64,
+        period_user: i64,
+        period_kernel: i64,
+        page_faults: u32,
+        total_processes: u32,
+        active_processes: u32,
+        terminated_processes: u32,
+    }
+
+    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` (winnt.h), information class 9: `JOBOBJECT_BASIC_LIMIT_INFORMATION`, then
+    /// `IO_COUNTERS` (six u64) and the four memory fields, flattened.
+    #[cfg(windows)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimit {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        limit_flags: u32,
+        min_working_set: usize,
+        max_working_set: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+        io: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
+
     #[cfg(windows)]
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateJobObjectW(attributes: *const core::ffi::c_void, name: *const u16) -> isize;
         fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
         fn TerminateJobObject(job: isize, exit_code: u32) -> i32;
+        fn SetInformationJobObject(job: isize, class: i32, info: *const core::ffi::c_void, len: u32) -> i32;
+        fn QueryInformationJobObject(job: isize, class: i32, info: *mut core::ffi::c_void, len: u32, ret_len: *mut u32) -> i32;
         fn CloseHandle(h: isize) -> i32;
         fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
         fn Thread32First(snapshot: isize, entry: *mut ThreadEntry) -> i32;
@@ -586,6 +651,13 @@ mod group {
                     return Err(format!("cannot create its kill group (CreateJobObjectW: error {})", GetLastError()));
                 }
                 let g = Group(job); // closed on every return below
+                const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+                const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+                let limit = ExtendedLimit { limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, ..ExtendedLimit::default() };
+                let len = std::mem::size_of::<ExtendedLimit>() as u32;
+                if SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, &limit as *const ExtendedLimit as *const _, len) == 0 {
+                    return Err(format!("cannot make its kill group kill on close (SetInformationJobObject: error {})", GetLastError()));
+                }
                 if AssignProcessToJobObject(job, child.as_raw_handle() as isize) == 0 {
                     return Err(format!("cannot put it in its kill group (AssignProcessToJobObject: error {})", GetLastError()));
                 }
@@ -605,6 +677,20 @@ mod group {
         pub fn kill(&self) -> bool {
             // SAFETY: self.0 is a job handle this value owns.
             unsafe { TerminateJobObject(self.0, 1) != 0 }
+        }
+
+        /// How many processes in the job are still running (`ActiveProcesses`); an error if the job cannot be asked.
+        pub fn running(&self) -> Result<u32, String> {
+            const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;
+            let mut info = Accounting::default();
+            let len = std::mem::size_of::<Accounting>() as u32;
+            // SAFETY: self.0 is a job handle this value owns; `info` is a sized, writable JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+            let ok = unsafe { QueryInformationJobObject(self.0, JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION, &mut info as *mut Accounting as *mut _, len, std::ptr::null_mut()) };
+            if ok == 0 {
+                // SAFETY: a plain kernel call with no arguments.
+                return Err(format!("QueryInformationJobObject: error {}", unsafe { GetLastError() }));
+            }
+            Ok(info.active_processes)
         }
     }
 
@@ -652,7 +738,8 @@ mod group {
     #[cfg(windows)]
     impl Drop for Group {
         fn drop(&mut self) {
-            // SAFETY: closing the job handle this value owns; it does not kill anything (no kill-on-close limit is set).
+            // SAFETY: closing the job handle this value owns. The job was set to kill on close (`start`), so closing its last
+            // handle kills anything still in it: a dropped Group never leaves a process alive.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -671,6 +758,19 @@ mod group {
 
         pub fn kill(&self) -> bool {
             crate::scrub::command(&self.1, "kill").args(["-9", "--", &format!("-{}", self.0)]).status().is_ok_and(|s| s.success())
+        }
+
+        /// 1 while any process of the group lives (`kill -0 -<pgid>` succeeds), else 0; an error if `kill` cannot be run.
+        /// Not run on this machine.
+        pub fn running(&self) -> Result<u32, String> {
+            let st = crate::scrub::command(&self.1, "kill")
+                .args(["-0", "--", &format!("-{}", self.0)])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("cannot run kill -0: {e}"))?;
+            Ok(u32::from(st.success()))
         }
     }
 }
@@ -860,7 +960,8 @@ mod tests {
         }
         assert!(matches!(r(Ended::TimedOut).verdict(), Verdict::Fail(_)));
         for killed in [true, false] {
-            assert!(matches!(r(Ended::LeftRunning { code: Some(0), killed }).verdict(), Verdict::Fail(_)), "exit 0 with its output still held at the deadline never passes");
+            assert!(matches!(r(Ended::LeftRunning { code: Some(0), killed }).verdict(), Verdict::Fail(_)), "exit 0 with something still running at the deadline never passes");
+            assert!(matches!(r(Ended::CannotTell { code: Some(0), why: "x".into(), killed }).verdict(), Verdict::Fail(_)), "exit 0 with its group not asked never passes");
         }
         for e in [Ended::Exited(Some(1)), Ended::Exited(Some(2)), Ended::Exited(Some(3)), Ended::Exited(Some(4)), Ended::Exited(None), Ended::NotStarted("x".into())] {
             assert!(matches!(r(e.clone()).verdict(), Verdict::Inconclusive(_)), "{e:?}");

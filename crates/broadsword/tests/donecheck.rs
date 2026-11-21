@@ -275,3 +275,75 @@ fn a_done_check_command_past_its_timeout_is_killed_and_rejects_the_entry() {
     assert!((3.0..25.0).contains(&cmd_secs), "the command was cut at its 3 s timeout, not waited for: {cmd_secs} s recorded ({line})");
     assert_eq!(r.calls(), 0);
 }
+
+/// A script that starts a DETACHED descendant, holding none of the command's output (Windows: `Start-Process`, which hands it
+/// no handle; elsewhere: redirected to /dev/null), which waits about `wait_s` seconds and then writes `late.txt` in the folder
+/// `up` levels above the script (0: the task's worktree; 3: the test root, outside it, since any untracked file in the worktree
+/// blocks a merge); the script itself exits 0 at once. Returns (the committed file name, its content, the done-check command).
+fn detached(wait_s: u32, up: usize) -> (&'static str, String, &'static str) {
+    if cfg!(windows) {
+        let ps = format!("$m = Join-Path $PSScriptRoot '{}late.txt'\r\n", "..\\".repeat(up));
+        let ps = format!("{ps}Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '/C', \"ping -n {} 127.0.0.1 >nul & echo late> `\"$m`\"\"\r\nexit 0\r\n", wait_s + 1);
+        ("bg.ps1", ps, "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File bg.ps1")
+    } else {
+        let dir = std::iter::once("$(dirname \"$0\")").chain(std::iter::repeat_n("..", up)).collect::<Vec<_>>().join("/");
+        ("bg.sh", format!("(sleep {wait_s}; echo late > \"{dir}/late.txt\") </dev/null >/dev/null 2>&1 &\nexit 0\n"), "sh bg.sh")
+    }
+}
+
+/// The seconds the queue recorded for the first done-check command (`result: ...; <secs> s`).
+fn first_secs(dc: &str) -> f64 {
+    let line = dc.lines().find(|l| l.trim_start().starts_with("result:")).unwrap_or_else(|| panic!("no result line: {dc}"));
+    line.trim_end().strip_suffix(" s").and_then(|l| l.rsplit("; ").next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no seconds in {line:?}"))
+}
+
+/// Review q-20261121-053038: a done-check command that exits 0 but leaves a descendant running that holds NONE of its output
+/// has not finished. It must not pass (DID NOT FINISH, not a timeout: the command itself exits), and the descendant is killed:
+/// it would write `late.txt` into the worktree ~45 s after it started, after the 30 s deadline (on a loaded machine here the
+/// whole `broadsword run` of the ~3 s variant below took 21.1 s, so the deadline leaves room for the command to exit first). Not run
+/// on non-Windows machines (the `sh` variant is untested here).
+#[test]
+fn a_done_check_that_leaves_a_detached_descendant_running_fails_and_the_descendant_is_killed() {
+    let r = Root::new("detached", &[("done_check_timeout_seconds", "30")]);
+    let (file, content, cmd) = detached(45, 0);
+    let (id, e) = r.queued(file, &content, &format!("1. `broadsword run p --task <id> -- {cmd}` -> exits 0\n"));
+    let marker = r.wt(&id).join("late.txt");
+    let t = Instant::now();
+    let o = r.run(&["queue", "run", "--entry", &e]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    let why = r.field(&e, "reason");
+    assert_eq!(r.field(&e, "status"), "rejected", "reason = {why}");
+    assert!(why.contains("did not finish: a process it started was still running at the deadline"), "{why}");
+    assert_eq!(r.calls(), 0, "no reviewer was called");
+    let dc = r.donecheck(&e);
+    assert!(!dc.contains("result: PASS"), "{dc}");
+    assert!(dc.contains("DID NOT FINISH: the command exited (exit 0)") && dc.contains("everything it started was killed"), "{dc}");
+    println!("ended after {:.1} s: {}", t.elapsed().as_secs_f64(), dc.lines().find(|l| l.contains("result:")).unwrap_or(""));
+    // the descendant started before the done check returned, so unkilled it would have written its marker within 45 s of now
+    let back = Instant::now();
+    while back.elapsed().as_secs() < 48 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(!marker.exists(), "the detached descendant outlived the done check and wrote {}", marker.display());
+}
+
+/// The same detached descendant, but one that ends ~3 s later, well before the 60 s deadline: the queue WAITS for it (never
+/// fails a command just because something it started was briefly running) and the check passes. Its marker goes in the test
+/// root, outside the worktree (an untracked file there blocks the merge). Its recorded time covers the descendant's ~3 s: a check
+/// that returned when the command itself exited (b90305b5) recorded 1.5 s here.
+#[test]
+fn a_done_check_whose_detached_descendant_ends_before_the_deadline_is_waited_for_and_passes() {
+    let r = Root::new("detachedok", &[("done_check_timeout_seconds", "60")]);
+    let (file, content, cmd) = detached(3, 3);
+    let (_id, e) = r.queued(file, &content, &format!("1. `broadsword run p --task <id> -- {cmd}` -> exits 0\n"));
+    let o = r.run(&["queue", "run", "--entry", &e]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.field(&e, "status"), "merged", "reason = {}", r.field(&e, "reason"));
+    let dc = r.donecheck(&e);
+    assert!(dc.contains("result: PASS; exit 0"), "{dc}");
+    // the command's own time includes waiting for its descendant (which takes ~3 s after PowerShell starts)
+    let secs = first_secs(&dc);
+    println!("the command and its descendant: {secs:.1} s recorded");
+    assert!(secs >= 3.0, "the check returned before its ~3 s descendant could have ended: {secs} s ({dc})");
+    assert!(r.dir.join("late.txt").exists(), "the descendant ran to its end and wrote its marker");
+}
