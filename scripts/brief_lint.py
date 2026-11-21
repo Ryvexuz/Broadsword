@@ -55,6 +55,8 @@ placeholders with `<` or `*`, and sentences saying "separate task" are not check
       nowhere on the ref, unless its sentence says new/add/introduce/accept
   P5  a task id after "after", "needs", "requires", "depends on" or "blocked by" that has no line with
       status `merged` in the queue list; with no --queue-list at all it fails closed
+  P6  a brief that claims a records file (under docs/ or evidence/, or PROGRESS.md, LAB_LOG.md, RETRO.md)
+      must contain the line "Every number and claim is quoted from a file or command output."
 
 Threat model: this lint is ADVISORY. Its inputs are our own agents' briefs, not an adversary's.
 It catches honest mistakes and drift; making it bypass-proof is NOT a goal, and a deliberately
@@ -438,6 +440,9 @@ PREREQ_RE = re.compile(r"\b(?:after|needs?|requires?|depends\s+on|blocked\s+by)\
                        r"((?:t-\d{8}-\d{6}(?:-\d+)?(?:\s*(?:,|and)\s*)?)+)", re.I)
 TASK_ID_RE = re.compile(r"t-\d{8}-\d{6}(?:-\d+)?")
 PF_CMD_FLAGLESS = {"broadsword", "cargo", "git"}
+RECORDS_DIRS = ("docs/", "evidence/")
+RECORDS_FILES = {"PROGRESS.md", "LAB_LOG.md", "RETRO.md"}
+RECORDS_LINE = "Every number and claim is quoted from a file or command output."
 
 
 def _git(root, args):
@@ -567,6 +572,12 @@ def preflight(text, root, ref, queue_text):
             bad = [i for i in ids if i not in merged]
             if bad:
                 res.append(("P5", "FAIL", "prerequisite task(s) not merged in queue list: " + ", ".join(bad)))
+
+    # The one place P6 is decided: a records claim needs the quoted-claims line in the brief.
+    recs = sorted(c for c in claims if c.startswith(RECORDS_DIRS) or c.rsplit("/", 1)[-1] in RECORDS_FILES)
+    if recs and not any(re.sub(r"^(?:[-*]|\d+[.)])\s+", "", ln.strip()) == RECORDS_LINE for ln in lines):
+        res.append(("P6", "FAIL", "claims records file(s) " + ", ".join(recs)
+                    + " but the brief lacks the line: " + RECORDS_LINE))
     return res
 
 

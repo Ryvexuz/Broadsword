@@ -417,7 +417,7 @@ M4_BRIEF = ("# t-x: m4 calibration\n\nProject: crash-sim. Claims: `scenarios/val
 
 
 class Preflight(unittest.TestCase):
-    """P1-P5: the plan preflight. Each test was run before the rule existed and failed."""
+    """P1-P6: the plan preflight. Each test was run before the rule existed and failed."""
 
     def pf(self, text, files, queue=None):
         # brief()'s default done check runs scripts/test_a.py: it exists in every fixture unless a test says so
@@ -428,7 +428,7 @@ class Preflight(unittest.TestCase):
         return {r for r, lv, _ in self.pf(text, files, queue) if lv == "FAIL"}
 
     def test_p1_existing_and_claimed_new_paths_pass(self):
-        text = brief("`src/a.rs`, `docs/new.md` (new)", "- edit `src/a.rs` and write `docs/new.md`")
+        text = brief("`src/a.rs`, `tools/new.md` (new)", "- edit `src/a.rs` and write `tools/new.md`")
         self.assertEqual(self.pf(text, {"src/a.rs": "x"}), [])
 
     def test_p1_path_missing_on_main_and_not_claimed_new_fails_with_the_list(self):
@@ -532,6 +532,27 @@ class Preflight(unittest.TestCase):
         root = make_repo(self, {"src/a.rs": "x"})
         g = bl.preflight(brief("`src/a.rs`", "- edit `src/a.rs`"), root, "no-such-ref", None)
         self.assertEqual({(r, lv) for r, lv, _ in g}, {("P0", "FAIL")})
+
+    def test_p6_records_claim_without_the_quoted_line_fails(self):
+        line = "Every number and claim is quoted from a file or command output."
+        for claims in ("`PROGRESS.md` (new)", "`docs/STAGE-NOTES.md` (new)", "`evidence/run-1.txt` (new)",
+                       "`LAB_LOG.md` (new)"):
+            text = brief(claims, "- write the record")
+            self.assertEqual(self.fails(text, {"src/a.rs": "x"}), {"P6"}, claims)
+            g = self.pf(text, {"src/a.rs": "x"})
+            self.assertIn(line, [m for r, _, m in g if r == "P6"][0].split(": ", 1)[-1], claims)
+            ok = text.replace("- write the record", "- write the record\n" + line)
+            self.assertEqual(self.pf(ok, {"src/a.rs": "x"}), [], claims)
+
+    def test_p6_code_only_brief_passes_without_the_line(self):
+        text = brief("`src/a.rs`, `docs2/x.md` (new), `scripts/notes.py` (new)", "- edit `src/a.rs`")
+        self.assertEqual(self.pf(text, {"src/a.rs": "x"}), [])
+
+    def test_p6_names_the_claimed_records_file(self):
+        g = self.pf(brief("`docs/` (new folder), `RETRO.md` (new)", "- write"), {"src/a.rs": "x"})
+        msg = [m for r, _, m in g if r == "P6"][0]
+        self.assertIn("docs/", msg)
+        self.assertIn("RETRO.md", msg)
 
     def test_cli_preflight_flags_and_exit_codes(self):
         d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_cli_"))
