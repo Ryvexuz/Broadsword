@@ -101,6 +101,29 @@ class RecordTests(Base):
         self.assertTrue(text.startswith(sp.SPOT_HEADER + "\n"))
         self.assertEqual(text.splitlines()[1].split("\t")[:5], ["q-A", k, "false", "opus (spot)", "ev line"])
 
+    def record_with(self, orig_judge, judge, *extra):
+        k = self.selected_keys(1)[0]
+        self.write_verdicts([vrow("q-A", k, judge=orig_judge)])
+        (self.root / sp.SPOT_FILE).unlink(missing_ok=True)  # each call is a fresh case
+        return self.run_main("--record", f"q-A|{k}", "real", judge, "ev", *extra)[0]
+
+    def test_independence_is_by_family(self):
+        self.assertEqual(self.record_with("orchestrator", "claude-opus-5-5"), 2)  # orchestrator is Opus
+        self.assertEqual(self.record_with("orchestrator (haiku raised other points)", "opus"), 2)
+        self.assertEqual(self.record_with("haiku (gating)", "claude-haiku-4-5"), 2)
+        self.assertEqual(self.record_with("opus (gating)", "sonnet"), 0)
+        self.assertEqual(self.record_with("orchestrator", "sonnet"), 0)
+        self.assertEqual(self.record_with("haiku (gating)", "gpt-5", "--exclude", "GPT-5.2"), 2)  # exclude by family
+        self.assertEqual(self.record_with("haiku (gating)", "claude-sonnet-5-5", "--exclude", "claude-sonnet-4"), 2)
+
+    def test_unknown_family_refused(self):
+        self.assertEqual(self.record_with("haiku (gating)", "mystery-model"), 2)
+        self.assertEqual(self.record_with("haiku (gating)", "orchestrators"), 2)
+        self.assertEqual(self.record_with("mystery (gating)", "opus"), 2)  # original judge unknown: cannot prove independence
+        self.assertEqual(self.record_with("haiku (gating)", "opus", "--exclude", "mystery"), 2)
+        self.assertEqual(sp.family(""), "")
+        self.assertEqual(sp.family("orchestrator"), sp.ORCHESTRATOR_FAMILY)
+
     def test_refuses_not_due_duplicate_bad_result_empty_evidence(self):
         keys = self.selected_keys(1)
         k = keys[0]

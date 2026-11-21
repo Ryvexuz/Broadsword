@@ -12,9 +12,10 @@ row in or out of the sample by rewording. The row key printed and taken by --rec
 Default: print every due row that has no result yet in <root>/state/shadow-spotchecks.tsv (header: entry, finding_key, result,
 judge, evidence, date); exit 0. --check: same listing, exit 1 while any due row is open (for the session-end check), else 0.
 --record: append one result under an OS lock on <spotchecks file>.lock. Refuses a key that is not due, a key already recorded, a
-result outside real|false|unsure, empty evidence or judge, and a judge whose model (first word of the name, lower case) equals the
-model of the row's original judge (first word of the `judge` column; the tsv has no coder or gating-reviewer column) or any
---exclude model (pass the coder and the gating reviewer). The judge being a strong model that is none of those is the
+result outside real|false|unsure, empty evidence or judge, and a judge whose model FAMILY (haiku, sonnet, opus, fable or gpt:
+any name containing one, so `claude-opus-5-5` is opus) equals the family of the row's original judge (first word of the `judge`
+column; `orchestrator` is ORCHESTRATOR_FAMILY, opus) or of any --exclude model (pass the coder and the gating reviewer; the tsv
+has no such columns). An unknown or empty family, for the judge, the original judge or an --exclude, is refused. The judge being a strong model that is none of those is the
 orchestrator's duty; this script cannot see it.
 A malformed tsv (wrong header, wrong column count, empty entry or key, unknown verdict or result) fails closed: exit 2, nothing
 written. Never writes state/shadow-verdicts.tsv. Standard library only.
@@ -102,10 +103,30 @@ def open_rows(root: Path) -> list:
     return [c for c in due_rows(root) if (c[0], c[1]) not in done]
 
 
-def model_of(judge: str) -> str:
-    """The model name: first word of a judge string, lower case ('haiku (gating)' -> 'haiku')."""
-    parts = judge.lower().split()
-    return parts[0] if parts else ""
+# The orchestrator is the main session, an Opus model (AGENTS.md, "Orchestrator (main session, Opus)"). The name `orchestrator`
+# in the verdicts file therefore has this family. Change it here if the orchestrator's model changes.
+ORCHESTRATOR_FAMILY = "opus"
+# Mirrors reviewer::model_family in crates/broadsword/src/reviewer.rs (haiku, sonnet, opus by substring), plus fable and gpt,
+# which that function leaves as the trimmed name. Anything else is unknown and refused.
+FAMILIES = ("haiku", "sonnet", "opus", "fable", "gpt")
+
+
+def family(name: str) -> str:
+    """The family of a model name: `orchestrator` -> ORCHESTRATOR_FAMILY; a name containing a known family -> that family
+    (`claude-opus-5-5` -> opus); empty or unknown -> "" (callers refuse)."""
+    n = name.strip().lower()
+    if n == "orchestrator":
+        return ORCHESTRATOR_FAMILY
+    for f in FAMILIES:
+        if f in n:
+            return f
+    return ""
+
+
+def judge_family(judge: str) -> str:
+    """Family of a judge column or a --record judge: the first word names the model ('haiku (gating)', 'orchestrator (...)')."""
+    parts = judge.split()
+    return family(parts[0]) if parts else ""
 
 
 class _Lock:
@@ -171,10 +192,20 @@ def record(root: Path, rowkey: str, result: str, judge: str, evidence: str, excl
             raise ValueError(f"{rowkey!r} is not a due row (false verdict in the 1-in-{SAMPLE_MOD} sample)")
         if (entry, key) in recorded(root):
             raise ValueError(f"{rowkey!r} already has a spot-check result")
-        banned = {model_of(row[4])} | {model_of(x) for x in exclude}
-        banned.discard("")
-        if model_of(judge) in banned:
-            raise ValueError(f"judge {judge!r} is the original judge, the gating reviewer or the coder: pick an independent judge")
+        jf = judge_family(judge)
+        if not jf:
+            raise ValueError(f"judge {judge!r} has an unknown model family (known: {', '.join(FAMILIES)}, orchestrator): refused")
+        orig = judge_family(row[4])
+        if not orig:
+            raise ValueError(f"the original judge {row[4]!r} of {rowkey!r} has an unknown model family: cannot check independence")
+        banned = {orig}
+        for x in exclude:
+            xf = family(x)
+            if not xf:
+                raise ValueError(f"--exclude {x!r} has an unknown model family: refused")
+            banned.add(xf)
+        if jf in banned:
+            raise ValueError(f"judge {judge!r} (family {jf}) is in the family of the original judge, the gating reviewer or the coder: pick an independent judge")
         out = "\t".join([entry, key, result, judge, evidence, date or time.strftime("%Y-%m-%d", time.gmtime())])
         path = root / SPOT_FILE
         new = not path.is_file() or path.stat().st_size == 0
