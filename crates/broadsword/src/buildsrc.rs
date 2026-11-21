@@ -46,7 +46,8 @@
 //! projects/crash-sim; render's drive tests then found no binary). People and other projects' tests run main's binaries from
 //! there, NEVER from cargo's own `<build_dir>/<profile>/`: that is a cache which any checkout's build may overwrite or clean, and
 //! after another folder's clean it holds only what that job built (a binary it did not build is missing, and a reader fails
-//! loudly; nothing is ever copied back into it, so an exe there is always the build its bin note names). A file beside each
+//! loudly; this module never copies anything into it, so main's kept copy never sits there under another folder's bin note).
+//! A file beside each
 //! kept exe (`<exe>.source`) holds the build-source note it was kept under (`projects/<p>`, `.`, or a `run:` note of one).
 //! It is written in exactly two places, both under the build lock and both from an exe whose note names the main checkout
 //! (so a worktree's exe never lands there), and both only from a SUCCESSFUL main step:
