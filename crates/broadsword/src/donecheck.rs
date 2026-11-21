@@ -43,6 +43,11 @@
 //! is called. Any other non-zero exit (a refusal: bad input, paused, busy, disk, which print no step summary), no exit code, or a
 //! program that could not start gives NO VERDICT: the queue ends the entry `blocked`.
 //!
+//! NON-WINDOWS. Done-check execution needs Windows job-object containment: off Windows `classify` (through `classify_for`, which
+//! takes the platform) marks every otherwise-runnable line (`build`, `run`) `NOT RUN` with the reason "done-check execution needs
+//! Windows job-object containment", so nothing is ever spawned there; `run_one` also refuses to spawn off Windows. A process group
+//! cannot contain a child that calls `setsid()`, so no weaker containment is offered.
+//!
 //! Known limits: a secret split across two output lines is not recognised (as in job logs); a command killed at its timeout
 //! leaves the job it started interrupted, for `broadsword recover` (as any killed job does). The command cannot start anything
 //! outside its kill group: it is created suspended and runs only once it is in the group (`group`).
@@ -141,6 +146,15 @@ fn is_broadsword(tok: &str) -> bool {
 
 /// THE rule: is this done-check command one the queue may run for this entry? `Ok(args)` are the arguments after the program.
 pub fn classify(command: &str, projects_dir: &Path, project: &str, task: &str) -> Result<Vec<String>, String> {
+    classify_for(command, projects_dir, project, task, cfg!(windows))
+}
+
+/// Why nothing is run off Windows (shown as the NOT RUN reason; also the `NotStarted` text of `run_one` there).
+const NEEDS_WINDOWS: &str = "done-check execution needs Windows job-object containment";
+
+/// `classify` with the platform as a parameter, so the non-Windows rule is testable on Windows. Off Windows a command that would
+/// otherwise run (`build`, `run`) is refused with `NEEDS_WINDOWS`; `test` and `check` are never run on any platform.
+fn classify_for(command: &str, projects_dir: &Path, project: &str, task: &str, windows: bool) -> Result<Vec<String>, String> {
     if let Some(c) = command.chars().find(|c| SHELL_CHARS.contains(c)) {
         let what = if c == '<' || c == '>' { "an unfilled placeholder or a redirection" } else { "a shell character" };
         return Err(format!("it contains `{}` ({what}); the queue runs no shell and passes no shell syntax on", c.escape_default()));
@@ -181,6 +195,9 @@ pub fn classify(command: &str, projects_dir: &Path, project: &str, task: &str) -
         ("run", _) => return Err("`broadsword run` needs `-- <command>` right after `--task <task>`".into()),
         (_, []) => {}
         (_, extra) => return Err(format!("`broadsword {sub}` takes nothing after `--task <task>`; it has `{}`", extra.join(" "))),
+    }
+    if !windows && !COVERED.contains(&sub) {
+        return Err(NEEDS_WINDOWS.into());
     }
     Ok(args)
 }
@@ -452,6 +469,11 @@ fn fit(lines: &[String], max_bytes: usize, secrets: &Secrets) -> (Vec<String>, u
 /// Run `exe args` in `dir` under `limits`. Every line of output is redacted with `secrets` before it is kept.
 pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &Limits, secrets: &Secrets) -> Ran {
     let start = Instant::now();
+    if !cfg!(windows) {
+        // belt and braces: `classify` already refuses every runnable line off Windows, so nothing reaches here; if something
+        // does, nothing is spawned
+        return Ran { ended: Ended::NotStarted(NEEDS_WINDOWS.into()), secs: 0.0, tail: Vec::new(), dropped: 0, step_failed: false };
+    }
     let mut cmd = scrub::command(cfg, exe); // the one spawn helper: the scrubbed environment, never a shell
     cmd.args(args).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     group::prepare(&mut cmd);
@@ -547,8 +569,7 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
 /// it when its last handle closes (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), so a dropped `Group` never leaves a process alive. If
 /// the job cannot be made, limited, joined or the child resumed, the still-suspended child is killed and the command does not
 /// run (NO VERDICT). `running` asks the job how many processes in it are still alive (`ActiveProcesses`).
-/// Elsewhere: the child leads its own process group (`process_group(0)`), killed as a whole with `kill -9 -<pgid>` and asked
-/// with `kill -0 -<pgid>` (not run on this machine; a process that leaves the group is not reached).
+/// Elsewhere: no group exists (a process group cannot hold a child that calls setsid()), and nothing is run there.
 mod group {
     use std::process::{Child, Command};
 
@@ -561,12 +582,9 @@ mod group {
         cmd.creation_flags(CREATE_SUSPENDED);
     }
 
-    /// Elsewhere the child joins its own process group before it runs its program (set between fork and exec): no window either.
+    /// Elsewhere nothing is ever spawned (`classify_for`, `run_one`): no containment exists, so this does nothing.
     #[cfg(not(windows))]
-    pub fn prepare(cmd: &mut Command) {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    pub fn prepare(_cmd: &mut Command) {}
 
     #[cfg(windows)]
     pub struct Group(isize);
@@ -746,31 +764,22 @@ mod group {
         }
     }
 
-    /// The process group's id and the settings for the spawn helper that starts `kill`.
+    /// Elsewhere there is no containment, so no group can be made and nothing runs.
     #[cfg(not(windows))]
-    pub struct Group(u32, crate::config::Config);
+    pub struct Group;
 
     #[cfg(not(windows))]
     impl Group {
-        pub fn start(child: &Child, cfg: &crate::config::Config) -> Result<Group, String> {
-            Ok(Group(child.id(), cfg.clone()))
+        pub fn start(_child: &Child, _cfg: &crate::config::Config) -> Result<Group, String> {
+            Err(super::NEEDS_WINDOWS.into())
         }
 
         pub fn kill(&self) -> bool {
-            crate::scrub::command(&self.1, "kill").args(["-9", "--", &format!("-{}", self.0)]).status().is_ok_and(|s| s.success())
+            false
         }
 
-        /// 1 while any process of the group lives (`kill -0 -<pgid>` succeeds), else 0; an error if `kill` cannot be run.
-        /// Not run on this machine.
         pub fn running(&self) -> Result<u32, String> {
-            let st = crate::scrub::command(&self.1, "kill")
-                .args(["-0", "--", &format!("-{}", self.0)])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|e| format!("cannot run kill -0: {e}"))?;
-            Ok(u32::from(st.success()))
+            Err(super::NEEDS_WINDOWS.into())
         }
     }
 }
@@ -880,6 +889,20 @@ mod tests {
     fn c(cmd: &str) -> Result<Vec<String>, String> {
         // `broadsword` is always a project (SELF_PROJECT), so no folder is needed for these
         classify(cmd, Path::new("no-such-projects-folder"), "broadsword", T)
+    }
+
+    #[test]
+    fn off_windows_every_runnable_line_is_not_run_and_covered_lines_stay_covered() {
+        let p = Path::new("no-such-projects-folder");
+        for cmd in ["broadsword build broadsword --task t-1", "broadsword run broadsword --task t-1 -- cargo test"] {
+            assert!(classify_for(cmd, p, "broadsword", T, true).is_ok(), "runnable on Windows: {cmd}");
+            let why = classify_for(cmd, p, "broadsword", T, false).expect_err("not runnable off Windows");
+            assert!(why.contains("needs Windows job-object containment"), "{why}");
+        }
+        let covered = classify_for("broadsword test broadsword --task t-1", p, "broadsword", T, false).unwrap();
+        assert_eq!(covered[0], "test");
+        let other = classify_for("cargo test", p, "broadsword", T, false).unwrap_err();
+        assert!(other.contains("not the Broadsword binary"), "{other}");
     }
 
     #[test]
