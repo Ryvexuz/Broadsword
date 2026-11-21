@@ -906,11 +906,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn the_job_commands_of_the_entrys_own_project_and_task_run() {
         assert_eq!(c("broadsword test broadsword --task t-1").unwrap(), ["test", "broadsword", "--task", "t-1"]);
         assert_eq!(c("broadsword check BroadSword --task t-1").unwrap(), ["check", "broadsword", "--task", "t-1"], "the canonical name is passed");
         assert_eq!(c(r"C:\x\build\bin\broadsword.exe build broadsword --task t-1").unwrap()[0], "build", "a path to the binary is accepted (the queue's own binary runs)");
         assert_eq!(c("broadsword run broadsword --task t-1 -- cargo clippy -- -D warnings").unwrap(), ["run", "broadsword", "--task", "t-1", "--", "cargo", "clippy", "--", "-D", "warnings"]);
+    }
+
+    /// Off Windows the same lines classify as NOT RUN with the NEEDS_WINDOWS reason (`test` stays covered).
+    #[test]
+    #[cfg(not(windows))]
+    fn off_windows_the_job_commands_are_not_run_with_the_windows_reason() {
+        assert_eq!(c("broadsword test broadsword --task t-1").unwrap(), ["test", "broadsword", "--task", "t-1"]);
+        for cmd in [
+            "broadsword build broadsword --task t-1",
+            r"C:\x\build\bin\broadsword.exe build broadsword --task t-1",
+            "broadsword run broadsword --task t-1 -- cargo clippy -- -D warnings",
+        ] {
+            assert_eq!(c(cmd).unwrap_err(), NEEDS_WINDOWS, "{cmd}");
+        }
     }
 
     #[test]
@@ -942,6 +957,7 @@ mod tests {
     const BRIEF: &str = "# Brief: x\n\n**Task:** do `broadsword test broadsword --task <id>` things\n\n**Done check (each line is a command and what it must show):**\n1. `broadsword test broadsword --task <id>` -> `test: ok`\n2. `python -I scripts/check.py` -> ok\n3. A scratch-root run's file, pasted.\n   - see `state/queue/x.donecheck`\n4) `broadsword run broadsword --task <task id> -- cargo clippy` -> clean\n\n**Next section:**\n5. `broadsword test broadsword --task t-1`\n";
 
     #[test]
+    #[cfg(windows)]
     fn the_done_check_section_is_parsed_and_nothing_is_dropped() {
         let p = plan(BRIEF, Path::new("none"), "broadsword", T);
         assert!(p.found);
@@ -953,6 +969,19 @@ mod tests {
         assert!(matches!(&p.items[3], Item::NotRun { why, .. } if why.contains("not a numbered line")));
         assert!(matches!(&p.items[4], Item::Run { args, .. } if args == &["run", "broadsword", "--task", "t-1", "--", "cargo", "clippy"]), "{:?}", p.items[4]);
         assert_eq!(p.runnable(), 1, "the section ends at the next heading: item 5 is outside it");
+    }
+
+    /// Off Windows the parse is the same except the `run` line (item 4) is NOT RUN with the NEEDS_WINDOWS reason.
+    #[test]
+    #[cfg(not(windows))]
+    fn off_windows_the_done_check_section_is_parsed_and_the_run_line_is_not_run() {
+        let p = plan(BRIEF, Path::new("none"), "broadsword", T);
+        assert!(p.found);
+        let labels: Vec<&str> = p.items.iter().map(|i| i.label()).collect();
+        assert_eq!(labels, ["1", "2", "3", "line 1", "4"], "{p:?}");
+        assert!(matches!(&p.items[0], Item::Covered { .. }));
+        assert!(matches!(&p.items[4], Item::NotRun { why, .. } if why == NEEDS_WINDOWS), "{:?}", p.items[4]);
+        assert_eq!(p.runnable(), 0);
     }
 
     #[test]

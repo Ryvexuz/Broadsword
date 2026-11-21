@@ -3,6 +3,10 @@
 //! The brief's done-check commands are run by the queue's own binary (`broadsword run p --task <id> -- git ...`, `broadsword test
 //! p --task <id>`), never a stand-in. NO MODEL IS EVER CALLED: the reviewer is `fake_claude`, as in tests/queue.rs, and it records
 //! the prompt it got (`stdin.txt`) and every call (`calls.log`).
+//!
+//! Every test here needs the done check to RUN a `build`/`run` line, which only happens on Windows (job-object containment);
+//! off Windows those lines are NOT RUN, and that behaviour is covered by the unit tests in src/donecheck.rs.
+#![cfg(windows)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
