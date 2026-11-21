@@ -703,7 +703,13 @@ install_dir=\"build/bin\"\n";
         let text = include_str!("../../../broadsword.toml");
         let shipped = Config::from_text(text, Path::new("p")).unwrap().python_tests;
         let own = shipped.iter().find(|(p, _)| p == "broadsword").expect("Broadsword declares its own Python tests");
-        assert!(own.1.iter().all(|s| s.starts_with("scripts/test_") || s.starts_with("clients/test_")), "{own:?}");
+        assert!(
+            own.1.iter().all(|s| s.starts_with("scripts/test_")
+                || s.starts_with("clients/test_")
+                || (s.starts_with("bench/")
+                    && Path::new(s).file_name().is_some_and(|name| name.to_string_lossy().starts_with("test_")))),
+            "{own:?}"
+        );
         let e = Config::from_text(&without_key(text, "python_tests"), Path::new("p")).unwrap_err();
         assert!(e.contains("python_tests") && e.contains("missing"), "{e}");
         assert_eq!(parse_python_tests("").unwrap(), vec![]);
