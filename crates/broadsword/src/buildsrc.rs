@@ -59,8 +59,13 @@
 //! NOT fail the job: the old copy stays, still named by its own `.source` note, a marker `<exe>.stale` beside it says
 //! `stale: <note of the new build>, in use at <UTC>`, the job prints a loud `main.bins: <bin> NOT refreshed (in use)` line,
 //! and the next main step that finds the copy free refreshes it and removes the marker. Every other copy error (disk full, a
-//! length mismatch) still fails the job. Before another folder's clean an in-use copy refuses that job instead (nothing built
-//! or cleaned): the clean would delete main's newer build from cargo's folder while main.bins holds only the older one.
+//! length mismatch) still fails the job. Before another folder's clean an in-use copy refuses that job instead (nothing built;
+//! the package in question is not cleaned, but packages processed earlier in the same job may already be): the clean would delete
+//! main's newer build from cargo's folder while main.bins holds only the older one. A copy is "current" by its BYTES alone: when
+//! they equal the built exe's, only the `.source` note is rewritten and the binary is never replaced.
+//!
+//! Known limits (follow-ups): after a restore the bin note of the restored exe names the worktree that ran the clean, not main;
+//! nothing reads the `.stale` marker yet (the render lookup task t-20261120-202643-2 will).
 //!
 //! Limits: a main `build`/`check`/`run` that FAILS refreshes nothing (main.bins keeps the last good build, the cache may hold the
 //! failed attempt's leftovers); a `run` of the main checkout counts (its command may build anything there, so its kept note is
@@ -533,7 +538,7 @@ fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
             std::fs::set_permissions(to, writable).map_err(CopyFail::Replace)?;
         }
         #[cfg(not(windows))]
-        drop(writable);
+        let _ = writable;
         std::fs::rename(&tmp, to).map_err(CopyFail::Replace)
     });
     if r.is_err() {
@@ -598,7 +603,9 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             guard_kept_files(cfg, "refusing to keep main's binaries", &to)?;
             let (side, stale) = (kept_note(&to), stale_marker(&to));
             let old = read_kept_note(cfg, profile, b);
-            let same = old.as_deref() == Some(note.as_str()) && std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
+            // sameness is the BYTES only: a copy that is current byte for byte is never replaced because its note text differs
+            // (a copy in use must not be refused or marked stale for that); only the note beside it is brought up to date
+            let same = std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
             let fail = |e: &dyn std::fmt::Display| format!("cannot keep main's `{b}` ({}) at {} {when}: {e}\nIf a program is running the kept copy, stop it and repeat", profile.dir(), to.display());
             let remove = |f: &Path| match std::fs::remove_file(f) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(fail(&e)),
@@ -606,6 +613,11 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             };
             if same {
                 remove(&stale)?; // up to date after all: no longer stale
+                if old.as_deref() != Some(note.as_str()) {
+                    // the binary is not touched (it may be running); the note is replaced atomically beside it
+                    write_atomic(&side, &note).map_err(|e| fail(&e))?;
+                    lines.push(format!("main.bins: `{b}` ({}) is current; its note now says {} (the binary was not touched)", profile.dir(), note));
+                }
                 continue;
             }
             // the note goes first and comes back last, so a crash in between leaves a copy with no note (never restored)
@@ -935,7 +947,7 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let main = main_folder(cfg, source);
     for (p, was) in &stale {
         if let Some(m) = main.as_deref().filter(|m| *m != source) {
-            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (nothing was built or cleaned)"), InUse::Refuse)?);
+            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), InUse::Refuse)?);
         }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };
@@ -1119,6 +1131,35 @@ mod tests {
                 std::fs::set_permissions(f, plain.clone()).unwrap();
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Identical bytes with a different note, the kept copy held open (in use): success, the note updated, the binary untouched.
+    #[test]
+    fn a_current_copy_in_use_only_gets_its_note_updated() {
+        let d = tmp("samebytes");
+        let cfg = cfg_at(&d.canonicalize().unwrap());
+        let (from, to) = (built_exe(&cfg, Profile::Release, "probe"), kept_exe(&cfg, Profile::Release, "probe"));
+        for p in [&from, &to] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"main's exe").unwrap();
+        }
+        std::fs::write(kept_note(&to), "run:projects/p\n").unwrap();
+        write_bin_note(&cfg, "probe", "projects/p").unwrap();
+        let modified = std::fs::metadata(&to).unwrap().modified().unwrap();
+        // a program running the copy: open for writing with sharing only for reads, so it can be neither replaced nor deleted
+        let mut hold = std::fs::OpenOptions::new();
+        hold.write(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut hold, 1);
+        let _running = hold.open(&to).unwrap();
+        let r = keep_main_bins(&cfg, "projects/p", "pkg", &["probe".to_string()], "in the test", InUse::Refuse);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(read_kept_note(&cfg, Profile::Release, "probe").as_deref(), Some("projects/p"));
+        assert_eq!(std::fs::read(&to).unwrap(), b"main's exe");
+        assert_eq!(std::fs::metadata(&to).unwrap().modified().unwrap(), modified, "the binary was not rewritten");
+        assert!(!stale_marker(&to).exists());
+        drop(_running);
         let _ = std::fs::remove_dir_all(&d);
     }
 
