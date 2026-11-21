@@ -519,9 +519,23 @@ fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
         }
         // the copy keeps the build's time (readers such as render's tests pick the newest exe)
         out.set_modified(meta.modified()?)?;
-        out.sync_all()
+        // ... and its permissions (the execute bits on Unix, the read-only flag on Windows): a kept or restored exe must stay runnable
+        let writable = out.metadata()?.permissions();
+        out.set_permissions(meta.permissions())?;
+        out.sync_all()?;
+        Ok(writable)
     })();
-    let r = copied.map_err(CopyFail::Copy).and_then(|_| std::fs::rename(&tmp, to).map_err(CopyFail::Replace));
+    let r = copied.map_err(CopyFail::Copy).and_then(|writable| {
+        // Windows refuses to replace a read-only file: the old copy was a read-only copy of an older build, so it is made
+        // replaceable first (the plain permissions of a new file; elsewhere a rename never needs the old file to be writable)
+        #[cfg(windows)]
+        if std::fs::metadata(to).is_ok_and(|m| m.permissions().readonly()) {
+            std::fs::set_permissions(to, writable).map_err(CopyFail::Replace)?;
+        }
+        #[cfg(not(windows))]
+        drop(writable);
+        std::fs::rename(&tmp, to).map_err(CopyFail::Replace)
+    });
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1068,6 +1082,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn copy_atomic_keeps_the_source_permissions() {
+        fn copy(f: &Path, t: &Path) {
+            if let Err(e) = copy_atomic(f, t) {
+                panic!("copy_atomic failed: {e}");
+            }
+        }
+        let d = tmp("copyperm");
+        let (from, to) = (d.join("from.exe"), d.join("to.exe"));
+        std::fs::write(&from, b"exe bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o755)).unwrap();
+            copy(&from, &to);
+            assert_eq!(std::fs::metadata(&to).unwrap().permissions().mode() & 0o777, 0o755, "the execute bits are kept");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut p = std::fs::metadata(&from).unwrap().permissions();
+            p.set_readonly(true);
+            std::fs::set_permissions(&from, p).unwrap();
+            copy(&from, &to);
+            assert!(std::fs::metadata(&to).unwrap().permissions().readonly(), "the read-only flag is kept");
+            // a read-only kept copy must still be replaceable by the next refresh
+            copy(&from, &to);
+            assert_eq!(std::fs::read(&to).unwrap(), b"exe bytes");
+            // make both writable again (the plain permissions of a new file) so the folder can be removed
+            let plain = d.join("plain");
+            std::fs::write(&plain, b"").unwrap();
+            let plain = std::fs::metadata(&plain).unwrap().permissions();
+            for f in [&from, &to] {
+                std::fs::set_permissions(f, plain.clone()).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
