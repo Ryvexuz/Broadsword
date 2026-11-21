@@ -275,6 +275,10 @@ fn kill_tree(c: &mut Child) {
 /// A passing test returns as soon as its condition is true, so this costs nothing on a pass; a real hang still fails, only later.
 const WAIT_CEILING_FACTOR: u64 = 5;
 
+/// How long the fake reviewer holds a FAKE_CLAUDE_HANG_FILE hang if nothing cuts it (`HANG_CAP_SECONDS` in tests/support/fake_claude.rs;
+/// keep the two equal). An uncut hang keeps the run going this long, so a run that ends well before it was cut by the queue.
+const FAKE_HANG_CAP_SECONDS: u64 = 300;
+
 /// A wait ceiling of `secs` seconds, scaled by `WAIT_CEILING_FACTOR`.
 fn ceiling(secs: u64) -> Duration {
     Duration::from_secs(secs * WAIT_CEILING_FACTOR)
@@ -777,7 +781,12 @@ fn a_reviewer_timeout_blocks_the_entry_with_no_verdict_and_it_can_be_retried() {
     let e = r.add(&id, "low", "sonnet");
     let t0 = Instant::now();
     let o = r.run_env(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
-    assert!(t0.elapsed() < Duration::from_secs(50), "the 60 s hang must be cut at the 2 s timeout");
+    // the whole run includes a check and the fake's own start, so the bound is half the hang cap, not the 2 s timeout: under load a
+    // run that is cut at 2 s still takes far longer than 2 s. An uncut hang runs the full FAKE_HANG_CAP_SECONDS (then the asserts below fail)
+    assert!(
+        t0.elapsed() < Duration::from_secs(FAKE_HANG_CAP_SECONDS / 2),
+        "the reviewer hang ({FAKE_HANG_CAP_SECONDS} s cap) must be cut at the 2 s timeout"
+    );
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "blocked");
     assert!(r.field(&e, "reason").contains("within 2 s") && r.field(&e, "reason").contains("no verdict"), "{}", r.field(&e, "reason"));
@@ -1431,12 +1440,29 @@ fn per_project_lock_lets_two_projects_drain_at_once_and_refuses_a_second_driver_
     assert_eq!(r.status(&qe), "merged", "reason = {}", r.field(&qe, "reason"));
     assert!(r.status(&pe).starts_with("running (interrupted"), "p's entry was interrupted: {}", r.status(&pe));
     // nothing the dead driver left blocks p: the next drain of p takes the lock at once, resumes the entry and merges it
+    // the test root's queue_lock_wait_seconds is 2 s, shorter than a drain, so for this one run it is raised to LOCK_WAIT_SECONDS: a
+    // stale holder makes the drain wait that whole setting and then exit 4, and the bound below is that setting (the earlier refused
+    // calls keep the 2 s, so they stay quick)
+    const LOCK_WAIT_SECONDS: u64 = 120;
+    train_set(
+        &r,
+        "queue_lock_wait_seconds",
+        &LOCK_WAIT_SECONDS.to_string(),
+    );
     let t0 = Instant::now();
     let o = r.run(&["queue", "run", "--all", "--project", "p"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(
+        !o.stderr.contains("queue busy"),
+        "a stale holder blocked p: {}",
+        o.stderr
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(LOCK_WAIT_SECONDS),
+        "the drain took as long as queue_lock_wait_seconds ({LOCK_WAIT_SECONDS} s): it waited for a stale holder"
+    );
     assert!(o.stdout.contains("RESUMING"), "{}", o.stdout);
     assert_eq!(r.status(&pe), "merged", "reason = {}", r.field(&pe, "reason"));
-    assert!(t0.elapsed() < Duration::from_secs(110), "the lock was free at once (no wait for a stale holder)");
     assert_eq!(r.run(&["queue", "run", "--all", "--project", "p"]).stdout.trim(), "the queue is empty for project `p`: nothing is queued, interrupted or stale");
 }
 
