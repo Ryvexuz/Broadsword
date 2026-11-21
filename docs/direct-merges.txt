@@ -33,3 +33,74 @@ broadsword | 38a22eb3c806 | Lazlo ("Merge on Sonnet review", 2026-11-19) | nb-19
 broadsword | c314a04b9b84 | Lazlo ("Merge on Sonnet review", 2026-11-19) | nb-19 earlier round under the same direct merge: Secrets fix round 2: resolve long names past MAX_PATH, and fail closed | evidence/direct-merges/nb19-62f458d.md
 broadsword | 4a50716a1c09 | Lazlo ("Merge on Sonnet review", 2026-11-19) | nb-19 earlier round under the same direct merge: Secrets fix round 3: restore ordinary alias-shaped files, list every secret skip, bare .env- and .env_ | evidence/direct-merges/nb19-62f458d.md
 broadsword | 6c67c5379600 | Lazlo ("Merge on Sonnet review", 2026-11-19) | nb-19 earlier round under the same direct merge: Secrets round 4: escaped record lists, recover names every secret left alone, one rule name, docs state Lazlo's set | evidence/direct-merges/nb19-62f458d.md
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# 2026-11-21 (UTC), task t-20261121-003648: LATE INDEPENDENT REVIEW of b9ae9e5 and ec7a479 (Opus 5.5, which built neither).
+# Both reached main as the exact commit Haiku last FAILED (q-20261118-074036, q-20261118-081559, status `rejected`).
+# Each Haiku BLOCKING point is ruled against the code on main today (d0843d0f): REAL, FALSE or KNOWN, with a quote.
+# Records only: no line below is an entry, and nothing here approves or reverts either commit.
+#
+# == b9ae9e5 (scripts/dev_metrics.py), Haiku q-20261118-074036 ==
+# H1 (BLOCKING) "for a merged task `tip` is taken from `main_sha` ... `base_head..main_sha` ... includes any other commits
+#    merged to main in between and inflates coding and handoff times for concurrent tasks."
+#    Verdict: REAL (today's code; the merge train came later). scripts/dev_metrics.py:169-170:
+#      tip = (src.get("main_sha") if ok else (src.get("checked_tip") or src.get("rebased_tip"))) if src else None
+#      times = commit_times(t.get("project"), src.get("base_head"), tip) if src else []
+#    For a single-entry merge the range is exact: queue.rs s_merge ends the entry stale unless main is still base_head
+#    ("if head != base { return Err(self.end(STALE, ...") and fast-forwards to the reviewed commit. But a merge-train member
+#    keeps base_head from its own rebase (queue.rs:1765 `self.e.set("base_head", head.clone());`) while train_link moves
+#    reviewed_tip onto the earlier members (queue.rs:1436 `self.e.set("reviewed_tip", now.clone());`) and the train sets
+#    `r.e.set("main_sha", own);` (queue.rs:2959). merge_train_max = 4 in broadsword.toml, so base_head..main_sha includes
+#    the earlier train members' commits. Measured on merged broadsword train members (git rev-list --count):
+#      q-20261120-055348 pos 3: base_head..main_sha = 9, base_head..reviewed_orig_tip = 4 (5 foreign commits)
+#      q-20261120-053815 pos 4: 8 vs 1;  q-20261120-053814-3 pos 3: 7 vs 3;  q-20261120-053808-2 pos 3: 4 vs 1
+#    Effect: commit_times() returns other tasks' author times, so `coding` (last time) and `handoff` (latest commit before
+#    each entry) can use another task's commit. Haiku's stated mechanism (main moving between rebase and fast-forward) is
+#    blocked by the stale guard; the overcount is real through the train path.
+# H2 (BLOCKING) "the log is split on the literal two-character sequence `"\\n"` instead of a newline, so ...
+#    `steps()` returns empty for every entry".
+#    Verdict: FALSE. scripts/dev_metrics.py:87 `for line in entry.get("log", "").split("\\n"):` is correct because entry
+#    files store newlines escaped: crates/broadsword/src/record.rs:63
+#      v.replace('\\', "\\\\").replace('\r', "\\r").replace('\n', "\\n")
+#    and fields() reads the raw value without unescaping. On state/queue/q-20261118-074036.entry the log value has no real
+#    newline and 11 literal backslash-n; split as above it yields ['preconditions: begin', 'rebase: begin', 'check: begin',
+#    'review: begin']. `python -I scripts/dev_metrics.py --since 20261120` (exit 0) prints check/review/main columns
+#    (e.g. t-20261120-001621: check 15m03s, review 2m44s, main 3m36s).
+# Fresh review of scripts/dev_metrics.py on main (434 lines):
+#    correctness: only H1 above. Not blocking: fields() never unescapes, so a value holding a literal backslash followed
+#    by n is split there too (step marks are unaffected: a mark line must start with a timestamp and end ": begin");
+#    `--since` with no value raises IndexError instead of a usage message.
+#    secrets: reads state/tasks, state/queue, state/jobs, state/agent-runs.tsv and `git log --format=%at`; never opens
+#    .env and prints no field that holds a key.
+#    deletion: none; the script writes nothing and runs only `git rev-parse` and `git log`.
+#    tests: `python -I -B scripts/test_dev_metrics.py` -> "Ran 13 tests ... OK"; none covers a train member.
+# b9ae9e5 late review: FAIL (1 REAL)
+#
+# == ec7a479 (bench/reviewer/run_openai.py), Haiku q-20261118-081559 ==
+# H1 (BLOCKING) "if `chat_completion` returns a non-dict JSON (e.g. a list or string) the `.get` raises AttributeError
+#    outside any try block, aborting the whole run".
+#    Verdict: FALSE. Neither call can return a non-dict. clients/openai_mcp.py:556-557 (chat_completion):
+#      if not isinstance(result, dict) or not isinstance(result.get("choices"), list) or not result["choices"]:
+#          raise Fail("the API response has no `choices`; it is not a Chat Completions response")
+#    and run_openai.py responses_call: `if not isinstance(result, dict) or not isinstance(result.get("output"), list):`
+#    raise oc.Fail(...). Fail is caught per case (`except oc.Fail as e: error = str(e)`), leaving raw None, so
+#    `normalize_usage((raw or {}).get("usage"))` only ever sees a dict or {}.
+# H2 (BLOCKING header) "a 200 with ... content non-empty but `finish_reason` missing (None) is rejected as "incomplete
+#    answer" ... so this is not blocking on its own."
+#    Verdict: FALSE as a blocking point (Haiku itself withdrew it). It is the documented rule: bench/reviewer/README.md
+#    "A 200 answer that is empty or whose `finish_reason` is not `stop` ... is recorded as an error", implemented as
+#      elif finish != "stop" or not text.strip():
+#    A run is never scored on an answer of unknown completeness; the error names finish_reason=None.
+# Fresh review of bench/reviewer/run_openai.py on main (315 lines, later changed by dd9886b and 3f92b3b):
+#    correctness: per-case errors never abort the loop (`except Exception as e: error = f"unexpected ..."`); malformed
+#    choices are caught (KeyError, IndexError, TypeError, AttributeError). Not blocking: the chat path keeps text that comes
+#    with a refusal (`elif not text.strip() and refusal:`) while parse_responses makes any refusal an error ("any refusal
+#    item makes the case an error, even beside text"); result files with the same tag in out_dir are overwritten.
+#    secrets: key from OPENAI_API_KEY or the root .env via oc.load_api_key, never printed; plain http refused for non-local
+#    hosts ("refusing to send the API key over plain http to a non-local host"); redirects refused; every written file and
+#    error passes oc.redact (exact key and sk- pattern). Not blocking: raw.json is redacted after json.dumps, where
+#    openai_mcp.redact_obj's docstring says redacting before serializing is the safe order; an OpenAI key holds no quote or
+#    backslash, so no leak path was found.
+#    deletion: none; it only creates out_dir (`mkdir(parents=True, exist_ok=True)`) and writes result files.
+#    tests: `python -I -B test_run_openai.py` in bench/reviewer -> "Ran 24 tests ... OK" (fake server on 127.0.0.1).
+# ec7a479 late review: PASS
