@@ -75,6 +75,12 @@ broadsword | 6c67c5379600 | Lazlo ("Merge on Sonnet review", 2026-11-19) | nb-19
 #    deletion: none; the script writes nothing and runs only `git rev-parse` and `git log`.
 #    tests: `python -I -B scripts/test_dev_metrics.py` -> "Ran 13 tests ... OK"; none covers a train member.
 # b9ae9e5 late review: FAIL (1 REAL)
+# Follow-up for the REAL finding H1: board task t-20261121-004802
+#    title: dev_metrics: count only a task's own commits for train-merged entries
+#    claims: scripts/dev_metrics.py, scripts/test_dev_metrics.py
+#    done check: (1) a new test with a fake train entry whose base_head..main_sha holds another task's commit fails on
+#    main before the fix and passes with it; (2) `python -I -B scripts/test_dev_metrics.py` prints OK; (3) for
+#    q-20261120-055348 the commit range the script uses counts 4 commits, not 9.
 #
 # == ec7a479 (bench/reviewer/run_openai.py), Haiku q-20261118-081559 ==
 # H1 (BLOCKING) "if `chat_completion` returns a non-dict JSON (e.g. a list or string) the `.get` raises AttributeError
