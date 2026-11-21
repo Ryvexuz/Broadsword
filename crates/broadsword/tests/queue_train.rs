@@ -14,10 +14,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod j;
-
 mod support;
 use support::{bin, fake_claude};
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
