@@ -556,11 +556,55 @@ class ReviewTests(unittest.TestCase):
         import datetime
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
-    def plant_ledger(self, root, usd):
+    def plant_ledger(self, root, usd, label="api-credits"):
         d = root / "state" / "gpt-spend"
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{self.today()}.tsv").write_text("utc\tcaller\tmodel\tinput_tokens\toutput_tokens\test_usd\tplan_or_credits\n"
-                                               f"2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t{usd}\tcodex-plan\n", encoding="utf-8")
+                                               f"2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t{usd}\t{label}\n", encoding="utf-8")
+
+    def test_plan_rows_over_the_cap_do_not_block_a_codex_call(self):
+        root = self.make_root()
+        self.plant_ledger(root, 500.0, "codex-plan")  # far over the built-in 60, but only plan calls
+        p = self.run_script(codex="ok", root=root)
+        j = json.loads(p.stdout)
+        self.assertFalse(j["is_error"], j)
+        self.assertEqual(j["backend"], "codex", j)
+        self.assertTrue((self.codex_dir / "started").exists(), "codex ran")
+        self.assertEqual(Fake.seen, [])
+        self.assertIn("1 plan calls, 0.0000 USD of credit spend (cap 60)", p.stderr)
+        self.assertFalse(list((root / "state" / "gpt-spend").glob("CAP-REACHED-*.txt")))
+
+    def test_plan_rows_over_the_cap_still_allow_the_api_fallback_when_credits_are_under(self):
+        root = self.make_root()
+        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\tp\tm\t1\t1\t500.0\tcodex-plan\n"
+                       "2026-01-01T00:00:01Z\tp\tm\t1\t1\t400.0\tcodex-plan-failed\n"
+                       "2026-01-01T00:00:02Z\tp\tm\t1\t1\t10.0\tapi-credits\n")
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)
+        self.assertEqual(j["backend"], "api", j)
+        self.assertFalse(j["is_error"], j)
+        self.assertEqual(len(Fake.seen), 1, "the API answered")
+
+    def test_credit_rows_at_the_cap_refuse_the_api_fallback(self):
+        for label in ("api-credits", "api-credits-failed"):
+            with self.subTest(label=label):
+                Fake.seen = []
+                root = self.make_root()
+                self.plant_ledger(root, 60.0, label)
+                j = json.loads(self.run_script(codex="fail", root=root).stdout)
+                self.assertTrue(j["is_error"], j)
+                self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
+                self.assertEqual(Fake.seen, [], "no API call")
+
+    def test_an_unknown_or_missing_label_counts_toward_the_cap(self):
+        for name, tail in (("unknown label", "\tmystery"), ("plan label with a space", "\tcodex-plan "), ("missing label", "")):
+            with self.subTest(name=name):
+                Fake.seen = []
+                root = self.make_root()
+                self.plant_raw(root, self.OLD_HEADER + f"2026-01-01T00:00:00Z\tp\tm\t1\t1\t60.0{tail}\n")
+                j = json.loads(self.run_script(codex="fail", root=root).stdout)
+                self.assertTrue(j["is_error"], j)
+                self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
+                self.assertEqual(Fake.seen, [], "no API call")
 
     def ledger_lines(self, root):
         return (root / "state" / "gpt-spend" / f"{self.today()}.tsv").read_text(encoding="utf-8").strip().split("\n")
@@ -569,33 +613,35 @@ class ReviewTests(unittest.TestCase):
         root = self.make_root()
         self.plant_ledger(root, 60.0)  # the built-in cap is 60
         for _ in range(2):
-            j = json.loads(self.run_script(codex="ok", root=root).stdout)
+            j = json.loads(self.run_script(codex="fail", root=root).stdout)  # codex is tried (free), the API fallback is refused
             self.assertTrue(j["is_error"], j)
             self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
-            self.assertFalse((self.codex_dir / "started").exists(), "no codex process")
             self.assertEqual(Fake.seen, [], "no API call")
-        self.assertFalse((root / "scripts" / "canary-ran").exists())
         notes = list((root / "state" / "gpt-spend").glob("CAP-REACHED-*.txt"))
         self.assertEqual([n.name for n in notes], [f"CAP-REACHED-{self.today()}.txt"])
-        self.assertEqual(len(self.ledger_lines(root)), 2, "a refused call adds no ledger row")
+        rows = [l.split("\t")[6] for l in self.ledger_lines(root)[1:]]
+        self.assertEqual(rows, ["api-credits", "codex-plan-failed", "codex-plan-failed"], "a refused API call adds no ledger row")
 
     def test_just_under_the_cap_still_calls(self):
         root = self.make_root()
         self.plant_ledger(root, 59.99)
-        j = json.loads(self.run_script(codex="ok", root=root).stdout)
-        self.assertEqual(j["backend"], "codex", j)
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)
+        self.assertEqual(j["backend"], "api", j)
+        self.assertFalse(j["is_error"], j)
 
-    def test_the_cap_comes_from_the_toml_and_zero_means_no_calls(self):
+    def test_the_cap_comes_from_the_toml_and_zero_means_no_api_calls(self):
         for cap in ("0", "0.0"):
             with self.subTest(cap=cap):
-                j = json.loads(self.run_script(codex="ok", cap=cap).stdout)
+                Fake.seen = []
+                j = json.loads(self.run_script(codex="fail", cap=cap).stdout)
                 self.assertTrue(j["is_error"], j)
                 self.assertEqual(j["codex_error"], "daily_cap_reached: 0.0000 of 0")
-                self.assertFalse((self.codex_dir / "started").exists())
                 self.assertEqual(Fake.seen, [])
+                j = json.loads(self.run_script(codex="ok", cap=cap).stdout)
+                self.assertEqual(j["backend"], "codex", "a plan call is not capped, even at cap 0")
         root = self.make_root(cap="5")
         self.plant_ledger(root, 5.0)
-        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)
         self.assertEqual(j["codex_error"], "daily_cap_reached: 5.0000 of 5", "a lower cap in the toml wins over the built-in 60")
 
     def test_a_bad_cap_in_the_toml_is_an_error_and_no_call(self):
@@ -636,24 +682,24 @@ class ReviewTests(unittest.TestCase):
 
     def test_an_old_seven_column_file_gives_the_same_cap_sum_and_is_not_rewritten(self):
         root = self.make_root()
-        old = self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t59.99\tcodex-plan\n"
+        old = self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t59.99\tapi-credits\n"
         self.plant_raw(root, old)
-        j = json.loads(self.run_script(codex="ok", root=root).stdout)
-        self.assertEqual(j["backend"], "codex", j)
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)
+        self.assertEqual(j["backend"], "api", j)
         text = (root / "state" / "gpt-spend" / f"{self.today()}.tsv").read_text(encoding="utf-8")
         self.assertTrue(text.startswith(old), "the old header and row are untouched; the new row is only appended")
         root2 = self.make_root()
-        self.plant_raw(root2, self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t60.0\tcodex-plan\n")
-        j = json.loads(self.run_script(codex="ok", root=root2).stdout)
+        self.plant_raw(root2, self.OLD_HEADER + "2026-01-01T00:00:00Z\tplanted\tgpt-5.6-sol\t1\t1\t60.0\tapi-credits\n")
+        j = json.loads(self.run_script(codex="fail", root=root2).stdout)
         self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
 
     def test_a_mixed_file_sums_old_and_new_rows(self):
         root = self.make_root()
-        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\told\tgpt-5.6-sol\t1\t1\t52.5\tcodex-plan\n"
-                       "2026-01-01T00:00:01Z\tnew\tgpt-5.6-sol\t1\t1\t7.5\tapi-credits\tshadow\n")
-        j = json.loads(self.run_script(codex="ok", root=root).stdout)
+        self.plant_raw(root, self.OLD_HEADER + "2026-01-01T00:00:00Z\told\tgpt-5.6-sol\t1\t1\t52.5\tapi-credits\n"
+                       "2026-01-01T00:00:01Z\tnew\tgpt-5.6-sol\t1\t1\t7.5\tapi-credits-failed\tshadow\n"
+                       "2026-01-01T00:00:02Z\tnew\tgpt-5.6-sol\t1\t1\t99.0\tcodex-plan\tshadow\n")
+        j = json.loads(self.run_script(codex="fail", root=root).stdout)
         self.assertEqual(j["codex_error"], "daily_cap_reached: 60.0000 of 60")
-        self.assertFalse((self.codex_dir / "started").exists())
         self.assertEqual(Fake.seen, [])
 
     def test_a_malformed_row_still_fails_closed_in_old_new_and_mixed_files(self):
@@ -739,9 +785,9 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(lines[1].split("\t")[6], "codex-plan")
         root = self.make_root(cap="0")
         out = self.direct(root)
-        self.assertEqual((out["err"], out["msg"]), ("Refused", "daily_cap_reached: 0.0000 of 0"))
-        self.assertFalse((self.codex_dir / "started").exists(), "cap reached: codex never starts")
-        self.assertFalse((root / "state" / "gpt-spend" / f"{self.today()}.tsv").exists())
+        self.assertIn("ok", out, "the cap is on credits: a direct codex call runs at cap 0")
+        self.assertTrue((self.codex_dir / "started").exists())
+        self.assertEqual(self.ledger_lines(root)[1].split("\t")[6], "codex-plan")
 
     def test_review_api_called_directly_is_capped_and_ledgered(self):
         root = self.make_root(cap="0")

@@ -25,16 +25,20 @@ rest). Invalid values are an error naming the variable. Until the queue passes t
 Two gates sit at the lowest level every GPT call passes through: the cap and ledger wrap review_codex() and review_api() themselves
 (see `metered`), so review() and direct callers such as bench/reviewer/run_codex.py are both covered, and one call is counted once:
 
-1. Daily spend cap (Lazlo 2026-11-19: GPT reviews may draw on the OpenAI overflow credits, at most $20 a day). Every call that gets
+1. Daily credit cap (Lazlo 2026-11-19, raised to $60 on 2026-11-20: GPT reviews may draw on the OpenAI overflow credits, at most $60 a day;
+   the cap is on CREDIT spend only, because calls the ChatGPT plan answers (codex) cost nothing extra). Every call that gets
    past the gates is appended as one row to <state_dir>/gpt-spend/<UTC date>.tsv (utc, caller, model, input_tokens, output_tokens,
    est_usd, plan_or_credits, call_type) under an OS lock. Older files have 7 columns (no call_type); they are never rewritten and
    still sum correctly, and scripts/usage_sum.py reads their rows as call_type "unknown". `call_type` comes from OPENAI_REVIEW_CALL_TYPE
-   (gate, shadow, full or bench; "unknown" if unset or blank). Before a call (a codex attempt and an API fallback are each a call), if today's est_usd sum is >= the cap, no model is called: the result
-   is is_error with codex_error "daily_cap_reached: <sum> of <cap>" (callers record SKIPPED), and CAP-REACHED-<date>.txt is written
-   once. THE ESTIMATE IS CONSERVATIVE: tokens x list price from bench/models.json, and calls the ChatGPT plan answered are counted
-   at list price too, so the sum can only over-state what the credits were charged. A model with no listed price counts at the
+   (gate, shadow, full or bench; "unknown" if unset or blank). Only the est_usd of rows labelled api-credits or api-credits-failed is summed against the cap; codex-plan and codex-plan-failed rows
+   are still written and counted (as a number of calls) but add nothing to the sum. Any other label, a missing label or an unreadable
+   row counts in full (an unreadable row refuses the call, never skipped). Before an API call (the fallback after a codex failure or a
+   direct review_api call), if the credit sum is >= the cap, no model is called: the result is is_error with codex_error
+   "daily_cap_reached: <credit sum> of <cap>" (callers record SKIPPED), and CAP-REACHED-<date>.txt is written once. A codex attempt is
+   never refused because of the cap. Every call that runs prints one stderr line saying how many plan calls and how much credit spend the day held before it.
+   THE ESTIMATE IS CONSERVATIVE: tokens x list price from bench/models.json, so the credit sum can only over-state what the credits were charged. A model with no listed price counts at the
    highest listed price (never 0). Calls running at the same moment can overshoot the cap by what they cost: the check is made
-   before a call, not held across it. Cap 0 means no GPT call at all. `caller` comes from OPENAI_REVIEW_CALLER ("unlabelled" if absent).
+   before a call, not held across it. Cap 0 means no API call at all (codex plan calls still run). `caller` comes from OPENAI_REVIEW_CALLER ("unlabelled" if absent).
 2. Codex canary (Lazlo 2026-11-19: re-run the shadow canary after any Codex update). Before any codex process other than
    `codex --version` is started, the current version is compared with <root>/<state_dir>/canary/last-pass.json (<root> is the main
    Broadsword root, also from a worktree: there is one record; written by scripts/shadow_canary.py on a full PASS). Missing, unreadable or different: scripts/shadow_canary.py --offline-only runs as a child
@@ -404,8 +408,8 @@ def review_codex(args, prompt: str, environ, deadline: float, timeout: float, sh
 
 # ---- gate 1: the daily GPT spend cap ----------------------------------------------------------------------------------------
 
-# TEMPORARY: Lazlo's cap of $20 a day (2026-11-19), in this ONE named place until broadsword.toml has the key `gpt_daily_cap_usd`
-# (follow-up once the toml is free to edit). If the toml already has that key it wins over this constant. 0 = no GPT calls.
+# TEMPORARY: Lazlo's cap on OpenAI CREDIT spend (api-credits rows only; codex plan calls are free and never refused), $20 a day on 2026-11-19, in this ONE named place until broadsword.toml has the key `gpt_daily_cap_usd`
+# (follow-up once the toml is free to edit). If the toml already has that key it wins over this constant. 0 = no API (credit) calls.
 # Raised to 60 on 2026-11-20 (Lazlo 19:19Z: "it has 13% usage for the week left feel free to keep usingit unti i tell you",
 # "if they are actually helpingthat is"). The estimate counts unpriced models at UNPRICED_USD_PER_MTOK, so it runs high.
 GPT_DAILY_CAP_USD = 60.0
@@ -514,38 +518,55 @@ def spend_dir(root: Path) -> Path:
     return root / state_dir_of(root) / "gpt-spend"
 
 
-def spent_today(ledger: Path) -> float:
-    """Sum of est_usd in today's ledger. A row that cannot be read is an error (fail closed), never skipped."""
+PLAN_LABELS = ("codex-plan", "codex-plan-failed")  # the ChatGPT plan answered: no credits
+CREDIT_LABELS = ("api-credits", "api-credits-failed")  # can cost credits
+
+
+def ledger_totals(ledger: Path) -> tuple:
+    """(credit_usd, plan_calls) for a ledger file. est_usd is summed for EVERY row except the plan-labelled ones: credit labels, any other
+    label and a missing label all count in full. A row whose est_usd cannot be read is an error (fail closed), never skipped."""
     if not ledger.is_file():
-        return 0.0
-    total = 0.0
+        return 0.0, 0
+    total, plans = 0.0, 0
     for n, line in enumerate(ledger.read_text(encoding="utf-8").split("\n"), 1):
         if not line.strip() or line.startswith("utc\t"):
             continue
         cols = line.split("\t")
         try:
-            total += float(cols[5])
+            usd = float(cols[5])
         except (IndexError, ValueError):
             raise oc.Fail(f"the GPT spend ledger {ledger.name} has an unreadable row (line {n})")
-    return total
+        if usd != usd or usd < 0 or usd == float("inf"):
+            raise oc.Fail(f"the GPT spend ledger {ledger.name} has an unreadable row (line {n})")
+        if len(cols) > 6 and cols[6] in PLAN_LABELS:
+            plans += 1
+        else:
+            total += usd
+    return total, plans
 
 
-def cap_gate(root: Path) -> None:
-    """Raises Refused when today's estimated spend has reached the cap; writes CAP-REACHED-<date>.txt once."""
+def spent_today(ledger: Path) -> float:
+    """Today's credit sum (see ledger_totals)."""
+    return ledger_totals(ledger)[0]
+
+
+def cap_gate(root: Path, backend: str) -> tuple:
+    """Returns (credit_usd, plan_calls) for today. Raises Refused for an API call when the credit sum has reached the cap (and writes
+    CAP-REACHED-<date>.txt once); a codex call is never refused for the cap. An unreadable ledger raises oc.Fail for both."""
     cap = daily_cap(root)
     day = utc_today()
     folder = spend_dir(root)
-    if (folder / f"LEDGER-FAILED-{day}.txt").is_file():  # a paid call went unrecorded today: the sum cannot be trusted, so fail closed
+    if (folder / f"LEDGER-FAILED-{day}.txt").is_file():  # a call went unrecorded today: the sum cannot be trusted, so fail closed
         raise Refused(f"ledger_unwritable: a GPT call today could not be recorded (see LEDGER-FAILED-{day}.txt)")
     with ledger_lock(folder / f"{day}.lock"):
-        total = spent_today(folder / f"{day}.tsv")
-    if total < cap:
-        return
+        total, plans = ledger_totals(folder / f"{day}.tsv")
+    if backend == "codex" or total < cap:
+        return total, plans
     note = folder / f"CAP-REACHED-{day}.txt"
     try:
         with open(note, "x", encoding="utf-8") as f:
-            f.write(f"GPT daily cap reached on {day} (UTC): estimated {total:.4f} USD of {cap:g} USD. No GPT call is made until the next UTC day "
-                    f"or until gpt_daily_cap_usd is raised. Orchestrator: tell Lazlo.\n")
+            f.write(f"GPT daily credit cap reached on {day} (UTC): estimated {total:.4f} USD of {cap:g} USD of credit spend. No API call is made until the next UTC day "
+                    f"or until gpt_daily_cap_usd is raised; codex plan calls are not capped. Orchestrator: tell Lazlo.\n")
     except FileExistsError:
         pass
     except OSError:
@@ -587,7 +608,7 @@ def metered(backend: str, fn):
     a note says so, and LEDGER-FAILED-<date>.txt makes cap_gate refuse every later call that day (fail closed, no unrecorded spending)."""
     def inner(args, prompt, environ, *a, **k):
         root = oc.find_main_root(HERE)
-        cap_gate(root)
+        credits, plans = cap_gate(root, backend)
         try:
             result = fn(args, prompt, environ, *a, **k)
         except Refused:
@@ -596,6 +617,10 @@ def metered(backend: str, fn):
             ledger_row(root, environ, args.model, {"is_error": True}, backend)
             raise
         note = ledger_row(root, environ, args.model, result, backend)
+        try:  # plan use stays visible: one stderr line per call (not in the result, whose "notes" mean legacy defaults and ledger failures)
+            print(f"GPT today before this call: {plans} plan calls, {credits:.4f} USD of credit spend (cap {daily_cap(root):g})", file=sys.stderr)
+        except Exception:
+            pass
         if note:
             result.setdefault("notes", []).append(note)
         return result
