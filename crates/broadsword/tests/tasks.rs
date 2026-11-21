@@ -165,6 +165,104 @@ fn a_conflicting_start_exits_3_and_names_the_other_task() {
 }
 
 #[test]
+fn key_claims_on_different_keys_run_together() {
+    for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+        let r = Root::new("key-claims");
+        let alpha = format!("{file}#alpha");
+        let beta = format!("{file}#beta");
+        let a = r.add("broadsword", "alpha", &[&alpha]);
+        let b = r.add("broadsword", "beta", &[&beta]);
+        let c = r.add("broadsword", "alpha again", &[&alpha]);
+        let whole = r.add("broadsword", "whole file", &[file]);
+        let show = r.run(&["task", "show", &a]);
+        assert_eq!(show.code, 0, "{}", show.stderr);
+        assert!(show.stdout.contains(&format!("claims: {alpha}")), "{}", show.stdout);
+        for id in [&a, &b] {
+            let o = r.start(id, "coder");
+            assert_eq!(o.code, 0, "{file}: {}", o.stderr);
+            assert_eq!(r.status_of(id), "running");
+        }
+        let o = r.start(&c, "same-key");
+        assert_eq!(o.code, 3, "{}", o.stderr);
+        for want in [a.as_str(), c.as_str(), alpha.as_str(), "overlaps"] {
+            assert!(o.stderr.contains(want), "{want} in {}", o.stderr);
+        }
+        assert!(o.stderr.contains(&format!("task {a} (owner coder)")), "{}", o.stderr);
+        assert!(!o.stderr.contains(&format!("task {b} (owner")), "different key must not be reported: {}", o.stderr);
+        assert_eq!(r.status_of(&c), "open");
+        let check = r.run(&["task", "check", "broadsword", "--claim", &alpha]);
+        assert_eq!(check.code, 3, "{}", check.stdout);
+        assert!(check.stdout.contains(&format!("task {a} (owner coder)")), "{}", check.stdout);
+        let gamma = format!("{file}#gamma");
+        let check = r.run(&["task", "check", "broadsword", "--claim", &gamma]);
+        assert_eq!(check.code, 0, "{}", check.stdout);
+        assert!(check.stdout.starts_with("free:"), "{}", check.stdout);
+        let o = r.start(&whole, "whole-file");
+        assert_eq!(o.code, 3, "{}", o.stderr);
+        for want in [a.as_str(), b.as_str(), alpha.as_str(), beta.as_str(), file] {
+            assert!(o.stderr.contains(want), "{want} in {}", o.stderr);
+        }
+        assert_eq!(r.status_of(&whole), "open");
+        assert_eq!(r.list(&["--status", "running"]).len(), 2);
+        for id in [&a, &b] {
+            assert_eq!(r.run(&["task", "done", id]).code, 0);
+        }
+        let o = r.start(&whole, "whole-file");
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        let o = r.start(&c, "key-after-whole");
+        assert_eq!(o.code, 3, "whole-file holder must block a key: {}", o.stderr);
+        assert!(o.stderr.contains(&whole) && o.stderr.contains(&alpha), "{}", o.stderr);
+    }
+}
+
+#[test]
+fn key_claim_on_other_file_is_refused() {
+    let r = Root::new("key-claim-invalid");
+    for claim in ["crates/broadsword/src/task.rs#k", "config.rs#k", "nested/broadsword.toml#k"] {
+        let o = r.run(&["task", "add", "broadsword", "--title", "bad key file", "--claim", claim]);
+        assert_eq!(o.code, 2, "{claim}: {}", o.stderr);
+        assert!(o.stderr.contains("key claims are only for broadsword.toml and crates/broadsword/src/config.rs"), "{}", o.stderr);
+    }
+    for key in ["", "Alpha", "a-b", "a/b", "a\\b", "a#b", "a b", "a ", "a\r", "a\n", "é"] {
+        let claim = format!("broadsword.toml#{key}");
+        let o = r.run(&["task", "add", "broadsword", "--title", "bad key", "--claim", &claim]);
+        assert_eq!(o.code, 2, "{claim:?}: {}", o.stderr);
+        assert!(o.stderr.contains("key must match") || o.stderr.contains("control character"), "{}", o.stderr);
+    }
+    assert_eq!(r.list(&[]), ["no tasks"], "invalid claims must not create records");
+}
+
+#[test]
+fn key_claim_starts_in_a_race_preserve_exclusion_and_independence() {
+    for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+        let alpha = format!("{file}#alpha");
+        let beta = format!("{file}#beta");
+        let folder = "crates/broadsword/src";
+        let mut cases = vec![(alpha.as_str(), alpha.as_str(), false), (file, alpha.as_str(), false), (alpha.as_str(), file, false), (alpha.as_str(), beta.as_str(), true)];
+        if file.contains('/') {
+            cases.push((folder, alpha.as_str(), false));
+        }
+        for (left, right, independent) in cases {
+            let r = Root::new("key-race");
+            let a = r.add("broadsword", "left", &[left]);
+            let b = r.add("broadsword", "right", &[right]);
+            let res = start_together(&r, &[(&a, "left".into()), (&b, "right".into())], 0);
+            let mut codes: Vec<i32> = res.iter().map(|x| x.0).collect();
+            codes.sort_unstable();
+            if independent {
+                assert_eq!(codes, [0, 0], "{left} vs {right}: {res:?}");
+                assert_eq!(r.list(&["--status", "running"]).len(), 2);
+            } else {
+                assert_eq!(codes, [0, 3], "{left} vs {right}: {res:?}");
+                assert_eq!(r.list(&["--status", "running"]).len(), 1);
+                let loser = res.iter().find(|x| x.0 == 3).unwrap();
+                assert!(loser.1.contains(left) && loser.1.contains(right) && loser.1.contains("overlaps"), "{res:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn different_projects_never_conflict() {
     let r = Root::new("projects");
     let a = r.add("p", "a", &["src"]);

@@ -3148,6 +3148,19 @@ mod tests {
     }
 
     #[test]
+    fn a_train_uses_key_claim_overlap_without_a_separate_rule() {
+        for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+            let alpha = format!("{file}#alpha");
+            let beta = format!("{file}#beta");
+            let items = vec![item("p", &[&alpha]), item("p", &[&beta]), item("p", &[&alpha]), item("p", &[file]), item("p", &["*"])];
+            assert_eq!(pick_train(&items, 2, false), vec![0, 1], "different keys share a full train");
+            assert_eq!(pick_train(&items, 3, true), vec![0, 1], "same key, whole file and wildcard stay out");
+            let whole_first = vec![item("p", &[file]), item("p", &[&alpha]), item("p", &[&beta])];
+            assert_eq!(pick_train(&whole_first, 3, true), vec![0], "a whole-file claim rides alone");
+        }
+    }
+
+    #[test]
     fn a_train_never_exceeds_merge_train_max() {
         let items: Vec<(String, Vec<String>)> = (0..6)
             .map(|i| {

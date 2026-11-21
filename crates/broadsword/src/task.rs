@@ -51,19 +51,30 @@ pub const WHOLE_PROJECT: &str = "*";
 /// Validate and normalise one claim: a file or folder path relative to the project root.
 /// `/` and `\` are the same, `.` segments and a trailing slash vanish. Absolute paths, drive letters, `..`,
 /// empty claims and patterns (`*`, `?` inside a path) are rejected; `*` alone is the whole project.
+/// Only `broadsword.toml` and `crates/broadsword/src/config.rs` may have a `#<key>` suffix (`[a-z0-9_]+`).
 pub fn normalize_claim(raw: &str) -> Result<String, String> {
     let bad = |why: &str| Err(format!("invalid claim `{raw}`: {why}"));
+    if raw.chars().any(char::is_control) {
+        return bad("contains a control character");
+    }
     let s = raw.trim();
     if s.is_empty() {
         return bad("empty; name a file or folder, or `*` for the whole project");
     }
-    if s.chars().any(char::is_control) {
-        return bad("contains a control character");
-    }
     if s == WHOLE_PROJECT {
         return Ok(WHOLE_PROJECT.into());
     }
-    let s = s.replace('\\', "/");
+    // Trim the path as before, but never trim an invalid key into a valid one.
+    let (path, key) = match raw.trim_start().split_once('#') {
+        Some((path, key)) => {
+            if key.is_empty() || !key.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+                return bad("key must match [a-z0-9_]+");
+            }
+            (path.trim(), Some(key))
+        }
+        None => (s, None),
+    };
+    let s = path.replace('\\', "/");
     if s.starts_with('/') {
         return bad("absolute paths are not allowed; claims are relative to the project root");
     }
@@ -81,23 +92,38 @@ pub fn normalize_claim(raw: &str) -> Result<String, String> {
     if out.is_empty() {
         return bad("it names no file or folder; use `*` for the whole project");
     }
-    Ok(out.join("/"))
+    let path = out.join("/");
+    if let Some(key) = key {
+        if !same(&path, "broadsword.toml") && !same(&path, "crates/broadsword/src/config.rs") {
+            return bad("key claims are only for broadsword.toml and crates/broadsword/src/config.rs");
+        }
+        return Ok(format!("{path}#{key}"));
+    }
+    Ok(path)
 }
 
 /// Do two normalised claims overlap? Equal, or one is an ancestor folder of the other by whole path segments
 /// (`src` overlaps `src/a.rs`, not `srcx`). `*` overlaps everything. `case_insensitive` is true on Windows.
+/// Different keys of the same file do not overlap; a whole-file or containing-folder claim overlaps every key.
 pub fn overlaps_with(a: &str, b: &str, case_insensitive: bool) -> bool {
     if a == WHOLE_PROJECT || b == WHOLE_PROJECT {
         return true;
     }
     let fold = |s: &str| if case_insensitive { s.to_lowercase() } else { s.to_string() };
     let (a, b) = (fold(a), fold(b));
+    let (a, ak) = a.split_once('#').map_or((a.as_str(), None), |(p, k)| (p, Some(k)));
+    let (b, bk) = b.split_once('#').map_or((b.as_str(), None), |(p, k)| (p, Some(k)));
+    if a == b {
+        return ak.is_none() || bk.is_none() || ak == bk;
+    }
     let (mut x, mut y) = (a.split('/'), b.split('/'));
     loop {
         match (x.next(), y.next()) {
             (Some(p), Some(q)) if p == q => {}
             (Some(_), Some(_)) => return false,
-            _ => return true, // one ran out: it is the ancestor (or equal)
+            (None, Some(_)) => return ak.is_none(), // only a plain claim can be an ancestor folder
+            (Some(_), None) => return bk.is_none(),
+            (None, None) => return true,
         }
     }
 }
@@ -811,6 +837,55 @@ mod tests {
         assert_eq!(normalize_claims(&["src", "src/", ".\\src", "docs"]).unwrap(), ["src", "docs"]);
         assert!(normalize_claims(&[]).is_err());
         assert!(normalize_claims(&["src", "../x"]).is_err());
+    }
+
+    #[test]
+    fn key_claim_normalisation_and_validation() {
+        assert_eq!(n("./broadsword.toml#alpha_09"), "broadsword.toml#alpha_09");
+        assert_eq!(n(" .\\crates\\\\broadsword/src/./config.rs/#beta"), "crates/broadsword/src/config.rs#beta");
+        assert_eq!(normalize_claims(&["broadsword.toml#alpha", "./broadsword.toml#alpha", "broadsword.toml#beta"]).unwrap(), ["broadsword.toml#alpha", "broadsword.toml#beta"]);
+        for key in ["", "Alpha", "a-b", "a.b", "a/b", "a\\b", "a#b", "a b", "a ", "a\t", "a\r", "a\n", "é", "a\u{2028}b"] {
+            let claim = format!("broadsword.toml#{key}");
+            let e = normalize_claim(&claim).unwrap_err();
+            assert!(e.contains("key must match") || e.contains("control character"), "{claim:?}: {e}");
+        }
+        for path in ["src/lib.rs", "config.rs", "other/broadsword.toml", "crates/broadsword/src/config.rs.bak"] {
+            let e = normalize_claim(&format!("{path}#k")).unwrap_err();
+            assert!(e.contains("key claims are only for broadsword.toml and crates/broadsword/src/config.rs"), "{e}");
+        }
+        for path in ["../broadsword.toml", "/broadsword.toml", "C:\\broadsword.toml", "crates/../broadsword.toml", "broadsword.toml.", "broadsword.toml?"] {
+            assert!(normalize_claim(&format!("{path}#k")).is_err(), "{path}");
+        }
+        // Large keys are data, not patterns or recursive parser input; validate the whole suffix.
+        let large = "a".repeat(100_000);
+        assert_eq!(n(&format!("broadsword.toml#{large}")), format!("broadsword.toml#{large}"));
+        assert!(normalize_claim(&format!("broadsword.toml#{large}!")).is_err());
+        assert_eq!(normalize_claim("BROADsword.toml#alpha").is_ok(), cfg!(windows));
+    }
+
+    #[test]
+    fn key_claim_overlap_matrix() {
+        for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+            let alpha = format!("{file}#alpha");
+            let beta = format!("{file}#beta");
+            let mut pairs = vec![(alpha.as_str(), alpha.as_str(), true), (alpha.as_str(), beta.as_str(), false), (file, alpha.as_str(), true), ("*", alpha.as_str(), true)];
+            if file.contains('/') {
+                pairs.extend([("crates", alpha.as_str(), true), ("crates/broadsword/src", alpha.as_str(), true), ("crates/broadsword/srcx", alpha.as_str(), false)]);
+            }
+            for (a, b, expected) in pairs {
+                for ci in [false, true] {
+                    assert_eq!(overlaps_with(a, b, ci), expected, "{a} vs {b}, ci={ci}");
+                    assert_eq!(overlaps_with(b, a, ci), expected, "{b} vs {a}, ci={ci}");
+                }
+            }
+            let upper = alpha.to_uppercase();
+            assert!(!overlaps_with(&upper, &alpha, false));
+            assert!(overlaps_with(&upper, &alpha, true));
+            assert!(overlaps_with(&file.to_uppercase(), &alpha, true));
+        }
+        assert!(!overlaps_with("broadsword.toml#alpha", "crates/broadsword/src/config.rs#alpha", false));
+        assert!(!overlaps_with("broadsword.toml#alpha", "broadsword.toml.bak", false));
+        assert!(!overlaps_with("broadsword.toml#alpha", "broadsword.toml/child", false));
     }
 
     #[test]

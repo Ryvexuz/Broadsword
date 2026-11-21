@@ -230,10 +230,9 @@ def check_git_worktree(root: Path, wt: Path) -> None:
 def claims_of(rec: dict) -> list:
     out = []
     for c in rec.get("claims", "").split("\n"):
-        c = c.strip()
-        if not c:
+        if not c.strip():
             continue
-        out.append("*" if c == "*" else "/".join(rel_parts(c, "claim")))
+        out.append(normalize_claim(c))
     if not out:
         raise Refused(f"task {rec.get('id')} has no claims")
     return out
@@ -243,8 +242,31 @@ def _fold(s: str) -> str:
     return s.casefold() if os.name == "nt" else s
 
 
+def normalize_claim(claim: str) -> str:
+    """Normalise a board claim, preserving a validated settings-file key suffix."""
+    if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in claim):
+        raise Refused("invalid claim: contains a control character")
+    if "#" in claim:
+        path, key = claim.lstrip().split("#", 1)
+        if re.fullmatch(r"[a-z0-9_]+", key) is None:
+            raise Refused("invalid claim: key must match [a-z0-9_]+")
+        path = "/".join(rel_parts(path.strip(), "claim"))
+        if _fold(path) not in (_fold("broadsword.toml"), _fold("crates/broadsword/src/config.rs")):
+            raise Refused("key claims are only for broadsword.toml and crates/broadsword/src/config.rs")
+        return f"{path}#{key}"
+    claim = claim.strip()
+    return "*" if claim == "*" else "/".join(rel_parts(claim, "claim"))
+
+
+def claim_path(claim: str) -> str:
+    """Coverage is file-level, not key-level; validate before dropping the suffix."""
+    return normalize_claim(claim).split("#", 1)[0] if "#" in claim else claim
+
+
 def under(path: str, claim: str) -> bool:
-    """`path` is the claim or inside it (task.rs claim semantics; case-insensitive on Windows)."""
+    """File coverage, case-insensitive on Windows: a key claim covers its file, irrespective of the edited key."""
+    if "#" in claim:
+        return _fold(path) == _fold(claim_path(claim))
     if claim == "*":
         return True
     p, c = _fold(path).split("/"), _fold(claim).split("/")
@@ -253,6 +275,7 @@ def under(path: str, claim: str) -> bool:
 
 def dir_overlaps(path: str, claim: str) -> bool:
     """A folder change is fine when the folder is inside a claim or holds one (it was made to hold a claimed file)."""
+    claim = claim_path(claim)
     if claim == "*":
         return True
     p, c = _fold(path).split("/"), _fold(claim).split("/")
@@ -555,7 +578,10 @@ def judge(changed: list, claims: list) -> list:
     Measured on NTFS, 2026-11-21 (scratch probe): creating, deleting, renaming or replacing a child and mkdir move a folder's
     LastWriteTime and ChangeTime; writing or appending to a child, its attributes, ACL, times or streams, and a grandchild
     being made do not. Anything else that moves a folder's times (os.utime on it) is a breach (review q-20261121-025544).
-    The worktree folder `.` follows the same rule: its direct children are the top-level paths."""
+    The worktree folder `.` follows the same rule: its direct children are the top-level paths.
+    A settings key claim covers changes to its file, not just diff hunks for that key."""
+    claims = [normalize_claim(c) for c in claims]
+
     def parent(path: str) -> str:
         return path.rpartition("/")[0] or "."
 

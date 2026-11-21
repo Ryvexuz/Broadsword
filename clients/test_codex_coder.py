@@ -78,6 +78,8 @@ if mode in ("inside", "hang", "mcp", "nousage", "outside", "gitfile", "junction"
 if mode == "outside":
     write("README.md", "changed outside the claim\n")
     write("other/b.txt")
+if mode == "settings":
+    write("broadsword.toml", "alpha = 1\n")
 if mode == "outsidedir":
     os.makedirs(os.path.join(wt, "emptydir"))
 if mode == "gitfile":
@@ -310,6 +312,22 @@ class CoderTests(unittest.TestCase):
         self.assertEqual(res["outside_claim"], [])
         self.assertFalse(res["claim_breach"])
         self.assertEqual(res["codex_items"], ["agent_message", "command_execution", "file_change"])
+
+    def test_changed_toml_under_its_key_claim_is_covered_but_not_under_a_loader_key(self):
+        (self.wt / "broadsword.toml").write_text("alpha = 0\n", encoding="utf-8")
+        self.write_task(claims="broadsword.toml#alpha")
+        code, res, _ = self.run_coder("settings")
+        self.assertEqual(code, 0, res)
+        self.assertIn("modified file broadsword.toml", res["changed_paths"])
+        self.assertEqual(res["outside_claim"], [])
+        self.assertFalse(res["claim_breach"])
+        (self.wt / "broadsword.toml").write_text("alpha = 0\n", encoding="utf-8")
+        self.write_task(claims="crates/broadsword/src/config.rs#alpha")
+        code, res, _ = self.run_coder("settings")
+        self.assertEqual(code, 3, res)
+        self.assertIn("modified file broadsword.toml", res["changed_paths"])
+        self.assertEqual(res["outside_claim"], ["broadsword.toml"])
+        self.assertTrue(res["claim_breach"])
 
     def test_a_write_outside_the_claim_is_a_claim_breach_exit_3_and_is_left_in_place(self):
         code, res, _ = self.run_coder("outside")
@@ -968,6 +986,63 @@ class PureTests(unittest.TestCase):
         self.assertTrue(cc.under("anything", "*"))
         self.assertTrue(cc.dir_overlaps("clients", "clients/x.py"))
         self.assertFalse(cc.dir_overlaps("other", "clients/x.py"))
+
+    def test_key_claim_validation_and_normalisation(self):
+        cc = self.cc
+        self.assertEqual(cc.claims_of({"claims": "./broadsword.toml#alpha_09\n.\\crates\\broadsword/src/./config.rs/#beta"}),
+                         ["broadsword.toml#alpha_09", "crates/broadsword/src/config.rs#beta"])
+        for key in ("", "Alpha", "a-b", "a.b", "a/b", "a\\b", "a#b", "a b", "a ", "a\t", "a\r", "a\n", "é", "a\u2028b"):
+            with self.subTest(key=key), self.assertRaises(cc.Refused):
+                cc.normalize_claim(f"broadsword.toml#{key}")
+        for path in ("src/lib.rs", "config.rs", "nested/broadsword.toml", "crates/broadsword/src/config.rs.bak"):
+            with self.subTest(path=path), self.assertRaisesRegex(cc.Refused, "key claims are only for"):
+                cc.normalize_claim(f"{path}#k")
+        for path in ("../broadsword.toml", "/broadsword.toml", "C:\\broadsword.toml", "crates/../broadsword.toml",
+                     "broadsword.toml.", "broadsword.toml?"):
+            with self.subTest(path=path), self.assertRaises(cc.Refused):
+                cc.normalize_claim(f"{path}#k")
+        large = "a" * 100_000
+        self.assertEqual(cc.normalize_claim(f"broadsword.toml#{large}"), f"broadsword.toml#{large}")
+        with self.assertRaises(cc.Refused):
+            cc.normalize_claim(f"broadsword.toml#{large}!")
+
+    def test_key_claim_file_coverage_at_the_low_level(self):
+        cc = self.cc
+        for file in ("broadsword.toml", "crates/broadsword/src/config.rs"):
+            for key in ("alpha", "beta"):
+                claim = f"{file}#{key}"
+                with self.subTest(claim=claim):
+                    self.assertTrue(cc.under(file, claim))
+                    self.assertFalse(cc.under(file + ".bak", claim))
+                    self.assertFalse(cc.under(file + "/child", claim))
+                    self.assertEqual(cc.under(file.upper(), claim), os.name == "nt")
+                    self.assertEqual(cc.judge([(file, "modified", "file")], [claim]), [])
+                    self.assertEqual(cc.judge([(file + ".bak", "modified", "file")], [claim]), [file + ".bak"])
+                    for kind in ("link", "hardlink", "unreadable"):
+                        self.assertEqual(cc.judge([(file, "added", kind)], [claim]), [file])
+                    self.assertEqual(cc.judge([(file + ":data", "modified", "stream")], [claim]), [])
+        loader = "crates/broadsword/src/config.rs#alpha"
+        self.assertTrue(cc.dir_overlaps("crates/broadsword/src", loader))
+        self.assertFalse(cc.under("crates/broadsword/src", loader))
+        self.assertFalse(cc.dir_overlaps("crates/broadsword/srcx", loader))
+        self.assertEqual(cc.judge([("broadsword.toml", "modified", "file")], [loader]), ["broadsword.toml"])
+        self.assertEqual(cc.judge([("crates", "modified", "dir-meta")], [loader]), ["crates"])
+        self.assertEqual(cc.judge([("crates:data", "modified", "stream")], [loader]), ["crates:data"])
+        added = [("crates/broadsword/src", "modified", "dir"), ("crates/broadsword/src/config.rs", "added", "file")]
+        self.assertEqual(cc.judge(added, [loader]), [])
+        self.assertEqual(cc.judge([("crates/broadsword/src", "modified", "dir")], [loader]), ["crates/broadsword/src"])
+        self.assertEqual(cc.judge([(".git", "modified", "file")], ["broadsword.toml#alpha"]), [".git"])
+
+    def test_invalid_key_claims_never_grant_coverage_even_to_direct_callers(self):
+        cc = self.cc
+        for claim in ("README.md#alpha", "broadsword.toml#", "broadsword.toml#alpha#beta", "broadsword.toml#alpha\n"):
+            with self.subTest(claim=claim):
+                with self.assertRaises(cc.Refused):
+                    cc.under("README.md", claim)
+                with self.assertRaises(cc.Refused):
+                    cc.dir_overlaps("crates", claim)
+                with self.assertRaises(cc.Refused):
+                    cc.judge([], [claim])
 
     def test_judge(self):
         cc = self.cc
