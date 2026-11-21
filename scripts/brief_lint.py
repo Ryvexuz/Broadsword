@@ -40,6 +40,22 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
   R5  WARN  only with --root: each backticked function or symbol (snake_case, `::` or `()`) of
             Requirements or the Done check, and the files `git grep` finds it in that are not claimed.
 
+Plan preflight (only with --root <repo> --preflight-ref <main branch>; `--queue-list <file>` holds
+`broadsword queue list` output). Each rule prints `FAIL preflight-Pn` with the missing list; a brief with
+none prints `PASS preflight`. A path counts as present when it is in the ref's tree, or is claimed
+"(new)" (a file under a claimed new folder too). Paths under scratch/ state/ build/ worktrees/ projects/,
+placeholders with `<` or `*`, and sentences saying "separate task" are not checked.
+  P0  the tree of the ref cannot be read (bad ref or not a repo): fail closed
+  P1  a path named anywhere in the brief (Done check commands included) missing from the ref
+  P2  a .md doc the brief names (and does not claim) is read one level deep: its data/code paths
+      (bsn rs py csv meta toml input json) missing from the ref, unless the brief claims them "(new)"
+  P3  a test named as `test NAME ...` or `fn NAME` (in the brief or such a doc) found nowhere on the ref
+      (git grep -w), unless the brief claims a new .rs or test file
+  P4  a --flag in Requirements or the Done check (commands of broadsword, cargo and git excepted) found
+      nowhere on the ref, unless its sentence says new/add/introduce/accept
+  P5  a task id after "after", "needs", "requires", "depends on" or "blocked by" that has no line with
+      status `merged` in the queue list; with no --queue-list at all it fails closed
+
 Threat model: this lint is ADVISORY. Its inputs are our own agents' briefs, not an adversary's.
 It catches honest mistakes and drift; making it bypass-proof is NOT a goal, and a deliberately
 hand-crafted brief that defeats it is a known limit, not a defect.
@@ -414,6 +430,146 @@ def claim_gaps(text, root=None):
     return res
 
 
+PF_SKIP_RE = re.compile(r"^(?:scratch|state|build|worktrees|projects)/")
+PF_SKIP_SENT_RE = re.compile(r"\bseparate task\b|\bafter this one\b", re.I)
+DOC_EXTS = {"bsn", "rs", "py", "csv", "meta", "toml", "input", "json"}
+TEST_NAME_RE = re.compile(r"\btest\s+([A-Za-z_][A-Za-z0-9_]{3,})\s+\.\.\.|`fn\s+([A-Za-z_]\w{3,})`")
+PREREQ_RE = re.compile(r"\b(?:after|needs?|requires?|depends\s+on|blocked\s+by)\s+"
+                       r"((?:t-\d{8}-\d{6}(?:-\d+)?(?:\s*(?:,|and)\s*)?)+)", re.I)
+TASK_ID_RE = re.compile(r"t-\d{8}-\d{6}(?:-\d+)?")
+PF_CMD_FLAGLESS = {"broadsword", "cargo", "git"}
+
+
+def _git(root, args):
+    r = subprocess.run(["git", "-C", root] + args, capture_output=True, text=True, encoding="utf-8")
+    return r
+
+
+def new_claim_paths(lines, secs):
+    """Claimed paths the Claims text marks new: `p (new)`, `p (new folder)`, `p (new, reason)`."""
+    out = set()
+    texts = []
+    for name, a, b in secs:
+        if name == "claims":
+            texts.append(section_of(lines[a])[1])
+            texts.extend(lines[a + 1:b])
+    for ln in lines:
+        m = re.search(r"\bClaims?:\s*(.*)", ln)
+        if m:
+            texts.append(m.group(1))
+    text = "\n".join(texts).replace("\\", "/")
+    for p in claim_paths(text):
+        if re.search(re.escape(p) + r"[`'\"]*\s*\((?:[^)]*\b)?new\b", text):
+            out.add(p)
+    return out
+
+
+def preflight(text, root, ref, queue_text):
+    """Plan preflight: [(rule, 'FAIL', message)] for inputs a brief names that are not on `ref` of the
+    repo at `root` and not claimed as new, and for prerequisite tasks not merged. Empty when clean.
+      P0 the tree of `ref` cannot be read          P3 a named test missing   P5 a prerequisite not merged
+      P1 a path named in the brief missing         P4 a named flag missing
+      P2 a path or test named by a doc the brief names (read one level deep) missing"""
+    r = _git(root, ["ls-tree", "-r", "--name-only", ref])
+    if r.returncode != 0:
+        return [("P0", "FAIL", f"cannot read the tree of {ref} under --root: {r.stderr.strip()[:120]}")]
+    tree = set(r.stdout.splitlines())
+    prefix = os.path.basename(os.path.abspath(root)).lower()
+
+    def on_main(p):
+        if p in tree or any(f.startswith(p.rstrip("/") + "/") for f in tree):
+            return True
+        return "/" not in p and any(f.endswith("/" + p) for f in tree)
+
+    def trim(p):
+        q = re.sub(rf"^projects/{re.escape(prefix)}/", "", p, flags=re.I)
+        return None if (PF_SKIP_RE.match(q) or "<" in q or "*" in q) else q
+
+    def grep(term):
+        # Docs are excluded: a doc that names a test or flag does not prove it exists.
+        g = _git(root, ["grep", "-q", "-w", "-F", "-e", term, ref, "--", ":!*.md"])
+        return g.returncode == 0
+
+    lines = text.splitlines()
+    secs = split_sections(lines)
+    claims = claimed_paths(lines, secs)
+    newc = new_claim_paths(lines, secs)
+    fresh = lambda p: covers(newc, p)
+    res = []
+
+    body = "\n".join(s for s in SENT_RE.split(text) if not PF_SKIP_SENT_RE.search(s))
+    miss = []
+    for p in named_paths(body):
+        q = trim(p)
+        if q and not on_main(q) and not fresh(q) and q not in miss:
+            miss.append(q)
+    if miss:
+        res.append(("P1", "FAIL", "named in the brief, not on " + ref + " and not claimed as new: " + ", ".join(miss)))
+
+    # Docs the brief names (and that exist on ref) are read one level deep: what they say to run needs
+    # its inputs too. Only the brief's own "(new)" claims excuse a missing file, not the doc's wording.
+    dmiss, tmiss, seen = [], [], set()
+    for p in named_paths(body):
+        q = trim(p)
+        if not (q and q.endswith(".md") and q in tree) or covers(claims, q):
+            continue
+        d = _git(root, ["show", f"{ref}:{q}"])
+        if d.returncode != 0:
+            continue
+        dtext = d.stdout
+        for tok in re.split(r"[\s,;()\[\]`'\"]+", dtext):
+            tok = tok.strip().rstrip(".:")
+            # A token with a backslash is a regex or an escape in a command, not a path.
+            if not tok or "\\" in tok or not claim_paths(tok) or tok.rsplit(".", 1)[-1] not in DOC_EXTS:
+                continue
+            t = trim(tok)
+            if t and not on_main(t) and not fresh(t) and t not in seen:
+                seen.add(t)
+                dmiss.append(f"{t} (named by {q})")
+        for m in TEST_NAME_RE.finditer(dtext):
+            n = m.group(1) or m.group(2)
+            if not grep(n) and n not in tmiss:
+                tmiss.append(f"{n} (named by {q})")
+    if dmiss:
+        res.append(("P2", "FAIL", "named by a doc the brief reads, not on " + ref + ": " + ", ".join(dmiss)))
+
+    new_test_file = any(re.search(r"(?:^|/)tests?/.*\.\w+$|(?:^|/)test_\w+\.\w+$|\.rs$", c) for c in newc)
+    tm = [m.group(1) or m.group(2) for m in TEST_NAME_RE.finditer(body)]
+    tests = [n for n in dict.fromkeys(tm) if not grep(n) and not new_test_file]
+    tests += tmiss
+    if tests:
+        res.append(("P3", "FAIL", "test(s) named, not on " + ref + " and no new test file claimed: " + ", ".join(tests)))
+
+    flags = []
+    for sent in SENT_RE.split(TICKS_RE.sub(lambda m: "" if is_command(m.group(1)) and
+                                           m.group(1).split()[0].split("/")[-1].split("\\")[-1].lower()
+                                           .removesuffix(".exe") in PF_CMD_FLAGLESS else m.group(0),
+                                           section_text(lines, secs, {"requirements", "done check"}))):
+        if NEW_WORD_RE.search(sent) and not NEGATED_RE.search(sent):
+            continue
+        for f in FLAG_RE.findall(sent):
+            if f not in flags and not grep(f):
+                flags.append(f)
+    if flags:
+        res.append(("P4", "FAIL", "flag(s) named, not on " + ref + " and not described as new: " + ", ".join(flags)))
+
+    ids = []
+    for m in PREREQ_RE.finditer(text):
+        ids += TASK_ID_RE.findall(m.group(1))
+    ids = list(dict.fromkeys(ids))
+    if ids:
+        if queue_text is None:
+            res.append(("P5", "FAIL", "prerequisite task(s) named but no --queue-list given to check them: "
+                        + ", ".join(ids)))
+        else:
+            merged = {f[2] for f in (ln.split("\t") for ln in queue_text.splitlines())
+                      if len(f) > 2 and f[1] == "merged"}
+            bad = [i for i in ids if i not in merged]
+            if bad:
+                res.append(("P5", "FAIL", "prerequisite task(s) not merged in queue list: " + ", ".join(bad)))
+    return res
+
+
 def positive(value):
     n = int(value)
     if n < 1:
@@ -428,11 +584,29 @@ def main(argv):
     p.add_argument("--max-files", type=positive, required=True)
     p.add_argument("--max-done-lines", type=positive, required=True)
     p.add_argument("--root", default=None, help="repo to search for R5 (git grep); omit to skip R5")
+    p.add_argument("--preflight-ref", default=None,
+                   help="git ref (the main branch) of --root; turns on the plan preflight P0-P5")
+    p.add_argument("--queue-list", default=None,
+                   help="file holding `broadsword queue list` output; P5 reads merged prerequisites from it")
     p.add_argument("briefs", nargs="+")
     try:
         a = p.parse_args(argv)
     except SystemExit as e:
         return 2 if e.code else 0
+    if a.preflight_ref and not a.root:
+        print("brief_lint: --preflight-ref needs --root", file=sys.stderr)
+        return 2
+    if a.queue_list and not a.preflight_ref:
+        print("brief_lint: --queue-list needs --preflight-ref", file=sys.stderr)
+        return 2
+    queue_text = None
+    if a.queue_list:
+        try:
+            with open(a.queue_list, encoding="utf-8") as f:
+                queue_text = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"brief_lint: cannot read {a.queue_list}: {e}", file=sys.stderr)
+            return 2
     failed = 0
     for path in a.briefs:
         try:
@@ -443,7 +617,8 @@ def main(argv):
             return 2
         res = lint(text, a.max_lines, a.max_bullets, a.max_files, a.max_done_lines)
         gaps = claim_gaps(text, a.root)
-        bad = [r for r in res if not r[1]] + [g for g in gaps if g[1] == "FAIL"]
+        pre = preflight(text, a.root, a.preflight_ref, queue_text) if a.preflight_ref else []
+        bad = [r for r in res if not r[1]] + [g for g in gaps if g[1] == "FAIL"] + pre
         print(f"{path}: {'ok' if not bad else str(len(bad)) + ' rule(s) failed'}")
         for rule, ok, msg in res:
             print(f"  {'PASS' if ok else 'FAIL'} {rule}: {msg}")
@@ -451,6 +626,11 @@ def main(argv):
             print(f"  {level} claimgap-{rule}: {msg}")
         if not any(g[1] == "FAIL" for g in gaps):
             print("  PASS claimgap")
+        if a.preflight_ref:
+            for rule, level, msg in pre:
+                print(f"  {level} preflight-{rule}: {msg}")
+            if not pre:
+                print("  PASS preflight")
         failed += bool(bad)
     print("brief_lint: ok" if not failed else f"brief_lint: {failed} brief(s) failed")
     return 1 if failed else 0

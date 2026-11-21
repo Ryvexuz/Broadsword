@@ -384,6 +384,165 @@ class ClaimGapRules(unittest.TestCase):
         self.assertEqual(gaps(text), [])  # no --root: R5 is skipped
 
 
+def make_repo(test, files):
+    """A temp git repo whose `main` branch holds `files` ({path: text}); returns its path."""
+    import subprocess
+    d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_pf_"))
+    test.addCleanup(shutil.rmtree, d, ignore_errors=True)
+    for name, text in files.items():
+        f = d / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "-C", str(d), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(["git", "-C", str(d), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(d)] + ident + ["commit", "-q", "-m", "fixture"], check=True)
+    return str(d)
+
+
+QUEUE = ("q-1\tmerged\tt-20261121-000001\tcrash-sim\thigh\topus\tcommit abc is on `main`\n"
+         "q-2\trejected\tt-20261121-000002\tcrash-sim\thigh\topus\tthe reviewer FAILED it\n"
+         "q-3\tmerged_check_failed\tt-20261121-000003\tcrash-sim\thigh\topus\tcheck did not pass\n")
+
+# The m4 case of 2026-11-21: the brief sent a coder to a doc whose checks need files nobody had made yet.
+M4_DOC = ("# Stage 6 m4\n"
+          "4.2 `tests/validation_files.rs`: `test validation_wall_embeds_validation_car ... ok`\n"
+          "4.3 `python -I -B validation/sweep.py --verify`\n"
+          "The files: `scenarios/validation_car.bsn` and `scenarios/validation_car_b.bsn`; "
+          "`scenarios/validation_wall_b.bsn (new)` is n20-08's.\n")
+M4_BRIEF = ("# t-x: m4 calibration\n\nProject: crash-sim. Claims: `scenarios/validation_car.bsn`, "
+            "`validation/CALIBRATION.md` (new).\n\n## Requirements\n"
+            "Read `docs/STAGE6-M4-M5.md`, the m4 section, first.\n- Calibrate on test A.\n\n"
+            "## Done check\n1. `python -I -B validation/sweep.py --verify` ends ok.\n")
+
+
+class Preflight(unittest.TestCase):
+    """P1-P5: the plan preflight. Each test was run before the rule existed and failed."""
+
+    def pf(self, text, files, queue=None):
+        # brief()'s default done check runs scripts/test_a.py: it exists in every fixture unless a test says so
+        root = make_repo(self, {"scripts/test_a.py": "x", **files})
+        return [(r, lv, m) for r, lv, m in bl.preflight(text, root, "main", queue)]
+
+    def fails(self, text, files, queue=None):
+        return {r for r, lv, _ in self.pf(text, files, queue) if lv == "FAIL"}
+
+    def test_p1_existing_and_claimed_new_paths_pass(self):
+        text = brief("`src/a.rs`, `docs/new.md` (new)", "- edit `src/a.rs` and write `docs/new.md`")
+        self.assertEqual(self.pf(text, {"src/a.rs": "x"}), [])
+
+    def test_p1_path_missing_on_main_and_not_claimed_new_fails_with_the_list(self):
+        text = brief("`src/a.rs`", "- edit `src/a.rs`, read `data/b.csv` and `tests/c.rs`")
+        g = self.pf(text, {"src/a.rs": "x"})
+        self.assertEqual({r for r, lv, _ in g if lv == "FAIL"}, {"P1"})
+        self.assertIn("data/b.csv", g[0][2])
+        self.assertIn("tests/c.rs", g[0][2])
+        self.assertNotIn("src/a.rs", g[0][2])
+
+    def test_p1_a_claim_without_new_does_not_excuse_a_missing_file(self):
+        text = brief("`src/a.rs`", "- edit `src/a.rs`")
+        self.assertEqual(self.fails(text, {"README.md": "x"}), {"P1"})
+
+    def test_p1_a_file_under_a_claimed_new_folder_passes(self):
+        text = brief("`src/jobs/` (new folder)", "- add `src/jobs/graph.rs`")
+        self.assertEqual(self.pf(text, {"README.md": "x"}), [])
+
+    def test_p1_scratch_state_build_and_placeholder_paths_are_not_checked(self):
+        text = brief("`src/a.rs`", "- edit `src/a.rs`; save `scratch/out.txt`, `state/x/y.json`, `build/z/q.exe`, `a/<id>.md`")
+        self.assertEqual(self.pf(text, {"src/a.rs": "x"}), [])
+
+    def test_p1_path_in_a_done_check_command_must_exist_too(self):
+        text = brief("`src/a.rs`", "- edit `src/a.rs`", done="`python -I scripts/gone.py` shows OK.")
+        self.assertEqual(self.fails(text, {"src/a.rs": "x"}), {"P1"})
+
+    def test_p2_a_doc_the_brief_names_is_followed_one_level(self):
+        files = {"docs/STAGE6-M4-M5.md": M4_DOC, "scenarios/validation_car.bsn": "x", "validation/test.py": "x"}
+        g = self.pf(M4_BRIEF, files)
+        self.assertIn("P2", {r for r, lv, _ in g if lv == "FAIL"})
+        msg = " ".join(m for r, _, m in g if r == "P2")
+        for missing in ("tests/validation_files.rs", "scenarios/validation_car_b.bsn", "validation/sweep.py"):
+            self.assertIn(missing, msg)
+        self.assertIn("validation_wall_b.bsn", msg)  # the doc's own "(new)" does not excuse it
+        self.assertNotIn("validation_car.bsn", msg.replace("validation_car_b.bsn", ""))  # exists on main
+        mine = M4_BRIEF.replace("`validation/CALIBRATION.md` (new)",
+                                "`validation/CALIBRATION.md` (new), `scenarios/validation_wall_b.bsn` (new)")
+        msg = " ".join(m for r, _, m in self.pf(mine, files) if r == "P2")
+        self.assertNotIn("validation_wall_b.bsn", msg)  # only the brief's own (new) claim excuses it
+
+    def test_p2_passes_when_the_doc_inputs_exist(self):
+        files = {"docs/STAGE6-M4-M5.md": M4_DOC, "scenarios/validation_car.bsn": "x",
+                 "scenarios/validation_car_b.bsn": "x", "scenarios/validation_wall_b.bsn": "x",
+                 "tests/validation_files.rs": "fn validation_wall_embeds_validation_car() {}",
+                 "validation/sweep.py": "--verify"}
+        self.assertEqual(self.fails(M4_BRIEF, files), set())
+
+    def test_p3_test_name_missing_from_main_fails_and_present_passes(self):
+        done = "`cargo test` shows `test engine_never_nans ... ok`."
+        text = brief("`src/a.rs`", "- edit `src/a.rs`", done=done)
+        self.assertEqual(self.fails(text, {"src/a.rs": "x"}), {"P3"})
+        self.assertEqual(self.pf(text, {"src/a.rs": "#[test] fn engine_never_nans() {}"}), [])
+
+    def test_p3_a_test_in_a_claimed_new_test_file_is_allowed(self):
+        done = "`cargo test` shows `test engine_never_nans ... ok`."
+        text = brief("`tests/engine.rs` (new)", "- add `tests/engine.rs`", done=done)
+        self.assertEqual(self.pf(text, {"README.md": "x"}), [])
+
+    def test_p4_flag_absent_from_main_fails_unless_the_brief_adds_it(self):
+        files = {"src/main.rs": 'args: "--known"'}
+        text = brief("`src/main.rs`", "- `--known` is kept and `--ghost` is read")
+        g = self.pf(text, files)
+        self.assertEqual({r for r, lv, _ in g if lv == "FAIL"}, {"P4"})
+        self.assertIn("--ghost", g[0][2])
+        self.assertNotIn("--known", g[0][2])
+        added = brief("`src/main.rs`", "- add a new flag `--ghost`")
+        self.assertEqual(self.pf(added, files), [])
+
+    def test_p4_flags_of_broadsword_cargo_and_git_commands_are_not_checked(self):
+        text = brief("`src/a.rs`", "- x", done="`broadsword check x --task t` ok; `cargo run --release` ok")
+        self.assertEqual(self.pf(text, {"src/a.rs": "x"}), [])
+
+    def test_p5_prerequisite_not_merged_fails_and_merged_passes(self):
+        base = brief("`src/a.rs`", "- edit `src/a.rs`. Runs after t-20261121-000001 and needs t-20261121-000002 merged, "
+                                   "also after t-20261121-000003 and after t-20261121-999999.")
+        g = self.pf(base, {"src/a.rs": "x"}, QUEUE)
+        self.assertEqual({r for r, lv, _ in g if lv == "FAIL"}, {"P5"})
+        msg = g[0][2]
+        for bad in ("t-20261121-000002", "t-20261121-000003", "t-20261121-999999"):
+            self.assertIn(bad, msg)  # rejected, merged_check_failed and unknown are not merged
+        self.assertNotIn("t-20261121-000001", msg)
+        ok = brief("`src/a.rs`", "- edit `src/a.rs`. Runs after t-20261121-000001.")
+        self.assertEqual(self.pf(ok, {"src/a.rs": "x"}, QUEUE), [])
+
+    def test_p5_prerequisite_without_a_queue_list_fails_closed(self):
+        text = brief("`src/a.rs`", "- edit `src/a.rs`. Runs after t-20261121-000001.")
+        self.assertEqual(self.fails(text, {"src/a.rs": "x"}, None), {"P5"})
+
+    def test_p0_bad_ref_fails_closed(self):
+        root = make_repo(self, {"src/a.rs": "x"})
+        g = bl.preflight(brief("`src/a.rs`", "- edit `src/a.rs`"), root, "no-such-ref", None)
+        self.assertEqual({(r, lv) for r, lv, _ in g}, {("P0", "FAIL")})
+
+    def test_cli_preflight_flags_and_exit_codes(self):
+        d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_cli_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        root = make_repo(self, {"src/a.rs": "x", "scripts/test_a.py": "x", "docs/STAGE6-M4-M5.md": M4_DOC})
+        (d / "q.txt").write_text(QUEUE, encoding="utf-8")
+        (d / "m4.md").write_text(M4_BRIEF, encoding="utf-8")
+        (d / "ok.md").write_text(brief("`src/a.rs`", "- edit `src/a.rs`"), encoding="utf-8")
+        flags = Cli.FLAGS + ["--root", root, "--preflight-ref", "main", "--queue-list", str(d / "q.txt")]
+        code, out, _ = run_cli(flags + [str(d / "m4.md")])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL preflight-P2", out)
+        code, out, _ = run_cli(flags + [str(d / "ok.md")])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS preflight", out)
+        for bad in (Cli.FLAGS + ["--preflight-ref", "main", str(d / "ok.md")],  # no --root
+                    Cli.FLAGS + ["--root", root, "--queue-list", str(d / "q.txt"), str(d / "ok.md")],  # no ref
+                    flags[:-1] + [str(d / "nope.txt"), str(d / "ok.md")]):  # unreadable list
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bl.main(bad), 2, bad)
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_"))
