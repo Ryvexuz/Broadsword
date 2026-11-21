@@ -728,16 +728,29 @@ def toml_literal(value: str, what: str) -> str:
     return f"'{value}'"
 
 
-def coder_command(exe: str, model: str, effort: str, worktree: Path, work: Path, answer: Path) -> list:
+# The optional --service-tier. Only `fast` is accepted. codex 0.170.0 (offline evidence: its model catalog lists the tier
+# {"id": "priority", "name": "Fast"} and its config has a `service_tier` key) selects it with `-c service_tier="priority"`.
+SERVICE_TIERS = {"fast": "priority"}
+
+
+def check_service_tier(tier) -> None:
+    if tier is not None and tier not in SERVICE_TIERS:
+        raise Refused(f"`{tier}` is not a service tier (only fast is accepted)")
+
+
+def coder_command(exe: str, model: str, effort: str, worktree: Path, work: Path, answer: Path, service_tier=None) -> list:
     """The full codex command line, used by the coder run and the canary alike. Writes the catalog into `work`."""
     check_model_effort(model, effort)
+    check_service_tier(service_tier)
     catalog = Path(work) / "coder-catalog.json"
     catalog.write_text(json.dumps(coder_catalog(model, effort)), encoding="utf-8")
     wt = toml_literal(str(worktree), "the worktree path")
     profile = f'permissions.{PROFILE}.filesystem={{":minimal"="read", {wt}="write"}}'
+    tier = ["-c", f'service_tier="{SERVICE_TIERS[service_tier]}"'] if service_tier else []
     return [exe, "exec", "-m", model, *CODER_ARGS,
             "-c", profile,
             "-c", f'model_reasoning_effort="{effort}"',
+            *tier,
             "-c", f"model_catalog_json={toml_literal(str(catalog), 'the temp folder path')}",
             "-C", str(worktree), "--json", "-o", str(answer), "-"]
 
@@ -755,7 +768,7 @@ def build_prompt(template: str, task_id: str, project: str, claims: list, brief:
 
 def result_json(**kw) -> dict:
     base = {"type": "result", "is_error": True, "result": "", "total_cost_usd": None, "usage": {}, "modelUsage": {},
-            "backend": "codex", "changed_paths": [], "outside_claim": [], "claim_breach": False}
+            "backend": "codex", "service_tier": None, "changed_paths": [], "outside_claim": [], "claim_breach": False}
     base.update(kw)
     base["result"] = oc.redact(base["result"])
     return base
@@ -817,10 +830,10 @@ def codex_call(args, prompt: str, environ, cmd: list, cwd: str, child: dict, tim
 codex_call = rv.metered("codex", codex_call)
 
 
-def meter_env(environ, task_id: str) -> dict:
+def meter_env(environ, task_id: str, service_tier=None) -> dict:
     """The environment rv.metered labels the ledger row from (never the child's): caller and call_type."""
     env = dict(environ)
-    env.setdefault("OPENAI_REVIEW_CALLER", f"codex_coder {task_id}")
+    env.setdefault("OPENAI_REVIEW_CALLER", f"codex_coder {task_id}" + (f" service_tier={service_tier}" if service_tier else ""))
     env["OPENAI_REVIEW_CALL_TYPE"] = CALL_TYPE
     return env
 
@@ -844,6 +857,8 @@ def run_coder(args, environ) -> tuple:
     prompt = build_prompt(template, args.task, rec.get("project", ""), claims, brief)
     child = rv.codex_env(environ, root)
     timeout = settings["codex_coder_timeout_seconds"]
+    tier = getattr(args, "service_tier", None)
+    check_service_tier(tier)
     check_model_effort(args.model, args.effort)  # before any codex process, the version probe included
     coder_canary_gate(root, settings, exe, child)
     try:
@@ -863,8 +878,8 @@ def run_coder(args, environ) -> tuple:
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="bsw-coder-", dir=scratch, ignore_cleanup_errors=True) as work:
             answer = Path(work) / "answer.txt"
-            cmd = coder_command(exe, args.model, args.effort, wt, Path(work), answer)
-            call = codex_call(args, prompt, meter_env(environ, args.task), cmd, str(wt), child, timeout)
+            cmd = coder_command(exe, args.model, args.effort, wt, Path(work), answer, tier)
+            call = codex_call(args, prompt, meter_env(environ, args.task, tier), cmd, str(wt), child, timeout)
             code, stdout, stderr, error, usage = call["code"], call["stdout"], call["stderr"], call["error"], call["usage"]
             for note in call.get("notes") or []:  # a ledger row that could not be written
                 error = f"{error}; {note}" if error else note
@@ -905,7 +920,7 @@ def run_coder(args, environ) -> tuple:
         duration_ms=int(seconds * 1000), seconds=seconds, model=args.model, effort=args.effort, task=args.task,
         worktree=rec.get("worktree"), claims=claims, codex_exit_code=code, codex_items=items,
         changed_paths=[f"{what} {kind} {p}" for p, what, kind in changed], outside_claim=outside, claim_breach=bool(outside),
-        model_reported=False)
+        model_reported=False, service_tier=tier)
     return (EXIT_BREACH if outside else EXIT_ERROR if problems else EXIT_OK), res
 
 
@@ -1324,6 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True)
     p.add_argument("--effort")
     p.add_argument("--brief")
+    p.add_argument("--service-tier", dest="service_tier", help="optional: fast (ChatGPT plan fast mode)")
     p.add_argument("--canary", action="store_true", help="run the offline sandbox canary instead (no model call)")
     return p
 
@@ -1337,6 +1353,7 @@ def main(argv=None, environ=None) -> int:
     try:
         if missing:
             raise Refused(f"missing {', '.join(missing)}")
+        check_service_tier(args.service_tier)
         code, result = run_coder(args, environ)
     except Refused as e:
         code, result = EXIT_REFUSED, result_json(result=f"refused: {e}", model=args.model, effort=args.effort, task=args.task)

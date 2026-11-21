@@ -706,6 +706,35 @@ class CoderTests(unittest.TestCase):
         cat_arg = [a for a in args if a.startswith("model_catalog_json=")]
         self.assertEqual(len(cat_arg), 1)
 
+    def test_service_tier_fast_adds_exactly_one_config_pair_and_absent_adds_none(self):
+        code, res, _ = self.run_coder("inside")
+        self.assertEqual(code, 0, res)
+        plain = self.seen()["args"]
+        self.assertFalse([a for a in plain if "service_tier" in a], "no flag: today's command line, no tier config")
+        self.assertIsNone(res["service_tier"])
+        code, res, _ = self.run_coder("inside", extra=["--service-tier", "fast"])
+        self.assertEqual(code, 0, res)
+        fast = self.seen()["args"]
+        i = fast.index('service_tier="priority"')  # codex 0.170.0's catalog id for the Fast tier
+        self.assertEqual(fast[i - 1], "-c")
+        norm = lambda xs: [re.sub(r"bsw-coder-\w+", "bsw-coder-X", x) for x in xs]  # each run has its own temp folder
+        self.assertEqual(norm(fast[:i - 1] + fast[i + 1:]), norm(plain), "the flag adds only that one -c pair")
+        self.assertEqual(res["service_tier"], "fast")
+
+    def test_service_tier_is_in_the_ledger_row_with_the_plan_label(self):
+        code, res, _ = self.run_coder("inside", extra=["--service-tier", "fast"])
+        self.assertEqual(code, 0, res)
+        rows = self.ledger_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("service_tier=fast", rows[0][1])
+        self.assertIn("codex-plan", rows[0])
+        self.run_coder("inside")
+        self.assertNotIn("service_tier", self.ledger_rows()[1][1])
+
+    def test_another_service_tier_is_refused_before_codex_starts(self):
+        for v in ("priority", "flex", "FAST", ""):
+            self.assert_refused("is not a service tier", extra=["--service-tier", v])
+
     def test_codex_never_starts_a_network_fetch_plugins_and_daemon_are_always_off(self):
         # Without these codex 0.170.0 runs a background `git fetch` of github.com/openai/plugins.git (and a shared daemon).
         code, res, _ = self.run_coder("inside")
