@@ -60,6 +60,11 @@ def is_toml_claim(c):
     return c == 'broadsword.toml' or (c.startswith('config/') and c.endswith('.toml'))
 
 
+def toml_files(entries):
+    """The set of toml claim paths of one record, backslashes turned into slashes (exact-match key)."""
+    return {c.replace(chr(92), '/') for c in entries if is_toml_claim(c)}
+
+
 def read_record(f):
     d = {}
     with open(f, encoding='utf8') as fh:
@@ -87,8 +92,11 @@ def load(tasks_dir, win_start, now):
     rows = []
     for f in sorted(glob.glob(os.path.join(tasks_dir, '*.task'))):
         d = read_record(f)
+        if d.get('project') != 'broadsword':
+            continue
         entries = claim_entries(f, d)
-        if any(is_toml_claim(c) for c in entries) and win_start <= int(d.get('created', '0')) <= now:
+        d['_files'] = toml_files(entries)
+        if d['_files'] and win_start <= int(d.get('created', '0')) <= now:
             d['_c'] = int(d['created'])
             d['_s'] = int(d['started']) if d.get('started') else None
             d['_e'] = int(d['ended']) if d.get('ended') else None
@@ -157,7 +165,7 @@ def main():
         h = hold_iv(d, win_start, now)
         ov = []
         for o in rows:
-            if o is d:
+            if o is d or not (d['_files'] & o['_files']):
                 continue
             oh = hold_iv(o, win_start, now)
             if oh:

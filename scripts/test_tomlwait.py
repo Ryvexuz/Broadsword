@@ -39,7 +39,7 @@ RECORDS = [
 def write_tasks(folder, records):
     os.makedirs(folder, exist_ok=True)
     for name, r in records:
-        lines = ['id = T-' + name, 'project = broadsword', 'status = ' + r['status'],
+        lines = ['id = T-' + name, 'project = ' + r.get('project', 'broadsword'), 'status = ' + r['status'],
                  'created = %d' % epoch(r['created']), 'claims = ' + r['claims']]
         if r['started']:
             lines.append('started = %d' % epoch(r['started']))
@@ -95,6 +95,67 @@ class ClipToWindow(unittest.TestCase):
         self.assertEqual(len(line), 1, out)
         self.assertIn('wait=15.0', line[0])
         self.assertIn('overlap=', line[0])
+
+
+def rec(created, started, ended, claims, project='broadsword', status='done'):
+    return dict(status=status, created=created, started=started, ended=ended, claims=claims, project=project)
+
+
+class SameFileAndProject(unittest.TestCase):
+    def setUp(self):
+        os.makedirs(SCRATCH, exist_ok=True)
+        self.root = tempfile.mkdtemp(prefix='tomlwait-test-', dir=os.path.abspath(SCRATCH))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def row(self, records, name):
+        folder = os.path.join(self.root, 'recs')
+        write_tasks(folder, records)
+        out = run_script(folder)
+        print(chr(10) + out)
+        rows = [l for l in out.splitlines() if l.startswith('T-' + name + ' ')]
+        self.assertEqual(len(rows), 1, out)
+        return rows[0], out
+
+    def test_waiter_is_not_counted_behind_a_holder_of_a_different_config_file(self):
+        # Waiter waits 09:10-09:40 on config/queue.toml; the holder holds only config/review.toml 09:15-09:30.
+        records = [
+            ('waiter', rec('2026-11-20T09:10:00Z', '2026-11-20T09:40:00Z', '2026-11-20T09:50:00Z', 'config/queue.toml')),
+            ('holder', rec('2026-11-20T09:00:00Z', '2026-11-20T09:15:00Z', '2026-11-20T09:30:00Z', 'config/review.toml')),
+        ]
+        line, out = self.row(records, 'waiter')
+        self.assertIn('overlap=0.0', line)
+        self.assertIn('measure_b overlap_sum_min=0.0', out)
+
+    def test_waiter_is_counted_behind_a_holder_of_the_same_config_file(self):
+        # Same fixture, but the holder holds config/queue.toml: the 15 minutes 09:15-09:30 are counted.
+        records = [
+            ('waiter', rec('2026-11-20T09:10:00Z', '2026-11-20T09:40:00Z', '2026-11-20T09:50:00Z', 'config/queue.toml')),
+            ('holder', rec('2026-11-20T09:00:00Z', '2026-11-20T09:15:00Z', '2026-11-20T09:30:00Z', 'config/queue.toml')),
+        ]
+        line, out = self.row(records, 'waiter')
+        self.assertIn('overlap=15.0', line)
+        self.assertIn('measure_b overlap_sum_min=15.0', out)
+
+    def test_a_holder_matches_through_a_backslash_path_and_one_of_several_claims(self):
+        records = [
+            ('waiter', rec('2026-11-20T09:10:00Z', '2026-11-20T09:40:00Z', '2026-11-20T09:50:00Z', 'src/a.rs' + chr(92) + 'nconfig/queue.toml')),
+            ('holder', rec('2026-11-20T09:00:00Z', '2026-11-20T09:15:00Z', '2026-11-20T09:30:00Z', 'config' + chr(92) + 'queue.toml')),
+        ]
+        line, _ = self.row(records, 'waiter')
+        self.assertIn('overlap=15.0', line)
+
+    def test_record_of_another_project_is_ignored(self):
+        # 'other' belongs to crash-sim and claims config/queue.toml; it must not be listed or counted as a holder.
+        records = [
+            ('waiter', rec('2026-11-20T09:10:00Z', '2026-11-20T09:40:00Z', '2026-11-20T09:50:00Z', 'config/queue.toml')),
+            ('other', rec('2026-11-20T09:00:00Z', '2026-11-20T09:15:00Z', '2026-11-20T09:30:00Z', 'config/queue.toml', project='crash-sim')),
+        ]
+        line, out = self.row(records, 'waiter')
+        self.assertIn('overlap=0.0', line)
+        self.assertNotIn('T-other', out)
+        self.assertIn('measure_a tasks=1', out)
 
 
 if __name__ == '__main__':
