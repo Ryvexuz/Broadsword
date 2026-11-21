@@ -1,4 +1,4 @@
-# bench/coder: a coding benchmark for models
+﻿# bench/coder: a coding benchmark for models
 
 Six Rust tasks, from easy to hard, each graded by hidden tests. It compares how well different models write code: Claude old and new now, OpenAI later.
 
@@ -143,4 +143,37 @@ python -I -B bench/coder/run.py regrade <out-dir>
 
 ## Retries and cost to pass (`--attempts`)
 
-`python -I -B run.py <out> <provider> <model> <effort> --retries 3 [tasks]` (`--attempts 3` is the same) asks each task up to 3 times (1 to 3; default 1 = the one-shot run, same JSON as before). A task that does not fully pass is asked again with its spec plus the names of the failing hidden tests (names only: no compiler text, no assertion output, no earlier solution; "did not compile" or "no single code block" when there are no names). Each round is graded as one Broadsword batch. The result JSON then also holds `attempts_made`, `pass_at` (first attempt that fully passed, null = no pass), `cost_usd_total`, `cost_unknown_attempts`, `wall_s_total` and an `attempts` list; the other fields describe the last attempt. `--retries` is the attempt budget for every provider; the openai provider's HTTP retries on 429/5xx are `--http-retries`. When the harness gives no failing test names (build failure, tests that could not be listed) the retry says only that the solution did not compile or did not pass all hidden tests. With N > 1 every attempt keeps its own files (`<tag>__a1.*`, `__a2.*`, ...) and `<tag>.*` is the latest. In the cost-to-pass table an ungraded task counts as unresolved (shown "ungraded", cost so far), a one-shot record that passed is a pass at 1, and a Codex (plan allowance) call without a price shows "plan", not n/a or $0. `score.py` then adds a second table ranked by cost to pass (tasks without a pass first-sorted last, then cost): `pass@1`, `passed`, per task "tries $cost" or "no pass $cost", and "no pass at cost X" in the last column. Out of scope of this task (cost to completion, t-20261118-141428-2) and done in its follow-up board task t-20261119-215840: `--review <model>` (one review of each passing solution, its BLOCKING lines recorded) and reviewer cost per real bug caught in `score.py`. Neither exists in `run.py` or `score.py` yet.
+## Optional reviewer and adjudication
+
+Append `--review <reviewer-model>` to a normal run. After grading, each final
+graded, compiling solution receives one review, even if some hidden tests failed.
+The reviewer receives only `spec.md` and the saved Rust source, never hidden tests
+or grading diagnostics. Reviews use `clients/openai_review.py`'s `review_codex()`
+and its `codex_command()` internally: the benchmark adds no Codex flags and does
+not fall back to the API. The existing model timeout setting bounds each call.
+
+The result's `review` object records model, backend, nullable cost and tokens,
+answer, findings, and a `failed` flag with an error for failed calls or malformed
+replies. Findings are requested as a JSON list of concrete correctness bugs;
+an empty list is a successful review with no findings, not an adjudication.
+
+To judge each recorded finding against the same spec and solution:
+
+```
+python -I -B bench/coder/run.py adjudicate <out-dir> --review <judge-model>
+```
+
+Each finding gets its own Codex judge call and stores `verdict` (`REAL` or `FALSE`),
+`judge_model`, evidence, and the call record in `judgment`. Failed calls or invalid
+judgments are recorded as failed, clear any previous verdict for that finding,
+and make adjudication exit unsuccessfully. No hidden tests are sent to the judge.
+Only a finding adjudicated REAL with a recorded judge counts in the reviewer
+table in `score.py`. That table reports reviews, failures, REAL findings and cost
+per REAL finding; Codex plan quota and a zero-REAL denominator both display `n/a`,
+never zero dollars. Regrade alone does not make reviewer calls.
+
+## Retries and cost to pass (`--attempts`)
+
+`python -I -B run.py <out> <provider> <model> <effort> --retries 3 [tasks]` (`--attempts 3` is the same) asks each task up to 3 times (1 to 3; default 1 = the one-shot run, same JSON as before). A task that does not fully pass is asked again with its spec plus the names of the failing hidden tests (names only: no compiler text, no assertion output, no earlier solution; "did not compile" or "no single code block" when there are no names). Each round is graded as one Broadsword batch. The result JSON then also holds `attempts_made`, `pass_at` (first attempt that fully passed, null = no pass), `cost_usd_total`, `cost_unknown_attempts`, `wall_s_total` and an `attempts` list; the other fields describe the last attempt. `--retries` is the attempt budget for every provider; the openai provider's HTTP retries on 429/5xx are `--http-retries`. When the harness gives no failing test names (build failure, tests that could not be listed) the retry says only that the solution did not compile or did not pass all hidden tests. With N > 1 every attempt keeps its own files (`<tag>__a1.*`, `__a2.*`, ...) and `<tag>.*` is the latest. In the cost-to-pass table an ungraded task counts as unresolved (shown "ungraded", cost so far), a one-shot record that passed is a pass at 1, and a Codex (plan allowance) call without a price shows "plan", not n/a or $0. `score.py` then adds a second table ranked by cost to pass (tasks without a pass first-sorted last, then cost): `pass@1`, `passed`, per task "tries $cost" or "no pass $cost", and "no pass at cost X" in the last column.
+
+

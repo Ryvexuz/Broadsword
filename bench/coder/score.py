@@ -161,6 +161,24 @@ def printable(rows):
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
 
 
+def reviewer_table(recs):
+    groups = {}
+    for rec in recs:
+        review = rec.get("review")
+        if review:
+            groups.setdefault(review["model"], []).append(review)
+    rows = [["reviewer model", "reviews", "failed", "REAL findings", "cost per REAL finding"]]
+    for model, reviews in sorted(groups.items()):
+        real = sum(1 for r in reviews if not r["failed"] for f in r["findings"]
+                   if f.get("verdict") == "REAL" and f.get("judge_model")
+                   and not f.get("judgment", {}).get("failed", False))
+        costs = [r.get("cost_usd") for r in reviews]
+        known = all(c is not None for c in costs) and all(r.get("backend") != "codex" for r in reviews)
+        cost = f"${sum(costs) / real:.3f}" if real and known else "n/a"
+        rows.append([model, len(reviews), sum(bool(r["failed"]) for r in reviews), real, cost])
+    return rows if groups else None
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -219,6 +237,10 @@ def main():
         print()
         print("cost to pass (all attempts; ranked by tasks without a pass, then known-cost models before models with an "
               "unknown or plan cost, then cost; a + is a lower bound):")
+        printable(table)
+    table = reviewer_table(recs)
+    if table:
+        print("\nreviewer cost per adjudicated REAL finding (codex: n/a, plan quota):")
         printable(table)
     errored = [(k, r) for k, by_task in sorted(groups.items()) for _, r in sorted(by_task.items()) if r["_err"] is not None]
     if errored:

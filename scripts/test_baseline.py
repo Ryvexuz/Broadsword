@@ -195,6 +195,21 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("1 coder runs have no token count", res.stdout)
 
+    def test_all_unknown_coder_tokens_do_not_make_zero_average(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens="")
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIsNone(self.metrics()["coder_tokens_per_merged"])
+        data = json.loads((self.r.root / "state" / "baselines" / "b1.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["samples"]["merged_with_coder_run"], 0)
+
+    def test_unknown_only_task_does_not_dilute_known_task_average(self):
+        self.r.merged_task(T0 + 600, T0 + 1800, coder_tokens="")
+        self.r.merged_task(T0 + 700, T0 + 1900, coder_tokens=800)
+        res = self.record()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.metrics()["coder_tokens_per_merged"], 800)
+
     def test_malformed_review_token_count_is_an_input_error(self):
         self.r.merged_task(T0 + 600, T0 + 1800)
         rev = next((self.r.root / "state" / "queue").glob("*.review"))

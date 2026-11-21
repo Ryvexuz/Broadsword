@@ -372,10 +372,11 @@ def measure(root, since, until):
     coder_secs = coder_tok = coder_runs = unfinished_runs = coder_tok_unmerged = 0
     merged_with_run = set()
     no_tok_runs = no_sec_runs = no_span_runs = 0
-    for lineno, line in enumerate(lines[1:], 2):
-        if not line.strip():
-            continue
-        v = dict(zip(head, line.split("\t")))
+    try:
+        runs = dm.read_runs()
+    except (OSError, UnicodeError) as e:
+        raise InputError(f"{runs_file}: unreadable ({e})") from None
+    for lineno, v in enumerate(runs, 2):
         span = task_span.get(v.get("task"))
         known = bool(span and span[0])
         if known:
@@ -391,6 +392,9 @@ def measure(root, since, until):
             continue
         secs = strict_num(v.get("seconds"), f"{runs_file} line {lineno}: seconds")
         tok = strict_num(v.get("tokens"), f"{runs_file} line {lineno}: tokens")
+        # Validate strictly above; share dev_metrics' unknown-versus-zero interpretation.
+        secs, tok = dm.num(v.get("seconds")), dm.num(v.get("tokens"))
+        token_known = tok is not None
         if v.get("role") == "coder":
             no_tok_runs += tok is None
             no_sec_runs += secs is None
@@ -413,7 +417,7 @@ def measure(root, since, until):
             coder_tok += tok
             if v.get("task") not in merged_ids:
                 coder_tok_unmerged += tok
-            else:
+            elif token_known:
                 merged_with_run.add(v.get("task"))
     if unfinished_runs:
         notes.append(f"{unfinished_runs} coder run(s) in the window belong to tasks not finished in it (or of no known task): "
@@ -473,7 +477,7 @@ def measure(root, since, until):
         "build_lock_wait_s": None,
     }
     if merged_with_run and len(merged_with_run) < n:
-        notes.append(f"{n - len(merged_with_run)} of {n} merged tasks have no coder run recorded: "
+        notes.append(f"{n - len(merged_with_run)} of {n} merged tasks have no coder run recorded with known tokens: "
                      f"coder_tokens_per_merged divides by the {len(merged_with_run)} that have one")
     if not coder_runs:
         notes.append("no coder runs of tasks that ended in this window in state/agent-runs.tsv: coder tokens not known")
