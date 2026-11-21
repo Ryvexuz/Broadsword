@@ -7,11 +7,17 @@ Approved as a process gap by Lazlo on 2026-11-21 04:39Z (cmsg_019Gy38ApTnA8WHdHw
 
 Source: the task records in `state/tasks/*.task` (fields `created`, `started`, `ended`, `claims`, epoch seconds; read-only) and the log
 lines in `state/pc-progress.md` that name `broadsword.toml`. Every figure below comes from the committed script `scripts/tomlwait.py` (run
-from the project root as `build/bin/broadsword.exe run broadsword -- python -I scripts/tomlwait.py`; it reads the main checkout's
-`state/tasks`), not from hand arithmetic. It takes every task whose `claims` list names `broadsword.toml` or a `config/*.toml` file and
+from the worktree or project root; it reads the main checkout's `state/tasks`, found as `../../../state/tasks`), not from hand
+arithmetic. The window has no defaults: `--start` and `--end` (UTC, `YYYY-MM-DDTHH:MM:SSZ`) are both required, and a missing one exits 2. It takes every task whose `claims` list names `broadsword.toml` or a `config/*.toml` file and
 that was created from 2026-11-20 09:00Z to 2026-11-21 04:40Z. Columns: wait_min = created to started (to ended for an abandoned task
 that never started, else to the window end), hold_min = started to ended (or window end), overlap_min = the part of the wait during
-which another listed task held the claim. Its output, pasted unchanged:
+which another listed task held the claim. The command, then its output pasted unchanged:
+
+```
+build/bin/broadsword.exe run broadsword --task t-20261121-044024-4 -- python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z
+```
+
+
 
 ```
 window 11-20 09:00:00 to 11-21 04:40:00 minutes 1180.0
@@ -116,7 +122,7 @@ still hot (18 claims for config.rs). Splitting the toml removes one of three con
 which is outside this note, is to move each area's keys into its own struct module so `config.rs` stops being one claim; then it can
 be measured the same way. I do not claim the split alone cuts waits by a number; section 6 says how to measure it.
 
-## 5. Proposed layout (53 keys)
+## 5. Proposed layout (53 existing keys; 54 once `config_files` is added)
 
 | file | keys | count | why it lives there |
 |---|---|---|---|
@@ -126,7 +132,8 @@ be measured the same way. I do not claim the split alone cuts waits by a number;
 | `config/review.toml` | `reviewer_backend`, `reviewer_cli`, `reviewer_model_low`, `reviewer_model_high`, `reviewer_model_high_fallback`, `reviewer_model_high_gpt`, `reviewer_effort_high`, `reviewer_timeout_seconds`, `reviewer_diff_max_kb`, `reviewer_brief_max_kb`, `reviewer_check_tail_kb`, `reviewer_max_calls_per_entry`, `shadow_reviewer`, `shadow_reviewer_model`, `shadow_reviewer_timeout_seconds` | 15 | reviewer and shadow reviewer models, edited for model switches |
 | `config/test.toml` | `build_lock_wait_seconds`, `python_tests`, `test_parallel_binaries`, `test_output_wait_seconds` | 4 | test and check job settings |
 
-Total 24 + 4 + 6 + 15 + 4 = 53 existing keys, so nothing is added or dropped except `config_files`. (I counted the 15 review keys from
+Total 24 + 4 + 6 + 15 + 4 = 53 existing keys (the `grep -cE` count of the current `broadsword.toml` is also 53). After the move the
+set is those 53 plus `config_files`, 54 keys in all; no existing key is added or dropped. (I counted the 15 review keys from
 lines 51 to 62 and 73 to 76 of the current file; the sum matches the 53.) The assignment is a proposal: the task that does the move
 re-counts with the grep above and stops if the numbers differ.
 
@@ -192,8 +199,12 @@ minutes, (c) 653.2 minutes (10.89 hours). Also from that output: 649.9 minutes o
 window, 5 tasks open and unstarted. The 257.4 minutes of section 1 is a different, narrower reading (four tasks the log ties to the
 toml); it is not a baseline for these measures.
 
-How the change is judged: after the move merges, run the same committed script with the same arguments over the next 20 toml-area tasks or the
-next 24 hours, whichever is longer, with the `config/*.toml` match already in the script, and compare lines (a), (b) and (c).
+How the change is judged: after the move merges, run the committed script over the next 20 toml-area tasks or the next 24 hours, whichever is longer, with the `config/*.toml` match
+already in the script, and compare lines (a), (b) and (c). The window is named in the command; there are no defaults.
+Baseline command (already run, section 1):
+`build/bin/broadsword.exe run broadsword --task t-20261121-044024-4 -- python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z`
+After command (new window): `build/bin/broadsword.exe run broadsword --task <after task id> -- python -I scripts/tomlwait.py --start <window start, UTC> --end <window end, UTC>`,
+where the start is the created time of the first toml-area task after the move and the end is the later of 20 such tasks or 24 hours after it.
 Divide (b) and (c) by the window minutes before comparing, since the windows differ. Keep the split if (b) and (c) per window minute drop and no new
 class of failure appears. Revert (section 7 step 7)
 if either of these happens:

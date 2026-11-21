@@ -1,15 +1,15 @@
 """Toml-claim wait and hold measure for docs/CONFIG-SPLIT.md (sections 1 and 8).
 
-Usage (from the project root; the task records live outside Git):
-    python -I scripts/tomlwait.py [tasks_dir [window_start_epoch [now_epoch]]]
-Defaults: tasks_dir = state/tasks (relative to the current folder: the
-main checkout three levels above a worktree, first; the worktree's own state/tasks is a stale copy), window 2026-11-20T09:00:00Z to
-2026-11-21T04:40:00Z (the section 1 baseline).
+Usage (run from the worktree or the project root; the task records live outside Git):
+    python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z [--tasks-dir DIR]
+--start and --end are both required UTC times in the form YYYY-MM-DDTHH:MM:SSZ. There are no defaults:
+a missing or malformed argument exits 2 with a usage message. Any task record with a missing or malformed
+claims line exits 2 and names the file.
 
 Takes every task whose `claims` names broadsword.toml or a config/*.toml file and
-that was created inside the window. Per task, in minutes:
-  wait    = created -> started (or ended if abandoned unstarted, else now)
-  hold    = started -> ended (or now, if still running); 0 if never started
+that was created inside the window [--start, --end]. Per task, in minutes:
+  wait    = created -> started (or ended if abandoned unstarted, else the window end)
+  hold    = started -> ended (or the window end, if still running); 0 if never started
   overlap = part of the wait during which ANOTHER listed task held the claim
 Summary measures (named in docs/CONFIG-SPLIT.md section 8):
   measure_a = number of tasks listed
@@ -17,23 +17,40 @@ Summary measures (named in docs/CONFIG-SPLIT.md section 8):
   measure_c = minutes during which at least one task held the claim while at
               least one other listed task was waiting (as a time union)
 """
+import argparse
+import datetime
 import glob
 import os
 import re
 import sys
-import datetime
 
-WIN_START = 1795165200  # 2026-11-20T09:00:00Z
-NOW = 1795236000        # 2026-11-21T04:40:00Z
+ISO_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
+CLAIM_SPLIT = re.compile(re.escape(chr(92) + 'n') + '|' + chr(10))
+
+
+def fail(msg):
+    print('tomlwait: ' + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def parse_utc(text):
+    try:
+        t = datetime.datetime.strptime(text, ISO_FORMAT).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected UTC time YYYY-MM-DDTHH:MM:SSZ, got %r' % text)
+    return int(t.timestamp())
 
 
 def find_tasks_dir(arg):
+    """Return the task records folder: the --tasks-dir value if one was given. Otherwise
+    try ../../../state/tasks, then state/tasks, both relative to the current folder, and
+    return the first that is a directory. Exits 2 if neither is one."""
     if arg:
         return arg
     for cand in ('../../../state/tasks', 'state/tasks'):
         if os.path.isdir(cand):
             return cand
-    sys.exit('tomlwait: no state/tasks folder found; pass the tasks dir as the first argument')
+    fail('no state/tasks folder found; pass --tasks-dir')
 
 
 def is_toml_claim(c):
@@ -41,17 +58,35 @@ def is_toml_claim(c):
     return c == 'broadsword.toml' or (c.startswith('config/') and c.endswith('.toml'))
 
 
+def read_record(f):
+    d = {}
+    with open(f, encoding='utf8') as fh:
+        for l in fh:
+            if ' = ' in l:
+                k, v = l.rstrip('\n').split(' = ', 1)
+                d[k] = v
+    return d
+
+
+def claim_entries(f, d):
+    """The claim entries of one record. The record must carry a claims line, and every
+    entry (split on a literal backslash-n or a newline) must be non-empty with no
+    leading or trailing spaces. Anything else is malformed: exit 2, naming the file."""
+    if 'claims' not in d:
+        fail('%s: no claims line' % f)
+    raw = d['claims']
+    entries = CLAIM_SPLIT.split(raw)
+    if any(e.strip() == '' or e != e.strip() for e in entries):
+        fail('%s: malformed claims line %r (empty value, empty entry or padded entry)' % (f, raw))
+    return entries
+
+
 def load(tasks_dir, win_start, now):
     rows = []
     for f in sorted(glob.glob(os.path.join(tasks_dir, '*.task'))):
-        d = {}
-        with open(f, encoding='utf8') as fh:
-            for l in fh:
-                if ' = ' in l:
-                    k, v = l.rstrip('\n').split(' = ', 1)
-                    d[k] = v
-        cl = re.split(re.escape(chr(92) + 'n') + '|' + chr(10), d.get('claims', ''))
-        if any(is_toml_claim(c) for c in cl) and win_start <= int(d.get('created', '0')) <= now:
+        d = read_record(f)
+        entries = claim_entries(f, d)
+        if any(is_toml_claim(c) for c in entries) and win_start <= int(d.get('created', '0')) <= now:
             d['_c'] = int(d['created'])
             d['_s'] = int(d['started']) if d.get('started') else None
             d['_e'] = int(d['ended']) if d.get('ended') else None
@@ -90,13 +125,18 @@ def union_len(ivs):
 
 
 def main():
-    a = sys.argv[1:]
-    tasks_dir = find_tasks_dir(a[0] if len(a) > 0 else None)
-    win_start = int(a[1]) if len(a) > 1 else WIN_START
-    now = int(a[2]) if len(a) > 2 else NOW
+    ap = argparse.ArgumentParser(description='Toml-claim wait and hold measure (docs/CONFIG-SPLIT.md section 8).')
+    ap.add_argument('--start', type=parse_utc, required=True, help='window start, UTC, YYYY-MM-DDTHH:MM:SSZ')
+    ap.add_argument('--end', type=parse_utc, required=True, help='window end, UTC, YYYY-MM-DDTHH:MM:SSZ')
+    ap.add_argument('--tasks-dir', default=None, help='task records folder (default: found as in find_tasks_dir)')
+    args = ap.parse_args()
+    win_start, now = args.start, args.end
+    if now <= win_start:
+        fail('--end must be later than --start')
+    tasks_dir = find_tasks_dir(args.tasks_dir)
     rows = load(tasks_dir, win_start, now)
     if not rows:
-        sys.exit('tomlwait: no toml-claiming task in the window (empty input is an error)')
+        fail('no toml-claiming task in the window (empty input is an error)')
     fmt = lambda t: datetime.datetime.fromtimestamp(int(t), datetime.timezone.utc).strftime('%m-%d %H:%M:%S')
     win_min = (now - win_start) / 60
     print('window', fmt(win_start), 'to', fmt(now), 'minutes %.1f' % win_min)
