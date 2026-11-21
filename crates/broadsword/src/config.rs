@@ -77,8 +77,6 @@ pub struct Config {
     pub install_dir: PathBuf,
     pub mcp_call_timeout_seconds: u64,
     pub mcp_output_max_kb: u64,
-    /// How long one `clients/codex_coder.py` run (a whole GPT coding task) may take before it is killed. Read by that Python client, which loads this key itself.
-    pub codex_coder_timeout_seconds: u64,
     pub checkpoint_ignored_max_mb: u64,
     pub max_resumes: u64,
     pub job_disk_reserve_gb: u64,
@@ -296,6 +294,8 @@ impl Config {
         check_folders_apart(&scratch_dir, &build_dir, &state_dir, &install_dir, &worktrees_dir)?;
         let positive = |k: &str| get_int(&m, k).and_then(|v| if v == 0 { Err(format!("{k}: must be at least 1")) } else { Ok(v) });
         let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
+        // read only by clients/codex_coder.py, which loads this key itself: validated here so a missing or 0 value is refused at load, and not stored (no field nothing reads)
+        positive("codex_coder_timeout_seconds")?;
         let reviewer_backend = get_str(&m, "reviewer_backend")?;
         if reviewer_backend != "claude" {
             return Err(format!("reviewer_backend = \"{reviewer_backend}\": only \"claude\" is supported"));
@@ -379,7 +379,6 @@ impl Config {
             install_dir,
             mcp_call_timeout_seconds,
             mcp_output_max_kb,
-            codex_coder_timeout_seconds: positive("codex_coder_timeout_seconds")?,
             checkpoint_ignored_max_mb: get_int(&m, "checkpoint_ignored_max_mb")?,
             max_resumes: get_int(&m, "max_resumes")?,
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
@@ -476,7 +475,7 @@ mod tests {
         assert_eq!(c.state_dir, Path::new("proj").join(".").join("state"));
         assert!(c.checkpoint_ignored_max_mb > 0 && c.max_resumes > 0);
         assert_eq!(c.install_dir, Path::new("proj").join(".").join("build/bin"));
-        assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0 && c.codex_coder_timeout_seconds > 0);
+        assert!(c.mcp_call_timeout_seconds > 0 && c.mcp_output_max_kb > 0);
         assert_eq!(c.worktrees_dir, Path::new("proj").join(".").join("worktrees"));
         assert!(c.build_lock_wait_seconds > 0);
     }

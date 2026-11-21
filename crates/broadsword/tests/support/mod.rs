@@ -35,6 +35,7 @@ const BASE: &[(&str, &str)] = &[
     ("install_dir", "\"build/bin\""),
     ("mcp_call_timeout_seconds", "1800"),
     ("mcp_output_max_kb", "1024"),
+    ("codex_coder_timeout_seconds", "1800"),
     ("checkpoint_ignored_max_mb", "50"),
     ("max_resumes", "3"),
     ("job_disk_reserve_gb", "0"),
