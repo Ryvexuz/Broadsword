@@ -356,6 +356,32 @@ class RunOpenAI(unittest.TestCase):
         self.assertEqual(m["gpt-4o"]["max_output_tokens"], 16384)
         self.assertEqual(m["gpt-4o-mini"]["max_output_tokens"], 16384)
 
+    def test_real_models_json_loads_with_a_list_price_and_source_on_every_row(self):
+        m = ro.load_models(REAL_HERE.parent / "models.json")
+        for name, spec in m.items():
+            with self.subTest(model=name):
+                self.assertGreater(spec["price_usd_per_mtok"]["input"], 0)
+                self.assertGreater(spec["price_usd_per_mtok"]["output"], 0)
+                self.assertIsInstance(spec["price_source"], str)
+
+    def test_a_malformed_price_is_refused_with_a_named_error(self):
+        good = {"api": "chat", "max_output_tokens": 20000, "service_tiers": ["default"]}
+        bad_prices = {"not a dict": 5, "missing output": {"input": 1}, "zero": {"input": 0, "output": 1}, "negative": {"input": 1, "output": -2},
+                      "string": {"input": "1", "output": 2}, "bool": {"input": True, "output": 2}, "nan": {"input": float("nan"), "output": 2},
+                      "inf": {"input": 1, "output": float("inf")}, "extra key": {"input": 1, "output": 2, "x": 3}}
+        for label, price in bad_prices.items():
+            with self.subTest(price=label):
+                (self.tmp / "models.json").write_text(json.dumps({"models": {"gpt-fake": dict(good, price_usd_per_mtok=price)}}), encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    ro.load_models(self.tmp / "models.json")
+                self.assertIn("price_usd_per_mtok", str(cm.exception))
+        (self.tmp / "models.json").write_text(json.dumps({"models": {"gpt-fake": dict(good, price_source=7)}}), encoding="utf-8")
+        with self.assertRaises(SystemExit) as cm:
+            ro.load_models(self.tmp / "models.json")
+        self.assertIn("price_source", str(cm.exception))
+        (self.tmp / "models.json").write_text(json.dumps({"models": {"gpt-fake": dict(good, price_usd_per_mtok={"input": 1.5, "output": 2}, price_source="s")}}), encoding="utf-8")
+        self.assertEqual(ro.load_models(self.tmp / "models.json")["gpt-fake"]["price_usd_per_mtok"], {"input": 1.5, "output": 2})
+
     def test_help_makes_no_network_call(self):
         p = subprocess.run([sys.executable, "-I", "-B", str(REAL_HERE / "run_openai.py"), "--help"],
                            capture_output=True, text=True, timeout=60, env={k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"})

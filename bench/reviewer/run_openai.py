@@ -28,7 +28,7 @@ oc = _load("openai_mcp", HERE.parent.parent / "clients" / "openai_mcp.py")
 
 
 MODELS_FILE = HERE.parent / "models.json"  # bench/models.json: per-model API kind, token cap and tiers
-MODEL_KEYS = {"api", "max_output_tokens", "service_tiers", "note"}
+MODEL_KEYS = {"api", "max_output_tokens", "service_tiers", "note", "price_usd_per_mtok", "price_source"}
 API_KINDS = ("chat", "responses")
 TIERS = ("default", "flex", "fast")
 
@@ -49,6 +49,13 @@ def load_models(path=None):
               and all(t in TIERS for t in spec["service_tiers"]))
         if not ok:
             sys.exit(f"{path}: the entry for {name!r} is invalid (needs api in {API_KINDS}, max_output_tokens > 0, service_tiers from {TIERS})")
+        if "price_usd_per_mtok" in spec:
+            p = spec["price_usd_per_mtok"]
+            if not (isinstance(p, dict) and set(p) == {"input", "output"}
+                    and all(isinstance(p[k], (int, float)) and not isinstance(p[k], bool) and 0 < p[k] < float("inf") for k in p)):
+                sys.exit(f"{path}: the entry for {name!r} has an invalid price_usd_per_mtok (needs {{\"input\": x, \"output\": y}}, both finite numbers > 0)")
+        if "price_source" in spec and not isinstance(spec["price_source"], str):
+            sys.exit(f"{path}: the entry for {name!r} has an invalid price_source (needs a string)")
     return models
 
 
