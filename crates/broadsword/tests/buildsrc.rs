@@ -544,21 +544,21 @@ fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build(
     assert!(!stale.exists());
 }
 
-/// Round 10 (review q-20261121-032813), the shared part of the reviewer's sequence: project A (`proj`) and project B (`projb`)
-/// both have a package `markprobe`. A's main build is kept; then, while A's kept copy runs, A's main checkout is rebuilt
-/// (MARK-main2), so the copy is marked stale and A's newer exe is only in cargo's folder. Returns B's task id, the running copy,
-/// A's kept exe and its stale marker.
+/// Round 10 (review q-20261121-032813), the shared part of the reviewer's sequence: project A (`proj`, package `markprobe`) and
+/// project B (`projb`, package `b_package`) both build a bin `markprobe`, so both write `build/<profile>/markprobe.exe`. A's
+/// main build is kept; then, while A's kept copy runs, A's main checkout is rebuilt (MARK-main2), so the copy is marked stale
+/// and A's newer exe is only in cargo's folder. Returns B's task id, the running copy, A's kept exe and its stale marker.
+/// Round 11 (review q-20261121-041528) uses it with another package name for B: only the bin (exe path) is shared.
 #[cfg(windows)]
-fn shared_package_name_with_a_stale_copy_in_use(r: &Root) -> (String, Child, PathBuf, PathBuf) {
+fn shared_exe_path_with_a_stale_copy_in_use(r: &Root, b_package: &str) -> (String, Child, PathBuf, PathBuf) {
     let proj = r.dir.join("projects/proj");
     fs::write(proj.join("src/main.rs"), "fn main() {\n    if std::env::args().nth(1).as_deref() == Some(\"wait\") {\n        std::thread::sleep(std::time::Duration::from_secs(120));\n    }\n    print!(\"{}\", markprobe::MARKER);\n}\n").unwrap();
-    // project B: another repo whose package has the same name
+    // project B: another repo whose package `b_package` has a bin named `markprobe`
     let b = r.dir.join("projects/projb");
     fs::create_dir_all(b.join("src")).unwrap();
-    fs::write(b.join("Cargo.toml"), "[package]\nname = \"markprobe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+    fs::write(b.join("Cargo.toml"), format!("[package]\nname = \"{b_package}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"markprobe\"\npath = \"src/main.rs\"\n\n[workspace]\n")).unwrap();
     fs::write(b.join(".gitignore"), "target\n").unwrap();
-    fs::write(b.join("src/main.rs"), "fn main() { print!(\"{}\", markprobe::MARKER); }\n").unwrap();
-    set_marker(&b, "MARK-b");
+    fs::write(b.join("src/main.rs"), "fn main() { print!(\"MARK-b\"); }\n").unwrap();
     git(&b, &["init", "-q", "-b", "main"]);
     git(&b, &["config", "core.autocrlf", "false"]);
     git(&b, &["add", "."]);
@@ -585,7 +585,7 @@ fn shared_package_name_with_a_stale_copy_in_use(r: &Root) -> (String, Child, Pat
 #[test]
 fn another_projects_worktree_with_the_same_package_name_refuses_while_the_stale_copy_is_in_use() {
     let r = Root::new("sharedrefuse", 120);
-    let (tb, mut running, kept, stale) = shared_package_name_with_a_stale_copy_in_use(&r);
+    let (tb, mut running, kept, stale) = shared_exe_path_with_a_stale_copy_in_use(&r, "markprobe");
     let o = r.run(&["run", "projb", "--task", &tb, "--", "echo", "nothing"]);
     let left = r.probe();
     let _ = running.kill();
@@ -603,7 +603,7 @@ fn another_projects_worktree_with_the_same_package_name_refuses_while_the_stale_
 #[test]
 fn another_projects_worktree_with_the_same_package_name_keeps_the_vouched_exe_before_its_clean() {
     let r = Root::new("sharedkeep", 120);
-    let (tb, mut running, kept, stale) = shared_package_name_with_a_stale_copy_in_use(&r);
+    let (tb, mut running, kept, stale) = shared_exe_path_with_a_stale_copy_in_use(&r, "markprobe");
     let _ = running.kill();
     let _ = running.wait();
     let o = r.ok(&["run", "projb", "--task", &tb, "--", "echo", "nothing"]);
@@ -612,6 +612,45 @@ fn another_projects_worktree_with_the_same_package_name_keeps_the_vouched_exe_be
     assert_eq!(String::from_utf8_lossy(&printed.stdout), "MARK-main2", "A's newest successful build reached main.bins/proj before B's clean");
     assert!(!stale.exists(), "the copy is fresh again");
     assert!(!r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX)).exists(), "and B's clean ran");
+}
+
+/// Round 11 (review q-20261121-041528): B's package has ANOTHER name (`otherpkg`) but the same bin name `markprobe`, so both
+/// projects write `build/debug/markprobe.exe`. While A's stale kept copy is in use, B's worktree job must refuse before it
+/// cleans or builds that path. On dd272911 B's job matched other projects by package name only, found none, and went on (this
+/// test failed at the refusal assertion). Windows only (in use).
+#[cfg(windows)]
+#[test]
+fn another_projects_worktree_with_only_the_same_bin_name_refuses_while_the_stale_copy_is_in_use() {
+    let r = Root::new("binrefuse", 120);
+    let (tb, mut running, kept, stale) = shared_exe_path_with_a_stale_copy_in_use(&r, "otherpkg");
+    let o = r.run(&["run", "projb", "--task", &tb, "--", "cargo", "build", "--offline"]);
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let left = fs::read(&exe).ok();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_ne!(o.code, 0, "B's job must be refused while A's vouched copy is in use:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("before cleaning `otherpkg`"), "{}", o.stderr);
+    let printed = Command::new(&exe).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    assert!(left.is_some() && printed == "MARK-main2", "A's newer exe is still in cargo's folder, not removed or overwritten (it prints {printed:?})");
+    assert!(stale.is_file() && kept.is_file());
+}
+
+/// Round 11 (review q-20261121-041528): once A's stale kept copy is free, B's worktree job (package `otherpkg`, bin `markprobe`)
+/// first keeps A's newer exe in main.bins/proj, then cleans and builds its own exe at the same path. On dd272911 the job lost
+/// A's MARK-main2 (main.bins kept the older MARK-main; this test failed at the `kept main's` assertion). Windows only.
+#[cfg(windows)]
+#[test]
+fn another_projects_worktree_with_only_the_same_bin_name_keeps_the_vouched_exe_before_writing_its_path() {
+    let r = Root::new("binkeep", 120);
+    let (tb, mut running, kept, stale) = shared_exe_path_with_a_stale_copy_in_use(&r, "otherpkg");
+    let _ = running.kill();
+    let _ = running.wait();
+    let o = r.ok(&["run", "projb", "--task", &tb, "--", "cargo", "build", "--offline"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug") && o.stdout.contains("cleaned `otherpkg`"), "{}", o.stdout);
+    let prints = |p: &Path| String::from_utf8_lossy(&Command::new(p).output().unwrap().stdout).into_owned();
+    assert_eq!(prints(&kept), "MARK-main2", "A's newest successful build reached main.bins/proj before B wrote the path");
+    assert!(!stale.exists(), "the copy is fresh again");
+    assert_eq!(prints(&r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX))), "MARK-b", "B's own build then wrote the shared path");
 }
 
 /// Round 10: if any project's packages cannot be listed, a clean is refused (fail closed): nothing then tells whether it would

@@ -59,8 +59,10 @@
 //!   not copied, and its kept copy and note stay as they are. So main.bins holds main's newest build of every bin a successful
 //!   step built;
 //! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), for the main checkout of EVERY
-//!   project that has a package of that name (`mains_with_packages`: cargo's folder is shared by package name, so a worktree
-//!   of project B can delete project A's main exe; if any project's packages cannot be listed the clean is refused), ONLY for a copy marked stale
+//!   project that has a bin with the same exe file name, in any package (`keep_mains_sharing_exe_paths` over
+//!   `mains_with_packages`: the shared thing is the exe PATH `<profile>/<bin><exe>`, so a worktree of project B, with the same
+//!   package name or only the same bin name, can remove or overwrite project A's main exe; a package-level clean is found
+//!   through its bins; if any project's packages cannot be listed the clean is refused), ONLY for a copy marked stale
 //!   (below) whose marker names exactly the exe still in cargo's folder (its length and modified time): that exe is the
 //!   successful build the refresh could not copy. Any other exe there (a failed or partial main build's leftovers, whose bin
 //!   note prepare already set to main) is never copied: main.bins keeps the last good copy.
@@ -811,15 +813,16 @@ type PackageBins = Vec<(String, Vec<String>)>;
 
 /// THE list of main checkouts and their packages that a clean must consider before it deletes a package's artifacts from the
 /// shared build folder: every project job.rs knows (`job::list_projects`: `broadsword` at the root and each project folder with
-/// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `bins_of`). Cargo's
-/// folder is shared by package NAME, so a clean of `p` from any folder may delete an exe that another project's main checkout
-/// built under the same name. A project folder with no Cargo.toml has no packages (cargo built nothing from it) and is left out.
+/// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `bins_of`). An exe
+/// path in cargo's folder is shared by every package with a bin of that name, so a clean or build from any folder may remove or
+/// overwrite an exe another project's main checkout built (`keep_mains_sharing_exe_paths` matches by exe name). A project
+/// folder with no Cargo.toml has no packages (cargo built nothing from it) and is left out.
 /// Err = some project's packages cannot be listed: the caller refuses the clean (fail closed), because nothing then tells whether
 /// that project's main binaries would be deleted.
 fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, PackageBins)>, String> {
     let mut out = Vec::new();
     for name in crate::job::list_projects(cfg) {
-        let refuse = |why: String| format!("refusing to clean: the packages of project `{name}` cannot be listed ({why}), so nothing tells whether this clean would delete a binary its main checkout built under the same package name; nothing was built or cleaned. Fix that project's Cargo.toml (or its folder) and repeat");
+        let refuse = |why: String| format!("refusing to clean: the packages of project `{name}` cannot be listed ({why}), so nothing tells whether this clean or build would remove or overwrite a binary its main checkout built at the same path; nothing was built or cleaned. Fix that project's Cargo.toml (or its folder) and repeat");
         let dir = crate::job::resolve_project(&cfg.root, &cfg.projects_dir, &name).map_err(refuse)?;
         if !dir.join("Cargo.toml").is_file() {
             continue;
@@ -828,6 +831,39 @@ fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, PackageBins)>, Strin
         out.push((main, bins_of(cfg, &dir).map_err(refuse)?));
     }
     Ok(out)
+}
+
+/// True if two bin target names give the same exe path in cargo's folder (`<profile>/<bin><EXE_SUFFIX>`): equal names, and on
+/// Windows equal without regard to ASCII case (its file names are case-insensitive; a bin name is plain ASCII).
+fn same_exe_name(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// THE check before a job of `source` cleans package `pkg` (whose bin targets in the job's folder are `bins`) and then builds:
+/// what is shared, and can be lost, is an exe PATH in cargo's folder, `<profile>/<bin><EXE_SUFFIX>`, whichever package produces
+/// it. The paths this job can remove or write are its own bins of `pkg`, plus the bins of a package named `pkg` in any main
+/// checkout (a package-level clean: the old package-name match is this case). For EVERY other main checkout in `mains`
+/// (`mains_with_packages`) that has a bin, in any package, with one of those exe names, keep-or-refuse runs for that bin
+/// (`keep_main_bins` with `Keep::BeforeForeignClean`: the bin note says whether that main checkout built the exe there; a vouched
+/// exe is kept, one in use refuses the job, anything else is left). Err = the job is refused before anything is cleaned.
+fn keep_mains_sharing_exe_paths(cfg: &Config, source: &str, mains: &[(String, PackageBins)], pkg: &str, bins: &[String]) -> Result<Vec<String>, String> {
+    let mut names: Vec<&str> = bins.iter().map(String::as_str).collect();
+    for (_, targets) in mains {
+        for (_, bs) in targets.iter().filter(|(n, _)| n == pkg) {
+            names.extend(bs.iter().map(String::as_str));
+        }
+    }
+    let when = format!("before cleaning `{pkg}` (this job is refused: `{pkg}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)");
+    let mut lines = Vec::new();
+    for (m, targets) in mains.iter().filter(|(m, _)| m != source) {
+        for (owner, bs) in targets {
+            let shared: Vec<String> = bs.iter().filter(|b| names.iter().any(|n| same_exe_name(n, b))).cloned().collect();
+            if !shared.is_empty() {
+                lines.extend(keep_main_bins(cfg, m, owner, &shared, &when, Keep::BeforeForeignClean)?);
+            }
+        }
+    }
+    Ok(lines)
 }
 
 /// Write `text` and a newline to `path` atomically (temp file, flushed, renamed).
@@ -1073,18 +1109,13 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
     // main's binaries: before a job of ANOTHER folder cleans a package, a successful main build that main.bins could not take yet
-    // (its copy was in use) is kept (see `keep_main_bins`), for EVERY project whose main checkout has a package of that name
-    // (cargo's folder is shared by package name, so another project's main exe can be the one this clean deletes). Nothing is
+    // (its copy was in use) is kept (see `keep_main_bins`), for EVERY project whose main checkout has a bin with the same exe
+    // name (`keep_mains_sharing_exe_paths`: an exe path is shared whichever package builds it, so another project's main exe can
+    // be the one this clean removes or the build after it overwrites). Nothing is
     // ever copied back into cargo's folder after the clean: it then holds only what this job builds.
     let mains = if stale.is_empty() { Vec::new() } else { mains_with_packages(cfg)? };
     for (p, was) in &stale {
-        for (m, targets) in mains.iter().filter(|(m, _)| m != source) {
-            let Some((_, main_bins)) = targets.iter().find(|(n, _)| n == p) else { continue };
-            // what the clean deletes is this job's bins of `p`; what that main checkout keeps is its own bins of `p`: both
-            let mut bins: Vec<String> = bins_of_pkg(p).to_vec();
-            bins.extend(main_bins.iter().filter(|b| !bins_of_pkg(p).contains(b)).cloned());
-            lines.extend(keep_main_bins(cfg, m, p, &bins, &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), Keep::BeforeForeignClean)?);
-        }
+        lines.extend(keep_mains_sharing_exe_paths(cfg, source, &mains, p, bins_of_pkg(p))?);
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };
             let out = clean_command(cfg, dir, p, profile)?.output().map_err(|e| format!("cannot start `cargo clean -p {p}{flag}`: {e}"))?;
