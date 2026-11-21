@@ -10,8 +10,10 @@ sys.dont_write_bytecode = True
 import contextlib
 import importlib.util
 import io
+import os
 import pathlib
 import re
+import subprocess
 import tempfile
 import unittest
 
@@ -195,6 +197,49 @@ class Completion(unittest.TestCase):
         rows = self.costs(tasks, entries, [])
         self.assertEqual(rows["t1"]["usd_unknown"], 1)
         self.assertIn("1 review(s) without a price", self.completion_text(tasks, entries))
+
+
+class TrainMemberCommits(unittest.TestCase):
+    """A train member's merged entry has base_head older than the train below it: main_sha includes the other members'
+    commits. Only the member's own commits (train_up..main_sha) may count as its coding time."""
+
+    def git(self, repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, repo, msg, when):
+        env = dict(os.environ, GIT_AUTHOR_DATE=f"{when} +0000", GIT_COMMITTER_DATE=f"{when} +0000")
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "commit", "-q", "--allow-empty", "-m", msg], check=True, capture_output=True, env=env)
+        return self.git(repo, "rev-parse", "HEAD")
+
+    def test_train_member_counts_only_its_own_commits(self):
+        T = 1795150000  # task created and started at T
+        with scratch_tmp() as d:
+            old = dm.ROOT
+            root = pathlib.Path(d)
+            try:
+                self.git(root, "init", "-q")
+                base = self.commit(root, "base", T - 50)
+                other = self.commit(root, "other task, train member below", T + 900)  # newer author time: wrong range would show it
+                own = self.commit(root, "own task commit", T + 100)
+                (root / "state" / "tasks").mkdir(parents=True)
+                (root / "state" / "queue").mkdir()
+                (root / "state" / "tasks" / "t-test-train.task").write_text(
+                    f"id = t-test-train\nstatus = done\nproject = broadsword\ntitle = train member\n"
+                    f"created = {T}\nstarted = {T}\nended = {T + 1000}\n", encoding="utf-8")
+                (root / "state" / "queue" / "q-test-train.entry").write_text(
+                    f"id = q-test-train\ntask = t-test-train\nstatus = merged\nproject = broadsword\nverdict = PASS\n"
+                    f"created = {T + 200}\nended = {T + 300}\ncoder = sonnet\nreviewer_model = haiku\n"
+                    f"base_head = {base}\nmain_sha = {own}\ntrain_up = {other}\n", encoding="utf-8")
+                dm.ROOT = root
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    dm.main()
+            finally:
+                dm.ROOT = old
+        row = next(ln.split() for ln in buf.getvalue().splitlines() if ln.startswith("t-test-train"))
+        # columns: id, project, status, lead, coding, ...; coding = own commit (T+100) - start (T) = 1m40s
+        self.assertEqual(row[4], "1m40s", buf.getvalue())
 
 
 if __name__ == "__main__":

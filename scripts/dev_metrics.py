@@ -139,8 +139,17 @@ def covered(intervals, lo, hi):
     return total
 
 
+def coder_base(src, merged):
+    """The commit before the coder's own commits, for the entry src. A merged train member has train_up: the main tip it
+    was merged on top of. Its base_head is older and its main_sha includes the commits of the members merged before it,
+    so base_head would count their commits as its own. Other entries use base_head, as before."""
+    if merged and src.get("train_up"):
+        return src.get("train_up")
+    return src.get("base_head")
+
+
 def main():
-    since = sys.argv[sys.argv.index("--since") + 1] if "--since" in sys.argv else None
+    since =sys.argv[sys.argv.index("--since") + 1] if "--since" in sys.argv else None
     start_of = calendar.timegm(time.strptime(since, "%Y%m%d")) if since else 0
     now = int(time.time())
     tasks = [fields(p) for p in sorted((ROOT / "state" / "tasks").glob("*.task"))]
@@ -167,7 +176,7 @@ def main():
         # (a rejected or abandoned task still had coding time and handoff waits; that is the waste worth seeing).
         src = ok[-1] if ok else next((e for e in reversed(es) if e.get("base_head") and (e.get("checked_tip") or e.get("rebased_tip"))), None)
         tip = (src.get("main_sha") if ok else (src.get("checked_tip") or src.get("rebased_tip"))) if src else None
-        times = commit_times(t.get("project"), src.get("base_head"), tip) if src else []
+        times = commit_times(t.get("project"), coder_base(src, bool(ok)), tip) if src else []
         last = times[-1] if times else None
         q0 = num(es[0].get("created")) if es else None
         q1 = max((num(e.get("ended")) or 0 for e in es), default=0) or None
