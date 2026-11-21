@@ -2,6 +2,7 @@
 
 Run: python -I -B scripts/test_cold_move.py   (or python -I -m unittest scripts/test_cold_move.py -v)
 """
+import atexit
 import contextlib
 import io
 import os
@@ -46,6 +47,64 @@ def age(path, when=OLD):
     os.utime(path, (when, when))
 
 
+def build_fixture_repo(root):
+    """The fixture repo, built with real git calls. Used once per run as a template."""
+    root.mkdir()
+    git(root, "init", "-q")
+    put(root / "README.md", "hello")
+    # a tracked folder under reference/
+    put(root / "reference" / "tracked" / "a.txt", "tracked")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "init")
+    # untracked cold items
+    put(root / "cache" / "oldcache" / "x.bin", "x" * 1000)
+    put(root / "cache" / "oldcache" / "sub" / "y.bin", "y" * 10)
+    age(root / "cache" / "oldcache")
+    put(root / "cache" / "newcache" / "z.bin", "fresh")
+    put(root / "evidence" / "ev1" / "e.txt", "evidence")
+    put(root / "reference" / "ref1" / "r.txt", "reference")
+    (root / "state").mkdir()
+    put(root / "state" / "records" / "rec.txt", "record")
+    # worktrees
+    for name in ("t-done", "t-run"):
+        git(root, "worktree", "add", "-q", "-b", name, f"worktrees/proj/{name}")
+    put(root / "state" / "board.tsv", "t-done\tdone\nt-run\trunning\n")
+
+
+_TEMPLATE = {}
+
+
+def template_root():
+    """Build the template repo once per run (lazily); every test copies it, never shares it."""
+    if "root" not in _TEMPLATE:
+        tmp = tempfile.TemporaryDirectory()
+        atexit.register(tmp.cleanup)
+        _TEMPLATE["tmp"] = tmp
+        root = Path(tmp.name).resolve() / "internal"
+        build_fixture_repo(root)
+        _TEMPLATE["root"] = root
+    return _TEMPLATE["root"]
+
+
+def copy_fixture_repo(root):
+    """A private copy of the template at `root`. Git keeps absolute paths in the worktree links
+    (.git/worktrees/<n>/gitdir and <worktree>/.git); they are rewritten to the new place."""
+    src = template_root()
+    shutil.copytree(src, root)
+    link_files = list((root / ".git" / "worktrees").glob("*/gitdir"))
+    link_files += list((root / "worktrees").glob("*/*/.git"))
+    assert len(link_files) == 4, link_files
+    for f in link_files:
+        text = f.read_text(encoding="utf-8")
+        new = text.replace(src.as_posix(), root.as_posix()).replace(str(src), str(root))
+        assert new != text, f
+        # opened "r+": Windows refuses "w" on a hidden file, and git hides its dot files
+        with open(f, "r+", encoding="utf-8", newline="") as h:
+            h.seek(0)
+            h.write(new)
+            h.truncate()
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -53,27 +112,8 @@ class Fixture(unittest.TestCase):
         base = Path(self.tmp.name).resolve()
         self.root = base / "internal"
         self.ext = base / "external"
-        self.root.mkdir()
+        copy_fixture_repo(self.root)
         self.ext.mkdir()
-        git(self.root, "init", "-q")
-        put(self.root / "README.md", "hello")
-        # a tracked folder under reference/
-        put(self.root / "reference" / "tracked" / "a.txt", "tracked")
-        git(self.root, "add", "-A")
-        git(self.root, "commit", "-q", "-m", "init")
-        # untracked cold items
-        put(self.root / "cache" / "oldcache" / "x.bin", "x" * 1000)
-        put(self.root / "cache" / "oldcache" / "sub" / "y.bin", "y" * 10)
-        age(self.root / "cache" / "oldcache")
-        put(self.root / "cache" / "newcache" / "z.bin", "fresh")
-        put(self.root / "evidence" / "ev1" / "e.txt", "evidence")
-        put(self.root / "reference" / "ref1" / "r.txt", "reference")
-        (self.root / "state").mkdir()
-        put(self.root / "state" / "records" / "rec.txt", "record")
-        # worktrees
-        for name in ("t-done", "t-run"):
-            git(self.root, "worktree", "add", "-q", "-b", name, f"worktrees/proj/{name}")
-        put(self.root / "state" / "board.tsv", "t-done\tdone\nt-run\trunning\n")
         self.board = self.root / "state" / "board.tsv"
         self.approval = self.root / "state" / "cold-move-approved.txt"
 
