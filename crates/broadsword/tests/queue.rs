@@ -279,6 +279,29 @@ const WAIT_CEILING_FACTOR: u64 = 5;
 /// keep the two equal). An uncut hang keeps the run going this long, so a run that ends well before it was cut by the queue.
 const FAKE_HANG_CAP_SECONDS: u64 = 300;
 
+/// Seconds between two lines of an entry's recorded step log (`queue show`: `<YYYY-MM-DD HH:MM:SS UTC> <step>: <text>`): the LAST line
+/// containing `from` to the first later line containing `to`. Panics, naming the log, if either line is missing.
+fn recorded_span_secs(steps: &str, from: &str, to: &str) -> u64 {
+    fn secs(line: &str) -> u64 {
+        let t = line.trim_start();
+        let n: Vec<i64> = t.get(..19).unwrap_or("").split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty()).map(|x| x.parse().unwrap()).collect();
+        assert_eq!(n.len(), 6, "a step-log timestamp: {line}");
+        let (mut y, m, d) = (n[0], n[1], n[2]);
+        y -= (m <= 2) as i64;
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+        (days * 86400 + n[3] * 3600 + n[4] * 60 + n[5]) as u64
+    }
+    let lines: Vec<&str> = steps.lines().filter(|l| l.trim_start().starts_with("20")).collect();
+    let i = lines.iter().rposition(|l| l.contains(from) && l.contains("calling")).unwrap_or_else(|| panic!("no `{from}` call line in the step log:
+{steps}"));
+    let j = lines[i..].iter().position(|l| l.contains(to)).unwrap_or_else(|| panic!("no `{to}` line after the call in the step log:
+{steps}")) + i;
+    secs(lines[j]) - secs(lines[i])
+}
+
 /// A wait ceiling of `secs` seconds, scaled by `WAIT_CEILING_FACTOR`.
 fn ceiling(secs: u64) -> Duration {
     Duration::from_secs(secs * WAIT_CEILING_FACTOR)
@@ -779,14 +802,14 @@ fn a_reviewer_timeout_blocks_the_entry_with_no_verdict_and_it_can_be_retried() {
     fs::write(&hang, "1").unwrap();
     let main_before = r.head();
     let e = r.add(&id, "low", "sonnet");
-    let t0 = Instant::now();
     let o = r.run_env(&["queue", "run"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
-    // the whole run includes a check and the fake's own start, so the bound is half the hang cap, not the 2 s timeout: under load a
-    // run that is cut at 2 s still takes far longer than 2 s. An uncut hang runs the full FAKE_HANG_CAP_SECONDS (then the asserts below fail)
-    assert!(
-        t0.elapsed() < Duration::from_secs(FAKE_HANG_CAP_SECONDS / 2),
-        "the reviewer hang ({FAKE_HANG_CAP_SECONDS} s cap) must be cut at the 2 s timeout"
-    );
+    // the queue RECORDED when it called the reviewer and when it blocked the entry (the timestamps in the entry's step log): that span is the
+    // reviewer call alone, without the check or the process starts that load stretches. A hang the queue cuts at 2 s spans about 2 s; one it
+    // never cuts spans FAKE_HANG_CAP_SECONDS, so the bound is half of that
+    let steps = r.show(&e);
+    let span = recorded_span_secs(&steps, "reviewer `", ": blocked: ");
+    assert!(span < FAKE_HANG_CAP_SECONDS / 2, "the reviewer hang ({FAKE_HANG_CAP_SECONDS} s cap) must be cut at the 2 s timeout, the entry recorded {span} s:
+{steps}");
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "blocked");
     assert!(r.field(&e, "reason").contains("within 2 s") && r.field(&e, "reason").contains("no verdict"), "{}", r.field(&e, "reason"));
@@ -1440,27 +1463,11 @@ fn per_project_lock_lets_two_projects_drain_at_once_and_refuses_a_second_driver_
     assert_eq!(r.status(&qe), "merged", "reason = {}", r.field(&qe, "reason"));
     assert!(r.status(&pe).starts_with("running (interrupted"), "p's entry was interrupted: {}", r.status(&pe));
     // nothing the dead driver left blocks p: the next drain of p takes the lock at once, resumes the entry and merges it
-    // the test root's queue_lock_wait_seconds is 2 s, shorter than a drain, so for this one run it is raised to LOCK_WAIT_SECONDS: a
-    // stale holder makes the drain wait that whole setting and then exit 4, and the bound below is that setting (the earlier refused
-    // calls keep the 2 s, so they stay quick)
-    const LOCK_WAIT_SECONDS: u64 = 120;
-    train_set(
-        &r,
-        "queue_lock_wait_seconds",
-        &LOCK_WAIT_SECONDS.to_string(),
-    );
-    let t0 = Instant::now();
+    // no timing bound on the drain: the test root's queue_lock_wait_seconds is 2 s, so a stale holder makes the drain give up after 2 s
+    // with exit 4 ("queue busy"), which the exit code and stderr asserts below catch; how long the build and merge take is not the point
     let o = r.run(&["queue", "run", "--all", "--project", "p"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
-    assert!(
-        !o.stderr.contains("queue busy"),
-        "a stale holder blocked p: {}",
-        o.stderr
-    );
-    assert!(
-        t0.elapsed() < Duration::from_secs(LOCK_WAIT_SECONDS),
-        "the drain took as long as queue_lock_wait_seconds ({LOCK_WAIT_SECONDS} s): it waited for a stale holder"
-    );
+    assert!(!o.stderr.contains("queue busy"), "a stale holder blocked p: {}", o.stderr);
     assert!(o.stdout.contains("RESUMING"), "{}", o.stdout);
     assert_eq!(r.status(&pe), "merged", "reason = {}", r.field(&pe, "reason"));
     assert_eq!(r.run(&["queue", "run", "--all", "--project", "p"]).stdout.trim(), "the queue is empty for project `p`: nothing is queued, interrupted or stale");
