@@ -449,7 +449,7 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
     // Everything the command starts, so it can all be killed even after the command itself has exited (when `kill_tree` can
     // no longer find the tree from its pid). The child is still suspended here (Windows): it runs only once it is in the group,
     // and if that fails it never runs at all.
-    let group = match group::Group::start(&child) {
+    let group = match group::Group::start(&child, cfg) {
         Ok(g) => g,
         Err(e) => {
             let _ = child.kill();
@@ -577,7 +577,7 @@ mod group {
     impl Group {
         /// Put the SUSPENDED `child` (see `prepare`) in a new job, then resume it. Any failure is an error, and the caller kills
         /// the still-suspended child (fail closed: a command is never run outside its kill group).
-        pub fn start(child: &Child) -> Result<Group, String> {
+        pub fn start(child: &Child, _cfg: &crate::config::Config) -> Result<Group, String> {
             use std::os::windows::io::AsRawHandle;
             // SAFETY: plain kernel32 calls on a handle we own (the job) and the child's process handle, which `child` keeps open.
             let group = unsafe {
@@ -659,17 +659,18 @@ mod group {
         }
     }
 
+    /// The process group's id and the settings for the spawn helper that starts `kill`.
     #[cfg(not(windows))]
-    pub struct Group(u32);
+    pub struct Group(u32, crate::config::Config);
 
     #[cfg(not(windows))]
     impl Group {
-        pub fn start(child: &Child) -> Result<Group, String> {
-            Ok(Group(child.id()))
+        pub fn start(child: &Child, cfg: &crate::config::Config) -> Result<Group, String> {
+            Ok(Group(child.id(), cfg.clone()))
         }
 
         pub fn kill(&self) -> bool {
-            std::process::Command::new("kill").args(["-9", "--", &format!("-{}", self.0)]).status().is_ok_and(|s| s.success())
+            crate::scrub::command(&self.1, "kill").args(["-9", "--", &format!("-{}", self.0)]).status().is_ok_and(|s| s.success())
         }
     }
 }
@@ -951,8 +952,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_kill_group_takes_only_a_child_created_suspended() {
+        let cfg = Config::load_from(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
         let spawn = |suspended: bool| {
-            let mut c = std::process::Command::new("cmd.exe");
+            let mut c = scrub::command(&cfg, "cmd.exe"); // the one spawn helper, as run_one
             c.args(["/C", "ping -n 3 127.0.0.1 >nul"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             if suspended {
                 group::prepare(&mut c);
@@ -961,12 +963,12 @@ mod tests {
         };
         let mut running = spawn(false);
         std::thread::sleep(Duration::from_millis(200));
-        let e = group::Group::start(&running).err().expect("a running child is refused");
+        let e = group::Group::start(&running, &cfg).err().expect("a running child is refused");
         assert!(e.contains("was already running"), "{e}");
         let _ = running.kill();
         let _ = running.wait();
         let mut held = spawn(true);
-        let g = group::Group::start(&held).expect("a suspended child is put in the group and resumed");
+        let g = group::Group::start(&held, &cfg).expect("a suspended child is put in the group and resumed");
         assert!(g.kill(), "the group can be killed");
         assert!(held.wait().is_ok());
     }
