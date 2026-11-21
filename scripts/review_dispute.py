@@ -131,14 +131,22 @@ def read_entry(root: Path, cfg: dict, entry: str) -> dict:
 
 
 def finding_is_recorded(root: Path, cfg: dict, e: dict, finding: str) -> bool:
-    hay = [e.get(k, "") for k in ("blocking", "shadow_blocking", "minor")]
+    """True only if `finding` equals ONE whole recorded finding (one entry-field item, or one line of the review/shadow file),
+    compared after whitespace normalisation only. A fragment of a finding or a span across two findings is never recorded:
+    the referee must rule on the claim the reviewer actually made."""
+    want = norm(finding)
+    if not want:
+        return False
+    units = []
+    for k in ("blocking", "shadow_blocking", "minor"):
+        units.extend(e.get(k, "").split("\\n"))  # the entry file joins findings with a literal backslash-n
     for k in ("review_file", "shadow_file"):
         rel = e.get(k, "").strip()
         if rel and not Path(rel).is_absolute() and ".." not in Path(rel).parts:
             p = root / rel
             if p.is_file():
-                hay.append(p.read_text(encoding="utf-8", errors="replace"))
-    return norm(finding) in norm("\n".join(hay))
+                units.extend(p.read_text(encoding="utf-8", errors="replace").splitlines())
+    return any(norm(u) == want for u in units)
 
 
 def repo_of(root: Path, cfg: dict, project: str) -> Path:

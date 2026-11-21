@@ -178,8 +178,23 @@ class DisputeTests(unittest.TestCase):
         self.assertIn("does not occur", str(c.exception))
         self.assertEqual(self.env.rows(), [])
 
-    def test_finding_matches_with_whitespace_and_entry_newline_escapes(self):
-        self.assertEqual(self.env.go(finding="the parser  accepts a negative length\nsecond finding".replace("the", "src/lib.rs:10 - the", 1))[0], "false")
+    def test_whole_finding_is_accepted_with_whitespace_differences(self):
+        self.assertEqual(self.env.go(finding="src/lib.rs:10 -  the parser\taccepts a negative length ")[0], "false")
+        self.assertEqual(self.env.go(finding="second finding")[0], "false")
+
+    def test_trimmed_fragment_of_a_finding_is_refused(self):
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go(finding="the parser accepts a negative length")
+        self.assertIn("does not occur", str(c.exception))
+        self.assertEqual((self.env.runs, self.env.prompts, self.env.rows()), ([], [], []))
+
+    def test_span_across_two_findings_is_refused(self):
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go(finding=FINDING + "\nsecond finding")
+        self.assertIn("does not occur", str(c.exception))
+        with self.assertRaises(rd.Refused):
+            self.env.go(finding=FINDING + " second finding")
+        self.assertEqual((self.env.runs, self.env.prompts, self.env.rows()), ([], [], []))
 
     def test_model_must_be_neutral(self):
         cases = [
