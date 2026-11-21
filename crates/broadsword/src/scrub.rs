@@ -183,8 +183,49 @@ pub fn child_env(cfg: &Config) -> Vec<(OsString, OsString)> {
 
 fn filter_env(secrets: &Secrets, all: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
     let text: Vec<(String, String)> = all.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
-    let drop: Vec<String> = secrets.scrub_names(&text).into_iter().map(|n| n.to_uppercase()).collect(); // Windows names are case-insensitive
+    let mut drop: Vec<String> = secrets.scrub_names(&text).into_iter().map(|n| n.to_uppercase()).collect(); // Windows names are case-insensitive
+    // the Broadsword markers (`MARKERS`) pass only in their exact shape; the secret rule above still applies to them first
+    for (k, v) in &text {
+        if let Some((_, _, shape_ok)) = MARKERS.iter().find(|(name, _, _)| name.eq_ignore_ascii_case(k)) {
+            if !shape_ok(v) {
+                drop.push(k.to_uppercase());
+            }
+        }
+    }
     all.into_iter().filter(|(k, _)| !drop.contains(&k.to_string_lossy().to_uppercase())).collect()
+}
+
+// ---- Broadsword's own markers -----------------------------------------------------------------
+
+/// Set by job.rs on the command of a `run` that holds the build lock, as `<job id>:<pid>` (`run_lock_marker`). A Broadsword
+/// call inside that command reads it in `buildsrc::lock` and refuses at once instead of waiting out a lock its parent holds.
+pub const RUN_LOCK_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
+
+/// The allow-list of Broadsword's own variables that cross `child_env`: (name, why it is safe, the only value shape that
+/// passes). An entry never overrides the secret rule (a marker holding a secret value is dropped like any variable); it only
+/// adds that a malformed value is dropped too.
+const MARKERS: &[(&str, &str, fn(&str) -> bool)] = &[(
+    RUN_LOCK_MARKER,
+    "holds only a job id and a pid (no secret); a nested Broadsword call needs it to refuse at once instead of deadlocking on the build lock its parent run holds (buildsrc::lock)",
+    |v| parse_run_lock_marker(v).is_some(),
+)];
+
+/// The marker value for job `job_id` of this process.
+pub fn run_lock_marker(job_id: &str) -> String {
+    format!("{job_id}:{}", std::process::id())
+}
+
+/// `<job id>:<pid>` -> (job id, pid). The job id is 1 to 200 ASCII letters, digits, `-`, `_` or `.`; the pid is decimal digits
+/// only (no sign, no space), not 0. Anything else is None (no marker).
+pub fn parse_run_lock_marker(v: &str) -> Option<(&str, u32)> {
+    let (id, pid) = v.rsplit_once(':')?;
+    let id_ok = !id.is_empty() && id.len() <= 200 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    let pid_ok = !pid.is_empty() && pid.len() <= 10 && pid.bytes().all(|b| b.is_ascii_digit());
+    if !id_ok || !pid_ok {
+        return None;
+    }
+    let pid: u32 = pid.parse().ok()?;
+    (pid != 0).then_some((id, pid))
 }
 
 /// Give `cmd` exactly the scrubbed environment: everything is cleared first, so nothing the parent holds leaks through.
@@ -328,6 +369,19 @@ mod tests {
         let kept = filter_env(&s, vec![os("PATH", "/bin"), os("my_api_key", "x"), os("OTHER", "prefix-longsecretvalue-suffix"), os("HARMLESS", "ok")]);
         let names: Vec<String> = kept.iter().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["PATH", "HARMLESS"]);
+    }
+
+    #[test]
+    fn the_run_lock_marker_passes_only_in_its_shape_and_never_with_a_secret() {
+        assert_eq!(parse_run_lock_marker("20261121-211202-broadsword-run:4242"), Some(("20261121-211202-broadsword-run", 4242)));
+        for bad in ["", ":1", "job:", "job:0", "job:-1", "job:+1", "job: 1", "job:1 ", "a b:1", "job:99999999999", "j\\x:1", "j:1\n"] {
+            assert_eq!(parse_run_lock_marker(bad), None, "{bad:?}");
+        }
+        let s = Secrets::collect(Path::new("no-such-root-for-scrub-test"), &[("X_TOKEN".into(), "markersecret77".into())], 6);
+        let names = |kept: Vec<(OsString, OsString)>| kept.iter().map(|(k, _)| k.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(filter_env(&s, vec![os("PATH", "/bin"), os(RUN_LOCK_MARKER, "job-1:77")])), ["PATH", RUN_LOCK_MARKER]);
+        assert_eq!(names(filter_env(&s, vec![os("PATH", "/bin"), os("broadsword_run_holds_build_lock", "not a marker")])), ["PATH"], "malformed: dropped, any case");
+        assert_eq!(names(filter_env(&s, vec![os("PATH", "/bin"), os(RUN_LOCK_MARKER, "markersecret77:77")])), ["PATH"], "a secret value is dropped even in the marker's shape");
     }
 
     fn dump(mut c: Command) -> String {

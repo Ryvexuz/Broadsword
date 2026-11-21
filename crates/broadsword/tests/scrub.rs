@@ -6,6 +6,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+mod support;
 
 /// (file under src/, text the line contains, how many such lines, why it may start a child without the helper).
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
@@ -183,4 +186,67 @@ fn the_check_fails_on_a_new_spawn_site_and_on_a_stale_entry() {
         ["allow-list entry src/a.rs `Command::new(program)`: expected 1 line(s), found 0"],
         "{p:?}"
     );
+}
+
+/// A `run` command sees `BROADSWORD_RUN_HOLDS_BUILD_LOCK=<its job id>:<the run's pid>` (set fresh, replacing an inherited
+/// one), and still none of the planted secrets: neither a secret-named variable nor a copy of a `.env` value.
+#[test]
+fn run_child_sees_lock_marker_but_no_secret() {
+    const MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
+    const API_NAME: &str = "PLANTED_RUNMARK_API_KEY";
+    const API_VALUE: &str = "planted-runmark-key-61d0e3";
+    const COPY_NAME: &str = "BS_PLANTED_RUNMARK_COPY";
+    const DOTENV_VALUE: &str = "planted-runmark-dotenv-9ac4";
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scratch")
+        .join(format!("scrub-runmark-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let p = dir.join("projects/p");
+    fs::create_dir_all(p.join("src")).unwrap();
+    fs::create_dir_all(dir.join("scratch")).unwrap();
+    fs::write(dir.join("broadsword.toml"), support::config(&[])).unwrap();
+    fs::write(dir.join(".env"), format!("SOME_SETTING={DOTENV_VALUE}\n")).unwrap();
+    fs::write(
+        p.join("Cargo.toml"),
+        "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(p.join("src/lib.rs"), "").unwrap();
+    fs::write(p.join(".gitignore"), "target\n").unwrap();
+    for a in [
+        &["init", "-q"][..],
+        &["config", "user.email", "t@t"],
+        &["config", "user.name", "t"],
+        &["config", "core.autocrlf", "false"],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "init"],
+    ] {
+        let o = Command::new("git").args(a).current_dir(&p).output().unwrap();
+        assert!(o.status.success(), "git {a:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    // the run's command already goes through the system shell (cmd /C on Windows, sh -c elsewhere)
+    let dump: &[&str] = if cfg!(windows) { &["set"] } else { &["env"] };
+    let o = Command::new(support::bin())
+        .args(["run", "p", "--"])
+        .args(dump)
+        .current_dir(&dir)
+        .env(API_NAME, API_VALUE)
+        .env(COPY_NAME, DOTENV_VALUE)
+        .env(MARKER, "inherited-run:1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let names: Vec<&str> = out.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k.trim())).collect();
+    assert!(names.iter().any(|k| k.eq_ignore_ascii_case("PATH")), "the dump lists no PATH, so it proves nothing");
+    for bad in [API_NAME, COPY_NAME, API_VALUE, DOTENV_VALUE, "[REDACTED]"] {
+        assert!(!out.contains(bad), "the run's child saw `{bad}`; its variables: {names:?}");
+    }
+    let marks: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix(&format!("{MARKER}="))).map(str::trim).collect();
+    assert_eq!(marks.len(), 1, "exactly one marker line: {marks:?}");
+    let (id, pid) = marks[0].rsplit_once(':').unwrap_or_else(|| panic!("marker {:?}", marks[0]));
+    assert!(id.ends_with("-p-run") && id != "inherited-run", "the run's own job id, not the inherited one: {id}");
+    assert!(pid.parse::<u32>().is_ok_and(|n| n > 1), "the run's pid: {pid}");
 }

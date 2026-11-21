@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 mod support;
 use support::bin;
 const SYNC_GATE: &str = "BROADSWORD_INTERNAL_TEST_BUILD_SYNC_GATE_FILE";
+/// scrub::RUN_LOCK_MARKER: a `run` sets it on its command; `Root::cmd` removes any inherited one so every test starts clean.
+const RUN_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct Out {
@@ -82,7 +84,7 @@ impl Root {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(bin());
-        c.args(args).current_dir(&self.dir).env_remove(SYNC_GATE).stdin(Stdio::null());
+        c.args(args).current_dir(&self.dir).env_remove(SYNC_GATE).env_remove(RUN_MARKER).stdin(Stdio::null());
         c
     }
 
@@ -1014,6 +1016,76 @@ fn run_holds_the_build_lock_while_it_runs() {
     assert!(o.stderr.contains("build folder busy"), "{}", o.stderr);
     finish(j, 60);
     r.ok(&["build", "proj"]);
+}
+
+/// The `build_lock_wait_secs` of every job record of `r` whose status is `status` (None where the field is missing).
+fn lock_waits(r: &Root, status: &str) -> Vec<Option<f64>> {
+    r.job_records()
+        .iter()
+        .filter_map(|p| fs::read_to_string(p).ok())
+        .filter(|t| t.lines().any(|l| l.trim() == format!("status = {status}")))
+        .map(|t| t.lines().find_map(|l| l.strip_prefix("build_lock_wait_secs = ")).map(|v| v.trim().parse::<f64>().unwrap_or_else(|e| panic!("bad build_lock_wait_secs {v:?}: {e}"))))
+        .collect()
+}
+
+/// Audit 2026-11-21 22Z fix 3: a `broadsword build` inside a `run` of the same root used to wait out the whole
+/// `build_lock_wait_seconds` (here 120 s) for the lock its own parent holds. It must be refused at once with exit 3.
+#[test]
+fn nested_build_inside_run_is_refused_at_once() {
+    let r = Root::new("nested", 120);
+    let started = Instant::now();
+    let o = r.run(&["run", "proj", "--", bin(), "build", "proj"]);
+    let took = started.elapsed();
+    let all = format!("{}\n{}", o.stdout, o.stderr);
+    assert!(took < Duration::from_secs(60), "the nested build waited {took:?} (the lock wait is 120 s)\n{all}");
+    assert_eq!(o.code, 3, "the run ends with the inner call's exit 3\n{all}");
+    assert!(all.contains("runs inside") && all.contains("`broadsword run` job"), "{all}");
+    let refused = lock_waits(&r, "refused");
+    assert_eq!(refused.len(), 1, "one refused record, the inner build: {refused:?}");
+    assert!(refused[0].is_some_and(|w| w < 60.0), "{refused:?}");
+    // the run itself let go of the lock when its command ended: a plain build takes it
+    r.ok(&["build", "proj"]);
+}
+
+/// A marker that does not name the lock's live holder (a stale one from a finished run, or another process) refuses nothing
+/// sooner: with the lock free the build takes it; with the lock busy it waits the whole configured time, as before.
+#[test]
+fn stale_run_marker_does_not_refuse() {
+    let r = Root::new("stalemark", 1);
+    let o = r.cmd(&["build", "proj"]).env(RUN_MARKER, format!("20200101-000000-proj-run:{}", dead_pid())).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "free lock, stale marker: the build runs\n{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(r.probe(), "MARK-main");
+    let t1 = r.task("a", "MARK-t1");
+    let (g1, e1) = (r.scratch("gate1"), r.scratch("err1.txt"));
+    let j1 = r.spawn_gated(&["build", "proj", "--task", &t1], &g1, &e1);
+    assert!(wait_for(&e1, "TEST HOOK ACTIVE", 60), "job 1 never reached the sync gate");
+    // a live pid that is not the holder (this test process), and a malformed marker
+    for marker in [format!("x-run:{}", std::process::id()), "garbage".to_string()] {
+        let started = Instant::now();
+        let o = r.cmd(&["build", "proj"]).env(RUN_MARKER, &marker).output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(3), "{marker}: {err}");
+        assert!(err.contains("build_lock_wait_seconds") && !err.contains("runs inside"), "{marker}: the normal refusal after the full wait: {err}");
+        assert!(started.elapsed() >= Duration::from_secs(1), "{marker}: it waited the configured time: {:?}", started.elapsed());
+    }
+    fs::write(&g1, "go").unwrap();
+    assert_eq!(finish(j1, 300), 0);
+}
+
+/// A job refused after the full lock wait records how long it waited.
+#[test]
+fn refused_job_records_its_lock_wait() {
+    let r = Root::new("refusedwait", 1); // build_lock_wait_seconds = 1
+    let t1 = r.task("a", "MARK-t1");
+    let (g1, e1) = (r.scratch("gate1"), r.scratch("err1.txt"));
+    let j1 = r.spawn_gated(&["build", "proj", "--task", &t1], &g1, &e1);
+    assert!(wait_for(&e1, "TEST HOOK ACTIVE", 60), "job 1 never reached the sync gate");
+    assert_eq!(r.run(&["build", "proj"]).code, 3);
+    let refused = lock_waits(&r, "refused");
+    fs::write(&g1, "go").unwrap();
+    assert_eq!(finish(j1, 300), 0);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].is_some_and(|w| w >= 1.0), "build_lock_wait_secs present and at least the 1 s wait: {refused:?}");
 }
 
 fn dead_pid() -> u32 {

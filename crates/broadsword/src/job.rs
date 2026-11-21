@@ -1502,6 +1502,8 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
                 Ok(l) => l,
                 Err((code, msg)) => {
                     eprintln!("broadsword: {msg}");
+                    // the wait a refused (or failed) job really had, so audits see lock waits of refused jobs too
+                    rec.set("build_lock_wait_secs", format!("{:.1}", asked.elapsed().as_secs_f64()));
                     return end(&mut rec, if code == buildsrc::EXIT_BUSY { record::REFUSED } else { record::FAILED }, code);
                 }
             };
@@ -1549,6 +1551,12 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         // The same place gives the child the scrubbed environment (`scrub.rs`): no secret-named variable, nothing holding a `.env` value.
         scrub::apply(&mut cmd, cfg);
         cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
+        if kind == "run" && build_hold.is_some() {
+            // this process holds the build lock for the whole command: a Broadsword call inside it refuses at once
+            // (buildsrc::lock) instead of waiting out a lock that frees only when the command ends. Set after the scrub, so it
+            // replaces any marker this process inherited.
+            cmd.env(scrub::RUN_LOCK_MARKER, scrub::run_lock_marker(&job_id));
+        }
         let mut spawn_err: Option<String> = None;
         // The children this job has running right now (one, or the test step's side-by-side pool), recorded so recovery can find
         // each orphan: `child_pid`/`child_start` name the first, `child_pids` all of them as `pid:start|pid:start...`.

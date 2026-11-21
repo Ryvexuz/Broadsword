@@ -104,7 +104,7 @@
 
 use crate::config::Config;
 use crate::lock::{self, Lock};
-use crate::{json, task};
+use crate::{json, scrub, task};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -211,13 +211,80 @@ pub const EXIT_BUSY: u8 = 3;
 /// Take `state/build.lock`. A job holds it while cargo compiles (see the module comment): a build, test or check releases it
 /// once its test executables are copied and runs the tests from the copies; a `run` holds it until its command ends. A second job waits up to `build_lock_wait_seconds`, then is
 /// refused (exit 3, nothing built, cleaned or recorded) with a message that says how long it waited and who held it.
+///
+/// Nested run (audit 2026-11-21 22Z fix 3): a `run` job sets `scrub::RUN_LOCK_MARKER` = `<job id>:<pid>` on its command
+/// (job.rs). A Broadsword call inside that command that asks for this lock while the lock's holder IS that pid would wait out
+/// the whole `build_lock_wait_seconds` for a lock its own parent holds until the call returns: a deadlock. So it is refused at
+/// once (exit 3). The marker never grants the lock: it is read only after one try of the lock found it busy, and with a free
+/// lock, a malformed marker, or a holder that is not the marker's live process (a stale marker), the call behaves exactly as
+/// it would without it.
 pub fn lock(cfg: &Config) -> Result<Lock, (u8, String)> {
     let wait = cfg.build_lock_wait_seconds;
-    lock::acquire(&cfg.state_dir.join("build.lock"), Duration::from_secs(wait), &move |owner| {
+    let path = cfg.state_dir.join("build.lock");
+    let marker = std::env::var(scrub::RUN_LOCK_MARKER).ok();
+    if let Some((job, pid)) = marker.as_deref().and_then(scrub::parse_run_lock_marker) {
+        if let Some(l) = try_once(&path)? {
+            return Ok(took(cfg, l));
+        }
+        if held_by(cfg, pid) {
+            // settle: the holder writes its owner file right after it takes the lock; look again, so a lock that changed
+            // hands during the first look (old owner file still naming the marker's pid) is never mistaken for the parent's
+            std::thread::sleep(NESTED_SETTLE);
+            if let Some(l) = try_once(&path)? {
+                return Ok(took(cfg, l));
+            }
+            if held_by(cfg, pid) {
+                return Err((EXIT_BUSY, format!("build folder busy: this command runs inside `broadsword run` job {job}, which holds the build lock (pid {pid}); run it directly, not inside another run. Nothing was built, cleaned or recorded")));
+            }
+        }
+    }
+    let l = lock::acquire(&path, Duration::from_secs(wait), &move |owner| {
         let who = owner.map(|p| format!(" (pid {p})")).unwrap_or_default();
         format!("build folder busy: another build, test or check job{who} held the build lock for the whole {wait} s wait (build_lock_wait_seconds); nothing was built, cleaned or recorded. Repeat the call later (the lock frees itself when that job ends)")
     })
-    .map_err(|e| (if e.starts_with("build folder busy") { EXIT_BUSY } else { EXIT_FAILED }, e))
+    .map_err(|e| (if e.starts_with("build folder busy") { EXIT_BUSY } else { EXIT_FAILED }, e))?;
+    Ok(took(cfg, l))
+}
+
+/// How long the nested-run check waits before it looks at the lock's holder a second time. Not a setting: it only adds this
+/// much latency to a refusal that would otherwise take the whole `build_lock_wait_seconds`, and no limit depends on it.
+const NESTED_SETTLE: Duration = Duration::from_millis(200);
+
+const TRY_BUSY: &str = "busy";
+
+/// One try of the lock: `Some` when it was free (and is now held), `None` when it is busy.
+fn try_once(path: &Path) -> Result<Option<Lock>, (u8, String)> {
+    match lock::acquire(path, Duration::ZERO, &|_| TRY_BUSY.to_string()) {
+        Ok(l) => Ok(Some(l)),
+        Err(e) if e == TRY_BUSY => Ok(None),
+        Err(e) => Err((EXIT_FAILED, e)),
+    }
+}
+
+/// `state/build.lock.owner`: `<pid> <creation time>` of the process that holds the build lock, written by `took` right after
+/// the lock is taken. Why a second file: on Windows the bytes of the locked `build.lock` cannot be read by another handle.
+/// Only `held_by` reads it, and only to refuse SOONER; nothing ever takes or keeps the lock because of it.
+fn owner_file(cfg: &Config) -> PathBuf {
+    cfg.state_dir.join("build.lock.owner")
+}
+
+/// Record this process as the lock's holder (see `owner_file`). A failed write is harmless: `held_by` then matches no marker
+/// (an unreadable or older file names another or a dead process), so a nested call waits as it did before this check existed.
+fn took(cfg: &Config, l: Lock) -> Lock {
+    let me = std::process::id();
+    let start = crate::sys::start_time(me).map(|t| t.to_string()).unwrap_or_else(|| "-".into());
+    let _ = std::fs::write(owner_file(cfg), format!("{me} {start}\n"));
+    l
+}
+
+/// Does the owner file name `pid` as the holder, AND is `pid` still that very process (same creation time)? Strict: an
+/// unreadable file, an unknown creation time, a dead or reused pid all answer no (then the caller waits, as before).
+fn held_by(cfg: &Config, pid: u32) -> bool {
+    let Ok(text) = std::fs::read_to_string(owner_file(cfg)) else { return false };
+    let mut it = text.split_whitespace();
+    let (Some(p), Some(s), None) = (it.next(), it.next(), it.next()) else { return false };
+    let (Ok(p), Ok(s)) = (p.parse::<u32>(), s.parse::<u64>()) else { return false };
+    p == pid && crate::sys::exact_match(Some(s), crate::sys::process_state(pid))
 }
 
 // ---- package names ----------------------------------------------------------------------
