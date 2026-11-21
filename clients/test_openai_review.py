@@ -959,5 +959,54 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn(FAKE_KEY, p.stdout + p.stderr)
 
 
+class RealPriceTests(unittest.TestCase):
+    """The REAL bench/models.json (not a fixture) is read by the code that writes est_usd. BSW_PRICES_ROOT points the tests at another
+    root's models.json; it exists only to show these tests fail against a models.json without prices."""
+
+    LIST = {"gpt-4o": (2.5, 10.0), "gpt-4o-mini": (0.15, 0.6), "gpt-4.1-mini": (0.4, 1.6), "gpt-5-pro": (15.0, 120.0),
+            "gpt-5.2-pro": (21.0, 168.0), "gpt-5.4-pro": (30.0, 180.0), "gpt-5.5-pro": (30.0, 180.0), "gpt-5.3-codex": (1.75, 14.0),
+            "gpt-5.5": (5.0, 30.0), "gpt-5.6-sol": (4.0, 20.0), "gpt-6.1-terra": (1.0, 5.0), "gpt-6.1-sol": (2.0, 10.0),
+            "gpt-6.2-sol": (2.0, 10.0), "gpt-6.2-astra": (8.0, 40.0)}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.real_root = Path(os.environ.get("BSW_PRICES_ROOT") or HERE.parent)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("openai_review_prices", SCRIPT)
+        cls.m = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(HERE))
+        try:
+            spec.loader.exec_module(cls.m)
+        finally:
+            sys.path.remove(str(HERE))
+
+    def test_every_model_in_the_real_models_json_is_priced_at_list(self):
+        listed = json.loads((self.real_root / "bench" / "models.json").read_text(encoding="utf-8"))["models"]
+        self.assertEqual(set(listed), set(self.LIST), "a model was added or removed: add or remove its list price here")
+        for name, want in self.LIST.items():
+            with self.subTest(model=name):
+                self.assertEqual(self.m.model_prices(self.real_root, name), want)
+
+    def test_an_unpriced_model_gets_the_highest_listed_price_never_below_the_old_fallback(self):
+        got = self.m.model_prices(self.real_root, "no-such-model")
+        self.assertEqual(got, (30.0, 180.0))
+        self.assertGreaterEqual(got[0], 30.0)
+        self.assertGreaterEqual(got[1], 120.0, "the cap only gets stricter than the old 30/120 fallback")
+
+    def test_a_ledger_row_at_list_price_for_known_tokens(self):
+        root = Path(tempfile.mkdtemp(prefix="pricesroot-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "bench").mkdir()
+        shutil.copy(self.real_root / "bench" / "models.json", root / "bench" / "models.json")
+        (root / "broadsword.toml").write_text('state_dir = "state"\n', encoding="utf-8")
+        result = {"is_error": False, "modelUsage": {"gpt-6.1-sol": {"inputTokens": 14372, "outputTokens": 1237}}}
+        self.m.record_spend(root, {}, "gpt-6.1-sol", result, "codex")
+        rows = [ln.split("\t") for ln in next((root / "state" / "gpt-spend").glob("*.tsv")).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[1][3:5], ["14372", "1237"])
+        # list price 2 / 10 per million tokens; the old 30 / 120 fallback gave 0.579600 for the same tokens
+        self.assertEqual(float(rows[1][5]), (14372 * 2 + 1237 * 10) / 1e6)
+        self.assertEqual(float(rows[1][5]), 0.041114)
+
+
 if __name__ == "__main__":
     unittest.main()
