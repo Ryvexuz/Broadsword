@@ -1334,6 +1334,18 @@ class RaceClosed(Fixture):
         self.assertEqual(code, 1, out)
         self.assertIn("not the verified file", out)
 
+    def test_item_reached_through_a_link_above_it_is_refused(self):
+        """The item's own path goes through a junction (a folder above it was swapped): the
+        final-path check on the item's handle refuses it; nothing is scanned through the link."""
+        real = Path(self.tmp.name).resolve() / "real_parent"
+        put(real / "item" / "x.txt", "x")
+        via = self.root / "evidence" / "via"
+        if not junction(via, real):
+            self.skipTest("cannot make an NTFS junction here")
+        with self.assertRaises(OSError) as cm:
+            cold_move.scan_tree(via / "item")
+        self.assertIn("a folder above it is a link", str(cm.exception))
+
     def test_handle_scan_never_lists_a_folder_swapped_after_its_parent_was_listed(self):
         """The Windows scan: sub/ is swapped after the root was listed and before sub is opened.
         Opening sub relative to the root handle opens the junction itself, which is refused."""
