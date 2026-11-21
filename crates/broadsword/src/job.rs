@@ -1558,13 +1558,18 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             // this process holds the build lock for the whole command: once it has proved that (buildsrc::run_proof, kept in
             // the hold and let go just before the build lock), a Broadsword call inside it refuses at once (buildsrc::lock)
             // instead of waiting out a lock that frees only when the command ends. Set after the scrub, so it replaces any
-            // marker this process inherited; with no proof, no marker at all.
+            // marker this process inherited. With no proof the command never starts (review q-20261121-222529): every run
+            // command that holds the build lock carries a proven marker, so there is no silent fallback to the deadlock.
             let marker = scrub::run_lock_marker(&job_id);
-            hold.proof = buildsrc::run_proof(cfg, &marker);
-            if hold.proof.is_some() {
-                cmd.env(scrub::RUN_LOCK_MARKER, marker);
-            } else {
-                cmd.env_remove(scrub::RUN_LOCK_MARKER);
+            match buildsrc::run_proof(cfg, &marker) {
+                Ok(proof) => {
+                    hold.proof = Some(proof);
+                    cmd.env(scrub::RUN_LOCK_MARKER, marker);
+                }
+                Err(e) => {
+                    eprintln!("broadsword: cannot prove this run holds the build lock ({e}), so a Broadsword call inside its command could not refuse at once and would wait out the lock this run holds; the command was not started");
+                    return end(&mut rec, record::FAILED, EXIT_FAILED);
+                }
             }
         }
         let mut spawn_err: Option<String> = None;

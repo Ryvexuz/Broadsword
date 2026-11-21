@@ -246,13 +246,14 @@ fn run_proof_paths(cfg: &Config) -> (PathBuf, PathBuf) {
 }
 
 /// Called by a `run` job that HOLDS the build lock, before it starts its command: write `marker` as the id, then take the proof
-/// lock. `Some` = proved (the caller keeps the lock until just before it releases the build lock, and may set the marker);
-/// `None` = not proved (a write or lock error), so the caller sets no marker and a nested call waits as before.
-pub fn run_proof(cfg: &Config, marker: &str) -> Option<Lock> {
+/// lock. `Ok` = proved (the caller keeps the lock until just before it releases the build lock, and sets the marker);
+/// `Err` = not proved (a write or lock error, named in the message). The caller must then NOT start the command (job.rs fails
+/// the run): a command without the marker would bring back the nested-call deadlock silently (review q-20261121-222529).
+pub fn run_proof(cfg: &Config, marker: &str) -> Result<Lock, String> {
     let (id, proof) = run_proof_paths(cfg);
-    std::fs::write(&id, marker).ok()?;
+    std::fs::write(&id, marker).map_err(|e| format!("cannot write {}: {e}", id.display()))?;
     // a nested call may hold a shared lock on it for an instant while it checks it (`nested_in_holder`)
-    lock::acquire(&proof, Duration::from_secs(cfg.build_lock_wait_seconds), &|_| TRY_BUSY.to_string()).ok()
+    lock::acquire(&proof, Duration::from_secs(cfg.build_lock_wait_seconds), &|_| format!("{} stayed busy", proof.display()))
 }
 
 /// Is the build lock held right now by the run whose marker is `marker`? Yes only if the id reads `marker`, the proof lock is

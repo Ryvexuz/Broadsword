@@ -1121,6 +1121,31 @@ fn refused_job_records_its_lock_wait() {
     assert!(refused[0].is_some_and(|w| w >= 1.0), "build_lock_wait_secs present and at least the 1 s wait: {refused:?}");
 }
 
+/// Review q-20261121-222529: when a `run` cannot prove it holds the build lock (here the proof id cannot be written: a folder
+/// stands at its path), it used to start its command anyway without the marker, so a nested build waited the whole lock wait.
+/// Now the run fails before its command starts and says why: no run command ever runs without the fail-fast marker.
+#[test]
+fn run_that_cannot_prove_its_lock_never_starts_its_command() {
+    let r = Root::new("noproof", 30);
+    fs::create_dir_all(r.dir.join("state/build.lock.run.id")).unwrap();
+    let flag = r.scratch("noproof-started.txt");
+    let flag_s = flag.to_string_lossy().replace('\\', "/");
+    let cmd: Vec<&str> = if cfg!(windows) { vec!["echo", "x>", &flag_s, "&&", bin(), "build", "proj"] } else { vec!["echo x >", &flag_s, ";", bin(), "build", "proj"] };
+    let mut args = vec!["run", "proj", "--"];
+    args.extend(cmd);
+    let started = Instant::now();
+    let o = r.run(&args);
+    let took = started.elapsed();
+    let all = format!("{}\n{}", o.stdout, o.stderr);
+    assert!(took < Duration::from_secs(20), "the run took {took:?} (the lock wait is 30 s)\n{all}");
+    assert_eq!(o.code, 1, "the run fails (EXIT_FAILED)\n{all}");
+    assert!(all.contains("cannot prove this run holds the build lock"), "{all}");
+    assert!(!flag.exists(), "the run's command never started\n{all}");
+    assert_eq!(lock_waits(&r, "failed").len(), 1, "one failed record, the run itself");
+    // the run let go of the lock: a plain build takes it
+    r.ok(&["build", "proj"]);
+}
+
 fn dead_pid() -> u32 {
     let mut c = if cfg!(windows) { Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap() } else { Command::new("true").spawn().unwrap() };
     let pid = c.id();
