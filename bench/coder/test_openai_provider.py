@@ -121,8 +121,9 @@ def codex_gates(tmp):
     root = tmp / "gate-root"
     (root / "state" / "canary").mkdir(parents=True, exist_ok=True)
     (root / "broadsword.toml").write_text('state_dir = "state"\n', encoding="utf-8")
-    (tmp / "state" / "canary").mkdir(parents=True, exist_ok=True)  # the canary record is read next to the clients/ folder, not under root
-    (tmp / "state" / "canary" / "last-pass.json").write_text(json.dumps({"codex_version": "codex-cli 9.9.9-test"}), encoding="utf-8")
+    # the canary record is read from <main root>/<state_dir>/canary/last-pass.json (canary_state_file), the root find_main_root returns;
+    # it names the fake codex's version, so the gate passes without running scripts/shadow_canary.py
+    (root / "state" / "canary" / "last-pass.json").write_text(json.dumps({"codex_version": "codex-cli 9.9.9-test"}), encoding="utf-8")
     (tmp / "clients").mkdir(exist_ok=True)
     review = op._review()
     old_here, old_root = review.HERE, review.oc.find_main_root
@@ -351,15 +352,26 @@ class Provider(unittest.TestCase):
         self.assertEqual(json.loads(r["raw"])["model_used"], ["gpt-answered-by"])
 
     def test_codex_gate_refusal_is_a_failed_call_that_never_claims_a_model(self):
+        # The gate that can still refuse a codex call is the canary: the daily cap never refuses codex (plan calls are free).
+        # No record for the fake codex's version and no scripts/shadow_canary.py beside the temp clients/ folder: canary_failed.
         env, log = self.codex_env()
-        with unittest.mock.patch.dict(os.environ, env, clear=True), codex_gates(self.tmp):
-            (self.tmp / "gate-root" / "broadsword.toml").write_text('state_dir = "state"\ngpt_daily_cap_usd = 0\n', encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, env, clear=True), codex_gates(self.tmp) as root:
+            (root / "state" / "canary" / "last-pass.json").unlink()
             op.prepare_codex("gpt-codex-fake", "default", 120)
             r = op.call_codex(SYSTEM, "USER PROMPT", "gpt-codex-fake", "default")
         self.assertTrue(r["is_error"])
-        self.assertIn("daily_cap_reached", r["error"])
+        self.assertIn("canary_failed", r["error"])
         self.assertEqual((r["answer"], r["model_used"], r["model_reported"]), ("", [], False))
-        self.assertFalse(log.exists())  # codex was never started
+        self.assertFalse(log.exists())  # codex was never started (only `codex --version`, which the fake does not log)
+
+    def test_codex_is_never_refused_for_the_daily_cap(self):
+        env, log = self.codex_env()
+        with unittest.mock.patch.dict(os.environ, env, clear=True), codex_gates(self.tmp) as root:
+            (root / "broadsword.toml").write_text('state_dir = "state"\ngpt_daily_cap_usd = 0\n', encoding="utf-8")
+            op.prepare_codex("gpt-codex-fake", "default", 120)
+            r = op.call_codex(SYSTEM, "USER PROMPT", "gpt-codex-fake", "default")
+        self.assertEqual((r["is_error"], r["answer"]), (False, CODE))
+        self.assertTrue(log.exists())
 
     def test_codex_result_never_claims_a_model(self):
         r, log = self.codex_go()
