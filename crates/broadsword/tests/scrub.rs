@@ -221,8 +221,16 @@ fn run_child_sees_lock_marker_but_no_secret() {
         &["add", "-A"],
         &["commit", "-q", "-m", "init"],
     ] {
-        let o = Command::new("git").args(a).current_dir(&p).output().unwrap();
-        assert!(o.status.success(), "git {a:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let o = Command::new("git")
+            .args(a)
+            .current_dir(&p)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {a:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
     // the run's command already goes through the system shell (cmd /C on Windows, sh -c elsewhere)
     let dump: &[&str] = if cfg!(windows) { &["set"] } else { &["env"] };
@@ -238,15 +246,41 @@ fn run_child_sees_lock_marker_but_no_secret() {
         .unwrap();
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     let _ = fs::remove_dir_all(&dir);
-    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
-    let names: Vec<&str> = out.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k.trim())).collect();
-    assert!(names.iter().any(|k| k.eq_ignore_ascii_case("PATH")), "the dump lists no PATH, so it proves nothing");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let names: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim()))
+        .collect();
+    assert!(
+        names.iter().any(|k| k.eq_ignore_ascii_case("PATH")),
+        "the dump lists no PATH, so it proves nothing"
+    );
     for bad in [API_NAME, COPY_NAME, API_VALUE, DOTENV_VALUE, "[REDACTED]"] {
-        assert!(!out.contains(bad), "the run's child saw `{bad}`; its variables: {names:?}");
+        assert!(
+            !out.contains(bad),
+            "the run's child saw `{bad}`; its variables: {names:?}"
+        );
     }
-    let marks: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix(&format!("{MARKER}="))).map(str::trim).collect();
+    let marks: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix(&format!("{MARKER}=")))
+        .map(str::trim)
+        .collect();
     assert_eq!(marks.len(), 1, "exactly one marker line: {marks:?}");
-    let (id, pid) = marks[0].rsplit_once(':').unwrap_or_else(|| panic!("marker {:?}", marks[0]));
-    assert!(id.ends_with("-p-run") && id != "inherited-run", "the run's own job id, not the inherited one: {id}");
-    assert!(pid.parse::<u32>().is_ok_and(|n| n > 1), "the run's pid: {pid}");
+    let (id, pid) = marks[0]
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("marker {:?}", marks[0]));
+    assert!(
+        id.ends_with("-p-run") && id != "inherited-run",
+        "the run's own job id, not the inherited one: {id}"
+    );
+    assert!(
+        pid.parse::<u32>().is_ok_and(|n| n > 1),
+        "the run's pid: {pid}"
+    );
 }

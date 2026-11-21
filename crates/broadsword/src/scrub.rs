@@ -201,10 +201,13 @@ fn filter_env(secrets: &Secrets, all: Vec<(OsString, OsString)>) -> Vec<(OsStrin
 /// call inside that command reads it in `buildsrc::lock` and refuses at once instead of waiting out a lock its parent holds.
 pub const RUN_LOCK_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
 
+/// (name, why it is safe, the only value shape that passes).
+type Marker = (&'static str, &'static str, fn(&str) -> bool);
+
 /// The allow-list of Broadsword's own variables that cross `child_env`: (name, why it is safe, the only value shape that
 /// passes). An entry never overrides the secret rule (a marker holding a secret value is dropped like any variable); it only
 /// adds that a malformed value is dropped too.
-const MARKERS: &[(&str, &str, fn(&str) -> bool)] = &[(
+const MARKERS: &[Marker] = &[(
     RUN_LOCK_MARKER,
     "holds only a job id and a pid (no secret); a nested Broadsword call needs it to refuse at once instead of deadlocking on the build lock its parent run holds (buildsrc::lock)",
     |v| parse_run_lock_marker(v).is_some(),
