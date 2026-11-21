@@ -103,6 +103,60 @@ impl Secrets {
         out
     }
 
+    /// `kept`, a piece of a longer RAW (not yet redacted) text that was cut at its start, its end or both, made safe to show:
+    /// THE one rule for text that is cut or tailed. Besides every whole secret (as `redact`), it masks the longest PREFIX of
+    /// `kept` that equals the end of a secret value and the longest SUFFIX that equals the start of one, of 1 byte or more, so
+    /// a secret split by the cut never shows in part; and if any secret value is longer than `kept`, all of `kept` is masked
+    /// (it could lie wholly inside one). The masked spans are found on the raw text and merged, each run becoming one
+    /// `[REDACTED]`, so a secret that overlaps a masked end is covered too. Fail-closed by design: it masks more than needed
+    /// (an end that merely looks like the start or end of a secret, even an end that was not cut), never less.
+    pub fn redact_cut(&self, kept: &str) -> String {
+        if self.redact.iter().any(|s| s.len() > kept.len()) {
+            return if kept.is_empty() { String::new() } else { "[REDACTED]".to_string() };
+        }
+        let b = kept.as_bytes();
+        let n = b.len();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for s in self.redact.iter().filter(|s| !s.is_empty()) {
+            let sb = s.as_bytes();
+            spans.extend(kept.match_indices(s.as_str()).map(|(i, m)| (i, i + m.len())));
+            // the longest suffix of `kept` that is a prefix of `s` (the cut fell inside `s`, after its start)
+            if let Some(p) = (n + 1 - sb.len().min(n)..n).find(|&p| sb.starts_with(&b[p..])) {
+                spans.push((p, n));
+            }
+            // the longest prefix of `kept` that is a suffix of `s` (the cut fell inside `s`, before its end)
+            if let Some(q) = (1..sb.len().min(n + 1)).rev().find(|&q| sb.ends_with(&b[..q])) {
+                spans.push((0, q));
+            }
+        }
+        // widen each span to char boundaries (they already are when a secret's bytes match whole characters), then merge
+        for sp in spans.iter_mut() {
+            while !kept.is_char_boundary(sp.0) {
+                sp.0 -= 1;
+            }
+            while !kept.is_char_boundary(sp.1) {
+                sp.1 += 1;
+            }
+        }
+        spans.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (st, en) in spans {
+            match runs.last_mut() {
+                Some(last) if st <= last.1 => last.1 = last.1.max(en),
+                _ => runs.push((st, en)),
+            }
+        }
+        let mut out = String::new();
+        let mut at = 0usize;
+        for (st, en) in runs {
+            out.push_str(&kept[at..st]);
+            out.push_str("[REDACTED]");
+            at = en;
+        }
+        out.push_str(&kept[at..]);
+        out
+    }
+
     /// Which variables of `env` the reviewer CLI must NOT inherit: secret-named ones; any whose value equals or contains a
     /// secret value; any whose value equals a short `.env` value.
     pub fn scrub_names(&self, env: &[(String, String)]) -> Vec<String> {
@@ -228,6 +282,44 @@ mod tests {
 
     fn os(k: &str, v: &str) -> (OsString, OsString) {
         (k.into(), v.into())
+    }
+
+    fn one(secret: &str) -> Secrets {
+        Secrets::collect(Path::new("no-such-root-for-scrub-test"), &[("CUT_TEST_TOKEN".into(), secret.into())], 6)
+    }
+
+    #[test]
+    fn redact_cut_masks_a_secret_whose_first_half_ends_the_kept_text() {
+        let secret = "QZXJVKWBGHMF";
+        let s = one(secret);
+        assert_eq!(s.redact_cut(&format!("log: value {}", &secret[..6])), "log: value [REDACTED]");
+        assert_eq!(s.redact_cut(&format!("log: value {}", &secret[..1])), "log: value [REDACTED]", "even one byte");
+        assert_eq!(s.redact_cut(&format!("{} and more", &secret[6..])), "[REDACTED] and more", "a cut at the start too");
+    }
+
+    #[test]
+    fn redact_cut_redacts_a_short_secret_fully_inside_as_before() {
+        let secret = "QZXJVKWBGHMF";
+        let s = one(secret);
+        let text = format!("a {secret} b {secret} c");
+        assert_eq!(s.redact_cut(&text), "a [REDACTED] b [REDACTED] c");
+        assert_eq!(s.redact_cut(&text), s.redact(&text), "the same as redact when no end looks like part of a secret");
+        assert_eq!(s.redact_cut("nothing secret here"), "nothing secret here");
+    }
+
+    #[test]
+    fn redact_cut_masks_everything_when_a_secret_is_longer_and_merges_overlaps() {
+        let secret = "QZXJVKWBGHMF";
+        let s = one(secret);
+        assert_eq!(s.redact_cut(&secret[3..9]), "[REDACTED]", "it could lie inside the secret");
+        assert_eq!(s.redact_cut(""), "");
+        // a whole secret overlapping a masked end, and both ends masked at once: one marker per merged run, no byte of it left
+        let text = format!("{}{secret}xy{}", &secret[4..], &secret[..3]);
+        let out = s.redact_cut(&text);
+        assert_eq!(out, "[REDACTED]xy[REDACTED]", "{out}");
+        // multi-byte characters around the cut stay whole
+        let u = one("éQZXJVKWBé");
+        assert_eq!(u.redact_cut("ü-ü-ü-ü éQZ"), "ü-ü-ü-ü [REDACTED]");
     }
 
     #[test]

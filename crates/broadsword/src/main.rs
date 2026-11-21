@@ -21,6 +21,7 @@ macro_rules! eprint {
 mod buildsrc;
 mod cleanup;
 mod config;
+mod donecheck;
 mod git;
 mod install;
 mod job;

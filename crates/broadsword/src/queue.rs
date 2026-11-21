@@ -120,6 +120,7 @@ use crate::reviewer::{self, CallError};
 use crate::task::{self, fail, now_secs};
 use crate::worktree::{self, JobDirError};
 use crate::perfgate::{self, Gate as Perf};
+use crate::donecheck;
 use crate::{git, pause, sys, tools, wtgit};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -397,7 +398,7 @@ fn is_open(status: &str) -> bool {
 }
 
 /// The entry fields that hold free text (output of the check, the reviewer, git): redacted before they are written.
-const TEXT_KEYS: [&str; 11] = ["brief", "check_summary", "check_tail", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason", "perf"];
+const TEXT_KEYS: [&str; 12] = ["brief", "check_summary", "check_tail", "done_check", "reason", "error", "log", "blocking", "minor", "shadow_blocking", "shadow_reason", "perf"];
 
 /// What a shadow review records in the entry (cleared on a fresh attempt).
 /// How the GPT client is named in a review file and the entry.
@@ -658,6 +659,9 @@ pub fn cmd_show(cfg: &Config, id: &str) -> ExitCode {
     if !e.get("perf").is_empty() {
         println!("perf gate:\n  {}", e.get("perf").replace('\n', "\n  "));
     }
+    if !e.get("done_check").is_empty() {
+        println!("done check, run by the queue (state/queue/{}):\n  {}", e.get("done_check_file"), e.get("done_check").replace('\n', "\n  "));
+    }
     for (label, k) in [("blocking findings", "blocking"),("minor findings", "minor"), ("shadow blocking findings (recorded only, never gating)", "shadow_blocking")] {
         if !e.get(k).is_empty() {
             println!("{label}:\n  {}", e.get(k).replace('\n', "\n  "));
@@ -860,7 +864,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
     if !resumed {
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
-            "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf",
+            "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf", "done_check", "done_check_file",
             "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
         ] {
             e.set(k, "");
@@ -1238,10 +1242,11 @@ impl<'a> Run<'a> {
     /// The check step: the real check, or (merge train mode) the deferral that leaves the check to the train.
     fn check_step(&mut self) -> R<()> {
         if self.defer_check {
-            self.s_defer_check()
+            self.s_defer_check()?;
         } else {
-            self.s_check()
+            self.s_check()?;
         }
+        self.s_done_check()
     }
 
     /// Step 4, review.
@@ -1861,6 +1866,61 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// DONE CHECK (donecheck.rs), the end of the check step, before any model is asked. The brief's runnable done-check commands
+    /// (`broadsword build|run <project> --task <task>`, see `donecheck::classify`) run in the task's worktree on the commit that is
+    /// about to be reviewed; `broadsword test|check` lines are never run, but shown COVERED with the queue check's result (pending
+    /// for a train member: its train's check decides); the others are listed NOT RUN. WHERE: a single entry runs them right after its own check (and
+    /// perf gate) passed; a MERGE TRAIN member, whose own check is deferred, runs them on its own rebased commit in its worktree
+    /// before its review, because the review is per entry and a failing done check must reject before any review is spent. They
+    /// run once per attempt: the deferred check a train-less merge makes later (`merge_phase`) does not repeat them. The result,
+    /// redacted, is stored in `done_check` (the review prompt's "DONE CHECK, RUN BY THE QUEUE" section) and in
+    /// `<entry>.donecheck` (`<entry>.<attempt>.donecheck` for a later attempt). A command that FAILS (exit 1, or killed at
+    /// done_check_timeout_seconds) ends the entry `rejected` with no model asked; one that gives no verdict ends it `blocked`; a
+    /// branch that moved while they ran ends it `stale`.
+    fn s_done_check(&mut self) -> R<()> {
+        let (dir, branch, wt) = (self.dir.clone(), self.branch(), self.wt.clone());
+        let tip = self.g(wtgit::branch_tip(&dir, &branch))?;
+        let stored = self.e.get("project").to_string();
+        let project = job::canonical_project(&self.cfg.projects_dir, &stored).unwrap_or(stored);
+        let plan = donecheck::plan(self.e.get("brief"), &self.cfg.projects_dir, &project, self.e.get("task"));
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => return Err(self.blocked(&format!("the done check cannot run: the path of this broadsword binary cannot be read ({e}); nothing was reviewed or merged"))),
+        };
+        let limits = donecheck::Limits::from_config(self.cfg);
+        self.log("check", &format!("done check: {} item(s) in the brief's Done check, {} runnable; running them on commit {} in the task's worktree", plan.items.len(), plan.runnable(), short(&tip)))?;
+        let id = self.e.id().to_string();
+        let report = donecheck::run_plan(self.cfg, &exe, &wt, plan, &limits, &self.secrets, |m| println!("queue entry {id}: {m}"));
+        // `broadsword test|check` lines are never run: the queue's own check covers them (a train member's check is its train's)
+        let covered = if self.e.get("check_deferred") == "yes" {
+            "COVERED (pending: the merge train's check of the combined branches decides; nothing merges unless it passes)".to_string()
+        } else {
+            format!("COVERED by the queue's check (job {}: {})", if self.e.get("check_job").is_empty() { "none" } else { self.e.get("check_job") }, self.e.get("check_summary").lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("; "))
+        };
+        let text = self.secrets.redact(&format!("commit: {tip}\n{}", report.text(&exe, &limits, &covered)));
+        let attempt = self.e.get_num("attempt").unwrap_or(1);
+        let name = if attempt <= 1 { format!("{id}.donecheck") } else { format!("{id}.{attempt}.donecheck") };
+        let path = queue_dir(self.cfg).join(&name);
+        let file = format!("entry: {id}\nattempt: {attempt}\ntask: {}\nproject: {project}\n{text}", self.e.get("task"));
+        let tmp = path.with_extension("donecheck.tmp");
+        if let Err(e) = std::fs::write(&tmp, self.secrets.redact(&file).as_bytes()).and_then(|_| std::fs::rename(&tmp, &path)) {
+            return Err(self.internal(&format!("cannot write the done-check file {}: {e}", path.display())));
+        }
+        self.e.set("done_check", text);
+        self.e.set("done_check_file", name.clone());
+        self.save()?;
+        let now = self.g(wtgit::branch_tip(&dir, &branch))?;
+        if now != tip {
+            return Err(self.end(STALE, &format!("branch changed during the done check: `{branch}` was at {} and is at {} now; nothing was reviewed or merged. Run `queue run --entry {id}` to check it again", short(&tip), short(&now)), EXIT_RETRY));
+        }
+        let which = report.stopped_at.as_ref().map(|(i, _)| report.plan.items[*i].label().to_string()).unwrap_or_default();
+        match report.verdict() {
+            donecheck::Verdict::Pass => self.log("check", &format!("done check passed on commit {} (see state/queue/{name})", short(&tip))),
+            donecheck::Verdict::Fail(m) => Err(self.end(REJECTED, &format!("done-check command [{which}] of the brief FAILED ({m}) on commit {}; see state/queue/{name}. No model was asked. Fix it, commit, and queue the task again with `queue add`", short(&tip)), EXIT_REJECTED)),
+            donecheck::Verdict::Inconclusive(m) => Err(self.blocked(&format!("done-check command [{which}] of the brief could not run to a verdict ({m}); see state/queue/{name}; nothing was reviewed or merged; fix the cause, then `queue run --entry {id}`"))),
+        }
+    }
+
     // -- step 4: review ---------------------------------------------------------------------
 
     fn s_review(&mut self) -> R<()> {
@@ -1914,7 +1974,8 @@ impl<'a> Run<'a> {
         } else {
             println!("queue entry {}: reviewer CLI is {}", self.e.id(), cli.path);
         }
-        let prompt = self.secrets.redact(&reviewer::build_prompt(self.e.get("brief"), self.e.get("check_summary"), self.e.get("check_tail"), &diff));
+        let brief = with_done_check(self.e.get("brief"), self.e.get("done_check"));
+        let prompt = self.secrets.redact(&reviewer::build_prompt(&brief, self.e.get("check_summary"), self.e.get("check_tail"), &diff));
         let short_note = if self.secrets.short_count() > 0 { format!("; {} value(s) of .env are shorter than {} characters: not redacted from text (too common) but kept out of the reviewer's environment", self.secrets.short_count(), self.cfg.redact_min_chars) } else { String::new() };
         // Which gate runs: a GPT gate first when the rule picked one; a SKIPPED GPT call falls back to Claude in this same run.
         let mut model = gate.model.clone();
@@ -3009,6 +3070,12 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
 }
 
 /// The last `max` bytes of a file as text (empty if it cannot be read). Cut at a line start when it cut anything.
+/// The brief as the reviewer gets it: the brief, then the done check the queue ran (`s_done_check`).
+fn with_done_check(brief: &str, done_check: &str) -> String {
+    let body = if done_check.is_empty() { "not recorded for this entry (its check step ran before the queue ran done checks); nothing was run by the queue" } else { done_check };
+    format!("{brief}\n\nDONE CHECK, RUN BY THE QUEUE (the brief's done-check commands that the queue may run were run by it on the reviewed commit, and this is their real output; a line marked NOT RUN was not run by anyone here, so do not take it as passed):\n{body}")
+}
+
 fn read_tail(path: &Path, max: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else { return String::new() };

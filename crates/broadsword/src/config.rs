@@ -157,6 +157,10 @@ pub struct Config {
     /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
     /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
     pub python_tests: Vec<(String, Vec<String>)>,
+    /// The merge queue's DONE CHECK (donecheck.rs): a done-check command the queue runs is killed (its whole tree) after this long.
+    pub done_check_timeout_seconds: u64,
+    /// The merge queue's DONE CHECK: the last N lines of each command's output go to the reviewer and the `.donecheck` file.
+    pub done_check_tail_lines: u64,
     /// The test step runs up to this many copied test executables (and Python test scripts) at once; 1 = one after another.
     pub test_parallel_binaries: u64,
     /// Side by side, a test child that has exited has its output pipes waited for at most this many seconds (a process it
@@ -327,6 +331,8 @@ impl Config {
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
         Ok(Config {
             python_tests,
+            done_check_timeout_seconds: positive("done_check_timeout_seconds")?,
+            done_check_tail_lines: positive("done_check_tail_lines")?,
             shadow_reviewer,
             shadow_reviewer_model: model("shadow_reviewer_model")?,
             shadow_reviewer_timeout_seconds: positive("shadow_reviewer_timeout_seconds")?,
@@ -550,6 +556,8 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+done_check_timeout_seconds = 600
+done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
 install_dir=\"build/bin\"\n";
@@ -661,6 +669,20 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn done_check_settings_are_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        let c = Config::from_text(text, Path::new("p")).unwrap();
+        assert!(c.done_check_timeout_seconds > c.build_lock_wait_seconds, "a done check waiting for the build lock must not be killed first");
+        assert!(c.done_check_tail_lines >= 1);
+        for key in ["done_check_timeout_seconds", "done_check_tail_lines"] {
+            let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
+            assert!(e.contains(key), "{key}: {e}");
+            let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+            assert!(Config::from_text(&zero, Path::new("p")).is_err(), "{key} = 0");
+        }
+    }
+
+    #[test]
     fn test_parallel_binaries_is_required_and_positive() {
         let text = include_str!("../../../broadsword.toml");
         assert!(Config::from_text(text, Path::new("p")).unwrap().test_parallel_binaries >= 1);
@@ -714,6 +736,8 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+done_check_timeout_seconds = 600
+done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
 worktrees_dir = \"worktrees\"\n";
@@ -763,6 +787,8 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 python_tests = \"\"
+done_check_timeout_seconds = 600
+done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
 worktrees_dir = \"worktrees\"\n";
