@@ -1007,6 +1007,31 @@ class RealPriceTests(unittest.TestCase):
         self.assertEqual(float(rows[1][5]), (14372 * 2 + 1237 * 10) / 1e6)
         self.assertEqual(float(rows[1][5]), 0.041114)
 
+    def test_the_cap_check_refuses_an_api_call_once_real_priced_credit_rows_reach_the_cap(self):
+        """api-credits rows written by record_spend (priced from the real models.json) feed cap_gate: below the cap an API call passes,
+        at the cap and above it cap_gate raises Refused. Each row is 30000 in + 2000 out on gpt-6.1-sol = 0.08 at list price."""
+        def make(cap):
+            root = Path(tempfile.mkdtemp(prefix="capprices-"))
+            self.addCleanup(shutil.rmtree, root, True)
+            (root / "bench").mkdir()
+            shutil.copy(self.real_root / "bench" / "models.json", root / "bench" / "models.json")
+            (root / "broadsword.toml").write_text(f'state_dir = "state"\ngpt_daily_cap_usd = {cap}\n', encoding="utf-8")
+            return root
+        result = {"is_error": False, "modelUsage": {"gpt-6.1-sol": {"inputTokens": 30000, "outputTokens": 2000}}}
+        root = make("0.15")
+        self.m.record_spend(root, {}, "gpt-6.1-sol", result, "api")
+        credit, plans = self.m.cap_gate(root, "api")
+        self.assertEqual((credit, plans), (0.08, 0), "one 0.08 row is below the 0.15 cap: the API call may go")
+        self.m.record_spend(root, {}, "gpt-6.1-sol", result, "api")
+        with self.assertRaises(self.m.Refused) as cm:
+            self.m.cap_gate(root, "api")
+        self.assertIn("daily_cap_reached: 0.1600 of 0.15", str(cm.exception), "two rows sum to 0.16: above the cap")
+        self.assertEqual(self.m.cap_gate(root, "codex")[0], 0.16, "a codex call is never refused for the cap")
+        root = make("0.08")
+        self.m.record_spend(root, {}, "gpt-6.1-sol", result, "api")
+        with self.assertRaises(self.m.Refused, msg="a sum exactly at the cap refuses"):
+            self.m.cap_gate(root, "api")
+
 
 if __name__ == "__main__":
     unittest.main()
