@@ -26,6 +26,7 @@ TOML = """root = "."
 install_dir = "build/bin"
 state_dir = "state"
 projects_dir = "projects"
+worktrees_dir = "worktrees"
 reviewer_diff_max_kb = 50
 reviewer_check_tail_kb = 1
 reviewer_brief_max_kb = 4
@@ -62,6 +63,8 @@ class Env:
         git(self.root, "add", "b.rs")
         git(self.root, "commit", "-q", "-m", "change")
         self.tip = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        self.wt = self.root / "worktrees" / "broadsword" / "t-1"
+        git(self.root, "worktree", "add", "-q", "--detach", str(self.wt), self.tip)
         self.entry = "q-20261121-050000"
         lines = [
             "project = broadsword", "task = t-1", f"coder = {coder}", f"reviewer_model = {reviewer}",
@@ -118,6 +121,33 @@ class DisputeTests(unittest.TestCase):
     def test_real_and_unsure_rulings(self):
         for r in ("real", "unsure"):
             self.assertEqual(self.env.go(caller=self.env.caller(good_reply(r)), finding=FINDING + " ")[0], r)
+
+    def test_worktree_at_another_head_is_refused(self):
+        (self.env.wt / "c.txt").write_text("later\n")
+        git(self.env.wt, "add", "c.txt")
+        git(self.env.wt, "commit", "-q", "-m", "later commit")
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go()
+        self.assertIn("not the entry's reviewed tip", str(c.exception))
+        self.assertEqual((self.env.runs, self.env.prompts, self.env.rows()), ([], [], []))
+
+    def test_dirty_or_untracked_worktree_is_refused(self):
+        (self.env.wt / "b.rs").write_text("fn negative_length_is_refused() { edited }\n")
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go()
+        self.assertIn("not clean", str(c.exception))
+        git(self.env.wt, "checkout", "--", "b.rs")
+        (self.env.wt / "new_untracked.rs").write_text("x\n")
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go()
+        self.assertIn("not clean", str(c.exception))
+        self.assertEqual((self.env.runs, self.env.rows()), ([], []))
+
+    def test_missing_worktree_is_refused(self):
+        git(self.env.root, "worktree", "remove", "--force", str(self.env.wt))
+        with self.assertRaises(rd.Refused) as c:
+            self.env.go()
+        self.assertIn("does not exist", str(c.exception))
 
     def test_failing_test_is_recorded_and_no_model_is_asked(self):
         ruling, _ = self.env.go(runner=self.env.runner("test result: FAILED. 0 passed; 1 failed", 101))

@@ -64,7 +64,7 @@ EFFORT_NOTE = "client-default (clients/openai_review.py has no effort flag; medi
 CLIENT = Path("clients") / "openai_review.py"
 REQUIRED_KEYS = (
     "reviewer_diff_max_kb", "reviewer_check_tail_kb", "reviewer_brief_max_kb", "reviewer_timeout_seconds",
-    "shadow_reviewer_timeout_seconds", "redact_min_chars", "install_dir", "state_dir", "projects_dir",
+    "shadow_reviewer_timeout_seconds", "redact_min_chars", "install_dir", "state_dir", "projects_dir", "worktrees_dir",
 )
 ENTRY_RE = re.compile(r"^q-\d{8}-\d{6}(-[A-Za-z0-9]+)?$")
 CARGO_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_:.]*$")
@@ -101,7 +101,7 @@ def load_config(root: Path) -> dict:
         raise Refused(f"broadsword.toml lacks the required key(s): {', '.join(missing)}")
     for k in REQUIRED_KEYS:
         v = cfg[k]
-        if k in ("install_dir", "state_dir", "projects_dir"):
+        if k in ("install_dir", "state_dir", "projects_dir", "worktrees_dir"):
             if not isinstance(v, str) or not v.strip():
                 raise Refused(f"broadsword.toml: {k} must be a non-empty string")
         elif isinstance(v, bool) or not isinstance(v, int) or v <= 0:
@@ -160,6 +160,30 @@ def git_diff(repo: Path, base: str, tip: str, max_kb: int) -> str:
     if not text.strip():
         raise Refused("the diff is empty")
     return text
+
+
+def check_worktree(root: Path, cfg: dict, project: str, task: str, tip: str) -> None:
+    """The test runs in the task's worktree, so that tree must be exactly the diff's tip: HEAD == tip and nothing modified or untracked.
+    Chosen over a fresh detached worktree because `broadsword run --task` runs in the task's own worktree and shared build folder; a
+    second checkout would need its own claim in the build-source notes. A missing worktree is refused too (it cannot be verified)."""
+    if not re.match(r"^[A-Za-z0-9_.-]+$", task):
+        raise Refused(f"task id {task!r} is not a plain name")
+    wt = root / cfg["worktrees_dir"] / project / task
+    if not wt.is_dir():
+        raise Refused(f"the task worktree {wt} does not exist: the test cannot be run against the reviewed commit")
+
+    def g(*a):
+        p = subprocess.run(["git", "-C", str(wt), *a], capture_output=True, timeout=120)
+        if p.returncode != 0:
+            raise Refused(f"git {' '.join(a)} failed in {wt}: {p.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        return p.stdout.decode("utf-8", "replace")
+
+    head = g("rev-parse", "HEAD").strip()
+    if head != tip and not (len(tip) < 40 and head.startswith(tip)):
+        raise Refused(f"the task worktree HEAD {head[:12]} is not the entry's reviewed tip {tip[:12]}: the test would not prove the reviewed diff")
+    dirty = g("status", "--porcelain", "--untracked-files=all").strip()
+    if dirty:
+        raise Refused(f"the task worktree is not clean (git status --porcelain: {dirty.splitlines()[0][:120]}): the test would not prove the reviewed diff")
 
 
 def added_lines(diff: str) -> str:
@@ -338,9 +362,11 @@ def dispute(root: Path, entry_id: str, finding: str, test: str, model: str, excl
     if not finding_is_recorded(root, cfg, e, finding):
         raise Refused(f"the finding text does not occur in the blocking, shadow_blocking or minor lines (or review files) of {entry_id}")
     argv, must_be_added = test_command(test)
-    diff = git_diff(repo_of(root, cfg, e["project"]), e["base_head"], e.get("checked_tip") or e["rebased_tip"], cfg["reviewer_diff_max_kb"])
+    tip = e.get("checked_tip") or e["rebased_tip"]
+    diff = git_diff(repo_of(root, cfg, e["project"]), e["base_head"], tip, cfg["reviewer_diff_max_kb"])
     if must_be_added not in added_lines(diff):
         raise Refused(f"the test name {must_be_added!r} is not on an added line of the change's diff: the proof must be part of the change itself")
+    check_worktree(root, cfg, e["project"], e["task"], tip)
     code, output = runner(root, cfg, e["project"], e["task"], test)
     secrets = secret_values(root, cfg, environ)
     output = redact(output, secrets)
