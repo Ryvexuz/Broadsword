@@ -2060,7 +2060,7 @@ impl<'a> Run<'a> {
         let n = self.take_review_call()?;
         self.log("review", &format!("calling the GPT gate `{model}` through {script}{} (call {n} of at most {}, at most {} s); this spends money (plan, then credits under the daily cap) and uses the network", if hook { " [TEST HOOK]" } else { "" }, self.cfg.reviewer_max_calls_per_entry, self.cfg.reviewer_timeout_seconds))?;
         let one_line = |m: &str| m.lines().next().unwrap_or("").chars().take(300).collect::<String>();
-        Ok(match reviewer::call_gpt(self.cfg, &python, &script, model, reviewer::gate_system_prompt(self.e.get("risk")), prompt, "gate", self.cfg.reviewer_timeout_seconds) {
+        Ok(match reviewer::call_gpt(self.cfg, &python, &script, model, reviewer::gate_system_prompt(self.e.get("risk")), prompt, "gate", self.e.get("task"), self.cfg.reviewer_timeout_seconds) {
             Err(CallError::Timeout(s)) => Err(format!("no answer within {s} s (reviewer_timeout_seconds)")),
             Err(CallError::Start(m) | CallError::Failed(m)) => Err(one_line(&m)),
             Ok(r) => match &r.invalid {
@@ -2094,7 +2094,7 @@ impl<'a> Run<'a> {
         };
         self.log("shadow", &format!("calling the shadow reviewer `{model}` (recorded only, never gating; at most {} s); this spends money and uses the network", self.cfg.shadow_reviewer_timeout_seconds))?;
         let t0 = std::time::Instant::now();
-        let result = reviewer::call_shadow(self.cfg, &python, &script, &model, prompt);
+        let result = reviewer::call_shadow(self.cfg, &python, &script, &model, prompt, self.e.get("task"));
         let secs = t0.elapsed().as_secs_f64();
         self.e.set("shadow_secs", format!("{secs:.1}"));
         let review = match result {

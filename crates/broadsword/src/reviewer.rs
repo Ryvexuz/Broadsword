@@ -433,25 +433,50 @@ pub fn check_shadow_model(rev: &mut Review, requested: &str) {
 }
 
 /// Call the shadow reviewer once, with the same prompt, the scrubbed environment and `shadow_reviewer_timeout_seconds`.
-pub fn call_shadow(cfg: &Config, python: &str, script: &str, model: &str, prompt: &str) -> Result<Review, CallError> {
-    call_gpt(cfg, python, script, model, SYSTEM_PROMPT, prompt, "shadow", cfg.shadow_reviewer_timeout_seconds)
+pub fn call_shadow(cfg: &Config, python: &str, script: &str, model: &str, prompt: &str, task_id: &str) -> Result<Review, CallError> {
+    call_gpt(cfg, python, script, model, SYSTEM_PROMPT, prompt, "shadow", task_id, cfg.shadow_reviewer_timeout_seconds)
 }
 
 /// The env var through which a caller tells clients/openai_review.py what kind of call this is (`gate` or `shadow`), for its ledger.
 pub const CALL_TYPE_ENV: &str = "OPENAI_REVIEW_CALL_TYPE";
+/// The env var that labels the ledger's caller cell with the call type and the reviewed task ID.
+pub const CALLER_ENV: &str = "OPENAI_REVIEW_CALLER";
+
+/// Build a single-cell caller label from review metadata, rejecting known secret values.
+/// An empty task field (including a missing record field) is recorded as `unknown`.
+fn review_caller(call_type: &str, task_id: &str, secrets: &Secrets) -> Result<String, CallError> {
+    if !matches!(call_type, "gate" | "shadow") {
+        return Err(CallError::Start("invalid_review_call_type: expected gate or shadow".into()));
+    }
+    // Match the alphabet of record::sanitize without silently changing the task being attributed.
+    if !task_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Err(CallError::Start("invalid_review_task_id: expected an ID containing only ASCII letters, digits, hyphens or underscores".into()));
+    }
+    let caller = format!("{call_type} {}", if task_id.is_empty() { "unknown" } else { task_id });
+    // Explicit child variables are set AFTER the inherited environment is scrubbed. Check this new value too,
+    // including the raw ID so an exact short secret cannot be hidden by the call-type prefix.
+    let labels = vec![(CALLER_ENV.to_string(), caller.clone()), (CALLER_ENV.to_string(), task_id.to_string())];
+    if !secrets.scrub_names(&labels).is_empty() {
+        return Err(CallError::Start("review_caller_contains_secret: refusing to put a secret in the spend ledger".into()));
+    }
+    Ok(caller)
+}
 
 /// Call clients/openai_review.py once (the shadow review and the GPT gate both come here, so both pass the client's cap and ledger),
-/// with the scrubbed environment, `OPENAI_REVIEW_CALL_TYPE=<call_type>` and a kill after `timeout_s`. The answer must come from the
-/// requested model: a model named by the backend that is another one makes the review `invalid`.
+/// with the scrubbed environment, `OPENAI_REVIEW_CALL_TYPE=<call_type>`, `OPENAI_REVIEW_CALLER=<call_type> <task_id>` (or
+/// `<call_type> unknown` for an empty task ID) and a kill after `timeout_s`. The answer must come from the requested model:
+/// a model named by the backend that is another one makes the review `invalid`.
 #[allow(clippy::too_many_arguments)]
-pub fn call_gpt(cfg: &Config, python: &str, script: &str, model: &str, system_prompt: &str, prompt: &str, call_type: &str, timeout_s: u64) -> Result<Review, CallError> {
+pub fn call_gpt(cfg: &Config, python: &str, script: &str, model: &str, system_prompt: &str, prompt: &str, call_type: &str, task_id: &str, timeout_s: u64) -> Result<Review, CallError> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let secrets = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize);
+    let caller = review_caller(call_type, task_id, &secrets)?;
+    let remove = secrets.scrub_names(&env);
     let cwd = cfg.scratch_dir.join("review-cwd");
     std::fs::create_dir_all(&cwd).map_err(|e| CallError::Start(format!("cannot create {}: {e}", cwd.display())))?;
     let mut args: Vec<String> = vec!["-I".into(), "-B".into(), script.into()];
     args.extend(["-p", "--system-prompt", system_prompt, "--model", model, "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--output-format", "json"].iter().map(|s| s.to_string()));
-    let env: Vec<(String, String)> = std::env::vars().collect();
-    let remove = Secrets::collect(&cfg.root, &env, cfg.redact_min_chars as usize).scrub_names(&env);
-    let out = run_cli(python, &args, &cwd, &remove, &[(CALL_TYPE_ENV, call_type)], prompt, Duration::from_secs(timeout_s))?;
+    let out = run_cli(python, &args, &cwd, &remove, &[(CALL_TYPE_ENV, call_type), (CALLER_ENV, &caller)], prompt, Duration::from_secs(timeout_s))?;
     let mut rev = parse_claude_output(&out.stdout, out.code, &out.stderr)?;
     check_shadow_model(&mut rev, model);
     check_reported_models(&mut rev, model);
@@ -597,6 +622,50 @@ mod tests {
     use crate::scrub::secret_name;
 
     #[test]
+    fn review_caller_names_the_call_type_and_task_or_unknown() {
+        let secrets = Secrets::default();
+        for call_type in ["gate", "shadow"] {
+            for task_id in ["t-20261121-161632", "t-20261121-070932-2", "task_ABC"] {
+                assert_eq!(review_caller(call_type, task_id, &secrets).unwrap(), format!("{call_type} {task_id}"));
+            }
+            assert_eq!(review_caller(call_type, "", &secrets).unwrap(), format!("{call_type} unknown"));
+        }
+    }
+
+    #[test]
+    fn review_caller_does_not_truncate_a_large_id_or_accept_its_invalid_tail() {
+        let secrets = Secrets::default();
+        let task_id = "t".repeat(64 * 1024);
+        assert_eq!(review_caller("shadow", &task_id, &secrets).unwrap(), format!("shadow {task_id}"));
+        let invalid = format!("{task_id}\r");
+        assert!(matches!(review_caller("shadow", &invalid, &secrets), Err(CallError::Start(m)) if m.starts_with("invalid_review_task_id:")));
+    }
+
+    #[test]
+    fn review_caller_rejects_invalid_fields_without_echoing_them() {
+        let secrets = Secrets::default();
+        for call_type in ["", "unknown", "gate\tshadow", "gate\r", "gate\n", "gate\u{2028}"] {
+            assert!(matches!(review_caller(call_type, "t-1", &secrets), Err(CallError::Start(m)) if m == "invalid_review_call_type: expected gate or shadow"));
+        }
+        for task_id in [" ", " t-1", "t-1 ", "t-1\trow", "t-1\nrow", "t-1\rrow", "t-1\u{2028}row", "t-1\0row", "C:\\task", "../task", "task/name"] {
+            assert!(matches!(review_caller("gate", task_id, &secrets), Err(CallError::Start(m)) if m == "invalid_review_task_id: expected an ID containing only ASCII letters, digits, hyphens or underscores"));
+        }
+    }
+
+    #[test]
+    fn review_caller_rejects_secret_values_even_in_valid_ids() {
+        let env = vec![("TEST_SECRET".into(), "private-task-value".into())];
+        // A source file cannot contain a child .env file; only the supplied environment supplies secrets here.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/reviewer.rs");
+        let secrets = Secrets::collect(&root, &env, 6);
+        for call_type in ["gate", "shadow"] {
+            for task_id in ["private-task-value", "t-private-task-value-2"] {
+                assert!(matches!(review_caller(call_type, task_id, &secrets), Err(CallError::Start(m)) if m == "review_caller_contains_secret: refusing to put a secret in the spend ledger"));
+            }
+        }
+    }
+
+    #[test]
     fn gate_prompt_is_shadow_prompt_plus_block() {
         assert!(SYSTEM_PROMPT_GATE.contains("Rules for BLOCKING lines:"));
         assert!(!SYSTEM_PROMPT.contains("Rules for BLOCKING lines:"));
@@ -685,6 +754,11 @@ mod tests {
         assert_eq!(s.redact("r=eu-west-1 p=ghp_abcdef123456 q=hunter2hunter2 t=ab"), "r=[REDACTED] p=[REDACTED] q=[REDACTED] t=ab");
         assert_eq!(s.short_count(), 1);
         assert_eq!(s.scrub_names(&env), ["MY_COPY", "EXACT_SHORT"], "contains for long values, equals for short ones");
+        for call_type in ["gate", "shadow"] {
+            for task_id in ["eu-west-1", "ab"] {
+                assert!(matches!(review_caller(call_type, task_id, &s), Err(CallError::Start(m)) if m == "review_caller_contains_secret: refusing to put a secret in the spend ledger"));
+            }
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 
