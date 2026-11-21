@@ -52,7 +52,12 @@
 //! It is written in exactly two places, both under the build lock and both from an exe whose note names the main checkout
 //! (so a worktree's exe never lands there), and both only from a SUCCESSFUL main step:
 //! - after every successful cargo step or `run` command of the main checkout itself (`refresh_main_bins`, called by job.rs
-//!   after a build or run step and after the test step's compile), so it always holds main's newest good build;
+//!   after a build or run step and after the test step's compile), for ONLY the exes that step produced: job.rs records the
+//!   fingerprint (length and modified time) of every bin exe in cargo's folder right before the step (`snapshot_main_bins`,
+//!   once per step, the one record both refresh sites use), and an exe whose fingerprint did not change during the step
+//!   (cached from an earlier step, maybe a FAILED one: `run -- cargo build --keep-going` can link bin A while bin B fails) is
+//!   not copied, and its kept copy and note stay as they are. So main.bins holds main's newest build of every bin a successful
+//!   step built;
 //! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), ONLY for a copy marked stale
 //!   (below) whose marker names exactly the exe still in cargo's folder (its length and modified time): that exe is the
 //!   successful build the refresh could not copy. Any other exe there (a failed or partial main build's leftovers, whose bin
@@ -62,7 +67,8 @@
 //! NOT fail the job: the old copy stays, still named by its own `.source` note, a marker `<exe>.stale` beside it says
 //! `stale: <note of the new build>, in use at <UTC>` and, on its second line, `built: <length> bytes, modified <time>` of the
 //! new build in cargo's folder; the job prints a loud `main.bins: <bin> NOT refreshed (in use)` line, and the next main step
-//! that finds the copy free refreshes it and removes the marker. Every other copy error (disk full, a length mismatch) still
+//! that finds the copy free refreshes it and removes the marker (the marker vouches for that exe, so it is copied even when the
+//! next step does not rebuild it). Every other copy error (disk full, a length mismatch) still
 //! fails the job, after its summary block. Before another folder's clean a stale copy that is still in use refuses that job
 //! (nothing built; the package in question is not cleaned, but packages processed earlier in the same job may already be): the
 //! clean would delete main's newer build from cargo's folder while main.bins holds only the older one. A copy is "current" by
@@ -72,7 +78,11 @@
 //!
 //! Limits: a main `build`/`check`/`run` that FAILS refreshes nothing (main.bins keeps the last good build, the cache may hold the
 //! failed attempt's leftovers); a `run` of the main checkout counts (its command may build anything there, so its kept note is
-//! `run:<folder>`, never `.`); a `run` whose packages cannot be listed refreshes nothing (its line says so), and a main exe
+//! `run:<folder>`, never `.`); a bin that a failed step linked and the next successful step found fresh (so did not relink)
+//! stays out of main.bins until a successful step writes it again (a change to its source, or a clean), and so does the exe of
+//! a successful step whose refresh FAILED (that job fails; no marker vouches for the exe); before another folder's clean a
+//! copy whose bytes are current keeps its note (only a step that wrote the exe renames its builder); a `run` whose
+//! packages cannot be listed (before or after its command) refreshes nothing (its line says so), and a main exe
 //! that no refresh copied (that run's, or one built before main.bins existed) is not kept before another folder's clean;
 //! copies in the older layout `main.bins/<profile>/` are no longer written or read; cargo-sweep never touches main.bins (it
 //! only deletes hash-named files in folders that hold a `.fingerprint`: test in cleanup.rs).
@@ -602,12 +612,14 @@ pub fn stale_marker(exe: &Path) -> PathBuf {
 }
 
 /// When `keep_main_bins` runs, which decides what it may copy and what a kept copy in use (cannot be replaced) does to the job.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Keep {
-    /// right after a SUCCESSFUL main step (`refresh_main_bins`): the exe in cargo's folder is that step's build, so it is copied.
-    /// A copy in use is main's previous build and the new one is in cargo's folder, so the job passes, says so loudly and marks
-    /// the copy stale (with the new exe's fingerprint)
-    AfterMainStep,
+#[derive(Clone, Copy)]
+enum Keep<'a> {
+    /// right after a SUCCESSFUL main step (`refresh_main_bins`), with what cargo's folder held before that step: only an exe the
+    /// step itself produced (`StepBins::produced`), or one a stale marker vouches for, is copied. Any other exe there (cached
+    /// from an earlier, maybe FAILED, step) keeps its current kept copy and note untouched. A copy in use is main's previous
+    /// build and the new one is in cargo's folder, so the job passes, says so loudly and marks the copy stale (with the new
+    /// exe's fingerprint)
+    AfterMainStep(&'a StepBins),
     /// before another folder's clean: only the exe a stale marker vouches for (a successful build the refresh could not copy:
     /// `vouched_by_marker`) is copied; anything else in cargo's folder may be a failed build's and is left to the clean. A
     /// vouched copy in use refuses the job (the clean would delete main's newer build from cargo's folder with no copy of it;
@@ -634,6 +646,48 @@ fn vouched_by_marker(kept: &Path, built: &Path) -> bool {
     text.lines().any(|l| l.strip_prefix(STALE_BUILT) == Some(now.as_str()))
 }
 
+/// What cargo's folder held for the bin exes of a MAIN checkout's packages just before one step (`snapshot_main_bins`): the
+/// fingerprint (`fingerprint`: length and modified time) of each `<profile>/<bin>` exe, or none where there was no exe. After
+/// the step, `produced` says which exes the step itself wrote, the only ones `refresh_main_bins` copies. THE one record both
+/// the job's step loop and the test step's compile refresh from (job.rs takes it once per step, before the step runs).
+pub struct StepBins {
+    /// Ok: (profile, bin, fingerprint before the step). Err: the packages could not be listed before the step, so nothing can
+    /// be told apart and nothing is refreshed (fail closed).
+    before: Result<Vec<(Profile, String, Option<String>)>, String>,
+}
+
+impl StepBins {
+    /// True if the exe `exe` of `bin` for `profile` was written during the step: it exists now and its fingerprint differs from
+    /// the one recorded before (or there was none: it appeared). False when the record could not be made.
+    fn produced(&self, profile: Profile, bin: &str, exe: &Path) -> bool {
+        let Ok(before) = &self.before else { return false };
+        let Ok(now) = fingerprint(exe) else { return false };
+        let was = before.iter().find(|(p, b, _)| *p == profile && b == bin).and_then(|(_, _, f)| f.as_deref());
+        was != Some(now.as_str())
+    }
+}
+
+/// The record of cargo's bin exes before a step of `dir` built from `source` (see `StepBins`). Call it with the build lock held,
+/// after the build folder was prepared and right before the step runs. For a source that is not a main checkout it records
+/// nothing (`refresh_main_bins` refreshes nothing for it anyway).
+pub fn snapshot_main_bins(cfg: &Config, dir: &Path, source: &str) -> StepBins {
+    if main_folder(cfg, source).as_deref() != Some(source) {
+        return StepBins { before: Ok(Vec::new()) };
+    }
+    let before = bins_of(cfg, dir).map(|targets| {
+        let mut v = Vec::new();
+        for (_, bins) in &targets {
+            for b in bins {
+                for profile in CLEAN_PROFILES {
+                    v.push((profile, b.clone(), fingerprint(&built_exe(cfg, profile, b)).ok()));
+                }
+            }
+        }
+        v
+    });
+    StepBins { before }
+}
+
 /// Copy main's exes of package `pkg` (whose binary targets are `bins`) to their kept place: every exe of those targets whose note
 /// (the bin note, else the package note for builds from before bin notes) names `main` (plain or `run:`), in each profile, with
 /// that note beside it. `when` ends the error message. Called after a successful main step (`refresh_main_bins`) and before a
@@ -656,6 +710,13 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
                 continue;
             }
             guard_kept_files(cfg, "refusing to keep main's binaries", &to)?;
+            // after a main step: an exe this step did not write is left alone, copy and note (it may be a failed step's),
+            // unless a stale marker vouches for it (an earlier successful step whose refresh found the copy in use)
+            if let Keep::AfterMainStep(step) = moment {
+                if !step.produced(profile, b, &from) && !vouched_by_marker(&to, &from) {
+                    continue;
+                }
+            }
             let (side, stale) = (kept_note(&to), stale_marker(&to));
             let old = read_kept_note(cfg, &project, profile, b);
             // sameness is the BYTES only: a copy that is current byte for byte is never replaced because its note text differs
@@ -668,7 +729,9 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             };
             if same {
                 remove(&stale)?; // up to date after all: no longer stale
-                if old.as_deref() != Some(note.as_str()) {
+                // only a step that wrote this exe may rename its kept copy's builder; before another folder's clean the copy
+                // and its note stay exactly as the last main step left them
+                if matches!(moment, Keep::AfterMainStep(_)) && old.as_deref() != Some(note.as_str()) {
                     // the binary is not touched (it may be running); the note is replaced atomically beside it
                     write_atomic(&side, &note).map_err(|e| fail(&e))?;
                     lines.push(format!("main.bins: `{b}` ({}) is current; its note now says {} (the binary was not touched)", profile.dir(), note));
@@ -677,7 +740,7 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             }
             // before another folder's clean only a successful build the refresh could not copy is kept: the exe in cargo's folder
             // may be a failed or partial main build's (prepare set its bin note to main before that build ran)
-            if moment == Keep::BeforeForeignClean && !vouched_by_marker(&to, &from) {
+            if matches!(moment, Keep::BeforeForeignClean) && !vouched_by_marker(&to, &from) {
                 lines.push(format!("main.bins: `{b}` ({}) not kept from {}: no successful main step vouches for that exe (it may be a failed build's); main.bins keeps the last good copy", profile.dir(), from.display()));
                 continue;
             }
@@ -689,7 +752,7 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
                     remove(&stale)?;
                     lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
                 }
-                Err(CopyFail::Replace(e)) if moment == Keep::AfterMainStep && in_use(&to) => {
+                Err(CopyFail::Replace(e)) if matches!(moment, Keep::AfterMainStep(_)) && in_use(&to) => {
                     // the old copy stays, still named by its own note; the marker says a newer build exists, and which exe it is
                     if let Some(o) = &old {
                         write_atomic(&side, o).map_err(|e| fail(&e))?;
@@ -717,13 +780,18 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
 }
 
 /// After a SUCCESSFUL cargo step (or `run` command) of the main checkout `source` itself, with the build lock still held: every
-/// bin target exe of `dir`'s packages whose note names `source` is copied to its kept place (`keep_main_bins`), so `main.bins`
-/// always holds main's newest build. Any other folder (a worktree, an unknown one) refreshes nothing. A `run` whose packages
-/// cannot be listed refreshes nothing and says so. Err = the copy failed (the caller fails the job: its output was built, but
-/// `main.bins` does not hold it).
-pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
+/// bin target exe of `dir`'s packages whose note names `source` AND that this step produced (`before`, taken by
+/// `snapshot_main_bins` right before the step) is copied to its kept place (`keep_main_bins`), so `main.bins` holds main's newest
+/// build of every bin a successful step built. An exe the step did not write (cached from an earlier step, which may have
+/// failed) is not copied, and its kept copy and note stay as they are. Any other folder (a worktree, an unknown one) refreshes
+/// nothing. A `run` whose packages cannot be listed (now, or before the step) refreshes nothing and says so. Err = the copy
+/// failed (the caller fails the job: its output was built, but `main.bins` does not hold it).
+pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str, before: &StepBins) -> Result<Vec<String>, String> {
     if main_folder(cfg, source).as_deref() != Some(source) {
         return Ok(Vec::new());
+    }
+    if let Err(e) = &before.before {
+        return Ok(vec![format!("main's binaries: not kept (the packages could not be listed before this step, so nothing tells which binaries it built: {e})")]);
     }
     let targets = match bins_of(cfg, dir) {
         Ok(t) => t,
@@ -731,7 +799,7 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<S
     };
     let mut lines = Vec::new();
     for (p, bins) in &targets {
-        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)", Keep::AfterMainStep)?);
+        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)", Keep::AfterMainStep(before))?);
     }
     Ok(lines)
 }
@@ -1185,7 +1253,13 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::OpenOptionsExt::share_mode(&mut hold, 1);
         let _running = hold.open(&to).unwrap();
+        // before another folder's clean nothing is renamed: the copy and its note stay as the last main step left them
         let r = keep_main_bins(&cfg, "projects/p", "pkg", &["probe".to_string()], "in the test", Keep::BeforeForeignClean);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(read_kept_note(&cfg, "p", Profile::Release, "probe").as_deref(), Some("run:projects/p"));
+        // after a main step that wrote the exe (no record of it before the step: it appeared), only the note is updated
+        let step = StepBins { before: Ok(Vec::new()) };
+        let r = keep_main_bins(&cfg, "projects/p", "pkg", &["probe".to_string()], "in the test", Keep::AfterMainStep(&step));
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(read_kept_note(&cfg, "p", Profile::Release, "probe").as_deref(), Some("projects/p"));
         assert_eq!(std::fs::read(&to).unwrap(), b"main's exe");

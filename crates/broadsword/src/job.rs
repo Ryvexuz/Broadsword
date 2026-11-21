@@ -649,11 +649,12 @@ enum PoolEnd {
 }
 
 /// `buildsrc::refresh_main_bins` for this job, its lines printed and logged. The caller holds the build lock and calls it only
-/// after a successful cargo step or `run` command. A failure is NOT reported here: it goes into `failed` (the first one is kept),
-/// and `run_job_info` reports it in its one place, after the job's summary block, and fails the job (main.bins does not hold
-/// what was built). Returns false when it failed.
-fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log, failed: &mut Option<String>) -> bool {
-    match buildsrc::refresh_main_bins(cfg, project_dir, source) {
+/// after a successful cargo step or `run` command, with `before`: the record of cargo's bin exes that `run_job_info` took right
+/// before that step (`buildsrc::snapshot_main_bins`, once per step), so only the exes the step produced are kept. A failure is
+/// NOT reported here: it goes into `failed` (the first one is kept), and `run_job_info` reports it in its one place, after the
+/// job's summary block, and fails the job (main.bins does not hold what was built). Returns false when it failed.
+fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log, before: &buildsrc::StepBins, failed: &mut Option<String>) -> bool {
+    match buildsrc::refresh_main_bins(cfg, project_dir, source, before) {
         Ok(lines) => {
             for l in lines {
                 println!("{l}");
@@ -688,6 +689,9 @@ struct TestStep<'a> {
     /// Set when refreshing main.bins after the compile failed (see `refresh_main_bins`); the tests still run, and the job
     /// reports it after its summary and fails.
     main_bins_failed: &'a mut Option<String>,
+    /// What cargo's folder held for main's bin exes before this step (taken by `run_job_info` while it holds the build lock;
+    /// `None` without the lock): the refresh after the compile keeps only the exes the compile produced.
+    step_bins: Option<&'a buildsrc::StepBins>,
 }
 
 impl TestStep<'_> {
@@ -722,8 +726,8 @@ impl TestStep<'_> {
         let arts = parse_artifacts(&compiled.stdout)?;
         let envs = package_envs(self.cfg, self.project_dir)?;
         // the compile succeeded: the main checkout's bins it built go to `build/main.bins` while the lock still holds
-        if hold.is_some() {
-            refresh_main_bins(self.cfg, self.project_dir, self.source, self.log, self.main_bins_failed);
+        if let (Some(_), Some(before)) = (hold.as_ref(), self.step_bins) {
+            refresh_main_bins(self.cfg, self.project_dir, self.source, self.log, before, self.main_bins_failed);
         }
         let mut kept = String::new();
         // 2. copy, then release the lock
@@ -1533,6 +1537,9 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         if let Ok(mut f) = log.lock() {
             let _ = writeln!(f, "=== {step} {name} ({}) ===", pause::now_string());
         }
+        // THE one record both refreshes of main.bins use (after this step, or after the test step's compile): cargo's bin exes
+        // before the step, so only the ones it produces are kept (buildsrc::StepBins). Taken under the build lock.
+        let step_bins = build_hold.is_some().then(|| buildsrc::snapshot_main_bins(cfg, &project_dir, &source));
         let mut cmd = match (&spec.command, *step) {
             (Some(line), "run") => shell_command(&project_dir, line),
             _ => cargo_command(cfg, &project_dir, step),
@@ -1560,7 +1567,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         let mut py: Option<PyTests> = None;
         let ran = if *step == "test" && kind != "run" {
             let parallel = cfg.test_parallel_binaries as usize;
-            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel, main_bins_failed: &mut main_bins_failed };
+            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel, main_bins_failed: &mut main_bins_failed, step_bins: step_bins.as_ref() };
             // the project's Python tests (SCALING F9) run once cargo's tests pass (side by side: in the same pool, after the
             // copies), always after the build lock is released
             match t.run(cmd, &mut build_hold, python_scripts(cfg, name)) {
@@ -1621,8 +1628,10 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         }
         // a successful step of the main checkout refreshes `build/main.bins`, the stable place of main's binaries (buildsrc.rs),
         // while the build lock still holds (the test step does it itself, before it releases the lock)
-        if build_hold.is_some() && !refresh_main_bins(cfg, &project_dir, &source, &log, &mut main_bins_failed) {
-            break; // no further step; the failure is reported after the summary below
+        if let (Some(_), Some(before)) = (build_hold.as_ref(), step_bins.as_ref()) {
+            if !refresh_main_bins(cfg, &project_dir, &source, &log, before, &mut main_bins_failed) {
+                break; // no further step; the failure is reported after the summary below
+            }
         }
     }
     info.summary = summary.clone();

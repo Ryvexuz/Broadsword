@@ -286,7 +286,10 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_kept_and_none_in_c
     for profile in ["debug", "release"] {
         assert!(!exe(profile).exists(), "cargo's {profile} folder holds only what this job built, never main's exe under the worktree's note:\n{}", o.stdout);
         assert_eq!(prints(&kept(profile)), "MARK-main", "main's {profile} binary is still available, still main's, in main.bins:\n{}", o.stdout);
-        assert_eq!(kept_note(profile).as_deref(), Some("run:projects/proj"), "the kept copy names the last note of main's build (the release `run`)");
+        // each kept copy names the step that built it: debug by `build`, release by the `run` (round 9: the release `run` did
+        // not write the debug exe, so it left that copy and its note alone)
+        let built_by = if profile == "debug" { "projects/proj" } else { "run:projects/proj" };
+        assert_eq!(kept_note(profile).as_deref(), Some(built_by), "the kept {profile} copy names the main step that built it");
     }
     assert!(!o.stdout.contains("restored"), "nothing is put back into cargo's folder:\n{}", o.stdout);
     let example = r.dir.join("build/release/examples").join(format!("only{}", std::env::consts::EXE_SUFFIX));
@@ -299,7 +302,7 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_kept_and_none_in_c
     assert_eq!(prints(&exe("debug")), "MARK-t2", "the worktree's own build gives its own binary");
     assert_eq!(r.bin_note().as_deref(), Some(format!("worktrees/proj/{t2}").as_str()), "and its bin note says so");
     assert_eq!(prints(&kept("debug")), "MARK-main", "the kept copy is never replaced by a worktree's exe");
-    assert_eq!(kept_note("debug").as_deref(), Some("run:projects/proj"));
+    assert_eq!(kept_note("debug").as_deref(), Some("projects/proj"));
 
     // the next job of another folder that cleans leaves no exe in cargo's folder, and main's kept copy as it was
     let o = r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--offline", "--example", "only"]);
@@ -371,6 +374,52 @@ fn a_failed_main_build_never_reaches_main_bins_even_through_a_foreign_clean() {
     assert_eq!(fs::read(&kept).unwrap(), before, "main.bins is unchanged, byte for byte:\n{}", o.stdout);
     assert_eq!(fs::read(&note).unwrap(), before_note, "and its note too");
     assert_eq!(prints(&kept), "MARK-main");
+}
+
+/// Round 9 (review q-20261121-023602, the reviewer's exact sequence): a main `run -- cargo build --keep-going` FAILS but links a
+/// new bin A (`markprobe`, MARK-new) while bin B does not compile; then a SUCCESSFUL main `run -- cargo build --example only`
+/// builds only the example. That success must not promote the failed build's A into main.bins: a step refreshes only the exes
+/// it produced, so main.bins keeps main's last good A, bytes and note. On 35517c05 (round 8) the successful run refreshed every
+/// cached bin and main.bins got MARK-new. The positive case follows: a successful build that does write A refreshes it.
+#[test]
+fn a_successful_step_refreshes_only_the_bins_it_built_never_a_failed_steps_leftover() {
+    let r = Root::new("onlyproduced", 120);
+    let proj = r.dir.join("projects/proj");
+    fs::create_dir_all(proj.join("examples")).unwrap();
+    fs::write(proj.join("examples/only.rs"), "fn main() { print!(\"example {}\", markprobe::MARKER); }\n").unwrap();
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let note = PathBuf::from(format!("{}.source", kept.display()));
+    let prints = |p: &Path| -> String {
+        let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    r.ok(&["build", "proj"]);
+    assert_eq!(prints(&kept), "MARK-main");
+    let (before, before_note) = (fs::read(&kept).unwrap(), fs::read(&note).unwrap());
+
+    // the failed main build: A links (MARK-new), B does not compile
+    set_marker(&proj, "MARK-new");
+    fs::create_dir_all(proj.join("src/bin")).unwrap();
+    fs::write(proj.join("src/bin/broken.rs"), "fn main() { this does not compile }\n").unwrap();
+    let o = r.run(&["run", "proj", "--", "cargo", "build", "--offline", "--keep-going"]);
+    assert_ne!(o.code, 0, "the main build fails:\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(prints(&exe), "MARK-new", "bin A from the failed build is in cargo's folder:\n{}\n{}", o.stdout, o.stderr);
+
+    // a successful main step that builds only the example: A is not its output
+    let o = r.ok(&["run", "proj", "--", "cargo", "build", "--offline", "--example", "only"]);
+    assert_eq!(prints(&exe), "MARK-new", "the example build left cargo's A as it was");
+    assert!(!o.stdout.contains("kept main's `markprobe`"), "the example build kept nothing it did not build:\n{}", o.stdout);
+    assert_eq!(fs::read(&kept).unwrap(), before, "main.bins keeps main's last good A, byte for byte:\n{}", o.stdout);
+    assert_eq!(fs::read(&note).unwrap(), before_note, "and its note");
+
+    // the positive case: a successful build that writes A refreshes it
+    fs::remove_file(proj.join("src/bin/broken.rs")).unwrap();
+    set_marker(&proj, "MARK-good");
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug"), "{}", o.stdout);
+    assert_eq!(prints(&kept), "MARK-good", "a successful build of A refreshes A:\n{}", o.stdout);
+    assert_eq!(fs::read_to_string(&note).unwrap().trim(), "projects/proj");
 }
 
 /// Round 2 (review q-20261120-202642): `build/main.bins` is THE stable place of main's binaries, so every SUCCESSFUL job of the
@@ -583,9 +632,12 @@ fn a_link_planted_at_a_temp_name_beside_a_kept_exe_never_writes_outside() {
     let precious = r.dir.join("outside-file.txt");
     fs::write(&precious, "precious file").unwrap();
     fs::hard_link(&precious, &tmp).unwrap();
+    // new code, so this step writes the exe (round 9: a step refreshes only the exes it produced; (a)'s exe was built by a step
+    // whose refresh refused, and a build that finds it fresh does not vouch for it)
+    set_marker(&proj, "MARK-main3");
     let o = r.ok(&["build", "proj"]);
     assert_eq!(fs::read_to_string(&precious).unwrap(), "precious file", "the outside file keeps its bytes:\n{}", o.stdout);
-    assert_eq!(prints(&kept), "MARK-main2", "and the kept copy is refreshed through a new temp file:\n{}", o.stdout);
+    assert_eq!(prints(&kept), "MARK-main3", "and the kept copy is refreshed through a new temp file:\n{}", o.stdout);
     assert_eq!(fs::read_to_string(format!("{}.source", kept.display())).unwrap().trim(), "projects/proj");
     assert!(!tmp.exists(), "no temp name is left");
 }
