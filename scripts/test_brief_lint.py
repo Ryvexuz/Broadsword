@@ -487,6 +487,17 @@ class Preflight(unittest.TestCase):
         text = brief("`tests/engine.rs` (new)", "- add `tests/engine.rs`", done=done)
         self.assertEqual(self.pf(text, {"README.md": "x"}), [])
 
+    def test_p3_doc_named_tests_get_the_new_test_file_excuse_too(self):
+        files = {"docs/STAGE6-M4-M5.md": M4_DOC, "scenarios/validation_car.bsn": "x"}
+        self.assertIn("P3", self.fails(M4_BRIEF, files))  # no new test file claimed: still fails
+        fixed = M4_BRIEF.replace("`validation/CALIBRATION.md` (new)",
+                                 "`validation/CALIBRATION.md` (new), `tests/validation_files.rs` (new)")
+        g = self.pf(fixed, files)
+        self.assertNotIn("P3", {r for r, _, _ in g})
+        self.assertIn("P2", {r for r, _, _ in g})  # the other doc inputs are still reported
+        msg = " ".join(m for r, _, m in self.pf(M4_BRIEF, files) if r == "P3")
+        self.assertIn("(named by docs/STAGE6-M4-M5.md)", msg)  # doc-found names are labelled
+
     def test_p4_flag_absent_from_main_fails_unless_the_brief_adds_it(self):
         files = {"src/main.rs": 'args: "--known"'}
         text = brief("`src/main.rs`", "- `--known` is kept and `--ghost` is read")

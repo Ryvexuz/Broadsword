@@ -535,8 +535,8 @@ def preflight(text, root, ref, queue_text):
 
     new_test_file = any(re.search(r"(?:^|/)tests?/.*\.\w+$|(?:^|/)test_\w+\.\w+$|\.rs$", c) for c in newc)
     tm = [m.group(1) or m.group(2) for m in TEST_NAME_RE.finditer(body)]
-    tests = [n for n in dict.fromkeys(tm) if not grep(n) and not new_test_file]
-    tests += tmiss
+    # The one place P3 is decided: brief-named and doc-named tests get the same new-test-file excuse.
+    tests = [] if new_test_file else [n for n in dict.fromkeys(tm) if not grep(n)] + tmiss
     if tests:
         res.append(("P3", "FAIL", "test(s) named, not on " + ref + " and no new test file claimed: " + ", ".join(tests)))
 
