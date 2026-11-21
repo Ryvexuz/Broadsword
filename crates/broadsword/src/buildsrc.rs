@@ -806,6 +806,9 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str, before: &StepBi
     Ok(lines)
 }
 
+/// A folder's packages, each with its bin target names (what `bins_of` gives).
+type PackageBins = Vec<(String, Vec<String>)>;
+
 /// THE list of main checkouts and their packages that a clean must consider before it deletes a package's artifacts from the
 /// shared build folder: every project job.rs knows (`job::list_projects`: `broadsword` at the root and each project folder with
 /// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `bins_of`). Cargo's
@@ -813,7 +816,7 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str, before: &StepBi
 /// built under the same name. A project folder with no Cargo.toml has no packages (cargo built nothing from it) and is left out.
 /// Err = some project's packages cannot be listed: the caller refuses the clean (fail closed), because nothing then tells whether
 /// that project's main binaries would be deleted.
-fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, Vec<(String, Vec<String>)>)>, String> {
+fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, PackageBins)>, String> {
     let mut out = Vec::new();
     for name in crate::job::list_projects(cfg) {
         let refuse = |why: String| format!("refusing to clean: the packages of project `{name}` cannot be listed ({why}), so nothing tells whether this clean would delete a binary its main checkout built under the same package name; nothing was built or cleaned. Fix that project's Cargo.toml (or its folder) and repeat");
