@@ -665,7 +665,11 @@ fn a_reviewer_model_equal_to_the_coder_blocks_the_entry_before_anything_runs() {
     let r = Root::new("samemodel", 30);
     let id = r.started("src");
     let tip = r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
-    let e = r.add(&id, "low", "Haiku");
+    // `queue add` refuses a haiku coder at low risk now, so the same-model block at run time is reached by changing the setting
+    // after the entry was queued with a coder the setting allowed.
+    let e = r.add(&id, "low", "Sonnet");
+    let toml = r.dir.join("broadsword.toml");
+    fs::write(&toml, fs::read_to_string(&toml).unwrap().replace("reviewer_model_low = \"haiku\"", "reviewer_model_low = \"sonnet\"")).unwrap();
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "blocked");
@@ -710,6 +714,39 @@ fn a_sonnet_coded_high_entry_is_reviewed_by_opus() {
     let (calls, out) = high_review("hiop", "sonnet");
     assert!(calls.contains("--model\u{1f}opus") && !calls.contains("--model\u{1f}sonnet"), "{calls}");
     assert!(!out.contains("fallback"), "{out}");
+}
+
+/// The `*.entry` files in the queue folder (empty when the folder does not exist).
+fn entry_files(r: &Root) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(r.dir.join("state/queue")) else { return Vec::new() };
+    rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".entry")).collect()
+}
+
+#[test]
+fn a_haiku_coder_at_low_risk_is_refused_by_queue_add_and_nothing_is_written() {
+    let r = Root::new("haikulow", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    for coder in ["haiku", "Haiku", "claude-haiku-4-5-20251001"] {
+        let o = r.run(&["queue", "add", &id, "--risk", "low", "--coder", coder]);
+        assert_eq!(o.code, 2, "{coder}: {}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains("has no allowed reviewer at --risk low; queue it with --risk high"), "{coder}: {}", o.stderr);
+        assert!(entry_files(&r).is_empty(), "{coder}: {:?}", entry_files(&r));
+    }
+    // no lock is left held: the same task queues at high risk straight away
+    let e = r.add(&id, "high", "haiku");
+    assert_eq!(entry_files(&r).len(), 1);
+    assert_eq!(r.status(&e), "queued");
+}
+
+#[test]
+fn sonnet_at_low_risk_is_still_accepted() {
+    let r = Root::new("sonnetlow", 30);
+    let id = r.started("src");
+    r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
+    let e = r.add(&id, "low", "sonnet");
+    assert_eq!(r.status(&e), "queued");
+    assert_eq!(entry_files(&r).len(), 1);
 }
 
 #[test]
@@ -1164,7 +1201,9 @@ fn model_names_are_compared_by_family_for_the_reviewer_must_differ_from_coder_ru
     let r = Root::new("family", 30);
     let id = r.started("src");
     r.commit(&r.wt(&id), "src/new.txt", "x\n", "task: new file");
-    let e = r.add(&id, "low", "claude-haiku-4-5-20251001");
+    let e = r.add(&id, "low", "claude-sonnet-4-5-20250929");
+    let toml = r.dir.join("broadsword.toml");
+    fs::write(&toml, fs::read_to_string(&toml).unwrap().replace("reviewer_model_low = \"haiku\"", "reviewer_model_low = \"sonnet\"")).unwrap();
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "blocked");

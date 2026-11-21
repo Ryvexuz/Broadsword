@@ -461,6 +461,11 @@ pub fn cmd_add(cfg: &Config, task_id: &str, risk: &str, coder: &str, brief_file:
     if coder.is_empty() || coder.chars().any(char::is_control) {
         return fail(EXIT_BAD_INPUT, "--coder must be the coder's model name on one line, e.g. sonnet");
     }
+    // A coder whose family is the low-risk reviewer's has no allowed reviewer at low risk. Derived from `gating_model`, the one place
+    // that picks reviewers, and checked before any lock is taken or any entry is written.
+    if risk == "low" && gating_model(cfg, risk, coder).is_err() {
+        return fail(EXIT_BAD_INPUT, format!("a {} coder has no allowed reviewer at --risk low; queue it with --risk high", reviewer::model_family(coder)));
+    }
     let brief_text = match brief_file.map(|f| read_brief(cfg, f)) {
         None => None,
         Some(Ok(t)) => Some(t),
