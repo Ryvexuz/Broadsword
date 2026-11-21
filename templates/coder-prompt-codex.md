@@ -68,6 +68,9 @@ Common reasons the reviewer rejects work here. Write code that avoids them from 
     give each check its own scratch file names.
 13. Numeric or parser code that can produce non-finite values. Bound inputs at construction (named limits with reasons), and
     check finiteness once on the values about to be applied, before any state changes.
+14. Derived numbers in records or docs (2026-11-21 06:22 mining: q-20261121-044606 wrote "232 minutes (00:02Z to 03:34Z)", which is 212, and 874 for a span of 879). DO compute every duration, count or percent with a command or script and paste its output next to the number. DON'T do the arithmetic in your head.
+15. A check that judges a commit must run on that commit (q-20261121-044812: review_dispute.py ran the test in the current tree while using the tips only for the diff). DO pin the tree under test to the commit being judged and print its sha in the output.
+16. Guards over a shared resource are keyed by the resource itself (q-20261121-041528: the keep was keyed by package name while cargo shares the exe PATH). DO key the guard by the thing that can collide (path, file, lock name), not by a label that usually matches it.
 
 Also: a test that only fails to compile without your change does not prove it can fail; describe a behavioural failure
 (disable one check, and what the test would then report). Never use `git stash`: Git does not work in your sandbox anyway,
