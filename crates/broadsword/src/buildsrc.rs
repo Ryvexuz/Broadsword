@@ -58,7 +58,9 @@
 //!   (cached from an earlier step, maybe a FAILED one: `run -- cargo build --keep-going` can link bin A while bin B fails) is
 //!   not copied, and its kept copy and note stay as they are. So main.bins holds main's newest build of every bin a successful
 //!   step built;
-//! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), ONLY for a copy marked stale
+//! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), for the main checkout of EVERY
+//!   project that has a package of that name (`mains_with_packages`: cargo's folder is shared by package name, so a worktree
+//!   of project B can delete project A's main exe; if any project's packages cannot be listed the clean is refused), ONLY for a copy marked stale
 //!   (below) whose marker names exactly the exe still in cargo's folder (its length and modified time): that exe is the
 //!   successful build the refresh could not copy. Any other exe there (a failed or partial main build's leftovers, whose bin
 //!   note prepare already set to main) is never copied: main.bins keeps the last good copy.
@@ -804,6 +806,27 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str, before: &StepBi
     Ok(lines)
 }
 
+/// THE list of main checkouts and their packages that a clean must consider before it deletes a package's artifacts from the
+/// shared build folder: every project job.rs knows (`job::list_projects`: `broadsword` at the root and each project folder with
+/// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `bins_of`). Cargo's
+/// folder is shared by package NAME, so a clean of `p` from any folder may delete an exe that another project's main checkout
+/// built under the same name. A project folder with no Cargo.toml has no packages (cargo built nothing from it) and is left out.
+/// Err = some project's packages cannot be listed: the caller refuses the clean (fail closed), because nothing then tells whether
+/// that project's main binaries would be deleted.
+fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, Vec<(String, Vec<String>)>)>, String> {
+    let mut out = Vec::new();
+    for name in crate::job::list_projects(cfg) {
+        let refuse = |why: String| format!("refusing to clean: the packages of project `{name}` cannot be listed ({why}), so nothing tells whether this clean would delete a binary its main checkout built under the same package name; nothing was built or cleaned. Fix that project's Cargo.toml (or its folder) and repeat");
+        let dir = crate::job::resolve_project(&cfg.root, &cfg.projects_dir, &name).map_err(refuse)?;
+        if !dir.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let main = rel_source(cfg, &dir).map_err(refuse)?;
+        out.push((main, bins_of(cfg, &dir).map_err(refuse)?));
+    }
+    Ok(out)
+}
+
 /// Write `text` and a newline to `path` atomically (temp file, flushed, renamed).
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     let tmp = atomic_tmp(path);
@@ -1047,12 +1070,17 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
     // main's binaries: before a job of ANOTHER folder cleans a package, a successful main build that main.bins could not take yet
-    // (its copy was in use) is kept (see `keep_main_bins`). Nothing is ever copied back into cargo's folder after the clean: it
-    // then holds only what this job builds.
-    let main = main_folder(cfg, source);
+    // (its copy was in use) is kept (see `keep_main_bins`), for EVERY project whose main checkout has a package of that name
+    // (cargo's folder is shared by package name, so another project's main exe can be the one this clean deletes). Nothing is
+    // ever copied back into cargo's folder after the clean: it then holds only what this job builds.
+    let mains = if stale.is_empty() { Vec::new() } else { mains_with_packages(cfg)? };
     for (p, was) in &stale {
-        if let Some(m) = main.as_deref().filter(|m| *m != source) {
-            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), Keep::BeforeForeignClean)?);
+        for (m, targets) in mains.iter().filter(|(m, _)| m != source) {
+            let Some((_, main_bins)) = targets.iter().find(|(n, _)| n == p) else { continue };
+            // what the clean deletes is this job's bins of `p`; what that main checkout keeps is its own bins of `p`: both
+            let mut bins: Vec<String> = bins_of_pkg(p).to_vec();
+            bins.extend(main_bins.iter().filter(|b| !bins_of_pkg(p).contains(b)).cloned());
+            lines.extend(keep_main_bins(cfg, m, p, &bins, &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), Keep::BeforeForeignClean)?);
         }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };

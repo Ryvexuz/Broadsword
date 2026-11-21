@@ -544,6 +544,90 @@ fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build(
     assert!(!stale.exists());
 }
 
+/// Round 10 (review q-20261121-032813), the shared part of the reviewer's sequence: project A (`proj`) and project B (`projb`)
+/// both have a package `markprobe`. A's main build is kept; then, while A's kept copy runs, A's main checkout is rebuilt
+/// (MARK-main2), so the copy is marked stale and A's newer exe is only in cargo's folder. Returns B's task id, the running copy,
+/// A's kept exe and its stale marker.
+#[cfg(windows)]
+fn shared_package_name_with_a_stale_copy_in_use(r: &Root) -> (String, Child, PathBuf, PathBuf) {
+    let proj = r.dir.join("projects/proj");
+    fs::write(proj.join("src/main.rs"), "fn main() {\n    if std::env::args().nth(1).as_deref() == Some(\"wait\") {\n        std::thread::sleep(std::time::Duration::from_secs(120));\n    }\n    print!(\"{}\", markprobe::MARKER);\n}\n").unwrap();
+    // project B: another repo whose package has the same name
+    let b = r.dir.join("projects/projb");
+    fs::create_dir_all(b.join("src")).unwrap();
+    fs::write(b.join("Cargo.toml"), "[package]\nname = \"markprobe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+    fs::write(b.join(".gitignore"), "target\n").unwrap();
+    fs::write(b.join("src/main.rs"), "fn main() { print!(\"{}\", markprobe::MARKER); }\n").unwrap();
+    set_marker(&b, "MARK-b");
+    git(&b, &["init", "-q", "-b", "main"]);
+    git(&b, &["config", "core.autocrlf", "false"]);
+    git(&b, &["add", "."]);
+    git(&b, &["commit", "-q", "-m", "first"]);
+    let tb = r.ok(&["task", "add", "projb", "--title", "t", "--claim", "b"]).stdout.trim().to_string();
+    r.ok(&["task", "start", &tb, "--owner", "coder", "--worktree"]);
+
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let stale = PathBuf::from(format!("{}.stale", kept.display()));
+    r.ok(&["build", "proj"]);
+    let running = Command::new(&kept).arg("wait").stdout(Stdio::null()).spawn().unwrap();
+    set_marker(&proj, "MARK-main2");
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("NOT refreshed (in use"), "{}", o.stdout);
+    assert!(stale.is_file());
+    assert_eq!(r.probe(), "MARK-main2", "A's newer exe is only in cargo's folder");
+    (tb, running, kept, stale)
+}
+
+/// Round 10 (review q-20261121-032813): while A's stale kept copy is still in use, a worktree job of project B (same package
+/// name) must refuse its clean, which would delete A's newer exe with no copy of it. On a8588620 B's job looked only at B's
+/// main checkout, cleaned, and deleted A's MARK-main2 (this test failed at the refusal assertion). Windows only (in use).
+#[cfg(windows)]
+#[test]
+fn another_projects_worktree_with_the_same_package_name_refuses_while_the_stale_copy_is_in_use() {
+    let r = Root::new("sharedrefuse", 120);
+    let (tb, mut running, kept, stale) = shared_package_name_with_a_stale_copy_in_use(&r);
+    let o = r.run(&["run", "projb", "--task", &tb, "--", "echo", "nothing"]);
+    let left = r.probe();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_ne!(o.code, 0, "B's clean must be refused while A's vouched copy is in use:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("before cleaning `markprobe`"), "{}", o.stderr);
+    assert_eq!(left, "MARK-main2", "A's newer exe was not deleted");
+    assert!(stale.is_file() && kept.is_file());
+}
+
+/// Round 10 (review q-20261121-032813): once A's stale kept copy is free, B's worktree clean (same package name) first keeps A's
+/// newer exe in main.bins/proj, then cleans. On a8588620 the clean deleted it and main.bins kept the older MARK-main (this test
+/// failed at the `kept main's` assertion). Windows only (the stale marker needs a copy in use).
+#[cfg(windows)]
+#[test]
+fn another_projects_worktree_with_the_same_package_name_keeps_the_vouched_exe_before_its_clean() {
+    let r = Root::new("sharedkeep", 120);
+    let (tb, mut running, kept, stale) = shared_package_name_with_a_stale_copy_in_use(&r);
+    let _ = running.kill();
+    let _ = running.wait();
+    let o = r.ok(&["run", "projb", "--task", &tb, "--", "echo", "nothing"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug") && o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+    let printed = Command::new(&kept).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&printed.stdout), "MARK-main2", "A's newest successful build reached main.bins/proj before B's clean");
+    assert!(!stale.exists(), "the copy is fresh again");
+    assert!(!r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX)).exists(), "and B's clean ran");
+}
+
+/// Round 10: if any project's packages cannot be listed, a clean is refused (fail closed): nothing then tells whether it would
+/// delete that project's main exe. Here project `other` gets a broken Cargo.toml and a worktree of `proj` would clean.
+#[test]
+fn a_clean_is_refused_when_some_projects_packages_cannot_be_listed() {
+    let r = Root::new("listfail", 120);
+    let t1 = r.task("a", "MARK-t1");
+    r.ok(&["build", "proj"]);
+    fs::write(r.dir.join("projects/other/Cargo.toml"), "this is not toml\n").unwrap();
+    let o = r.run(&["build", "proj", "--task", &t1]);
+    assert_ne!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("refusing to clean: the packages of project `other` cannot be listed"), "{}", o.stderr);
+    assert_eq!(r.probe(), "MARK-main", "nothing was cleaned or built");
+}
+
 /// Review q-20261120-231552: a junction at build/main.bins/proj/debug pointing OUTSIDE the build folder must never make the refresh
 /// delete a `.source` note or replace an exe there. The job refuses and the outside folder is untouched, byte for byte. On
 /// 1e9bf60 the refresh followed the junction (the outside exe and its note were replaced). Windows only (a junction).
