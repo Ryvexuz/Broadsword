@@ -1074,6 +1074,29 @@ mod tests {
         assert!(held.wait().is_ok());
     }
 
+    /// Review q-20261121-053038: `running` counts what is alive in the group (the child and the ping it starts), and a DROPPED
+    /// group kills everything still in it (kill on job close): the ping, which would run ~30 s, is gone at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_kill_group_kills_what_is_left_in_it_and_running_counts_it() {
+        let cfg = Config::load_from(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let mut c = scrub::command(&cfg, "cmd.exe");
+        c.args(["/C", "ping -n 30 127.0.0.1 >nul"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        group::prepare(&mut c);
+        let mut child = c.spawn().unwrap();
+        let g = group::Group::start(&child, &cfg).expect("in the group");
+        std::thread::sleep(Duration::from_millis(500));
+        let n = g.running().expect("the group can be asked");
+        assert!(n >= 1, "cmd (and its ping) are running: {n}");
+        assert!(child.try_wait().unwrap().is_none(), "cmd is still running before the drop ({n} in the group)");
+        let t = Instant::now();
+        drop(g);
+        let st = child.wait().unwrap();
+        println!("after the drop: {st:?} in {:.2} s", t.elapsed().as_secs_f64());
+        // (a kill on job close ends the processes with exit code 0, so only the time tells it from a ping run to its end)
+        assert!(t.elapsed() < Duration::from_secs(10), "a dropped group left its process running ({st:?})");
+    }
+
     /// Review q-20261120-230940: a command whose very first act is to start a grandchild, and which then exits at once, must
     /// never let that grandchild escape the kill group (the child must not run before it is in the group). 50 runs, 10 at a
     /// time; the grandchild holds the command's output and would write its marker ~3 s later, after the 1 s deadline.

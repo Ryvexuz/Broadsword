@@ -329,8 +329,9 @@ fn a_done_check_that_leaves_a_detached_descendant_running_fails_and_the_descenda
 
 /// The same detached descendant, but one that ends ~3 s later, well before the 60 s deadline: the queue WAITS for it (never
 /// fails a command just because something it started was briefly running) and the check passes. Its marker goes in the test
-/// root, outside the worktree (an untracked file there blocks the merge). Its recorded time covers the descendant's ~3 s: a check
-/// that returned when the command itself exited (b90305b5) recorded 1.5 s here.
+/// root, outside the worktree (an untracked file there blocks the merge). Because the check waited, the marker was written
+/// BEFORE the queue wrote the `.donecheck` file (right after the done check, src/queue.rs `s_done_check`); a check that returned
+/// when the command itself exited (b90305b5) wrote the file ~3 s before the marker.
 #[test]
 fn a_done_check_whose_detached_descendant_ends_before_the_deadline_is_waited_for_and_passes() {
     let r = Root::new("detachedok", &[("done_check_timeout_seconds", "60")]);
@@ -341,9 +342,10 @@ fn a_done_check_whose_detached_descendant_ends_before_the_deadline_is_waited_for
     assert_eq!(r.field(&e, "status"), "merged", "reason = {}", r.field(&e, "reason"));
     let dc = r.donecheck(&e);
     assert!(dc.contains("result: PASS; exit 0"), "{dc}");
-    // the command's own time includes waiting for its descendant (which takes ~3 s after PowerShell starts)
-    let secs = first_secs(&dc);
-    println!("the command and its descendant: {secs:.1} s recorded");
-    assert!(secs >= 3.0, "the check returned before its ~3 s descendant could have ended: {secs} s ({dc})");
-    assert!(r.dir.join("late.txt").exists(), "the descendant ran to its end and wrote its marker");
+    println!("the command and its descendant: {:.1} s recorded", first_secs(&dc));
+    let mtime = |p: PathBuf| fs::metadata(&p).and_then(|m| m.modified()).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let marker = mtime(r.dir.join("late.txt")); // the descendant ran to its end and wrote it
+    let file = mtime(r.dir.join("state/queue").join(format!("{e}.donecheck")));
+    println!("marker written {:?} before the .donecheck file", file.duration_since(marker));
+    assert!(marker <= file, "the done check returned before its descendant ended: the marker came {:?} after the .donecheck file", marker.duration_since(file));
 }
