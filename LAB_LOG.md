@@ -2,6 +2,18 @@
 
 One entry per session, newest first. At the end of each stage, three lessons for that stage go at the top.
 
+## 2026-11-20 — Records task t-20261121-001109-8: Stage 4 audit SERIOUS #1, #2, #4, #6
+
+- **Stage:** 4 v1 audit follow-up (records only). Written by a Sonnet 5.5 coder from raw files; the evidence is `evidence/stage-4-v1-records.md`.
+- **Result:** #1 both direct merges are on record only under a general "take the file" rule (no dated quote); #2 nothing was missing; #4 written as a decision for Lazlo (options A and B, recommendation B), rule unchanged; #6 the failed main check of q-20261118-054321 is written down with its cause (most probable, not proved) and the 20-run repeat of `a_second_queue_run_gets_busy_while_one_is_running` (table in the evidence file).
+- **Git commands beyond a plain commit, run by coders and the orchestrator on 2026-11-20:**
+  - `git worktree remove` and `git branch -d` (the orchestrator, about 18:57Z): removed an empty hand-made worktree and then its branch (the safe delete, which refuses an unmerged branch), so no stale worktree stays registered.
+  - `git reset --soft HEAD~1` (an N7 coder): undid its own unpushed temporary commit and kept the changes staged, so the work could be committed again as one commit.
+  - `git commit --amend --reset-author` (a viewer coder): rewrote the author of its own unpushed work-in-progress commit, which had the wrong author, before anything was queued.
+  - `git checkout <branch> -- <paths>` (the codex-route coder): copied four files from the kept nb-21 branch into its worktree without merging that branch.
+  - five local `git clone`s into scratch (the parallel-tests coder): made throwaway copies of the repo to use as separate measurement roots, so the measurement did not touch the real checkout; scratch is wiped after 24 hours.
+- **One lesson about AI development:** a record that says "approved" needs the approver's words and a date; a paraphrase two files away from the source is a claim, not evidence.
+
 ## 2026-11-20 — PC session: Stage 6, merge train, fallback reviewer, reviewer-quality study
 
 - **Stage:** 6 (crash sim; plans, reference data and process work for it). Written from `state/pc-progress.md` (00:00Z to 07:52Z), the queue and board listings and `git log`; nothing here is claimed merged unless `git merge-base --is-ancestor <sha> main` says so (re-checked 2026-11-20 09:15Z, main at 75f449c).

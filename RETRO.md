@@ -467,3 +467,12 @@ Read this list before the next milestone starts. The next retro checks each item
 - **Change:** `SPEC_CHECKLIST.md` row: a done check for a change to the queue or the job runner says how to measure it before the merge (the branch's binary against a scratch root). Enforced in the checklist; next retro checks it.
 - **Speed and cost:** two Opus reviews (~10 minutes of queue time) spent on an unmeetable check. Parked rather than merged directly, because Opus's finding was right, not wrong, and a timeout gap remained.
 
+
+## Stage 4 audit SERIOUS records: #1, #2, #4, #6 (2026-11-20, task t-20261121-001109-8)
+
+Full evidence with sources: `evidence/stage-4-v1-records.md`.
+
+- **Wrong:** (1) two tools (`scripts/dev_metrics.py` at b9ae9e5, `bench/reviewer/run_openai.py` at ec7a479) are on main as exactly the commit a Haiku reviewer FAILED; the approval is on record only as a general rule ("take the file") with no dated quote (`docs/direct-merges.txt`). (2) q-20261118-054321 ended `merged_check_failed` (the `gets_busy` test saw `blocked`, expected `merged`) and no record named the failure, its cause or who decided. (3) The shadow-verdict rule (`SPEC_CHECKLIST.md:48`) asks for an independent judge; none of the 59 rows in `state/shadow-verdicts.tsv` has one (haiku gating 20, opus gating 1, orchestrator 38).
+- **Why:** the decisions were made in the session and the record was written from memory afterwards; the queue's "a human decides" ending had no step that forced a written decision.
+- **Change:** records only here. #4 goes to Lazlo as a decision (Option B with a sampled independent check is recommended); no rule was changed. #2 needed nothing (the m1/m2 commands and raw logs are in `evidence/`). The repeat-run result for #6 is in the evidence file.
+- **Not yet in force:** no code makes a `merged_check_failed` entry require a written decision before the task can be marked done. Lazlo's call on #1 and #4 is open.
