@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 
 mod support;
 use support::bin;
+
+// The product's own process-identity code, to plant an owner record naming a live process exactly (start time included).
+#[allow(dead_code)]
+#[path = "../src/sys.rs"]
+mod sys;
 const SYNC_GATE: &str = "BROADSWORD_INTERNAL_TEST_BUILD_SYNC_GATE_FILE";
 /// scrub::RUN_LOCK_MARKER: a `run` sets it on its command; `Root::cmd` removes any inherited one so every test starts clean.
 const RUN_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
@@ -1070,6 +1075,34 @@ fn stale_run_marker_does_not_refuse() {
     }
     fs::write(&g1, "go").unwrap();
     assert_eq!(finish(j1, 300), 0);
+}
+
+/// Review q-20261121-220925: the lock changes hands to a job that has not (yet) written any owner record, while the previous
+/// owner named by the marker is still alive and every owner record left behind still names it. That must refuse nothing
+/// sooner. The test plants every leftover record a previous run owner could leave: `build.lock.owner` (`<pid> <start>`, the
+/// record commit c8df5695 trusted) and `build.lock.run.id` (the marker, the record the fix reads), both naming THIS live
+/// test process, while a gated build that writes neither holds the lock.
+#[test]
+fn stale_owner_record_of_a_live_previous_owner_does_not_refuse() {
+    let r = Root::new("staleowner", 1); // build_lock_wait_seconds = 1
+    let t1 = r.task("a", "MARK-t1");
+    let (g1, e1) = (r.scratch("gate1"), r.scratch("err1.txt"));
+    let j1 = r.spawn_gated(&["build", "proj", "--task", &t1], &g1, &e1);
+    assert!(wait_for(&e1, "TEST HOOK ACTIVE", 60), "job 1 never reached the sync gate");
+    let me = std::process::id();
+    let start = sys::start_time(me).expect("this test process's start time");
+    let marker = format!("20261121-000000-proj-run:{me}");
+    fs::write(r.dir.join("state/build.lock.owner"), format!("{me} {start}\n")).unwrap();
+    fs::write(r.dir.join("state/build.lock.run.id"), &marker).unwrap();
+    let started = Instant::now();
+    let o = r.cmd(&["build", "proj"]).env(RUN_MARKER, &marker).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let took = started.elapsed();
+    fs::write(&g1, "go").unwrap();
+    assert_eq!(finish(j1, 300), 0);
+    assert_eq!(o.status.code(), Some(3), "{err}");
+    assert!(!err.contains("runs inside") && err.contains("build_lock_wait_seconds"), "a stale owner record refused at once: {err}");
+    assert!(took >= Duration::from_secs(1), "it waited the configured time: {took:?}");
 }
 
 /// A job refused after the full lock wait records how long it waited.

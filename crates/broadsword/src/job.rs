@@ -1296,6 +1296,9 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
 /// comment). (A `run` also leaves the note `run:<folder>` for each package: see
 /// `buildsrc::prepare_for_run`; it is written before the command, so a crash cannot leave a note that vouches for it.)
 struct BuildHold {
+    /// A `run`'s proof that it holds the build lock (buildsrc::run_proof). Declared BEFORE `_lock`: fields drop in order, so
+    /// the proof is always let go before the build lock, and is never held by a process that no longer holds the build lock.
+    proof: Option<crate::lock::Lock>,
     _lock: crate::lock::Lock,
     /// When the lock was taken (the job prints how long it held it when the test step releases it early).
     taken: Instant,
@@ -1510,7 +1513,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             let waited = asked.elapsed().as_secs_f64();
             println!("build lock: taken after waiting {waited:.1} s");
             rec.set("build_lock_wait_secs", format!("{waited:.1}"));
-            build_hold = Some(BuildHold { _lock: lock, taken: Instant::now() });
+            build_hold = Some(BuildHold { proof: None, _lock: lock, taken: Instant::now() });
             let outcome = if kind == "run" {
                 buildsrc::prepare_for_run(cfg, &project_dir, &source)
             } else {
@@ -1551,11 +1554,18 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         // The same place gives the child the scrubbed environment (`scrub.rs`): no secret-named variable, nothing holding a `.env` value.
         scrub::apply(&mut cmd, cfg);
         cmd.env("CARGO_TARGET_DIR", &cfg.build_dir);
-        if kind == "run" && build_hold.is_some() {
-            // this process holds the build lock for the whole command: a Broadsword call inside it refuses at once
-            // (buildsrc::lock) instead of waiting out a lock that frees only when the command ends. Set after the scrub, so it
-            // replaces any marker this process inherited.
-            cmd.env(scrub::RUN_LOCK_MARKER, scrub::run_lock_marker(&job_id));
+        if let (true, Some(hold)) = (kind == "run", build_hold.as_mut()) {
+            // this process holds the build lock for the whole command: once it has proved that (buildsrc::run_proof, kept in
+            // the hold and let go just before the build lock), a Broadsword call inside it refuses at once (buildsrc::lock)
+            // instead of waiting out a lock that frees only when the command ends. Set after the scrub, so it replaces any
+            // marker this process inherited; with no proof, no marker at all.
+            let marker = scrub::run_lock_marker(&job_id);
+            hold.proof = buildsrc::run_proof(cfg, &marker);
+            if hold.proof.is_some() {
+                cmd.env(scrub::RUN_LOCK_MARKER, marker);
+            } else {
+                cmd.env_remove(scrub::RUN_LOCK_MARKER);
+            }
         }
         let mut spawn_err: Option<String> = None;
         // The children this job has running right now (one, or the test step's side-by-side pool), recorded so recovery can find
