@@ -10,6 +10,8 @@ Takes every task whose `claims` names broadsword.toml or a config/*.toml file an
 that was created inside the window [--start, --end]. Per task, in minutes:
   wait    = created -> started (or ended if abandoned unstarted, else the window end)
   hold    = started -> ended (or the window end, if still running); 0 if never started
+  Every wait and hold interval is clipped to [--start, --end] (clip_iv), so a task that ends after --end counts
+  only up to --end.
   overlap = part of the wait during which ANOTHER listed task held the claim
 Summary measures (named in docs/CONFIG-SPLIT.md section 8):
   measure_a = number of tasks listed
@@ -95,12 +97,19 @@ def load(tasks_dir, win_start, now):
     return rows
 
 
-def hold_iv(d, now):
-    return (d['_s'], d['_e'] or now) if d['_s'] else None
+def clip_iv(lo, hi, win_start, win_end):
+    """The one clip every hold and wait interval goes through: [lo, hi] cut to [win_start, win_end].
+    An interval that lies wholly outside the window comes back empty (lo == hi)."""
+    lo, hi = max(lo, win_start), min(hi, win_end)
+    return (lo, max(lo, hi))
 
 
-def wait_iv(d, now):
-    return (d['_c'], d['_s'] or d['_e'] or now)
+def hold_iv(d, win_start, now):
+    return clip_iv(d['_s'], d['_e'] or now, win_start, now) if d['_s'] else None
+
+
+def wait_iv(d, win_start, now):
+    return clip_iv(d['_c'], d['_s'] or d['_e'] or now, win_start, now)
 
 
 def inter(a, b):
@@ -144,13 +153,13 @@ def main():
     tot_hold = tot_over = 0.0
     contended = []
     for d in rows:
-        w = wait_iv(d, now)
-        h = hold_iv(d, now)
+        w = wait_iv(d, win_start, now)
+        h = hold_iv(d, win_start, now)
         ov = []
         for o in rows:
             if o is d:
                 continue
-            oh = hold_iv(o, now)
+            oh = hold_iv(o, win_start, now)
             if oh:
                 x = inter(w, oh)
                 if x:

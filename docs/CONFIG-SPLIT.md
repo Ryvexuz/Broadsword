@@ -17,7 +17,11 @@ which another listed task held the claim. The command, then its output pasted un
 build/bin/broadsword.exe run broadsword --task t-20261121-044024-4 -- python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z
 ```
 
-
+Re-taken with the clipping change (every hold and wait interval is cut to [--start, --end] in one helper, `clip_iv`). In this
+worktree `build/bin/broadsword.exe` does not exist, so the output below was taken with the same script and the same arguments run
+directly: `python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z`. A second run printed identical
+bytes. The figures equal the unclipped run's because no listed task ended after the window end (the latest recorded end is 04:32:56Z,
+and the running task holds to the window end).
 
 ```
 window 11-20 09:00:00 to 11-21 04:40:00 minutes 1180.0
@@ -194,13 +198,17 @@ Measure, all taken from the output of `scripts/tomlwait.py` (the same committed 
   claim. It is an upper bound on the claim-caused wait: a wait can have another cause at the same time (a gate, a cap, queue.rs).
 - (c) `measure_c contended_hold_min=` : the minutes in which a toml-area claim was held while at least one other toml-area task waited.
 
-Baseline, the script output of section 1 (window 2026-11-20 09:00Z to 2026-11-21 04:40Z, 1180.0 minutes): (a) 11 tasks, (b) 1857.9
+Baseline, the script output of section 1 re-taken with the clipping change (window 2026-11-20 09:00Z to 2026-11-21 04:40Z, 1180.0
+minutes; the same figures as the unclipped run, see section 1): (a) 11 tasks, (b) 1857.9
 minutes, (c) 653.2 minutes (10.89 hours). Also from that output: 649.9 minutes of claim holding by finished holders, 55.1 percent of the
 window, 5 tasks open and unstarted. The 257.4 minutes of section 1 is a different, narrower reading (four tasks the log ties to the
 toml); it is not a baseline for these measures.
 
 How the change is judged: after the move merges, run the committed script over the next 20 toml-area tasks or the next 24 hours, whichever is longer, with the `config/*.toml` match
 already in the script, and compare lines (a), (b) and (c). The window is named in the command; there are no defaults.
+Like for like: the baseline and the after-run both use the same committed script, which clips every hold and wait interval to
+[--start, --end]. A task that ends after the window end counts only up to that end, so the two runs apply one rule. Any figure taken
+with the unclipped script is not comparable to these and was re-taken (section 8 baseline above).
 Baseline command (already run, section 1):
 `build/bin/broadsword.exe run broadsword --task t-20261121-044024-4 -- python -I scripts/tomlwait.py --start 2026-11-20T09:00:00Z --end 2026-11-21T04:40:00Z`
 After command (new window): `build/bin/broadsword.exe run broadsword --task <after task id> -- python -I scripts/tomlwait.py --start <window start, UTC> --end <window end, UTC>`,
@@ -226,7 +234,7 @@ measure above; watch-for-harm above; revert rule section 7 step 7.
 
 ## 10. What was not verified
 
-- No code or config was changed, so the layout and the loader design were not run. The 53-key count and the group sizes come from
+- No broadsword.toml or config file was changed (scripts/tomlwait.py changed only for the clipping fix in this round), so the layout and the loader design were not run. The 53-key count and the group sizes come from
   grep and a hand count of the current file; the extension test the design needs does not exist yet.
 - The wait table is a computation over the task records of the time of the measurement; ongoing tasks keep growing. Each wait is the
   time from `created` to `started`, which includes any other cause (a dependency, a held claim on another file, a cap).
