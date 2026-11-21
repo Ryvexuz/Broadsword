@@ -254,7 +254,7 @@ mod tests {
         // main's kept copies, aged too
         let mut kept = Vec::new();
         for profile in [crate::buildsrc::Profile::Dev, crate::buildsrc::Profile::Release] {
-            let exe = crate::buildsrc::kept_exe(&c, profile, "markprobe");
+            let exe = crate::buildsrc::kept_exe(&c, "proj", profile, "markprobe");
             fs::create_dir_all(exe.parent().unwrap()).unwrap();
             fs::write(&exe, "main's exe").unwrap();
             let note = PathBuf::from(format!("{}.source", exe.display()));

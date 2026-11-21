@@ -40,37 +40,41 @@
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
 //! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
 //!
-//! Main's binaries: THE stable place is `<build_dir>/main.bins/<debug|release>/<bin><exe>` (found 2026-11-20: a worktree's
-//! bench build cleaned `crash-sim` and deleted `build/release/crash-sim.exe` that Lazlo had just built from projects/crash-sim;
-//! render's drive tests then found no binary). People and other projects' tests run main's binaries from there, NEVER from
-//! cargo's own `<build_dir>/<profile>/`: that is a cache which any checkout's build may overwrite or clean. A file beside each
+//! Main's binaries: THE stable place is `<build_dir>/main.bins/<project>/<debug|release>/<bin><exe>` (`kept_exe`; `<project>` is
+//! the project name, `broadsword` for the root, so two projects with the same bin name never share a copy. Found 2026-11-20: a
+//! worktree's bench build cleaned `crash-sim` and deleted `build/release/crash-sim.exe` that Lazlo had just built from
+//! projects/crash-sim; render's drive tests then found no binary). People and other projects' tests run main's binaries from
+//! there, NEVER from cargo's own `<build_dir>/<profile>/`: that is a cache which any checkout's build may overwrite or clean, and
+//! after another folder's clean it holds only what that job built (a binary it did not build is missing, and a reader fails
+//! loudly; nothing is ever copied back into it, so an exe there is always the build its bin note names). A file beside each
 //! kept exe (`<exe>.source`) holds the build-source note it was kept under (`projects/<p>`, `.`, or a `run:` note of one).
 //! It is written in exactly two places, both under the build lock and both from an exe whose note names the main checkout
-//! (so a worktree's exe never lands there):
-//! - after every SUCCESSFUL cargo step or `run` command of the main checkout itself (`refresh_main_bins`, called by job.rs
-//!   after a build or run step and after the test step's compile), so it always holds main's newest build;
-//! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), as a second guard.
+//! (so a worktree's exe never lands there), and both only from a SUCCESSFUL main step:
+//! - after every successful cargo step or `run` command of the main checkout itself (`refresh_main_bins`, called by job.rs
+//!   after a build or run step and after the test step's compile), so it always holds main's newest good build;
+//! - before a job of another folder cleans the package (`keep_main_bins` in `prepare_packages`), ONLY for a copy marked stale
+//!   (below) whose marker names exactly the exe still in cargo's folder (its length and modified time): that exe is the
+//!   successful build the refresh could not copy. Any other exe there (a failed or partial main build's leftovers, whose bin
+//!   note prepare already set to main) is never copied: main.bins keeps the last good copy.
 //!
-//! After a clean, any job of that project also puts the kept copy back in cargo's place if the clean removed it
-//! (`restore_main_bins`), for readers that still look there; the clean removed cargo's fingerprint, so a cargo step that needs
-//! the target still rebuilds it from the job's own source. The package and bin notes stay conservative: after a restore they
-//! name the job's folder, so the next job of another folder cleans again and `install` still refuses.
 //! In use: on Windows a kept copy that is running (Lazlo drives it) cannot be replaced. After a successful main step that does
 //! NOT fail the job: the old copy stays, still named by its own `.source` note, a marker `<exe>.stale` beside it says
-//! `stale: <note of the new build>, in use at <UTC>`, the job prints a loud `main.bins: <bin> NOT refreshed (in use)` line,
-//! and the next main step that finds the copy free refreshes it and removes the marker. Every other copy error (disk full, a
-//! length mismatch) still fails the job. Before another folder's clean an in-use copy refuses that job instead (nothing built;
-//! the package in question is not cleaned, but packages processed earlier in the same job may already be): the clean would delete
-//! main's newer build from cargo's folder while main.bins holds only the older one. A copy is "current" by its BYTES alone: when
-//! they equal the built exe's, only the `.source` note is rewritten and the binary is never replaced.
+//! `stale: <note of the new build>, in use at <UTC>` and, on its second line, `built: <length> bytes, modified <time>` of the
+//! new build in cargo's folder; the job prints a loud `main.bins: <bin> NOT refreshed (in use)` line, and the next main step
+//! that finds the copy free refreshes it and removes the marker. Every other copy error (disk full, a length mismatch) still
+//! fails the job, after its summary block. Before another folder's clean a stale copy that is still in use refuses that job
+//! (nothing built; the package in question is not cleaned, but packages processed earlier in the same job may already be): the
+//! clean would delete main's newer build from cargo's folder while main.bins holds only the older one. A copy is "current" by
+//! its BYTES alone: when they equal the built exe's, only the `.source` note is rewritten and the binary is never replaced.
 //!
-//! Known limits (follow-ups): after a restore the bin note of the restored exe names the worktree that ran the clean, not main;
-//! nothing reads the `.stale` marker yet (the render lookup task t-20261120-202643-2 will).
+//! Known limit (follow-up): nothing reads the `.stale` marker yet (the render lookup task t-20261120-202643-2 will).
 //!
 //! Limits: a main `build`/`check`/`run` that FAILS refreshes nothing (main.bins keeps the last good build, the cache may hold the
 //! failed attempt's leftovers); a `run` of the main checkout counts (its command may build anything there, so its kept note is
-//! `run:<folder>`, never `.`); a `run` whose packages cannot be listed refreshes nothing (its line says so); cargo-sweep never
-//! touches main.bins (it only deletes hash-named files in folders that hold a `.fingerprint`: test in cleanup.rs).
+//! `run:<folder>`, never `.`); a `run` whose packages cannot be listed refreshes nothing (its line says so), and a main exe
+//! that no refresh copied (that run's, or one built before main.bins existed) is not kept before another folder's clean;
+//! copies in the older layout `main.bins/<profile>/` are no longer written or read; cargo-sweep never touches main.bins (it
+//! only deletes hash-named files in folders that hold a `.fingerprint`: test in cleanup.rs).
 //!
 //! Deleting: `cargo clean -p` is the ONLY deletion of build output here. It is built in one function (`clean_command`) that always passes
 //! `-p <package>` (a bare `cargo clean` would wipe the whole folder), always points cargo at `build_dir` through both
@@ -376,16 +380,31 @@ pub fn note_folder(note: &str) -> &str {
 // ---- main's binaries survive another folder's clean -----------------------------------------
 
 /// THE stable place of main's binaries (people and other projects run these, never cargo's own profile folders): the KEPT copy of
-/// each binary the main checkout built: `<build_dir>/main.bins/<profile
-/// dir>/<bin><exe suffix>`, with `<that file>.source` holding the build-source note it was kept under. Cargo does not build
-/// there: a profile's folder carries the profile's name, and cargo allows only letters, digits, `-` and `_` in one, so no
-/// profile maps to a name with a `.`; `cargo clean -p` removes the named package's artifacts, which live in the profile folders.
-/// It stays inside the ONE shared build folder: only final executables are copied, never dependencies.
+/// each binary the main checkout built: `<build_dir>/main.bins/<project>/<profile dir>/<bin><exe suffix>`, with `<that
+/// file>.source` holding the build-source note it was kept under. Cargo does not build there: a profile's folder carries the
+/// profile's name, and cargo allows only letters, digits, `-` and `_` in one, so no profile maps to a name with a `.`; `cargo
+/// clean -p` removes the named package's artifacts, which live in the profile folders. It stays inside the ONE shared build
+/// folder: only final executables are copied, never dependencies.
 pub const KEEP_DIR: &str = "main.bins";
 
-/// The kept copy of `bin` for `profile`.
-pub fn kept_exe(cfg: &Config, profile: Profile, bin: &str) -> PathBuf {
-    cfg.build_dir.join(KEEP_DIR).join(profile.dir()).join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
+/// THE one place the path of a kept copy is made: `bin` for `profile` of the project `project` (its name as job.rs knows it:
+/// `broadsword` for the root, the folder name under `projects_dir` otherwise; see `kept_project`).
+pub fn kept_exe(cfg: &Config, project: &str, profile: Profile, bin: &str) -> PathBuf {
+    cfg.build_dir.join(KEEP_DIR).join(project).join(profile.dir()).join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The project name whose kept copies belong to the main checkout `main` (an output of `main_folder`): `broadsword` for `.`,
+/// `<p>` for `<projects>/<p>`. `None` (nothing is kept) for anything else, for a project folder named like Broadsword itself
+/// (job.rs always builds that name from the root, so it would share the root's copies) and for a name that is not one plain
+/// path part.
+pub fn kept_project(cfg: &Config, main: &str) -> Option<String> {
+    if main == MAIN_SOURCE {
+        return Some(crate::job::SELF_PROJECT.to_string());
+    }
+    let projects = rel_source(cfg, &cfg.projects_dir).ok().filter(|p| p != MAIN_SOURCE)?;
+    let p = main.strip_prefix(&format!("{projects}/"))?;
+    let plain = !p.is_empty() && p != "." && p != ".." && !p.contains(['/', '\\', ':']) && !p.eq_ignore_ascii_case(crate::job::SELF_PROJECT);
+    plain.then(|| p.to_string())
 }
 
 /// The note file beside a kept copy.
@@ -395,10 +414,10 @@ fn kept_note(exe: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// The build-source note a kept copy of `bin` for `profile` was kept under (`projects/<p>`, `.`, or a `run:` note of one of
-/// those), `None` if there is no kept copy or no (readable) note beside it.
-pub fn read_kept_note(cfg: &Config, profile: Profile, bin: &str) -> Option<String> {
-    let exe = kept_exe(cfg, profile, bin);
+/// The build-source note a kept copy of `bin` for `profile` of `project` was kept under (`projects/<p>`, `.`, or a `run:` note
+/// of one of those), `None` if there is no kept copy or no (readable) note beside it.
+pub fn read_kept_note(cfg: &Config, project: &str, profile: Profile, bin: &str) -> Option<String> {
+    let exe = kept_exe(cfg, project, profile, bin);
     if !exe.is_file() {
         return None;
     }
@@ -407,14 +426,14 @@ pub fn read_kept_note(cfg: &Config, profile: Profile, bin: &str) -> Option<Strin
     (!line.is_empty()).then_some(line)
 }
 
-/// The cargo output path of `bin` for `profile` (what a person or another project's test runs).
+/// The cargo output path of `bin` for `profile` (cargo's cache: what the last build of any checkout left there).
 fn built_exe(cfg: &Config, profile: Profile, bin: &str) -> PathBuf {
     cfg.build_dir.join(profile.dir()).join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// The main checkout of the project that `source` belongs to: `.` for `.` and for a worktree of Broadsword itself
 /// (`<worktrees>/broadsword/<id>`), `<projects>/<p>` for `<projects>/<p>` and for `<worktrees>/<p>/<id>`. `None` for any other
-/// folder (nothing is kept or restored for it). An exact allow-list of the two shapes job.rs builds sources from.
+/// folder (nothing is kept for it). An exact allow-list of the two shapes job.rs builds sources from.
 pub fn main_folder(cfg: &Config, source: &str) -> Option<String> {
     if source == MAIN_SOURCE {
         return Some(MAIN_SOURCE.to_string());
@@ -462,7 +481,7 @@ fn atomic_tmp(path: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
-/// EVERY path this module creates, writes, renames or removes for the kept (or restored) exe `exe`: the exe, its `.source` note
+/// EVERY path this module creates, writes, renames or removes for the kept exe `exe`: the exe, its `.source` note
 /// and `.stale` marker, and the temp file of each (`copy_tmp`, `atomic_tmp`). `guard_kept_files` checks exactly this list, and
 /// `copy_atomic` and `write_atomic` build their temp names with the same helpers.
 fn kept_files(exe: &Path) -> [PathBuf; 6] {
@@ -481,7 +500,7 @@ fn create_fresh(tmp: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
 }
 
-/// THE check before any file of a kept copy (or the cargo exe a kept copy is restored to) is read, written or removed: the
+/// THE check before any file of a kept copy is read, written or removed: the
 /// build-folder guard, then for the exe `exe` and every file written beside it (`.source`, `.stale`, the temp file): neither the
 /// file nor any folder on its way (`main.bins`, the profile folder, up to the drive root) may be a symlink, junction or reparse
 /// point, and a file or folder that exists must resolve inside `build_dir`. Err = refuse: nothing of it is touched.
@@ -524,7 +543,7 @@ fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
         }
         // the copy keeps the build's time (readers such as render's tests pick the newest exe)
         out.set_modified(meta.modified()?)?;
-        // ... and its permissions (the execute bits on Unix, the read-only flag on Windows): a kept or restored exe must stay runnable
+        // ... and its permissions (the execute bits on Unix, the read-only flag on Windows): a kept exe must stay runnable
         let writable = out.metadata()?.permissions();
         out.set_permissions(meta.permissions())?;
         out.sync_all()?;
@@ -532,14 +551,25 @@ fn copy_atomic(from: &Path, to: &Path) -> Result<(), CopyFail> {
     })();
     let r = copied.map_err(CopyFail::Copy).and_then(|writable| {
         // Windows refuses to replace a read-only file: the old copy was a read-only copy of an older build, so it is made
-        // replaceable first (the plain permissions of a new file; elsewhere a rename never needs the old file to be writable)
+        // replaceable first (the plain permissions of a new file; elsewhere a rename never needs the old file to be writable).
+        // When the rename then fails (the old copy is in use and stays), its read-only flag is set back: the old copy is left
+        // exactly as it was.
         #[cfg(windows)]
-        if std::fs::metadata(to).is_ok_and(|m| m.permissions().readonly()) {
-            std::fs::set_permissions(to, writable).map_err(CopyFail::Replace)?;
+        {
+            let was_readonly = std::fs::metadata(to).ok().map(|m| m.permissions()).filter(|p| p.readonly());
+            if was_readonly.is_some() {
+                std::fs::set_permissions(to, writable).map_err(CopyFail::Replace)?;
+            }
+            std::fs::rename(&tmp, to).map_err(|e| match was_readonly.map(|p| std::fs::set_permissions(to, p)) {
+                Some(Err(back)) => CopyFail::Replace(std::io::Error::new(e.kind(), format!("{e}; and setting the old file's read-only flag back failed: {back}"))),
+                _ => CopyFail::Replace(e),
+            })
         }
         #[cfg(not(windows))]
-        let _ = writable;
-        std::fs::rename(&tmp, to).map_err(CopyFail::Replace)
+        {
+            let _ = writable;
+            std::fs::rename(&tmp, to).map_err(CopyFail::Replace)
+        }
     });
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -570,25 +600,49 @@ pub fn stale_marker(exe: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// What a kept copy that is in use (cannot be replaced) does to the job.
+/// When `keep_main_bins` runs, which decides what it may copy and what a kept copy in use (cannot be replaced) does to the job.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum InUse {
-    /// after a successful main step (`refresh_main_bins`): the copy is main's previous build and the new one is in cargo's
-    /// folder, so the job passes, says so loudly and marks the copy stale
-    LeaveStale,
-    /// before another folder's clean: the clean would delete main's newer build from cargo's folder with no copy of it, so the
-    /// job is refused (nothing built or cleaned)
-    Refuse,
+enum Keep {
+    /// right after a SUCCESSFUL main step (`refresh_main_bins`): the exe in cargo's folder is that step's build, so it is copied.
+    /// A copy in use is main's previous build and the new one is in cargo's folder, so the job passes, says so loudly and marks
+    /// the copy stale (with the new exe's fingerprint)
+    AfterMainStep,
+    /// before another folder's clean: only the exe a stale marker vouches for (a successful build the refresh could not copy:
+    /// `vouched_by_marker`) is copied; anything else in cargo's folder may be a failed build's and is left to the clean. A
+    /// vouched copy in use refuses the job (the clean would delete main's newer build from cargo's folder with no copy of it;
+    /// nothing built or cleaned)
+    BeforeForeignClean,
+}
+
+/// What the `.stale` marker records of the exe in cargo's folder that a refresh could not copy: its length and modified time.
+/// A later build of any checkout writes a new file there (another length or time), so a match means it is still that exe.
+fn fingerprint(exe: &Path) -> std::io::Result<String> {
+    let m = std::fs::metadata(exe)?;
+    let t = m.modified()?.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)?;
+    Ok(format!("{} bytes, modified {}.{:09}", m.len(), t.as_secs(), t.subsec_nanos()))
+}
+
+/// The second line of a `.stale` marker: `built: <fingerprint>`.
+const STALE_BUILT: &str = "built: ";
+
+/// True if the `.stale` marker beside `kept` names exactly the exe `built` (its fingerprint on the marker's `built:` line): that
+/// exe is a successful main build the refresh could not copy. False for no marker, an unreadable one, or any other exe.
+fn vouched_by_marker(kept: &Path, built: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(stale_marker(kept)) else { return false };
+    let Ok(now) = fingerprint(built) else { return false };
+    text.lines().any(|l| l.strip_prefix(STALE_BUILT) == Some(now.as_str()))
 }
 
 /// Copy main's exes of package `pkg` (whose binary targets are `bins`) to their kept place: every exe of those targets whose note
 /// (the bin note, else the package note for builds from before bin notes) names `main` (plain or `run:`), in each profile, with
 /// that note beside it. `when` ends the error message. Called after a successful main step (`refresh_main_bins`) and before a
 /// job of ANOTHER folder cleans `pkg` (`prepare_packages`: nothing is cleaned until this succeeded; Err refuses the job, nothing
-/// deleted). The caller holds the build lock. An unchanged copy is not rewritten (and gets no line). The note beside the copy is removed first and written last, so a crash in between leaves a copy with no
-/// note, which is never restored.
-fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &str, busy: InUse) -> Result<Vec<String>, String> {
+/// deleted); `moment` says which, and with it what may be copied (see `Keep`). The caller holds the build lock. An unchanged
+/// copy is not rewritten (and gets no line). The note beside the copy is removed first and written last, so a crash in between
+/// leaves a copy with no note.
+fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &str, moment: Keep) -> Result<Vec<String>, String> {
     guard_build_dir(cfg, "refusing to keep main's binaries")?;
+    let Some(project) = kept_project(cfg, main) else { return Ok(Vec::new()) };
     let mut lines = Vec::new();
     for b in bins {
         let Some(note) = read_bin_note(cfg, b).or_else(|| read_note(cfg, pkg)) else { continue };
@@ -596,13 +650,13 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
             continue;
         }
         for profile in CLEAN_PROFILES {
-            let (from, to) = (built_exe(cfg, profile, b), kept_exe(cfg, profile, b));
+            let (from, to) = (built_exe(cfg, profile, b), kept_exe(cfg, &project, profile, b));
             if !from.is_file() {
                 continue;
             }
             guard_kept_files(cfg, "refusing to keep main's binaries", &to)?;
             let (side, stale) = (kept_note(&to), stale_marker(&to));
-            let old = read_kept_note(cfg, profile, b);
+            let old = read_kept_note(cfg, &project, profile, b);
             // sameness is the BYTES only: a copy that is current byte for byte is never replaced because its note text differs
             // (a copy in use must not be refused or marked stale for that); only the note beside it is brought up to date
             let same = std::fs::read(&from).ok().is_some_and(|x| std::fs::read(&to).ok().as_deref() == Some(x.as_slice()));
@@ -620,7 +674,13 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
                 }
                 continue;
             }
-            // the note goes first and comes back last, so a crash in between leaves a copy with no note (never restored)
+            // before another folder's clean only a successful build the refresh could not copy is kept: the exe in cargo's folder
+            // may be a failed or partial main build's (prepare set its bin note to main before that build ran)
+            if moment == Keep::BeforeForeignClean && !vouched_by_marker(&to, &from) {
+                lines.push(format!("main.bins: `{b}` ({}) not kept from {}: no successful main step vouches for that exe (it may be a failed build's); main.bins keeps the last good copy", profile.dir(), from.display()));
+                continue;
+            }
+            // the note goes first and comes back last, so a crash in between leaves a copy with no note
             remove(&side)?;
             match copy_atomic(&from, &to) {
                 Ok(()) => {
@@ -628,12 +688,13 @@ fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String], when: &s
                     remove(&stale)?;
                     lines.push(format!("kept main's `{b}` ({}, built from {}) at {}", profile.dir(), note_folder(&note), to.display()));
                 }
-                Err(CopyFail::Replace(e)) if busy == InUse::LeaveStale && in_use(&to) => {
-                    // the old copy stays, still named by its own note; the marker says a newer build exists
+                Err(CopyFail::Replace(e)) if moment == Keep::AfterMainStep && in_use(&to) => {
+                    // the old copy stays, still named by its own note; the marker says a newer build exists, and which exe it is
                     if let Some(o) = &old {
                         write_atomic(&side, o).map_err(|e| fail(&e))?;
                     }
-                    write_atomic(&stale, &format!("stale: {note}, in use at {}", crate::pause::now_string())).map_err(|e| fail(&e))?;
+                    let built = fingerprint(&from).map_err(|e| fail(&e))?;
+                    write_atomic(&stale, &format!("stale: {note}, in use at {}\n{STALE_BUILT}{built}", crate::pause::now_string())).map_err(|e| fail(&e))?;
                     lines.push(format!(
                         "main.bins: `{b}` ({}) NOT refreshed (in use: {e}); the copy is from {}. The new build is only in {} for now; the next main build refreshes the copy once nothing runs it ({} says so meanwhile)",
                         profile.dir(),
@@ -669,33 +730,7 @@ pub fn refresh_main_bins(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<S
     };
     let mut lines = Vec::new();
     for (p, bins) in &targets {
-        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)", InUse::LeaveStale)?);
-    }
-    Ok(lines)
-}
-
-/// After `pkg` was cleaned: every binary target of it whose exe is gone gets main's kept copy back in its cargo place, when the
-/// copy was kept from `main` (the main checkout of the job's own project). Cargo's fingerprint for the target was removed by the
-/// clean, so any cargo step that needs the target still rebuilds it from the job's own source; one that does not (an example
-/// only, a bench) leaves main's binary in place for people and other projects' tests.
-fn restore_main_bins(cfg: &Config, main: &str, bins: &[String]) -> Result<Vec<String>, String> {
-    guard_build_dir(cfg, "refusing to restore main's binaries")?;
-    let mut lines = Vec::new();
-    for b in bins {
-        for profile in CLEAN_PROFILES {
-            let (from, to) = (kept_exe(cfg, profile, b), built_exe(cfg, profile, b));
-            if !from.is_file() || to.exists() {
-                continue;
-            }
-            guard_kept_files(cfg, "refusing to restore main's binaries", &from)?;
-            guard_kept_files(cfg, "refusing to restore main's binaries", &to)?;
-            let Some(note) = read_kept_note(cfg, profile, b) else { continue };
-            if note_folder(&note) != main {
-                continue;
-            }
-            copy_atomic(&from, &to).map_err(|e| format!("cannot put main's kept `{b}` back at {}: {e}", to.display()))?;
-            lines.push(format!("restored main's `{b}` ({}, built from {}) at {} from its kept copy", profile.dir(), note_folder(&note), to.display()));
-        }
+        lines.extend(keep_main_bins(cfg, source, p, bins, "after this build (the build itself succeeded, but main.bins does not hold it)", Keep::AfterMainStep)?);
     }
     Ok(lines)
 }
@@ -942,12 +977,13 @@ fn prepare_packages(cfg: &Config, dir: &Path, source: &str, targets: Vec<(String
     task::wait_for_gate(cfg, TEST_SYNC_GATE_ENV, "the build-source sync (holding the build lock)");
     let mut lines = vec![format!("build source: {source} (packages: {})", packages.join(", "))];
     let wanted = if as_run { format!("{RUN_NOTE_PREFIX}{source}") } else { source.to_string() };
-    // main's binaries: a job of ANOTHER folder keeps a copy of each exe the main checkout of its project built before cleaning
-    // it, and every job puts that copy back where the clean removed it (see `keep_main_bins`, `restore_main_bins`)
+    // main's binaries: before a job of ANOTHER folder cleans a package, a successful main build that main.bins could not take yet
+    // (its copy was in use) is kept (see `keep_main_bins`). Nothing is ever copied back into cargo's folder after the clean: it
+    // then holds only what this job builds.
     let main = main_folder(cfg, source);
     for (p, was) in &stale {
         if let Some(m) = main.as_deref().filter(|m| *m != source) {
-            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), InUse::Refuse)?);
+            lines.extend(keep_main_bins(cfg, m, p, bins_of_pkg(p), &format!("before cleaning `{p}` (this job is refused: `{p}` was not cleaned and nothing was built; a package listed before it may already have been cleaned, with main's binaries kept first)"), Keep::BeforeForeignClean)?);
         }
         for profile in CLEAN_PROFILES {
             let flag = if profile == Profile::Release { " --release" } else { "" };
@@ -961,10 +997,6 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
                 ));
             }
         }
-        let restored = match main.as_deref() {
-            Some(m) => restore_main_bins(cfg, m, bins_of_pkg(p))?,
-            None => Vec::new(),
-        };
         write_note(cfg, p, &wanted)?;
         for b in bins_of_pkg(p) {
             write_bin_note(cfg, b, &wanted)?;
@@ -974,7 +1006,6 @@ nothing was built. The old copy of `{p}` in the build folder could not be remove
             Some(w) => format!("cleaned `{p}` in the shared build folder (it was last built from {}); its other packages and all dependencies were kept", note_folder(w)),
             None => format!("cleaned `{p}` in the shared build folder (no record of what built it); its dependencies were kept"),
         });
-        lines.extend(restored);
     }
     if marked {
         std::fs::remove_file(&marker).map_err(|e| format!("cannot remove the build-source marker {}: {e}", marker.display()))?;
@@ -1139,7 +1170,7 @@ mod tests {
     fn a_current_copy_in_use_only_gets_its_note_updated() {
         let d = tmp("samebytes");
         let cfg = cfg_at(&d.canonicalize().unwrap());
-        let (from, to) = (built_exe(&cfg, Profile::Release, "probe"), kept_exe(&cfg, Profile::Release, "probe"));
+        let (from, to) = (built_exe(&cfg, Profile::Release, "probe"), kept_exe(&cfg, "p", Profile::Release, "probe"));
         for p in [&from, &to] {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, b"main's exe").unwrap();
@@ -1153,9 +1184,9 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::OpenOptionsExt::share_mode(&mut hold, 1);
         let _running = hold.open(&to).unwrap();
-        let r = keep_main_bins(&cfg, "projects/p", "pkg", &["probe".to_string()], "in the test", InUse::Refuse);
+        let r = keep_main_bins(&cfg, "projects/p", "pkg", &["probe".to_string()], "in the test", Keep::BeforeForeignClean);
         assert!(r.is_ok(), "{r:?}");
-        assert_eq!(read_kept_note(&cfg, Profile::Release, "probe").as_deref(), Some("projects/p"));
+        assert_eq!(read_kept_note(&cfg, "p", Profile::Release, "probe").as_deref(), Some("projects/p"));
         assert_eq!(std::fs::read(&to).unwrap(), b"main's exe");
         assert_eq!(std::fs::metadata(&to).unwrap().modified().unwrap(), modified, "the binary was not rewritten");
         assert!(!stale_marker(&to).exists());
@@ -1203,8 +1234,55 @@ mod tests {
         }
         assert_eq!(Profile::Dev.dir(), "debug");
         assert_eq!(Profile::Release.dir(), "release");
-        let k = kept_exe(&cfg, Profile::Release, "crash-sim");
-        assert!(k.starts_with(cfg.build_dir.join(KEEP_DIR).join("release")), "{}", k.display());
+        let k = kept_exe(&cfg, "crash-sim", Profile::Release, "crash-sim");
+        assert_eq!(k, cfg.build_dir.join(KEEP_DIR).join("crash-sim").join("release").join(format!("crash-sim{}", std::env::consts::EXE_SUFFIX)));
+    }
+
+    /// Review q-20261121-011535 (minor at kept_exe): two projects with the same bin name must never share one kept copy. The
+    /// kept path is keyed by the project, which comes from the main folder in one place (`kept_project`).
+    #[test]
+    fn kept_copies_are_keyed_by_project() {
+        let cfg = cfg_at(Path::new("r"));
+        assert_eq!(kept_project(&cfg, ".").as_deref(), Some("broadsword"));
+        assert_eq!(kept_project(&cfg, "projects/crash-sim").as_deref(), Some("crash-sim"));
+        assert_eq!(kept_project(&cfg, "projects/other").as_deref(), Some("other"));
+        for bad in ["", "projects", "projects/", "projects/a/b", "projects/..", "projects/.", "projects/a\\b", "projects/c:x", "projects/broadsword", "projects/Broadsword", "worktrees/p/t", "run:projects/p", "elsewhere/p"] {
+            assert_eq!(kept_project(&cfg, bad), None, "{bad}");
+        }
+        // the same bin of two projects (and of the root) lands in three different places
+        let paths: Vec<PathBuf> = ["broadsword", "crash-sim", "other"].iter().map(|p| kept_exe(&cfg, p, Profile::Dev, "tool")).collect();
+        assert!(paths[0] != paths[1] && paths[1] != paths[2] && paths[0] != paths[2], "{paths:?}");
+        // and every main folder main_folder gives maps to its own project
+        for (source, project) in [(".", "broadsword"), ("worktrees/broadsword/t-1", "broadsword"), ("projects/crash-sim", "crash-sim"), ("worktrees/crash-sim/t-1", "crash-sim")] {
+            assert_eq!(main_folder(&cfg, source).and_then(|m| kept_project(&cfg, &m)).as_deref(), Some(project), "{source}");
+        }
+    }
+
+    /// Review q-20261121-011535 (minor at copy_atomic): when the rename over a read-only old copy fails because the copy is in
+    /// use, the old copy stays, and its read-only flag is set back. Windows only (only Windows refuses to replace an open file).
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_replace_of_a_read_only_copy_leaves_it_read_only() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmp("roback");
+        let (from, to) = (d.join("from.exe"), d.join("to.exe"));
+        std::fs::write(&from, b"new build").unwrap();
+        std::fs::write(&to, b"old build").unwrap();
+        let mut ro = std::fs::metadata(&to).unwrap().permissions();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&to, ro).unwrap();
+        // a program running the copy: open with sharing for reads only, so it can be neither replaced nor deleted
+        let running = std::fs::OpenOptions::new().read(true).share_mode(1).open(&to).unwrap();
+        let r = copy_atomic(&from, &to);
+        assert!(matches!(r, Err(CopyFail::Replace(_))), "the replace must fail while the copy is open");
+        drop(running);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old build", "the old copy stays");
+        assert!(std::fs::metadata(&to).unwrap().permissions().readonly(), "and stays read-only");
+        assert!(!copy_tmp(&to).exists(), "no temp file is left");
+        let plain = d.join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        std::fs::set_permissions(&to, std::fs::metadata(&plain).unwrap().permissions()).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -649,15 +649,25 @@ enum PoolEnd {
 }
 
 /// `buildsrc::refresh_main_bins` for this job, its lines printed and logged. The caller holds the build lock and calls it only
-/// after a successful cargo step or `run` command. Err = the job fails (main.bins does not hold what was built).
-fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log) -> Result<(), String> {
-    for l in buildsrc::refresh_main_bins(cfg, project_dir, source)? {
-        println!("{l}");
-        if let Ok(mut f) = log.lock() {
-            let _ = writeln!(f, "{l}");
+/// after a successful cargo step or `run` command. A failure is NOT reported here: it goes into `failed` (the first one is kept),
+/// and `run_job_info` reports it in its one place, after the job's summary block, and fails the job (main.bins does not hold
+/// what was built). Returns false when it failed.
+fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log, failed: &mut Option<String>) -> bool {
+    match buildsrc::refresh_main_bins(cfg, project_dir, source) {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+                if let Ok(mut f) = log.lock() {
+                    let _ = writeln!(f, "{l}");
+                }
+            }
+            true
+        }
+        Err(e) => {
+            failed.get_or_insert(e);
+            false
         }
     }
-    Ok(())
 }
 
 /// The test step's context: everything `run_child` needs, borrowed from the job.
@@ -675,6 +685,9 @@ struct TestStep<'a> {
     secrets: &'a Arc<Secrets>,
     /// `test_parallel_binaries`: how many test executables (and Python scripts) run at once. 1 = one after another, streamed.
     parallel: usize,
+    /// Set when refreshing main.bins after the compile failed (see `refresh_main_bins`); the tests still run, and the job
+    /// reports it after its summary and fails.
+    main_bins_failed: &'a mut Option<String>,
 }
 
 impl TestStep<'_> {
@@ -710,7 +723,7 @@ impl TestStep<'_> {
         let envs = package_envs(self.cfg, self.project_dir)?;
         // the compile succeeded: the main checkout's bins it built go to `build/main.bins` while the lock still holds
         if hold.is_some() {
-            refresh_main_bins(self.cfg, self.project_dir, self.source, self.log)?;
+            refresh_main_bins(self.cfg, self.project_dir, self.source, self.log, self.main_bins_failed);
         }
         let mut kept = String::new();
         // 2. copy, then release the lock
@@ -1407,6 +1420,8 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
 
     let mut summary: Vec<String> = Vec::new();
     let mut all_ok = true;
+    // the first failure to refresh main.bins (`refresh_main_bins`), reported once, after the summary block
+    let mut main_bins_failed: Option<String> = None;
     let mut exit_code: Option<i32> = None;
     let mut build_hold: Option<BuildHold> = None; // held (when taken) until this function returns
     for (i, step) in steps.iter().enumerate().skip(spec.first_step) {
@@ -1545,7 +1560,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         let mut py: Option<PyTests> = None;
         let ran = if *step == "test" && kind != "run" {
             let parallel = cfg.test_parallel_binaries as usize;
-            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel };
+            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel, main_bins_failed: &mut main_bins_failed };
             // the project's Python tests (SCALING F9) run once cargo's tests pass (side by side: in the same pool, after the
             // copies), always after the build lock is released
             match t.run(cmd, &mut build_hold, python_scripts(cfg, name)) {
@@ -1606,17 +1621,19 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         }
         // a successful step of the main checkout refreshes `build/main.bins`, the stable place of main's binaries (buildsrc.rs),
         // while the build lock still holds (the test step does it itself, before it releases the lock)
-        if build_hold.is_some() {
-            if let Err(e) = refresh_main_bins(cfg, &project_dir, &source, &log) {
-                eprintln!("broadsword: {e}");
-                return end(&mut rec, record::FAILED, EXIT_FAILED);
-            }
+        if build_hold.is_some() && !refresh_main_bins(cfg, &project_dir, &source, &log, &mut main_bins_failed) {
+            break; // no further step; the failure is reported after the summary below
         }
     }
     info.summary = summary.clone();
     println!("--- summary ---");
     for l in &summary {
         println!("{l}");
+    }
+    // THE one place a main.bins refresh failure is reported: after the summary block, then the job fails
+    if let Some(e) = &main_bins_failed {
+        eprintln!("broadsword: {e}");
+        return end(&mut rec, record::FAILED, EXIT_FAILED);
     }
     let code = if kind == "run" {
         // the command's own exit code becomes the job's (never 0 for a failure)

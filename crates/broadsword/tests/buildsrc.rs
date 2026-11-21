@@ -251,12 +251,13 @@ fn a_renamed_package_with_the_same_bin_name_does_not_leave_its_exe_vouched_for_m
 /// t-20261120-191700 (Lazlo's retest, 2026-11-20 19:15Z): he built `crash-sim` from projects/crash-sim, and one second later the
 /// queue's perf gate for a worktree entry cleaned `crash-sim` (its note named the main checkout) and built only its bench
 /// example, so build/release/crash-sim.exe was gone. Here: main builds the bin (debug through `build`, release through `run`, as
-/// Lazlo did), a worktree builds ONLY an example (with the clean). Main's exe must still be in cargo's place in both profiles,
-/// still main's build, and kept in `main.bins` with a note naming main. On the code before the fix the probe after the example
-/// build found no binary. Then the worktree builds the bin itself: cargo's place holds the worktree's exe (its bin note says
-/// so), but the kept copy is still main's, and the next foreign clean puts main's back.
+/// Lazlo did), a worktree builds ONLY an example (with the clean). Main's exe is still available, still main's build: kept in
+/// `main.bins/proj/<profile>` with a note naming main (on the code before the task the kept copy did not exist). Cargo's own
+/// folder holds only what the worktree job built: no `markprobe` exe at all (round 8, review q-20261121-011535: copying main's
+/// exe back there mislabelled it as the worktree's build). Then the worktree builds the bin itself: cargo's place holds the
+/// worktree's exe (its bin note says so), and the kept copy is still main's.
 #[test]
-fn a_worktree_that_builds_only_an_example_leaves_mains_binary_in_place_and_kept() {
+fn a_worktree_that_builds_only_an_example_leaves_mains_binary_kept_and_none_in_cargos_folder() {
     let r = Root::new("keepmain", 120);
     let proj = r.dir.join("projects/proj");
     fs::create_dir_all(proj.join("examples")).unwrap();
@@ -266,7 +267,7 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_in_place_and_kept(
     let t1 = r.task("a", "MARK-t1");
     let t2 = r.task("b", "MARK-t2");
     let exe = |profile: &str| r.dir.join("build").join(profile).join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
-    let kept = |profile: &str| r.dir.join("build/main.bins").join(profile).join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = |profile: &str| r.dir.join("build/main.bins/proj").join(profile).join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
     let prints = |p: &Path| -> String {
         let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
         String::from_utf8_lossy(&o.stdout).into_owned()
@@ -283,34 +284,93 @@ fn a_worktree_that_builds_only_an_example_leaves_mains_binary_in_place_and_kept(
     let o = r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--release", "--offline", "--example", "only"]);
     assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("last built from projects/proj"), "the race needs the clean:\n{}", o.stdout);
     for profile in ["debug", "release"] {
-        assert_eq!(prints(&exe(profile)), "MARK-main", "main's {profile} binary must still be in place and still main's:\n{}", o.stdout);
-        assert_eq!(prints(&kept(profile)), "MARK-main", "and kept:\n{}", o.stdout);
+        assert!(!exe(profile).exists(), "cargo's {profile} folder holds only what this job built, never main's exe under the worktree's note:\n{}", o.stdout);
+        assert_eq!(prints(&kept(profile)), "MARK-main", "main's {profile} binary is still available, still main's, in main.bins:\n{}", o.stdout);
         assert_eq!(kept_note(profile).as_deref(), Some("run:projects/proj"), "the kept copy names the last note of main's build (the release `run`)");
     }
-    // main.bins already holds main's build (each main job refreshes it), so the clean copies nothing new; it puts main's exe back
-    assert!(o.stdout.contains("restored main's `markprobe`"), "{}", o.stdout);
+    assert!(!o.stdout.contains("restored"), "nothing is put back into cargo's folder:\n{}", o.stdout);
     let example = r.dir.join("build/release/examples").join(format!("only{}", std::env::consts::EXE_SUFFIX));
     assert_eq!(prints(&example), "example MARK-t1", "the job's own cargo step built the worktree's example");
-    // the notes stay conservative: they name the worktree, so `install`-style readers and the next foreign build never vouch
     assert_eq!(r.bin_note().as_deref(), Some(format!("run:worktrees/proj/{t1}").as_str()));
 
     // a worktree whose cargo step needs the bin rebuilds it from its own source (the clean removed cargo's fingerprint)
     let o = r.ok(&["check", "proj", "--task", &t2]);
     assert!(o.stdout.contains("test: ok"), "{}", o.stdout);
-    assert_eq!(prints(&exe("debug")), "MARK-t2", "the worktree's own build gives its own binary, never main's restored copy");
+    assert_eq!(prints(&exe("debug")), "MARK-t2", "the worktree's own build gives its own binary");
     assert_eq!(r.bin_note().as_deref(), Some(format!("worktrees/proj/{t2}").as_str()), "and its bin note says so");
     assert_eq!(prints(&kept("debug")), "MARK-main", "the kept copy is never replaced by a worktree's exe");
     assert_eq!(kept_note("debug").as_deref(), Some("run:projects/proj"));
 
-    // the next job of another folder that cleans puts main's exe back where t2's was
+    // the next job of another folder that cleans leaves no exe in cargo's folder, and main's kept copy as it was
     let o = r.ok(&["run", "proj", "--task", &t1, "--", "cargo", "build", "--offline", "--example", "only"]);
     assert!(o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
-    assert_eq!(prints(&exe("debug")), "MARK-main", "{}", o.stdout);
+    assert!(!exe("debug").exists(), "{}", o.stdout);
+    assert_eq!(prints(&kept("debug")), "MARK-main");
 
-    // and main's own build afterwards still gives main's binary
+    // and main's own build afterwards gives main's binary in both places
     r.ok(&["build", "proj"]);
     assert_eq!(prints(&exe("debug")), "MARK-main");
+    assert_eq!(prints(&kept("debug")), "MARK-main");
     assert_eq!(r.bin_note().as_deref(), Some("projects/proj"));
+}
+
+/// Round 8 (review q-20261121-011535, the blocking finding): a worktree job that cleans the package and then runs nothing that
+/// builds it must leave NO binary for that bin in cargo's folder (a test or script there that runs the exe by path fails loudly,
+/// as before this task), and main's copy in main.bins untouched. On round 7's code (ce4ca63) `restore_main_bins` copied main's
+/// exe back into cargo's folder under the worktree's bin note, so the first assertion failed.
+#[test]
+fn a_worktree_job_that_cleans_and_builds_nothing_leaves_no_binary_in_cargos_folder() {
+    let r = Root::new("cleannothing", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    r.ok(&["build", "proj"]);
+    assert_eq!(r.probe(), "MARK-main");
+    let before = fs::read(&kept).unwrap_or_else(|e| panic!("main's build kept no copy at {}: {e}", kept.display()));
+
+    let o = r.ok(&["run", "proj", "--task", &t1, "--", "echo", "nothing"]);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("last built from projects/proj"), "the job cleans:\n{}", o.stdout);
+    assert!(!exe.exists(), "cargo's folder has no binary for `markprobe` after the clean:\n{}", o.stdout);
+    assert_eq!(fs::read(&kept).unwrap(), before, "main.bins still has main's copy, byte for byte");
+    assert_eq!(fs::read_to_string(format!("{}.source", kept.display())).unwrap().trim(), "projects/proj");
+}
+
+/// Round 8 (review q-20261121-011535, minor at keep_main_bins): a main build that FAILS can leave an exe it did build in cargo's
+/// folder (bin A compiled, bin B did not), with the bin note already set to main by prepare. The next job of another folder
+/// that cleans must NOT copy it into main.bins: main.bins keeps the last good copy, byte for byte and note for note. On round
+/// 7's code (ce4ca63) the foreign clean's keep copied the failed build's `markprobe` (MARK-new) into main.bins.
+#[test]
+fn a_failed_main_build_never_reaches_main_bins_even_through_a_foreign_clean() {
+    let r = Root::new("failedkeep", 120);
+    let t1 = r.task("a", "MARK-t1");
+    let proj = r.dir.join("projects/proj");
+    let exe = r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let note = PathBuf::from(format!("{}.source", kept.display()));
+    let prints = |p: &Path| -> String {
+        let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    r.ok(&["build", "proj"]);
+    assert_eq!(prints(&kept), "MARK-main");
+    let (before, before_note) = (fs::read(&kept).unwrap(), fs::read(&note).unwrap());
+
+    // new code for bin A (`markprobe`) and a second bin B that does not compile; --keep-going builds A although B fails
+    set_marker(&proj, "MARK-new");
+    fs::create_dir_all(proj.join("src/bin")).unwrap();
+    fs::write(proj.join("src/bin/broken.rs"), "fn main() { this does not compile }\n").unwrap();
+    let o = r.run(&["run", "proj", "--", "cargo", "build", "--offline", "--keep-going"]);
+    assert_ne!(o.code, 0, "the main build fails:\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(prints(&exe), "MARK-new", "bin A compiled into cargo's folder (the partial build):\n{}\n{}", o.stdout, o.stderr);
+    assert_eq!(fs::read(&kept).unwrap(), before, "the failed build refreshed nothing");
+
+    // a worktree job cleans the package: its keep must not take the failed build's exe
+    let o = r.ok(&["run", "proj", "--task", &t1, "--", "echo", "nothing"]);
+    assert!(o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+    assert!(o.stdout.contains("main.bins: `markprobe` (debug) not kept from"), "{}", o.stdout);
+    assert_eq!(fs::read(&kept).unwrap(), before, "main.bins is unchanged, byte for byte:\n{}", o.stdout);
+    assert_eq!(fs::read(&note).unwrap(), before_note, "and its note too");
+    assert_eq!(prints(&kept), "MARK-main");
 }
 
 /// Round 2 (review q-20261120-202642): `build/main.bins` is THE stable place of main's binaries, so every SUCCESSFUL job of the
@@ -323,7 +383,7 @@ fn every_successful_main_build_refreshes_main_bins_and_no_worktree_build_replace
     let t1 = r.task("a", "MARK-t1");
     let proj = r.dir.join("projects/proj");
     let suffix = std::env::consts::EXE_SUFFIX;
-    let kept = |profile: &str| r.dir.join("build/main.bins").join(profile).join(format!("markprobe{suffix}"));
+    let kept = |profile: &str| r.dir.join("build/main.bins/proj").join(profile).join(format!("markprobe{suffix}"));
     let prints = |p: &Path| -> String {
         let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
         String::from_utf8_lossy(&o.stdout).into_owned()
@@ -384,7 +444,7 @@ fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build(
     let proj = r.dir.join("projects/proj");
     // main's binary waits while it is given `wait`, so the kept copy can be kept running
     fs::write(proj.join("src/main.rs"), "fn main() {\n    if std::env::args().nth(1).as_deref() == Some(\"wait\") {\n        std::thread::sleep(std::time::Duration::from_secs(120));\n    }\n    print!(\"{}\", markprobe::MARKER);\n}\n").unwrap();
-    let kept = r.dir.join("build/main.bins/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
     let stale = PathBuf::from(format!("{}.stale", kept.display()));
     let prints = |p: &Path| -> String {
         let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
@@ -407,14 +467,35 @@ fn a_kept_copy_in_use_is_left_marked_stale_and_refreshed_by_the_next_main_build(
     assert!(marker.starts_with("stale: projects/proj, in use at "), "{marker}");
     assert_eq!(fs::read_to_string(format!("{}.source", kept.display())).unwrap().trim(), "projects/proj", "the copy is still named by its own note");
 
+    assert!(marker.lines().nth(1).is_some_and(|l| l.starts_with("built: ") && l.contains(" bytes, modified ")), "the marker names the new exe: {marker}");
+
     // nothing runs it now: the next main build (no code change) refreshes it and removes the marker
     let o = r.ok(&["build", "proj"]);
     assert!(o.stdout.contains("kept main's `markprobe` (debug"), "{}", o.stdout);
     assert_eq!(prints(&kept), "MARK-main2");
     assert!(!stale.exists(), "the marker is gone once the copy is fresh");
+
+    // a stale copy before ANOTHER folder's clean: the exe its marker vouches for (main's successful build) is kept, and while
+    // the copy is still in use that job is refused (its clean would delete main's newest build with no copy of it)
+    let t1 = r.task("a", "MARK-t1");
+    let mut running = Command::new(&kept).arg("wait").stdout(Stdio::null()).spawn().unwrap();
+    set_marker(&proj, "MARK-main3");
+    r.ok(&["build", "proj"]);
+    assert!(stale.exists());
+    let o = r.run(&["run", "proj", "--task", &t1, "--", "echo", "nothing"]);
+    let still = r.probe();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert_ne!(o.code, 0, "refused while the vouched copy is in use:\n{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("before cleaning `markprobe`"), "{}", o.stderr);
+    assert_eq!(still, "MARK-main3", "nothing was cleaned");
+    let o = r.ok(&["run", "proj", "--task", &t1, "--", "echo", "nothing"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug") && o.stdout.contains("cleaned `markprobe`"), "{}", o.stdout);
+    assert_eq!(prints(&kept), "MARK-main3", "main's newest successful build reached main.bins before the clean");
+    assert!(!stale.exists());
 }
 
-/// Review q-20261120-231552: a junction at build/main.bins/debug pointing OUTSIDE the build folder must never make the refresh
+/// Review q-20261120-231552: a junction at build/main.bins/proj/debug pointing OUTSIDE the build folder must never make the refresh
 /// delete a `.source` note or replace an exe there. The job refuses and the outside folder is untouched, byte for byte. On
 /// 1e9bf60 the refresh followed the junction (the outside exe and its note were replaced). Windows only (a junction).
 #[cfg(windows)]
@@ -424,7 +505,7 @@ fn a_junction_in_main_bins_makes_the_refresh_refuse_and_writes_nothing_outside()
     let r = Root::new("keepjunction", 120);
     let proj = r.dir.join("projects/proj");
     r.ok(&["build", "proj"]);
-    let debug = r.dir.join("build/main.bins/debug");
+    let debug = r.dir.join("build/main.bins/proj/debug");
     assert!(debug.is_dir());
     // the profile folder becomes a junction to a folder outside the build folder that holds files of the same names
     let outside = r.dir.join("outside");
@@ -441,9 +522,10 @@ fn a_junction_in_main_bins_makes_the_refresh_refuse_and_writes_nothing_outside()
         v
     };
 
-    // new main code: the build succeeds, the refresh must refuse
+    // new main code: the build succeeds, the refresh must refuse; and so must the test step's refresh after its compile
     set_marker(&proj, "MARK-main2");
     let o = r.run(&["build", "proj"]);
+    let ot = r.run(&["test", "proj"]);
     let after: Vec<(String, Vec<u8>)> = {
         let mut v: Vec<_> = fs::read_dir(&outside).unwrap().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), fs::read(e.path()).unwrap())).collect();
         v.sort();
@@ -453,6 +535,12 @@ fn a_junction_in_main_bins_makes_the_refresh_refuse_and_writes_nothing_outside()
     assert_eq!(after, before, "nothing outside the build folder was written, removed or replaced:\n{}\n{}", o.stdout, o.stderr);
     assert_eq!(o.code, 1, "the job refuses:\n{}\n{}", o.stdout, o.stderr);
     assert!(o.stderr.contains("refusing to keep main's binaries") && o.stderr.contains("junction"), "{}", o.stderr);
+    // round 8 (review q-20261121-011535, minor at job.rs:1611): a job whose build steps succeeded still prints its summary
+    // block before it reports the refresh failure and fails (on ce4ca63 it ended without the summary)
+    assert!(o.stdout.contains("--- summary ---\nbuild: ok"), "the summary is printed:\n{}", o.stdout);
+    assert_eq!(ot.code, 1, "the test job fails too:\n{}\n{}", ot.stdout, ot.stderr);
+    assert!(ot.stdout.contains("--- summary ---\ntest: ok"), "its tests ran and its summary is printed:\n{}\n{}", ot.stdout, ot.stderr);
+    assert!(ot.stderr.contains("refusing to keep main's binaries") && ot.stderr.contains("junction"), "{}", ot.stderr);
 }
 
 /// Review q-20261120-233123: the temp names beside a kept exe (`<exe>.source.tmp`, `.stale.tmp`, `.bskeep.tmp`) are written too,
@@ -468,7 +556,7 @@ fn a_link_planted_at_a_temp_name_beside_a_kept_exe_never_writes_outside() {
     let r = Root::new("keeptmp", 120);
     let proj = r.dir.join("projects/proj");
     r.ok(&["build", "proj"]);
-    let kept = r.dir.join("build/main.bins/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
     let tmp = PathBuf::from(format!("{}.source.tmp", kept.display()));
     let prints = |p: &Path| -> String {
         let o = Command::new(p).output().unwrap_or_else(|e| panic!("no binary at {}: {e}", p.display()));
