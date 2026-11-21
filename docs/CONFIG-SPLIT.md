@@ -6,26 +6,32 @@ Approved as a process gap by Lazlo on 2026-11-21 04:39Z (cmsg_019Gy38ApTnA8WHdHw
 ## 1. Measurement: tasks that waited on the broadsword.toml claim
 
 Source: the task records in `state/tasks/*.task` (fields `created`, `started`, `ended`, `claims`, epoch seconds; read-only) and the log
-lines in `state/pc-progress.md` that name `broadsword.toml`. Every figure below comes from the script `scratch/tomlwait.py` (scratch,
-wipeable; run from `state/tasks` as `python -I ../../scratch/tomlwait.py`), not from hand arithmetic. It takes every task whose `claims`
-list names `broadsword.toml` and that was created from 2026-11-20 09:00Z to 2026-11-21 04:40Z. Its output, pasted unchanged:
+lines in `state/pc-progress.md` that name `broadsword.toml`. Every figure below comes from the committed script `scripts/tomlwait.py` (run
+from the project root as `build/bin/broadsword.exe run broadsword -- python -I scripts/tomlwait.py`; it reads the main checkout's
+`state/tasks`), not from hand arithmetic. It takes every task whose `claims` list names `broadsword.toml` or a `config/*.toml` file and
+that was created from 2026-11-20 09:00Z to 2026-11-21 04:40Z. Columns: wait_min = created to started (to ended for an abandoned task
+that never started, else to the window end), hold_min = started to ended (or window end), overlap_min = the part of the wait during
+which another listed task held the claim. Its output, pasted unchanged:
 
 ```
 window 11-20 09:00:00 to 11-21 04:40:00 minutes 1180.0
-id | status | created | started | ended | wait_min(created->started or now) | hold_min(started->ended or now)
-t-20261120-092355 abandoned 11-20 09:23:55 11-20 23:42:33 11-21 03:34:41 wait=858.6 hold=232.1
-t-20261120-112230 open 11-20 11:22:30 - - wait=1037.5 hold=0.0
-t-20261120-152939 done 11-20 15:29:39 11-20 15:29:39 11-20 16:26:48 wait=0.0 hold=57.1
-t-20261120-170450 open 11-20 17:04:50 - - wait=695.2 hold=0.0
-t-20261120-174501 done 11-20 17:45:01 11-20 17:45:02 11-20 22:58:28 wait=0.0 hold=313.4
-t-20261120-191952 abandoned 11-20 19:19:52 - 11-20 19:20:15 wait=560.1 hold=0.0
-t-20261121-011525 running 11-21 01:15:25 11-21 04:36:37 - wait=201.2 hold=3.4
-t-20261121-034547 done 11-21 03:45:47 11-21 03:45:48 11-21 04:32:56 wait=0.0 hold=47.1
-t-20261121-035022 open 11-21 03:50:22 - - wait=49.6 hold=0.0
-t-20261121-043519 open 11-21 04:35:19 - - wait=4.7 hold=0.0
-t-20261121-043809 open 11-21 04:38:09 - - wait=1.9 hold=0.0
+id | status | created | started | ended | wait_min | hold_min | overlap_min
+t-20261120-092355 abandoned 11-20 09:23:55 11-20 23:42:33 11-21 03:34:41 wait=858.6 hold=232.1 overlap=370.6
+t-20261120-112230 open 11-20 11:22:30 - - wait=1037.5 hold=0.0 overlap=653.2
+t-20261120-152939 done 11-20 15:29:39 11-20 15:29:39 11-20 16:26:48 wait=0.0 hold=57.1 overlap=0.0
+t-20261120-170450 open 11-20 17:04:50 - - wait=695.2 hold=0.0 overlap=596.1
+t-20261120-174501 done 11-20 17:45:01 11-20 17:45:02 11-20 22:58:28 wait=0.0 hold=313.4 overlap=0.0
+t-20261120-191952 abandoned 11-20 19:19:52 - 11-20 19:20:15 wait=0.4 hold=0.0 overlap=0.4
+t-20261121-011525 running 11-21 01:15:25 11-21 04:36:37 - wait=201.2 hold=3.4 overlap=186.4
+t-20261121-034547 done 11-21 03:45:47 11-21 03:45:48 11-21 04:32:56 wait=0.0 hold=47.1 overlap=0.0
+t-20261121-035022 open 11-21 03:50:22 - - wait=49.6 hold=0.0 overlap=46.0
+t-20261121-043519 open 11-21 04:35:19 - - wait=4.7 hold=0.0 overlap=3.4
+t-20261121-043809 open 11-21 04:38:09 - - wait=1.9 hold=0.0 overlap=1.9
 tasks 11 started 5 abandoned_unstarted 1 open_unstarted 5
 total hold of started+ended tasks: 649.9 min = 55.1% of window
+measure_a tasks=11
+measure_b overlap_sum_min=1857.9
+measure_c contended_hold_min=653.2 hours=10.89
 ```
 
 What each row is (from the task titles and the log): 092355 the codex coder route (a new required key); 152939 not opened, claims only;
@@ -165,25 +171,33 @@ Show each new test failing first (the coder prompt rule): remove the guard, run,
 5. Step C, update the claim habit: briefs claim `config/<area>.toml` for a setting in that area (BRIEF template and the claim section of
    SPEC_CHECKLIST.md get one line). An edit to `broadsword.toml` stays allowed but is for core keys only.
 6. AGENTS.md, Settings: change the sentence to the new rule. This text is Lazlo's; it ships only with his yes (section 8).
-7. Revert: put the keys back in the root file and set `config_files = ""`. Steps A and B are separate commits so B reverts alone.
+7. Revert: put the keys back in the root file, set `config_files = ""` and delete the `config/*.toml` area files in the same commit (loader
+   rule 2 makes an unlisted `config/*.toml` that exists an error, so a revert that leaves them behind fails closed). Steps A and B are
+   separate commits so B reverts alone; `git revert` of the B commit does all three at once.
 
 Every key stays required and used. Required: the loader still errors if a key is missing from every file. Used: the every-key test still
 removes each key and greps the code.
 
 ## 8. Judging the change: before and after
 
-Measure (per 24 hours of orchestrator time, from `state/tasks/*.task`): for tasks whose `claims` name `broadsword.toml` or a `config/*.toml`
-file, (a) the number of such tasks, (b) the sum of `started - created` for those whose start was held by a toml-area claim holder (the
-overlap column of the script), (c) the hours a toml-area claim was held while another ready task wanted it.
+Measure, all taken from the output of `scripts/tomlwait.py` (the same committed script, section 1) over the tasks whose `claims` name
+`broadsword.toml` or a `config/*.toml` file. Each is a named line or column of that output:
+- (a) `measure_a tasks=` : the number of such tasks in the window.
+- (b) `measure_b overlap_sum_min=` : the sum of the `overlap_min` column, the minutes tasks waited while another toml-area task held the
+  claim. It is an upper bound on the claim-caused wait: a wait can have another cause at the same time (a gate, a cap, queue.rs).
+- (c) `measure_c contended_hold_min=` : the minutes in which a toml-area claim was held while at least one other toml-area task waited.
 
-Baseline (section 1, window 2026-11-20 09:00Z to 2026-11-21 04:40Z): 11 tasks, 257.4 minutes of waiting tied to the toml (201.2 of
-them shared with queue.rs), 649.9 minutes of claim holding in the 1180-minute window (55.1 percent of wall time), 5 tasks open and
-unstarted when measured (3 of them with a wait tied to the toml).
+Baseline, the script output of section 1 (window 2026-11-20 09:00Z to 2026-11-21 04:40Z, 1180.0 minutes): (a) 11 tasks, (b) 1857.9
+minutes, (c) 653.2 minutes (10.89 hours). Also from that output: 649.9 minutes of claim holding by finished holders, 55.1 percent of the
+window, 5 tasks open and unstarted. The 257.4 minutes of section 1 is a different, narrower reading (four tasks the log ties to the
+toml); it is not a baseline for these measures.
 
-How the change is judged: after the move merges, take the next 20 toml-area tasks or the next 24 hours, whichever is longer, with the
-same script. Keep the split if the minutes of waiting behind a holder drop and no new class of failure appears. Revert (section 7 step 7)
+How the change is judged: after the move merges, run the same committed script with the same arguments over the next 20 toml-area tasks or the
+next 24 hours, whichever is longer, with the `config/*.toml` match already in the script, and compare lines (a), (b) and (c).
+Divide (b) and (c) by the window minutes before comparing, since the windows differ. Keep the split if (b) and (c) per window minute drop and no new
+class of failure appears. Revert (section 7 step 7)
 if either of these happens:
-- waiting does not fall (the area files all get claimed together, because one task still edits several areas), or
+- (b) and (c) per window minute do not fall (the area files all get claimed together, because one task still edits several areas), or
 - the watch-for-harm signal: a config load failure, a "key in two files" or "unlisted file" error on main, or a test that reads a stale
   root file, in the first 20 tasks.
 Also record the number of tasks that still wait on `config.rs` or `tests/support/mod.rs` for a new key, since the section 4 limit says
