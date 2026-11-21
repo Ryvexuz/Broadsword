@@ -52,3 +52,13 @@ Token counts: OpenAI `prompt_tokens` / `completion_tokens` are written as `input
 (`test_run_codex.py` uses a fake codex on a temporary PATH; neither file makes a real call.)
 
 (`python -I` leaves the current folder off the import path, so plain `-m unittest test_run_openai` cannot find the module.)
+
+## Gate-prompt replay: `replay.py`
+
+Re-runs the queue's low-risk (Haiku) gating call on saved queue prompts for two system-prompt arms: A is today's
+`SYSTEM_PROMPT_GATE`, read from reviewer.rs through the canary's allow-listed parser; B is A plus the rules in a text
+file (`replay-rules-2026-11-20.txt`) at the end of the gate block. `python -I -B replay.py --show` prints both arms'
+length and sha256 without a call. A run checks every prompt file before the first paid call, reuses an existing reply
+file instead of buying it again, and stops if a reply names a non-Haiku model. Usage and the call are in its docstring.
+Tests (no model call): `python -I -B -m unittest discover -s bench/reviewer -p "test_replay.py" -v`.
+Results: `results/prompt-rules-2026-11-20.md` (DROP; raw replies beside it).
