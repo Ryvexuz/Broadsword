@@ -833,7 +833,9 @@ codex_call = rv.metered("codex", codex_call)
 def meter_env(environ, task_id: str, service_tier=None) -> dict:
     """The environment rv.metered labels the ledger row from (never the child's): caller and call_type."""
     env = dict(environ)
-    env.setdefault("OPENAI_REVIEW_CALLER", f"codex_coder {task_id}" + (f" service_tier={service_tier}" if service_tier else ""))
+    caller = env.get("OPENAI_REVIEW_CALLER") or f"codex_coder {task_id}"
+    # the tier is always recorded when given, appended to a caller the environment already set
+    env["OPENAI_REVIEW_CALLER"] = caller + (f" service_tier={service_tier}" if service_tier else "")
     env["OPENAI_REVIEW_CALL_TYPE"] = CALL_TYPE
     return env
 

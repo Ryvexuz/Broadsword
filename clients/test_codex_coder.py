@@ -276,6 +276,7 @@ class CoderTests(unittest.TestCase):
         e["APPDATA"] = str(self.base / "no-appdata")  # the real codex under %APPDATA%\npm is never found
         e["OPENAI_API_KEY"] = FAKE_KEY
         e["COPY_OF_DOTENV"] = DOTENV_VALUE
+        e.update(getattr(self, "extra_env", {}))
         return e
 
     def run_coder(self, mode="inside", extra=None, brief=None):
@@ -730,6 +731,17 @@ class CoderTests(unittest.TestCase):
         self.assertIn("codex-plan", rows[0])
         self.run_coder("inside")
         self.assertNotIn("service_tier", self.ledger_rows()[1][1])
+
+    def test_service_tier_is_recorded_even_when_the_caller_variable_is_already_set(self):
+        self.extra_env = {"OPENAI_REVIEW_CALLER": "orchestrator-label"}
+        try:
+            code, res, _ = self.run_coder("inside", extra=["--service-tier", "fast"])
+        finally:
+            self.extra_env = {}
+        self.assertEqual(code, 0, res)
+        caller = self.ledger_rows()[0][1]
+        self.assertIn("orchestrator-label", caller)
+        self.assertIn("service_tier=fast", caller)
 
     def test_another_service_tier_is_refused_before_codex_starts(self):
         for v in ("priority", "flex", "FAST", ""):
