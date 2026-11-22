@@ -687,6 +687,40 @@ pub fn merge_ff_only(main_dir: &Path, commit: &str) -> Result<(), String> {
     files_ok(main_dir, &["merge", "--ff-only", commit]).map(|_| ())
 }
 
+/// `git revert --no-commit <range>` in the main checkout: undo the commits of `range` (`<before>..<last>`) in the files and the
+/// index, without committing; `commit_file` then makes ONE new commit of it. Why: a main check that failed after the queue merged
+/// an entry or a merge train is undone by a new commit (history kept), never by a reset.
+pub fn revert_no_commit(main_dir: &Path, range: &str) -> Result<(), String> {
+    files_ok(main_dir, &["revert", "--no-commit", range]).map(|_| ())
+}
+
+/// `git revert --abort`: stop a revert and put the checked-out branch, the index and the files back as they were before it began.
+/// Why: a revert that conflicted or could not be committed must leave main exactly as it was.
+pub fn revert_abort(main_dir: &Path) -> Result<(), String> {
+    files_ok(main_dir, &["revert", "--abort"]).map(|_| ())
+}
+
+/// `git rev-parse --path-format=absolute --git-path REVERT_HEAD`, then does that file exist? Git keeps it while a revert is begun and
+/// not committed or aborted. Why: a failed queue revert must be aborted, and only one that is really in progress can be.
+pub fn revert_in_progress(main_dir: &Path) -> Result<bool, String> {
+    let p = ok(main_dir, &["rev-parse", "--path-format=absolute", "--git-path", "REVERT_HEAD"])?;
+    Ok(Path::new(&p).exists())
+}
+
+/// `git commit --file <msg_file>` in the main checkout: commit what is staged (the queue's revert) with the message in that file.
+/// Why: the revert of a range becomes ONE commit whose message names every reverted commit and the queue entry that reverted it.
+pub fn commit_file(main_dir: &Path, msg_file: &Path) -> Result<(), String> {
+    let f = msg_file.to_string_lossy();
+    files_ok(main_dir, &["commit", "--file", &f]).map(|_| ())
+}
+
+/// `git log --format=%H %s <range>`: every commit of `range`, newest first, as (sha, subject). Why: the queue's revert message lists
+/// git's default `Revert "<subject>"` line for each commit it undoes.
+pub fn commit_subjects(dir: &Path, range: &str) -> Result<Vec<(String, String)>, String> {
+    let out = ok(dir, &["log", "--format=%H %s", range])?;
+    Ok(out.lines().filter_map(|l| l.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())).or_else(|| (!l.is_empty()).then(|| (l.to_string(), String::new())))).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

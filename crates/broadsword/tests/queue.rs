@@ -1236,6 +1236,141 @@ fn a_check_that_fails_on_main_after_the_merge_is_loud_and_main_is_not_reset() {
     assert_eq!(r.run(&["queue", "run", "--entry", &e]).code, 2, "a human decides: it is not run again");
 }
 
+// ---- queue_auto_revert: a failed main check is reverted, and a lane is held until main is green ---------------------------
+
+/// `src/lib.rs` with a test that passes in a task worktree and fails in the main checkout (which lives under projects/p).
+fn only_outside_main() -> String {
+    LIB_BASE.to_string() + "\n#[cfg(test)]\nmod only_here {\n    #[test]\n    fn not_in_main() {\n        assert!(!env!(\"CARGO_MANIFEST_DIR\").replace('\\\\', \"/\").contains(\"/projects/p\"));\n    }\n}\n"
+}
+
+/// A root with queue_auto_revert on (the test config ships it off).
+fn revert_root(name: &str) -> Root {
+    let r = Root::new(name, 30);
+    train_set(&r, "queue_auto_revert", "\"on\"");
+    r
+}
+
+fn hold_file(r: &Root) -> PathBuf {
+    r.dir.join("state/queue/hold-p")
+}
+
+/// Every file git tracks at `rev`, with its blob id: equal lists mean equal files.
+fn tree_of(r: &Root, rev: &str) -> String {
+    git(&r.p(), &["ls-tree", "-r", rev])
+}
+
+#[test]
+fn auto_revert_a_merged_entry_whose_main_check_fails_is_reverted_and_main_is_green_again() {
+    let r = revert_root("autorevert");
+    let id = r.started("src");
+    let pre = r.head();
+    let work = r.commit(&r.wt(&id), "src/lib.rs", &only_outside_main(), "task: a test that only passes outside main");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged_check_failed");
+    let reason = r.field(&e, "reason");
+    assert!(reason.contains("reverted as") && reason.contains("main check after the revert passed"), "{reason}");
+    // the trunk holds the merged commit AND one new revert commit on top of it: history kept, nothing reset
+    let head = r.head();
+    assert_ne!(head, work);
+    assert_eq!(git(&r.p(), &["rev-parse", "HEAD~1"]), work, "the revert is a new commit on the merged one");
+    assert!(reason.contains(&head[..12]) || reason.contains(&head), "the entry names the revert commit: {reason}");
+    assert_eq!(tree_of(&r, "HEAD"), tree_of(&r, &pre), "the files equal main before the merge");
+    let msg = git(&r.p(), &["log", "-1", "--format=%B"]);
+    assert!(msg.contains("Revert \"task: a test that only passes outside main\"") && msg.contains(&format!("This reverts commit {work}.")), "{msg}");
+    assert!(msg.contains(&format!("Reverted-by: broadsword queue {e} (main check failed, job ")), "{msg}");
+    assert!(git(&r.p(), &["status", "--porcelain"]).is_empty());
+    assert!(!hold_file(&r).exists(), "a revert whose re-check passed leaves the lane open");
+    assert_eq!(r.task_status(&id), "running", "the task is not marked done");
+    assert!(r.wt(&id).exists(), "its worktree is kept");
+}
+
+#[test]
+fn auto_revert_a_train_of_two_is_reverted_as_one_range_in_one_commit() {
+    let r = train_root("autorevtrain", 2);
+    train_set(&r, "queue_auto_revert", "\"on\"");
+    let pre = r.head();
+    let (a, ea) = train_one(&r, "NOTES.txt", "notes\n");
+    let (b, eb) = train_one(&r, "src/lib.rs", &only_outside_main());
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    for e in [&ea, &eb] {
+        assert_eq!(r.status(e), "merged_check_failed", "{}", r.show(e));
+        assert!(r.field(e, "reason").contains("reverted as"), "{}", r.show(e));
+    }
+    // pre <- a <- b <- ONE revert of both
+    assert_eq!(git(&r.p(), &["rev-list", "--count", &format!("{pre}..HEAD")]), "3", "two merged commits and one revert commit");
+    assert_eq!(git(&r.p(), &["rev-parse", "HEAD~1"]), r.branch_tip(&b));
+    assert_eq!(git(&r.p(), &["rev-parse", "HEAD~2"]), r.branch_tip(&a));
+    assert_eq!(tree_of(&r, "HEAD"), tree_of(&r, &pre), "the files equal main before the train");
+    let msg = git(&r.p(), &["log", "-1", "--format=%B"]);
+    assert!(msg.contains("Revert \"task: NOTES.txt\"") && msg.contains("Revert \"task: src/lib.rs\"") && msg.contains("Reverted-by: broadsword queue "), "{msg}");
+    assert!(!hold_file(&r).exists());
+}
+
+#[test]
+fn auto_revert_refuses_when_the_trunk_moved_after_the_merge_and_holds_the_lane() {
+    let r = revert_root("autorevmoved");
+    let id = r.started("src");
+    let pre = r.head();
+    let tip = r.commit(&r.wt(&id), "src/lib.rs", &only_outside_main(), "task: a test that only passes outside main");
+    let e = r.add(&id, "low", "sonnet");
+    // the run died right after the merge was recorded; then someone else committed on main
+    git(&r.p(), &["merge", "--ff-only", &tip]);
+    let other = r.commit(&r.p(), "OTHER.txt", "someone else\n", "main: someone else");
+    r.edit_entry(&e, &[("status", "running"), ("step", "main_check"), ("attempt", "1"), ("pid", "4000000"), ("verdict", "PASS"), ("checked_tip", &tip), ("reviewed_tip", &tip), ("base_head", &pre), ("pre_merge_sha", &pre), ("main_sha", &tip), ("main_branch", "main")]);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged_check_failed");
+    assert_eq!(r.head(), other, "nothing was reverted: the trunk moved");
+    let reason = r.field(&e, "reason");
+    assert!(reason.contains(&tip) && reason.contains(&other) && reason.contains("HELD"), "{reason}");
+    let hold = fs::read_to_string(hold_file(&r)).expect("the hold file is written");
+    assert!(hold.contains(&e) && hold.contains("moved"), "{hold}");
+}
+
+#[test]
+fn auto_revert_a_held_lane_merges_nothing_and_the_hold_clears_after_a_passing_main_check() {
+    let r = revert_root("autorevhold");
+    // main itself fails its check, and the lane is held
+    r.commit(&r.p(), "src/lib.rs", &only_outside_main(), "main: a test that fails on main");
+    fs::create_dir_all(r.dir.join("state/queue")).unwrap();
+    fs::write(hold_file(&r), "time = 2026-11-22 00:00:00 UTC\nentry = q-test\nproject = p\nreason = the test held it\n").unwrap();
+    let id = r.started("NOTES.txt");
+    r.commit(&r.wt(&id), "NOTES.txt", "notes\n", "task: notes");
+    let e = r.add(&id, "low", "sonnet");
+    let before = r.head();
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 3, "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("lane p held: the test held it; clear with a passing check of main, then queue run"), "{}", o.stdout);
+    assert_eq!(r.head(), before, "a held lane merges nothing");
+    assert_eq!(r.status(&e), "queued");
+    assert!(hold_file(&r).exists());
+    // main is fixed: the next run's check of main passes, the hold clears, the entry merges
+    r.commit(&r.p(), "src/lib.rs", LIB_BASE, "main: fix");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("hold cleared"), "{}", o.stdout);
+    assert!(!hold_file(&r).exists());
+    assert_eq!(r.status(&e), "merged");
+}
+
+#[test]
+fn auto_revert_off_keeps_the_old_message_and_reverts_nothing() {
+    let r = revert_root("autorevoff");
+    train_set(&r, "queue_auto_revert", "\"off\"");
+    let id = r.started("src");
+    let work = r.commit(&r.wt(&id), "src/lib.rs", &only_outside_main(), "task: a test that only passes outside main");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged_check_failed");
+    assert!(o.stderr.contains("Main was NOT reset or reverted. A human decides"), "{}", o.stderr);
+    assert_eq!(r.head(), work, "nothing reverted");
+    assert!(!hold_file(&r).exists());
+}
+
 // ---- crash and resume ---------------------------------------------------------------------
 
 /// The cause of the flaky `a_run_killed_mid_review_is_resumed_by_the_next_queue_run`: a reviewer that dies while its run is alive

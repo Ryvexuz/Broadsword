@@ -133,6 +133,10 @@ pub struct Config {
     /// `"on"`: every `queue run` holds its project's own lock, `<state_dir>/queue/<project>.queue.lock`, so drivers of different
     /// projects run at once (and `queue run` needs `--project` or `--entry`); `"off"`: the one global `queue.lock`, as before.
     pub queue_per_project: bool,
+    /// `"on"`: a main check that fails after the queue merged an entry or a train reverts exactly those commits on the trunk (`git
+    /// revert`, new commits, never a reset), checks main again, and holds the project's lane (`state/queue/hold-<project>`) when the
+    /// revert or that check fails. `"off"`: the failure is reported and nothing is reverted, as before.
+    pub queue_auto_revert: bool,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -329,6 +333,11 @@ impl Config {
             "off" => false,
             other => return Err(format!("queue_per_project = \"{other}\": must be \"on\" or \"off\"")),
         };
+        let queue_auto_revert = match get_str(&m, "queue_auto_revert")?.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("queue_auto_revert = \"{other}\": must be \"on\" or \"off\"")),
+        };
         let shadow_reviewer = get_str(&m, "shadow_reviewer")?;
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
@@ -360,6 +369,7 @@ impl Config {
             perf_gate,
             perf_runs: positive("perf_runs")?,
             queue_per_project,
+            queue_auto_revert,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -563,6 +573,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+queue_auto_revert = \"on\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -753,6 +764,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+queue_auto_revert = \"on\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -806,6 +818,7 @@ queue_entry_read_wait_ms = 2000
 perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
+queue_auto_revert = \"on\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40

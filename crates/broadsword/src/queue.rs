@@ -23,7 +23,9 @@
 //!                        asked; fix, commit, `queue add` again [5]
 //!   rejected             the reviewer said FAIL (or gave no usable verdict); the task stays running and its worktree is kept;
 //!                        fix, commit, `queue add` again [5]
-//!   merged_check_failed  the branch IS on main but `check` failed there; main was NOT reset; a human decides [6]
+//!   merged_check_failed  the branch was merged but `check` failed on main; main was NOT reset. With queue_auto_revert on, the queue
+//!                        reverted the merged commits with one new commit (`Run::auto_revert`) and checked main again; if that
+//!                        could not be done or did not pass, the lane is HELD (`hold_gate`) until a check of main passes [6]
 //!   cancelled            dropped by `queue cancel`
 //!
 //! SHADOW REVIEW. When `shadow_reviewer` is `openai`, a second model reviews the same prompt after the gating verdict is recorded; its
@@ -252,6 +254,99 @@ fn lane_key(cfg: &Config, name: &str) -> Result<String, String> {
         Err(m) if m.starts_with("unknown project") => Ok(name.to_lowercase()),
         Err(m) => Err(m),
     }
+}
+
+/// LANE HOLD (queue_auto_revert): the file `<state_dir>/queue/hold-<lane key>` holds a project's lane after an automatic revert, or
+/// the check after it, failed. While it exists `queue run` merges nothing of that project (`hold_gate`, and `lane_hold` before every
+/// fast-forward). Only `hold_gate` removes it, and only after a check of that project's main passed.
+fn hold_path(cfg: &Config, project: &str) -> PathBuf {
+    let key = lane_key(cfg, project).unwrap_or_else(|_| project.to_lowercase());
+    queue_dir(cfg).join(format!("hold-{}", record::sanitize(&key)))
+}
+
+/// Write the hold of `project`'s lane: UTC time, the entry, the project and the reason, one `key = value` line each.
+fn write_hold(cfg: &Config, project: &str, entry: &str, reason: &str) -> Result<PathBuf, String> {
+    let path = hold_path(cfg, project);
+    let text = format!("time = {}\nentry = {entry}\nproject = {project}\nreason = {}\n", pause::now_string(), reason.replace(['\n', '\r'], " "));
+    std::fs::create_dir_all(queue_dir(cfg)).and_then(|_| std::fs::write(&path, text)).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// One field of a hold file's text (empty when it is missing).
+fn hold_field(text: &str, key: &str) -> String {
+    text.lines().find_map(|l| l.strip_prefix(&format!("{key} = "))).unwrap_or("").to_string()
+}
+
+/// The reason `project`'s lane is held, or None. A hold file that cannot be read still holds the lane (fail closed).
+fn lane_hold(cfg: &Config, project: &str) -> Option<String> {
+    let path = hold_path(cfg, project);
+    if !path.exists() {
+        return None;
+    }
+    Some(match std::fs::read_to_string(&path) {
+        Ok(t) => hold_field(&t, "reason"),
+        Err(e) => format!("the hold file {} cannot be read: {e}", path.display()),
+    })
+}
+
+/// `check <project>` of the project's main checkout `dir`, only while it has its trunk checked out: the job id when it passed, else why
+/// not (refused, or the job's exit and summary).
+fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<String, String> {
+    trunk_checkout(dir, "")?;
+    if let Some(code) = tools::guard_refusal(cfg, project, None) {
+        return Err(format!("the check of main was refused before it started, exit {code}"));
+    }
+    let mut info = JobInfo::default();
+    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
+    let job_id = info.id.clone().unwrap_or_else(|| "none".into());
+    if code != 0 {
+        return Err(format!("exit {code}, job {job_id}: {}", info.summary.join("; ")));
+    }
+    Ok(job_id)
+}
+
+/// HOLD GATE, at the start of every `queue run` (one entry or `--all`), under the lane's run lock: for every held project of the lane, a
+/// check of its main runs first; when it passes the hold is removed (the ONE place a hold file is ever deleted), otherwise the run merges
+/// and runs nothing (exit 3) and says why.
+fn hold_gate(cfg: &Config, lane: &Lane) -> Result<(), ExitCode> {
+    let Ok(rd) = std::fs::read_dir(queue_dir(cfg)) else { return Ok(()) };
+    let mut holds: Vec<PathBuf> = rd.flatten().map(|d| d.path()).filter(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("hold-"))).collect();
+    holds.sort();
+    let mut still: Vec<String> = Vec::new();
+    for path in holds {
+        let key = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("hold-")).unwrap_or("").to_string();
+        if lane.key.as_ref().is_some_and(|k| record::sanitize(k) != key) {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                still.push(format!("lane {key} held: the hold file {} cannot be read ({e}); clear with a passing check of main, then queue run", path.display()));
+                continue;
+            }
+        };
+        let project = Some(hold_field(&text, "project")).filter(|p| !p.is_empty()).unwrap_or_else(|| key.clone());
+        let reason = hold_field(&text, "reason");
+        println!("lane {project} is held ({reason}); checking its main first");
+        let checked = job::resolve_project(&cfg.root, &cfg.projects_dir, &project).and_then(|dir| main_check_now(cfg, &dir, &project));
+        match checked {
+            Ok(job) => match std::fs::remove_file(&path) {
+                Ok(()) => println!("lane {project}: hold cleared: the check of main passed (job {job})"),
+                Err(e) => still.push(format!("lane {project} held: {reason}; the check of main passed (job {job}) but the hold file could not be removed ({e})")),
+            },
+            Err(m) => {
+                println!("lane {project}: the check of main did not pass ({m})");
+                still.push(format!("lane {project} held: {reason}; clear with a passing check of main, then queue run"));
+            }
+        }
+    }
+    if still.is_empty() {
+        return Ok(());
+    }
+    for s in &still {
+        println!("{s}");
+    }
+    Err(ExitCode::from(EXIT_RETRY))
 }
 
 /// The lane key of a `--project` the caller typed: it must be a project (exit 2 otherwise, nothing run).
@@ -810,6 +905,9 @@ pub fn cmd_run(cfg: &Config, entry: Option<&str>, project: Option<&str>) -> Exit
         Ok(l) => l,
         Err(c) => return c,
     };
+    if let Err(c) = hold_gate(cfg, &lane) {
+        return c;
+    }
     // Choose and claim the entry under the short lock. Holding the lane's run lock already means no other run of the lane exists,
     // so every `running` entry of the lane is an interrupted one.
     let chosen = claim(cfg, |all| match entry {
@@ -869,7 +967,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
             "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf", "done_check", "done_check_file",
-            "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended",
+            "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended", "pre_merge_sha", "revert_sha",
         ] {
             e.set(k, "");
         }
@@ -980,6 +1078,9 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
         Ok(l) => l,
         Err(c) => return c,
     };
+    if let Err(c) = hold_gate(cfg, &lane) {
+        return c;
+    }
     let train = cfg.merge_train_max > 1;
     if !train && cfg.review_parallel > 1 {
         // PARALLEL REVIEW needs the merge train: without it each entry merges on the main it was rebased on, so a batch's later
@@ -2407,6 +2508,10 @@ verdict: {} (answer followed the format: {})
             // before recording it
             self.e.set("main_sha", reviewed.clone());
             if head == reviewed {
+                // a single entry fast-forwarded main from its base to its reviewed commit: that range is what it merged
+                if self.e.get("pre_merge_sha").is_empty() && !base.is_empty() && self.e.get("train").is_empty() {
+                    self.e.set("pre_merge_sha", base.clone());
+                }
                 return self.log("merge", &format!("main's HEAD already is the reviewed commit {}: recorded as merged", short(&head)));
             }
             return self.log("merge", &format!("the reviewed commit {} is already on main (HEAD {} contains it): recorded as merged", short(&reviewed), short(&head)));
@@ -2414,6 +2519,9 @@ verdict: {} (answer followed the format: {})
         let dirty = self.g(wtgit::status_porcelain_plain(&dir))?;
         if !dirty.is_empty() {
             return Err(self.blocked(&format!("the main checkout got uncommitted or untracked changes while the review ran ({}); nothing merged", some(&dirty))));
+        }
+        if let Some(why) = lane_hold(self.cfg, self.e.get("project")) {
+            return Err(self.blocked(&format!("lane {} held: {why}; nothing merged. Clear with a passing check of main, then queue run", self.e.get("project"))));
         }
         if head != base {
             return Err(self.end(STALE, &format!("main moved from {} to {} after the rebase and the review; nothing was merged. Run `queue run --entry {}` to rebase again", short(&base), short(&head), self.e.id()), EXIT_RETRY));
@@ -2430,6 +2538,9 @@ verdict: {} (answer followed the format: {})
         if self.on_trunk()? != head {
             return Err(self.end(STALE, &format!("main moved from {} just before the merge; nothing was merged. Run `queue run --entry {}` to rebase again", short(&head), self.e.id()), EXIT_RETRY));
         }
+        // AUTO-REVERT: the trunk tip before the fast-forward; `pre_merge_sha..main_sha` is exactly what this entry merged
+        self.e.set("pre_merge_sha", head.clone());
+        self.save()?;
         if let Err(m) = wtgit::merge_ff_only(&dir, &reviewed) {
             let now = self.g(trunk_tip(&dir, "").map(|(_, tip)| tip))?;
             if now != head {
@@ -2487,9 +2598,102 @@ verdict: {} (answer followed the format: {})
         let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
         if code != 0 {
             let extra = if info.summary.is_empty() { String::new() } else { format!(": {}", info.summary.join("; ")) };
-            return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("exit {code}, job {}", info.id.as_deref().unwrap_or("none")), &extra), EXIT_MERGED_BAD));
+            let job_id = info.id.clone().unwrap_or_else(|| "none".into());
+            if !self.cfg.queue_auto_revert {
+                return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("exit {code}, job {job_id}"), &extra), EXIT_MERGED_BAD));
+            }
+            let failed = format!("commit {sha} is on `{mb}` of project `{project}`, and `check {project}` there did not pass (exit {code}, job {job_id}){extra}.");
+            let reason = self.auto_revert(&failed, &job_id);
+            return Err(self.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD));
         }
         self.log("main_check", &format!("check on main passed ({})", info.summary.join("; ")))
+    }
+
+    /// AUTO-REVERT (queue_auto_revert = "on"), after a main check that ran and failed: undo exactly the commits this entry (or the
+    /// merge train it ended) fast-forwarded, `pre_merge_sha..main_sha`, with ONE new revert commit on the trunk, then check main
+    /// again. Never a reset, never a force, never a push. Refused (nothing is touched) when no pre-merge commit is recorded, when the
+    /// main checkout is not on the trunk, when the trunk moved since the merge, or when the checkout has changes. Any refusal, a revert
+    /// or commit that fails (aborted with `git revert --abort`), or a re-check that fails HOLDS the lane (`write_hold`). Returns the
+    /// entry's reason text; `failed` says what failed first.
+    fn auto_revert(&mut self, failed: &str, job_id: &str) -> String {
+        let project = self.e.get("project").to_string();
+        let held = |cfg: &Config, id: &str, why: &str| -> String {
+            let note = match write_hold(cfg, &project, id, why) {
+                Ok(p) => format!("Lane `{project}` is HELD ({}): `queue run` merges nothing for it until a check of its main passes", p.display()),
+                Err(m) => format!("the lane hold could NOT be written ({m})"),
+            };
+            format!("{failed} The automatic revert did not complete: {why}. {note}. Main was NOT reset. A human decides: fix forward, or `git revert` the commits. The task was NOT marked done and its worktree is kept")
+        };
+        let id = self.e.id().to_string();
+        match self.revert_merged(job_id) {
+            Err(why) => held(self.cfg, &id, &why),
+            Ok((range, rsha)) => {
+                let _ = self.log("main_check", &format!("main check failed; reverted {range} as {rsha}; checking main again"));
+                println!("queue entry {id}: main check failed; reverted {range} as {rsha}; check {project} again");
+                match main_check_now(self.cfg, &self.dir, &project) {
+                    Ok(job) => format!("{failed} The merged commits {range} were reverted as {rsha} (one new commit; nothing was reset); main check after the revert passed (job {job}). The task was NOT marked done and its worktree is kept: fix it and queue it again"),
+                    Err(m) => held(self.cfg, &id, &format!("the merged commits {range} were reverted as {rsha}, but the main check after the revert did not pass: {m}")),
+                }
+            }
+        }
+    }
+
+    /// The revert itself (see `auto_revert`): `Ok((range, revert commit))`, or why nothing (or nothing left) was reverted.
+    fn revert_merged(&mut self, job_id: &str) -> Result<(String, String), String> {
+        let (dir, mb) = (self.dir.clone(), self.e.get("main_branch").to_string());
+        let pre = self.e.get("pre_merge_sha").to_string();
+        let last = self.e.get("main_sha").to_string();
+        if pre.is_empty() || last.is_empty() {
+            return Err(format!("no pre-merge commit is recorded for this entry (pre_merge_sha `{pre}`, main_sha `{last}`), so the commits it merged cannot be told; nothing was reverted"));
+        }
+        let (_, tip) = trunk_checkout(&dir, &mb).map_err(|m| format!("{m}; nothing was reverted"))?;
+        if tip != last {
+            return Err(format!("the trunk `{mb}` moved since the merge: it was {last} after the merge, it is {tip} now (someone else committed); nothing was reverted"));
+        }
+        if pre == last || !wtgit::is_ancestor(&dir, &pre, &last)? {
+            return Err(format!("the recorded pre-merge commit {pre} is not before the merged commit {last}; nothing was reverted"));
+        }
+        let dirty = wtgit::status_porcelain_plain(&dir)?;
+        if !dirty.is_empty() {
+            return Err(format!("the main checkout has uncommitted or untracked changes ({}); nothing was reverted", some(&dirty)));
+        }
+        let range = format!("{pre}..{last}");
+        let commits = wtgit::commit_subjects(&dir, &range)?;
+        if commits.is_empty() {
+            return Err(format!("git lists no commit in {range}; nothing was reverted"));
+        }
+        let mut msg: String = commits.iter().map(|(_, s)| format!("Revert \"{s}\"\n")).collect();
+        msg.push('\n');
+        msg.extend(commits.iter().map(|(c, _)| format!("This reverts commit {c}.\n")));
+        msg.push_str(&format!("\nReverted-by: broadsword queue {} (main check failed, job {job_id})\n", self.e.id()));
+        std::fs::create_dir_all(&self.cfg.scratch_dir).map_err(|e| format!("cannot create {}: {e}; nothing was reverted", self.cfg.scratch_dir.display()))?;
+        let msg_file = self.cfg.scratch_dir.join(format!("queue-revert-{}.msg", record::sanitize(self.e.id())));
+        std::fs::write(&msg_file, &msg).map_err(|e| format!("cannot write the revert message {}: {e}; nothing was reverted", msg_file.display()))?;
+        // the last look before the revert: still the trunk checked out, still at the merged commit
+        let (_, now) = trunk_checkout(&dir, &mb).map_err(|m| format!("{m}; nothing was reverted"))?;
+        if now != last {
+            return Err(format!("the trunk `{mb}` moved just before the revert: it was {last}, it is {now} now; nothing was reverted"));
+        }
+        let done = wtgit::revert_no_commit(&dir, &range).and_then(|_| wtgit::commit_file(&dir, &msg_file));
+        let _ = std::fs::remove_file(&msg_file);
+        if let Err(m) = done {
+            let aborted = match wtgit::revert_in_progress(&dir) {
+                Ok(true) => match wtgit::revert_abort(&dir) {
+                    Ok(()) => "the revert was aborted (`git revert --abort`), main is as it was after the merge".to_string(),
+                    Err(e) => format!("AND `git revert --abort` failed: {e}; look at the main checkout"),
+                },
+                Ok(false) => "no revert was left in progress".to_string(),
+                Err(e) => format!("whether a revert is left in progress could not be read: {e}; look at the main checkout"),
+            };
+            return Err(format!("`git revert --no-commit {range}` and its commit failed: {m}; {aborted}"));
+        }
+        let (_, after) = trunk_checkout(&dir, &mb)?;
+        if after == last || !wtgit::is_ancestor(&dir, &last, &after)? {
+            return Err(format!("after the revert the trunk `{mb}` is at {after}, which is not a new commit on {last}; look at the project"));
+        }
+        self.e.set("revert_sha", after.clone());
+        let _ = self.save();
+        Ok((range, after))
     }
 
     // -- step 7: done -----------------------------------------------------------------------
@@ -3149,9 +3353,18 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
     // BEFORE the fast-forward: every member records step `merge`, so a drain killed from here on leaves each one a half-finished
     // merge (`half_merged`) that the next run resumes at its step, never one that is chained into a new train while its commits may
     // already be on main. A member whose record cannot be written stops the train before main moves.
+    if let Some(why) = lane_hold(cfg, members[0].0.e.get("project")) {
+        for (mut r, t) in members {
+            let c = r.leave_train(BLOCKED, &format!("lane {} held: {why}; merge train {train_id} merged nothing. Clear with a passing check of main, then queue run", r.e.get("project")), EXIT_RETRY);
+            finish_member(cfg, r, code_num(c), t, rows, worst);
+        }
+        return 0;
+    }
     let mut members = members;
     for (r, _) in members.iter_mut() {
         r.e.set("step", "merge");
+        // AUTO-REVERT: the trunk tip before the train's fast-forward; `pre_merge_sha..<train tip>` is exactly what the train merged
+        r.e.set("pre_merge_sha", head);
         if r.save().is_err() {
             return fail_members(cfg, members, &format!("could not record the merge step of merge train {train_id} before its fast-forward; main was not moved"), rows, worst);
         }
