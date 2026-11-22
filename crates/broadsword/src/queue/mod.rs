@@ -124,12 +124,14 @@
 //! and, create-only, under `refs/broadsword/queue/<entry id>/pre-rebase` (a later attempt: `pre-rebase-<N>`). All git commands are
 //! in wtgit.rs.
 
+mod add;
 mod entry;
 mod locks;
 mod train;
 
+pub use add::cmd_add;
 pub use entry::queue_dir;
-pub use train::{cmd_add, cmd_cancel, cmd_list, cmd_run, cmd_run_all, cmd_show};
+pub use train::{cmd_cancel, cmd_list, cmd_run, cmd_run_all, cmd_show};
 use crate::config::Config;
 use crate::record::Record;
 use crate::reviewer;
@@ -142,6 +144,8 @@ use std::process::ExitCode;
 #[cfg(test)]
 pub(crate) const SOURCE: &str = concat!(
     include_str!("mod.rs"),
+    "\n",
+    include_str!("add.rs"),
     "\n",
     include_str!("entry.rs"),
     "\n",
