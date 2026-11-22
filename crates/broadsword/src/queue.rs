@@ -329,13 +329,26 @@ fn fast_command(units: &[&str], tests: &[String]) -> String {
     c
 }
 
-/// The unit-test flags of the packages in `dir`, from `cargo metadata`: `--lib` when a package has a library target, `--bins` when one
-/// has a binary target (cargo refuses `--lib` for a package without a library: the Broadsword crate has only binaries).
+/// The unit-test flags of the packages `cargo test` in `dir` tests, from `cargo metadata`: `--lib` when a SELECTED package has a
+/// library target, `--bins` when one has a binary target (cargo refuses `--lib` when no selected package has a library: the
+/// Broadsword crate has only binaries). The selected packages are the workspace's default members (`workspace_default_members`:
+/// the root package when the root is one, else `default-members` or every member), never a member cargo does not test.
 fn unit_test_flags(cfg: &Config, dir: &Path) -> Result<Vec<&'static str>, String> {
-    let j = crate::json::parse(&crate::buildsrc::metadata_json(cfg, dir)?).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
-    let Some(crate::json::J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output: `packages` is not a list".into()) };
+    unit_flags_of(&crate::buildsrc::metadata_json(cfg, dir)?)
+}
+
+/// `unit_test_flags` on a `cargo metadata` output. A missing or empty default-member list is an error (the caller runs the full check).
+fn unit_flags_of(metadata: &str) -> Result<Vec<&'static str>, String> {
+    use crate::json::J;
+    let j = crate::json::parse(metadata).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let Some(J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output: `packages` is not a list".into()) };
+    let Some(J::Arr(defaults)) = j.get("workspace_default_members") else { return Err("cargo metadata output: no `workspace_default_members` list (cargo too old?)".into()) };
+    let selected: Vec<&str> = defaults.iter().filter_map(J::str).collect();
+    if selected.is_empty() {
+        return Err("cargo metadata output: `workspace_default_members` names no package".into());
+    }
     let (mut lib, mut bin) = (false, false);
-    for p in pkgs {
+    for p in pkgs.iter().filter(|p| p.get("id").and_then(J::str).is_some_and(|id| selected.contains(&id))) {
         let Some(crate::json::J::Arr(targets)) = p.get("targets") else { return Err("cargo metadata output: a package has no `targets` list".into()) };
         for t in targets {
             let Some(crate::json::J::Arr(kinds)) = t.get("kind") else { return Err("cargo metadata output: a target has no `kind` list".into()) };
@@ -3591,6 +3604,16 @@ mod tests {
         assert_eq!(crate::config::MERGE_FAST_SELF_PROJECT, job::SELF_PROJECT);
         assert_eq!(fast_command(&["--bins"], &["queue".into(), "wtgit".into()]), "cargo build --offline && cargo test --offline --bins --test queue --test wtgit");
         assert_eq!(fast_command(&["--lib", "--bins"], &["t".into()]), "cargo build --offline && cargo test --offline --lib --bins --test t");
+    }
+
+    #[test]
+    fn unit_flags_count_only_the_default_members() {
+        let pkg = |id: &str, kind: &str| format!("{{\"id\":\"{id}\",\"targets\":[{{\"kind\":[\"{kind}\"]}}]}}");
+        let meta = |defaults: &str| format!("{{\"packages\":[{},{}],\"workspace_default_members\":{defaults}}}", pkg("root", "bin"), pkg("inner", "lib"));
+        assert_eq!(unit_flags_of(&meta("[\"root\"]")).unwrap(), ["--bins"]);
+        assert_eq!(unit_flags_of(&meta("[\"root\",\"inner\"]")).unwrap(), ["--lib", "--bins"]);
+        assert!(unit_flags_of(&meta("[]")).is_err());
+        assert!(unit_flags_of(&format!("{{\"packages\":[{}]}}", pkg("root", "bin"))).is_err());
     }
 
     #[test]
