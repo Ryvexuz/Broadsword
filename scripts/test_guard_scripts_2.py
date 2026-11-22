@@ -12,7 +12,10 @@ started, under a random project name no real driver uses.
                                                                weakening must make its named tests FAIL
 """
 import calendar
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -163,7 +166,11 @@ class TestVenvInstall(Base):
     def test_accepts_tracked_pinned_file_dry_run(self):
         out = self.assertAllowed(self.REQ, "--dry-run")
         self.assertIn("python -I -m venv", out)
-        self.assertIn("-I -m pip install --isolated --only-binary=:all: -r ", out)
+        self.assertIn("PIP_CONFIG_FILE=nul ", out)
+        self.assertIn("-I -m pip install --isolated --only-binary=:all: --disable-pip-version-check --report ", out)
+        head = git(self.root, "rev-parse", "HEAD")
+        sha = hashlib.sha256(b"numpy==2.1.0\nscipy==1.14.1\n").hexdigest()
+        self.assertIn(f"{self.REQ} at {head}, sha256 {sha}", out)
         self.assertIn("dry run, nothing executed", out)
         self.assertFalse(os.path.exists(os.path.join(self.root, "shared", "venv")), "dry run created the venv")
         self.assertFalse(os.path.exists(os.path.join(self.root, "scratch")), "dry run wrote the copy")
@@ -204,6 +211,18 @@ class TestVenvInstall(Base):
         git(self.root, "add", self.REQ)
         self.assertRefused(self.REQ, "--dry-run")
 
+    def test_refuses_skip_worktree_swap(self):
+        # r3 B2: `git diff` cannot see a skip-worktree file, so other (well-formed, pinned) requirements in the worktree
+        # passed the diff and their bytes reached pip. Now pip gets only the committed blob, and a worktree that differs
+        # from it refuses.
+        git(self.root, "update-index", "--skip-worktree", self.REQ)
+        wr(os.path.join(self.root, self.REQ), "requests==2.32.3\n")
+        r = subprocess.run(["git", "-C", self.root, "diff", "--quiet", "HEAD", "--", self.REQ])
+        self.assertEqual(r.returncode, 0, "setup: git diff should not see the skip-worktree change")
+        self.assertRefused(self.REQ, "--dry-run")
+        self.assertRefused(self.REQ)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "scratch")), "a refusal wrote the copy")
+
     def test_refuses_bad_lines(self):
         bad = ["https://evil.example/pkg.whl\n", "-e .\n", "--index-url https://evil\n", "-r other.txt\n",
                "numpy>=2.0\n", "numpy\n", "numpy[extra]==2.1.0\n", "numpy==2.1.0 ; python_version>'3'\n",
@@ -232,6 +251,78 @@ class TestVenvInstall(Base):
     def test_refuses_venv_folder_without_python(self):
         os.makedirs(os.path.join(self.root, "shared", "venv", "Lib"))
         self.assertRefused(self.REQ, "--dry-run")
+
+
+def bundled_pip_wheel():
+    import ensurepip
+    d = os.path.join(os.path.dirname(ensurepip.__file__), "_bundled")
+    return ensurepip.version(), os.path.join(d, [f for f in os.listdir(d) if f.startswith("pip-")][0])
+
+
+class TestVenvInstallReal(Base):
+    """Real venv cases (no network): a real shared/venv made by this python, and the requirement `pip==<its version>`,
+    which the venv already has, so a correct run is "already satisfied" and never contacts an index."""
+    script_name = "venv-install.ps1"
+    REQ = "shared/requirements-pip.txt"
+
+    def setUp(self):
+        super().setUp()
+        self.pip_version, self.wheel = bundled_pip_wheel()
+        git(self.root, "init", "-q", "-b", "main")
+        wr(os.path.join(self.root, self.REQ), f"pip=={self.pip_version}\n")
+        git(self.root, "add", "shared")
+        git(self.root, "commit", "-q", "-m", "reqs")
+        self.venv = os.path.join(self.root, "shared", "venv")
+        r = subprocess.run([sys.executable, "-I", "-m", "venv", self.venv], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.vpy = os.path.join(self.venv, "Scripts", "python.exe")
+
+    def test_site_config_cannot_redirect_the_install(self):
+        # r3 B1: shared/venv/pip.ini (pip's SITE config, read even with --isolated) and a PIP_CONFIG_FILE / PIP_TARGET
+        # in the caller's environment all say: install into a folder outside the venv, from a local wheel folder.
+        # pip must read none of it: the run is "already satisfied" in the venv and nothing appears outside.
+        outside = outside_dir(self)
+        target = os.path.join(outside, "target")
+        wheels = os.path.join(outside, "wheels")
+        os.makedirs(wheels)
+        shutil.copy(self.wheel, wheels)
+        ini = (f"[global]\nno-index = true\nfind-links = {wheels}\ndisable-pip-version-check = true\n"
+               f"[install]\ntarget = {target}\n")
+        wr(os.path.join(self.venv, "pip.ini"), ini)
+        envini = os.path.join(outside, "env-pip.ini")
+        wr(envini, ini)
+        env = dict(os.environ)
+        env.update(GIT_ENV)
+        env.update({"PIP_CONFIG_FILE": envini, "PIP_TARGET": target, "PIP_NO_INDEX": "1", "PIP_FIND_LINKS": wheels})
+        r = subprocess.run(["powershell", "-NoProfile", "-File", self.script, self.REQ], cwd=self.root, env=env,
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertIn("post-check ok", r.stdout)
+        self.assertFalse(os.path.exists(target) and os.listdir(target), f"pip wrote outside the venv: {target}")
+
+    def post_check(self, report, reqs):
+        text = rd(self.script)
+        m = re.search(r"\$postCheck = @'\r?\n(.*?)\r?\n'@", text, re.S)
+        self.assertIsNotNone(m, "post-check block not found")
+        d = os.path.join(self.root, "scratch")
+        wr(os.path.join(d, "check.py"), m.group(1))
+        wr(os.path.join(d, "report.json"), json.dumps(report))
+        wr(os.path.join(d, "reqs.txt"), reqs)
+        return subprocess.run([self.vpy, "-I", os.path.join(d, "check.py"), self.venv, os.path.join(d, "report.json"),
+                               os.path.join(d, "reqs.txt")], capture_output=True, text=True)
+
+    def test_post_check_refuses_what_is_not_in_the_venv(self):
+        # r3 one-place rule: after pip, everything pip reports and every requirement must be installed IN the venv.
+        req = f"pip=={self.pip_version}\n"
+        ok = self.post_check({"install": [{"metadata": {"name": "pip", "version": self.pip_version}}]}, req)
+        self.assertEqual(ok.returncode, 0, (ok.stdout, ok.stderr))
+        self.assertIn("post-check ok", ok.stdout)
+        missing = self.post_check({"install": [{"metadata": {"name": "gs-not-there", "version": "1.0"}}]}, req)
+        self.assertEqual(missing.returncode, 1, (missing.stdout, missing.stderr))
+        self.assertIn("gs-not-there is not installed in the venv", missing.stdout)
+        wrong = self.post_check({"install": []}, "pip==1.0\n")
+        self.assertEqual(wrong.returncode, 1, (wrong.stdout, wrong.stderr))
+        self.assertIn("not 1.0", wrong.stdout)
 
 
 class TestAbandonStuck(Base):
@@ -773,8 +864,18 @@ class TestRestartOrch(Base):
 # --prove-fail: each weakening must make the named tests fail (the suite is the thing being proven).
 WEAKENINGS = [
     ("venv-install.ps1 without the unmodified check",
-     {"venv-install.ps1": [("if ($LASTEXITCODE -ne 0) { Refuse \"'$relIn' is modified", "if ($false) { Refuse \"'$relIn' is modified")]},
+     {"venv-install.ps1": [("if ($LASTEXITCODE -ne 0) { Refuse \"'$relIn' is modified", "if ($false) { Refuse \"'$relIn' is modified"),
+                           ("if ($wh -ne (Sha256Hex $bytes) -and", "if ($false -and")]},
      ["test_refuses_modified_file"]),
+    ("venv-install.ps1 reading the working file instead of the committed blob (the round-3 behaviour)",
+     {"venv-install.ps1": [("$bytes = GitBlob \"${rev}:$relIn\"", "$bytes = [IO.File]::ReadAllBytes($full)")]},
+     ["test_refuses_skip_worktree_swap"]),
+    ("venv-install.ps1 without PIP_CONFIG_FILE=nul (pip reads its config files again)",
+     {"venv-install.ps1": [("$env:PIP_CONFIG_FILE = 'nul'\n", "")]},
+     ["test_site_config_cannot_redirect_the_install"]),
+    ("venv-install.ps1 post-check without the not-installed rule",
+     {"venv-install.ps1": [("        bad.append(f\"{name} is not installed in the venv\")\n", "        pass\n")]},
+     ["test_post_check_refuses_what_is_not_in_the_venv"]),
     ("venv-install.ps1 without the name==version rule",
      {"venv-install.ps1": [("-cnotmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?==[0-9][A-Za-z0-9.!+]*$'", "-cnotmatch '.*'")]},
      ["test_refuses_bad_lines"]),
@@ -789,7 +890,7 @@ WEAKENINGS = [
      {"abandon-stuck.ps1": [("if (-not (NoLinks $exe)) {", "if ($false) {")]},
      ["test_refuses_build_junction"]),
     ("venv-install.ps1 without the link check on the copy it writes",
-     {"venv-install.ps1": [("AssertNoLinks $copy\n", "")]},
+     {"venv-install.ps1": [("foreach ($p in $copy, $report, $checkPy) { AssertNoLinks $p }\n", "")]},
      ["test_refuses_scratch_junction"]),
     ("read-b-files.ps1 without the link check",
      {"read-b-files.ps1": [("if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse \"'$q'", "if ($false) { Refuse \"'$q'")]},
@@ -840,12 +941,18 @@ WEAKENINGS = [
      ["test_refuses_recent_request"]),
 ]
 
-CLASSES = (TestVenvInstall, TestAbandonStuck, TestReadBFiles, TestStopDriver, TestRestartOrch)
+CLASSES = (TestVenvInstall, TestVenvInstallReal, TestAbandonStuck, TestReadBFiles, TestStopDriver, TestRestartOrch)
 
 
 def prove_fail():
     bad = 0
     for label, weaken, must_fail in WEAKENINGS:
+        # A weakening whose target text is gone would "fail" the tests in setUp and look like a pass: count it BAD.
+        missing = [old for name, pairs in weaken.items() for old, _ in pairs if old not in rd(os.path.join(SCRIPTS, name))]
+        if missing:
+            print(f"prove-fail BAD {label}: weakening target missing: {missing[0][:120]}")
+            bad += 1
+            continue
         WEAKEN.clear()
         WEAKEN.update(weaken)
         suite = unittest.TestSuite()
