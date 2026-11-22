@@ -72,7 +72,7 @@ if mode == "hardlink":
     os.makedirs(os.path.join(wt, "src"), exist_ok=True)
     os.link(os.path.join(d, "outside-target.txt"), os.path.join(wt, "src", "hl.txt"))
 if mode in ("inside", "hang", "mcp", "nousage", "outside", "gitfile", "junction", "newdir", "outsidedir", "hangoutside", "holdtemp",
-            "adsinside"):
+            "adsinside", "tiernote", "tiernoteitem"):
     write("src/new/a.py", "print('hi')\n")
     write("notes.md", "edited\n")
 if mode == "outside":
@@ -173,6 +173,11 @@ if mode in ("hang", "hangoutside"):
 open(out, "w", encoding="utf-8").write("I changed src/new/a.py and notes.md.")
 print(json.dumps({"type": "thread.started", "thread_id": "x"}))
 print(json.dumps({"type": "turn.started"}))
+NOTE = "Configured service tier `priority` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests."
+if mode == "tiernote":  # codex 0.170.0's real shape: a top-level error event
+    print(json.dumps({"type": "error", "message": NOTE}))
+if mode == "tiernoteitem":  # the same notice as an error item
+    print(json.dumps({"type": "item.completed", "item": {"id": "e0", "type": "error", "message": NOTE}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "command_execution", "command": "dir", "status": "completed"}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "file_change", "changes": [], "status": "completed"}}))
 if mode == "mcp":
@@ -721,6 +726,17 @@ class CoderTests(unittest.TestCase):
         norm = lambda xs: [re.sub(r"bsw-coder-\w+", "bsw-coder-X", x) for x in xs]  # each run has its own temp folder
         self.assertEqual(norm(fast[:i - 1] + fast[i + 1:]), norm(plain), "the flag adds only that one -c pair")
         self.assertEqual(res["service_tier"], "fast")
+
+    def test_a_tier_codex_says_it_omitted_fails_closed_with_a_named_reason(self):
+        for mode in ("tiernote", "tiernoteitem"):
+            code, res, _ = self.run_coder(mode, extra=["--service-tier", "fast"])
+            self.assertNotEqual(code, 0, res)
+            self.assertTrue(res["is_error"], res)
+            self.assertIn("service_tier_not_applied", res["result"])
+            self.assertEqual(res["service_tier"], "fast")
+        # without a requested tier the same notice is only a codex notice, not this run's failure
+        code, res, _ = self.run_coder("tiernote")
+        self.assertEqual(code, 0, res)
 
     def test_service_tier_is_in_the_ledger_row_with_the_plan_label(self):
         code, res, _ = self.run_coder("inside", extra=["--service-tier", "fast"])

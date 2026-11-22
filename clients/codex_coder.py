@@ -840,6 +840,20 @@ def meter_env(environ, task_id: str, service_tier=None) -> dict:
     return env
 
 
+def tier_not_applied(stdout: str):
+    """The text of a codex notice saying the configured service tier is not advertised as supported / will be omitted
+    (codex 0.170.0 prints it as {"type":"error","message":...} and then runs WITHOUT the tier), or None."""
+    for ev in rv.codex_events(stdout):
+        item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+        if ev.get("type") != "error" and item.get("type") != "error":
+            continue
+        for v in (ev.get("message"), item.get("message"), item.get("text")):
+            low = v.lower() if isinstance(v, str) else ""
+            if "service tier" in low and ("not advertised" in low or "will be omitted" in low):
+                return v.strip()[:300]
+    return None
+
+
 def run_coder(args, environ) -> tuple:
     """(exit code, result dict)."""
     t0 = time.monotonic()
@@ -900,6 +914,9 @@ def run_coder(args, environ) -> tuple:
         problems.append(error)
     elif code != 0:
         problems.append(f"codex exited with code {code}: {(stderr or '').strip()[-300:]}")
+    omitted = tier_not_applied(stdout) if tier else None
+    if omitted:  # the run was NOT on the tier it asked for, so it must never be counted as fast
+        problems.append(f"service_tier_not_applied: codex did not apply service tier {tier!r}: {omitted}")
     if unexpected:
         problems.append(f"codex printed unexpected items or events ({', '.join(unexpected)})")
     if not usage and not error:
