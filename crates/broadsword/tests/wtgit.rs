@@ -59,6 +59,8 @@ fn repo(name: &str) -> Repo {
     let main = root.join("main");
     fs::create_dir_all(&main).unwrap();
     git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["config", "user.name", "t"]);
+    git(&main, &["config", "user.email", "t@localhost"]);
     git(&main, &["config", "core.autocrlf", "false"]);
     fs::write(main.join("a.txt"), "one\n").unwrap();
     git(&main, &["add", "."]);
