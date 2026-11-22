@@ -484,7 +484,9 @@ pub fn note_folder(note: &str) -> &str {
 }
 
 mod kept;
-pub use kept::{kept_exe, kept_project, main_folder, read_kept_note, stale_marker, KEEP_DIR};
+pub use kept::{kept_exe, kept_project, main_folder, read_kept_note, stale_marker};
+#[cfg(test)]
+pub use kept::KEEP_DIR;
 #[cfg(test)]
 use kept::copy_tmp;
 use kept::{atomic_tmp, built_exe, copy_atomic, create_fresh, fingerprint, guard_kept_files, in_use, kept_note, vouched_by_marker, CopyFail, Keep, STALE_BUILT};
