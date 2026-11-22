@@ -349,6 +349,10 @@ impl Config {
         let (mcp_call_timeout_seconds, mcp_output_max_kb) = (positive("mcp_call_timeout_seconds")?, positive("mcp_output_max_kb")?);
         // read only by clients/codex_coder.py, which loads this key itself: validated here so a missing or 0 value is refused at load, and not stored (no field nothing reads)
         positive("codex_coder_timeout_seconds")?;
+        // read only by scripts/hotspots.py, which loads these keys itself: validated here (missing or 0 refused at load), not stored
+        for k in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits"] {
+            positive(k)?;
+        }
         let reviewer_backend = get_str(&m, "reviewer_backend")?;
         if reviewer_backend != "claude" {
             return Err(format!("reviewer_backend = \"{reviewer_backend}\": only \"claude\" is supported"));
@@ -635,6 +639,11 @@ done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
+hotspot_lines = 1500
+hotspot_window_hours = 48
+hotspot_wait_hours = 1
+hotspot_claims = 5
+hotspot_commits = 5
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -773,6 +782,19 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn hotspot_keys_are_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        assert!(Config::from_text(text, Path::new("p")).is_ok());
+        for key in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits"] {
+            let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
+            assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
+            let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("
+");
+            assert!(Config::from_text(&zero, Path::new("p")).is_err(), "{key} = 0");
+        }
+    }
+
+    #[test]
     fn python_tests_is_required_and_validated() {
         let text = include_str!("../../../broadsword.toml");
         let shipped = Config::from_text(text, Path::new("p")).unwrap().python_tests;
@@ -849,6 +871,11 @@ done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
+hotspot_lines = 1500
+hotspot_window_hours = 48
+hotspot_wait_hours = 1
+hotspot_claims = 5
+hotspot_commits = 5
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -904,6 +931,11 @@ done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
 test_output_wait_seconds = 10
+hotspot_lines = 1500
+hotspot_window_hours = 48
+hotspot_wait_hours = 1
+hotspot_claims = 5
+hotspot_commits = 5
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
@@ -976,17 +1008,19 @@ worktrees_dir = \"worktrees\"\n";
             }
         }
         let used = |name: &str| code.match_indices(&format!(".{name}")).any(|(i, _)| !code[i + 1 + name.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
-        // a key the Rust code never reads may be read by a Python client under clients/, by its exact quoted name
+        // a key the Rust code never reads may be read by a Python client under clients/ or script under scripts/, by its exact quoted name
         let mut py = String::new();
-        for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../clients")).unwrap().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".py") && !name.starts_with("test_") {
-                py.push_str(&std::fs::read_to_string(e.path()).unwrap());
+        for dir in ["clients", "scripts"] {
+            for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(dir)).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".py") && !name.starts_with("test_") {
+                    py.push_str(&std::fs::read_to_string(e.path()).unwrap());
+                }
             }
         }
         let used_by_python = |k: &str| py.contains(&format!("\"{k}\""));
         let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k)) && !used_by_python(k)).collect();
-        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name: {unused:?}");
+        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py or scripts/*.py reads by its quoted name: {unused:?}");
     }
 
     #[test]

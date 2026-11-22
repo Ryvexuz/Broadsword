@@ -78,6 +78,11 @@ const BASE: &[(&str, &str)] = &[
     // one after another unless a test sets it: the serial path keeps its streamed output and first-failure-stops order
     ("test_parallel_binaries", "1"),
     ("test_output_wait_seconds", "2"),
+    ("hotspot_lines", "1500"),
+    ("hotspot_window_hours", "48"),
+    ("hotspot_wait_hours", "1"),
+    ("hotspot_claims", "5"),
+    ("hotspot_commits", "5"),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),
