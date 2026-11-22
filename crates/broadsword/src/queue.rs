@@ -2508,10 +2508,6 @@ verdict: {} (answer followed the format: {})
             // before recording it
             self.e.set("main_sha", reviewed.clone());
             if head == reviewed {
-                // a single entry fast-forwarded main from its base to its reviewed commit: that range is what it merged
-                if self.e.get("pre_merge_sha").is_empty() && !base.is_empty() && self.e.get("train").is_empty() {
-                    self.e.set("pre_merge_sha", base.clone());
-                }
                 return self.log("merge", &format!("main's HEAD already is the reviewed commit {}: recorded as merged", short(&head)));
             }
             return self.log("merge", &format!("the reviewed commit {} is already on main (HEAD {} contains it): recorded as merged", short(&reviewed), short(&head)));
@@ -2644,7 +2640,8 @@ verdict: {} (answer followed the format: {})
         let pre = self.e.get("pre_merge_sha").to_string();
         let last = self.e.get("main_sha").to_string();
         if pre.is_empty() || last.is_empty() {
-            return Err(format!("no pre-merge commit is recorded for this entry (pre_merge_sha `{pre}`, main_sha `{last}`), so the commits it merged cannot be told; nothing was reverted"));
+            // NEVER derived (from the base or anything else): only the queue's own merge step records what it merged
+            return Err(format!("no pre-merge commit recorded; not reverting (pre_merge_sha `{pre}`, main_sha `{last}`: the queue's merge step did not record what this entry merged, e.g. main was fast-forwarded by hand)"));
         }
         let (_, tip) = trunk_checkout(&dir, &mb).map_err(|m| format!("{m}; nothing was reverted"))?;
         if tip != last {
@@ -2687,9 +2684,11 @@ verdict: {} (answer followed the format: {})
             };
             return Err(format!("`git revert --no-commit {range}` and its commit failed: {m}; {aborted}"));
         }
-        let (_, after) = trunk_checkout(&dir, &mb)?;
-        if after == last || !wtgit::is_ancestor(&dir, &last, &after)? {
-            return Err(format!("after the revert the trunk `{mb}` is at {after}, which is not a new commit on {last}; look at the project"));
+        // the revert commit must be exactly ONE new commit on the merged tip, on the trunk that is still checked out; anything else
+        // (the trunk moved or was switched during the revert) holds the lane with both shas, and no further git action is taken
+        let (_, after) = trunk_checkout(&dir, &mb).map_err(|m| format!("after the revert commit: {m}; expected the trunk at one new commit on {last}; look at the project"))?;
+        if after == last || !wtgit::is_ancestor(&dir, &last, &after)? || wtgit::rev_count(&dir, &format!("{last}..{after}"))? != 1 {
+            return Err(format!("after the revert the trunk `{mb}` is at {after}, whose parent is not the merged tip {last} checked before the revert; look at the project"));
         }
         self.e.set("revert_sha", after.clone());
         let _ = self.save();

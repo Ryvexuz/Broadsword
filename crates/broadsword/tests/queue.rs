@@ -1331,6 +1331,26 @@ fn auto_revert_refuses_when_the_trunk_moved_after_the_merge_and_holds_the_lane()
 }
 
 #[test]
+fn auto_revert_never_derives_a_pre_merge_commit_an_entry_merged_by_hand_is_not_reverted_and_the_lane_is_held() {
+    let r = revert_root("autorevnopre");
+    let id = r.started("src");
+    let base = r.head();
+    let tip = r.commit(&r.wt(&id), "src/lib.rs", &only_outside_main(), "task: a test that only passes outside main");
+    let e = r.add(&id, "low", "sonnet");
+    // main was fast-forwarded by hand (no queue merge step recorded a pre-merge commit); the entry resumes at its merge step
+    git(&r.p(), &["merge", "--ff-only", &tip]);
+    r.edit_entry(&e, &[("status", "running"), ("step", "merge"), ("attempt", "1"), ("verdict", "PASS"), ("checked_tip", &tip), ("reviewed_tip", &tip), ("base_head", &base), ("main_branch", "main")]);
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 6, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged_check_failed");
+    assert_eq!(r.head(), tip, "nothing was reverted");
+    let reason = r.field(&e, "reason");
+    assert!(reason.contains("no pre-merge commit recorded; not reverting") && reason.contains("HELD"), "{reason}");
+    let hold = fs::read_to_string(hold_file(&r)).expect("the hold file is written");
+    assert!(hold.contains(&e) && hold.contains("no pre-merge commit recorded"), "{hold}");
+}
+
+#[test]
 fn auto_revert_a_held_lane_merges_nothing_and_the_hold_clears_after_a_passing_main_check() {
     let r = revert_root("autorevhold");
     // main itself fails its check, and the lane is held
