@@ -1049,7 +1049,11 @@ worktrees_dir = \"worktrees\"\n";
         }
         // a key may reach the code through an accessor method of Config instead of the field itself
         fn accessor(k: &str) -> &str {
-            if k == "job_disk_reserve_gb" { "reserve_bytes" } else { k }
+            match k {
+                "job_disk_reserve_gb" => "reserve_bytes",
+                "merge_fast_tests" => "merge_fast_subset",
+                _ => k,
+            }
         }
         let used = |name: &str| code.match_indices(&format!(".{name}")).any(|(i, _)| !code[i + 1 + name.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
         // a key the Rust code never reads may be read by a Python client under clients/, by its exact quoted name
