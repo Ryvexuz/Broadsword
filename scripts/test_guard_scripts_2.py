@@ -580,6 +580,45 @@ class TestStopDriver(Base):
         self.assertRefused(self.proj)
         self.assertIsNone(d.poll())
 
+    def test_no_kill_by_pid(self):
+        # r2 B3: the kill goes through the verified handle only; nothing in the script kills by pid or by name.
+        text = rd(self.script)
+        for bad in ("Stop-Process", "taskkill", ".Kill(", "wmic"):
+            self.assertNotIn(bad, text)
+        self.assertIn("[BsProcCwd]::Terminate($h)", text)
+        self.assertIn("[BsProcCwd]::SameStart($h, $t.CreationDate)", text)
+
+    def test_stop_goes_through_a_verified_handle(self):
+        # r2 B3: the helper the stop uses, loaded from the script copy itself. The handle's creation time equals CIM's
+        # CreationDate (and a different time does not), terminate through the handle kills exactly that process, and
+        # once it has exited the same handle can neither pass as live nor kill anything (it never follows the pid).
+        probe = os.path.join(self.root, "scratch", "probe.ps1")
+        wr(probe, "$src = [IO.File]::ReadAllText($args[0])\n"
+                  "$m = [regex]::Match($src, \"(?s)Add-Type -TypeDefinition @'\\r?\\n(.*?)\\r?\\n'@\")\n"
+                  "Add-Type -TypeDefinition $m.Groups[1].Value\n"
+                  "$pid2 = [int]$args[1]\n"
+                  "$h = [BsProcCwd]::OpenForStop($pid2)\n"
+                  "\"open=$($h -ne [IntPtr]::Zero)\"\n"
+                  "$cim = Get-CimInstance Win32_Process -Filter \"ProcessId = $pid2\"\n"
+                  "\"same=$([BsProcCwd]::SameStart($h, $cim.CreationDate))\"\n"
+                  "\"other=$([BsProcCwd]::SameStart($h, $cim.CreationDate.AddMilliseconds(-1)))\"\n"
+                  "\"exited=$([BsProcCwd]::HasExited($h))\"\n"
+                  "\"term=$([BsProcCwd]::Terminate($h))\"\n"
+                  "Start-Sleep -Milliseconds 1500\n"
+                  "\"exited2=$([BsProcCwd]::HasExited($h))\"\n"
+                  "\"term2=$([BsProcCwd]::Terminate($h))\"\n"
+                  "[BsProcCwd]::Close($h)\n")
+        victim = self.spawn(["-NoProfile", "-Command", "Start-Sleep 120"])
+        bystander = self.spawn(["-NoProfile", "-Command", "Start-Sleep 120"])
+        time.sleep(1)
+        r = ps(probe, [self.script, str(victim.pid)], self.root)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        lines = r.stdout.split()
+        for want in ("open=True", "same=True", "other=False", "exited=False", "term=True", "exited2=True", "term2=False"):
+            self.assertIn(want, lines, (r.stdout, r.stderr))
+        self.assertTrue(self.gone(victim), "terminate through the handle did not stop the process")
+        self.assertIsNone(bystander.poll(), "another process was stopped")
+
 
 class TestRestartOrch(Base):
     script_name = "restart-orch.ps1"
@@ -664,15 +703,36 @@ class TestRestartOrch(Base):
         self.pc(f"{stamp(180)} orchestrator 10 handoff", f"{stamp(59)} fd04 requeued")
         self.assertRefusedNoWrite()
 
-    def test_handoff_up_to_5_min_before_the_line_fires(self):
-        age(self.handoff, 94)
-        self.pc(f"{stamp(180)} x", f"{stamp(90)} orchestrator 10 handoff written", f"{stamp(1)} y (tick-loop)")
+    def handoff_before_line(self, seconds):
+        # The line is stamped (whole seconds) 90 min ago; the handoff file is `seconds` before that stamp.
+        line_t = int(time.time() - 90 * 60)
+        os.utime(self.handoff, (line_t - seconds, line_t - seconds))
+        line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(line_t))
+        self.pc(f"{stamp(180)} x", f"{line} orchestrator 10 handoff written", f"{stamp(1)} y (tick-loop)")
+
+    def test_handoff_up_to_60_s_before_the_line_fires(self):
+        self.handoff_before_line(55)
         self.assertAllowed()
 
-    def test_refuses_handoff_over_5_min_before_the_line(self):
-        age(self.handoff, 97)
-        self.pc(f"{stamp(180)} x", f"{stamp(90)} orchestrator 10 handoff written", f"{stamp(1)} y (tick-loop)")
+    def test_refuses_handoff_over_60_s_before_the_line(self):
+        # r2 B1: the grace is 60 s, not 5 min. 61 s and 4 min before the line both refuse.
+        self.handoff_before_line(61)
         self.assertRefusedNoWrite()
+        self.handoff_before_line(240)
+        self.assertRefusedNoWrite()
+
+    def test_refuses_recent_line_mentioning_tick_loop(self):
+        # r2 B2: only lines that END with "(tick-loop)" are skipped; a recent orchestrator line that mentions it in the
+        # middle is the last orchestrator line, and it is under 60 min old, so the script refuses.
+        age(self.handoff, 30)
+        self.pc(f"{stamp(180)} orchestrator 10 handoff written",
+                f"{stamp(20)} orchestrator 12 restarted the (tick-loop) helper, pid 1",
+                f"{stamp(1)} AUTO-START t-1 (tick-loop)")
+        self.assertRefusedNoWrite()
+        # a (tick-loop) line with trailing spaces is still a tick-loop line
+        self.pc(f"{stamp(180)} orchestrator 10 handoff written", f"{stamp(1)} AUTO-START t-1 (tick-loop)   ")
+        age(self.handoff, 180.5)
+        self.assertAllowed()
 
     def test_refuses_while_another_run_holds_the_lock(self):
         # F5: the lock file exists (another run, or a stale one): refuse, write nothing.
@@ -751,14 +811,26 @@ WEAKENINGS = [
                            "    if ($kind -eq 'own') { $targets += $p }\n"
                            "    if ($p.Name -eq 'broadsword.exe' -and $p.CommandLine -match 'queue\\s+run\\s+--all\\s+--project\\s+' + $pq) { $targets += $p }\n")]},
      ["test_never_stops_the_queue_run_child"]),
+    ("stop-driver.ps1 killing by pid after the CIM re-read (the round-2 behaviour)",
+     {"stop-driver.ps1": [("if (-not [BsProcCwd]::Terminate($h)) {", "if (-not (Stop-Process -Id $id -Force -PassThru)) {")]},
+     ["test_no_kill_by_pid"]),
+    ("stop-driver.ps1 without the handle's creation-time check",
+     {"stop-driver.ps1": [("return Math.Abs(c - when.ToFileTime()) < 10;", "return true;")]},
+     ["test_stop_goes_through_a_verified_handle"]),
     ("restart-orch.ps1 without the handoff-just-before-the-line check",
-     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {", "if ($false) {")]},
-     ["test_refuses_handoff_older_than_last_line", "test_refuses_handoff_over_5_min_before_the_line"]),
+     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddSeconds(-$handoffGraceSeconds)) {", "if ($false) {")]},
+     ["test_refuses_handoff_older_than_last_line", "test_refuses_handoff_over_60_s_before_the_line"]),
+    ("restart-orch.ps1 with the round-2 5-minute grace",
+     {"restart-orch.ps1": [("$lastTime.AddSeconds(-$handoffGraceSeconds)", "$lastTime.AddMinutes(-5)")]},
+     ["test_refuses_handoff_over_60_s_before_the_line"]),
+    ("restart-orch.ps1 skipping any line that CONTAINS (tick-loop) (the round-2 behaviour)",
+     {"restart-orch.ps1": [("$lines[$i].TrimEnd().EndsWith('(tick-loop)', [StringComparison]::Ordinal)", "$lines[$i].Contains('(tick-loop)')")]},
+     ["test_refuses_recent_line_mentioning_tick_loop"]),
     ("restart-orch.ps1 without the 60-minute quiet check",
      {"restart-orch.ps1": [("if (-not (($now - $lastTime).TotalMinutes -gt $quietMinutes)) {", "if ($false) {")]},
      ["test_refuses_recent_last_line"]),
     ("restart-orch.ps1 with the round-1 rule (handoff must be newer than the last line)",
-     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {", "if (-not ($handoffTime -gt $lastTime)) {")]},
+     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddSeconds(-$handoffGraceSeconds)) {", "if (-not ($handoffTime -gt $lastTime)) {")]},
      ["test_real_handoff_pattern_fires"]),
     ("restart-orch.ps1 without the lock",
      {"restart-orch.ps1": [("[IO.FileMode]::CreateNew", "[IO.FileMode]::OpenOrCreate"), ("[IO.FileOptions]::DeleteOnClose", "[IO.FileOptions]::None")]},

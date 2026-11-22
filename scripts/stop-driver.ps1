@@ -13,8 +13,10 @@
 # A command line that merely contains these words (a -Command, a grep, another project) does not match.
 # It NEVER stops the driver's child `broadsword.exe queue run --all --project <project>`: a child already running is
 # left to finish its drain (it exits when the project is idle), so a merge in progress is never killed.
-# Each driver is re-read by pid right before it is stopped, and is stopped only if its creation time and command line
-# are unchanged (no pid reuse); the queue is re-checked for a running entry right before each stop too.
+# Each stop is bound to the process, not the pid: a handle to the driver is opened first (Windows does not reuse a pid
+# while a handle to it is open), then the driver is re-read by pid and must have the same creation time and command
+# line, and the handle's own creation time must match too; the kill goes through that handle (TerminateProcess). There
+# is no kill by pid. The queue is re-checked for a running entry right before each stop too.
 #
 # Checks, all of which must pass:
 #  1. <project> is a plain project name; the only other arguments are --when-idle-wait and --dry-run, each once.
@@ -89,6 +91,21 @@ public static class BsProcCwd {
     [DllImport("kernel32.dll")] static extern bool IsWow64Process(IntPtr h, out bool wow);
     [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, long[] info, int len, out int retLen);
+    [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr h, uint code);
+    // A handle to the process for the stop (PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION), or IntPtr.Zero.
+    // While it is open, Windows does not hand this pid to another process, so the pid names this one process.
+    public static IntPtr OpenForStop(int pid) { return OpenProcess(0x1001, false, pid); }
+    public static void Close(IntPtr h) { CloseHandle(h); }
+    public static bool HasExited(IntPtr h) { uint code; return !(GetExitCodeProcess(h, out code) && code == 259); }
+    // True if the handle's process was created at `when` (a CIM CreationDate), to 1 microsecond (CIM's precision).
+    public static bool SameStart(IntPtr h, DateTime when) {
+        long c, e, k, u;
+        if (!GetProcessTimes(h, out c, out e, out k, out u)) return false;
+        return Math.Abs(c - when.ToFileTime()) < 10;
+    }
+    public static bool Terminate(IntPtr h) { return TerminateProcess(h, 1); }
     static byte[] Read(IntPtr h, long addr, int n) {
         byte[] b = new byte[n]; IntPtr got;
         if (!ReadProcessMemory(h, new IntPtr(addr), b, new IntPtr(n), out got) || got.ToInt64() != n) return null;
@@ -158,10 +175,22 @@ $failed = 0
 foreach ($t in $targets) {
     $nowRunning = RunningEntries
     if ($nowRunning.Count -gt 0) { Refuse "queue entry $($nowRunning -join ', ') of '$project' started running; pid $($t.ProcessId) not stopped" }
-    $now = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$t.ProcessId)"
-    if ($null -eq $now) { continue }
-    if ($now.CreationDate -ne $t.CreationDate -or $now.CommandLine -ne $t.CommandLine -or (DriverOf $now) -ne 'own') { Write-Output "stop-driver: pid $($t.ProcessId) changed; not stopped"; continue }
-    try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop } catch { $failed++; [Console]::Error.WriteLine("stop-driver: could not stop pid $($t.ProcessId): $($_.Exception.Message)") }
+    $id = [int]$t.ProcessId
+    # The stop is bound to the process, not the pid: open a handle first (the pid cannot be reused while it is open),
+    # verify through it, and terminate through it. There is no kill by pid.
+    $h = [BsProcCwd]::OpenForStop($id)
+    if ($h -eq [IntPtr]::Zero) {
+        if ($null -eq (Get-CimInstance Win32_Process -Filter "ProcessId = $id")) { Write-Output "stop-driver: pid $id exited; nothing to stop"; continue }
+        $failed++; [Console]::Error.WriteLine("stop-driver: could not open pid $id to stop it"); continue
+    }
+    try {
+        if ([BsProcCwd]::HasExited($h)) { Write-Output "stop-driver: pid $id exited; nothing to stop"; continue }
+        $now = Get-CimInstance Win32_Process -Filter "ProcessId = $id"
+        if ($null -eq $now -or $now.CreationDate -ne $t.CreationDate -or $now.CommandLine -ne $t.CommandLine -or (DriverOf $now) -ne 'own' -or -not [BsProcCwd]::SameStart($h, $t.CreationDate)) {
+            Write-Output "stop-driver: pid $id changed; not stopped"; continue
+        }
+        if (-not [BsProcCwd]::Terminate($h)) { $failed++; [Console]::Error.WriteLine("stop-driver: could not stop pid $id") }
+    } finally { [BsProcCwd]::Close($h) }
 }
 if ($failed -gt 0) { exit 1 }
 Write-Output "stop-driver: stopped $($targets.Count) process(es) of '$project'"

@@ -16,8 +16,9 @@
 #     creates it. An existing shared/venv without python.exe refuses (something else is there).
 #
 # What runs: `shared/venv/Scripts/python.exe -I -m pip install --isolated --only-binary=:all: -r <copy>`. Two things are
-# STRICTER than the plain brief command, never weaker: `--isolated` (pip ignores PIP_* variables and user pip config, so
-# no config can add an index or a source build), and <copy> is a byte copy of the VALIDATED file in the scratch folder
+# STRICTER than the plain brief command, never weaker: `--isolated` (pip ignores PIP_* variables and USER pip config;
+# it still reads the global and site pip config, so it does NOT stop every config from adding an index: that is limited
+# by the `name==version` rule and --only-binary=:all:, not by --isolated), and <copy> is a byte copy of the VALIDATED file in the scratch folder
 # (scratch/venv-install/<random>.txt), so a change to the file after the checks cannot reach pip. PIP_* variables are
 # also removed from this process.
 # --dry-run runs every check, then only prints the commands; it creates and installs nothing.

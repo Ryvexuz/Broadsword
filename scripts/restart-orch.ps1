@@ -6,12 +6,16 @@
 #
 # Checks, all of which must pass (times are UTC; pc-progress lines start with YYYY-MM-DDTHH:MM:SSZ):
 #  1. No argument at all.
-#  2. The orchestrator went quiet: the last non-empty state/pc-progress.md line that does not contain "(tick-loop)" is
-#     over 60 minutes old. If that line has no readable time, it refuses.
-#  3. It went quiet right after a handoff: a newest state/handoff-*.md exists (by last-write time; no link), and it was
-#     last written no more than 5 minutes BEFORE that line (later than the line is fine). The orchestrator logs its
-#     "handoff written" line about a second after writing the handoff file, so the handoff is usually a little OLDER
-#     than the last line (real pattern: handoff 17:22:15Z, line 17:22:16Z).
+#  2. The orchestrator went quiet: the last non-empty state/pc-progress.md line that does not END with "(tick-loop)"
+#     (trailing spaces aside) is over 60 minutes old. A line that only mentions "(tick-loop)" elsewhere counts as an
+#     orchestrator line. If that line has no readable time, it refuses.
+#  3. It went quiet right after a handoff: a newest state/handoff-*.md exists (by last-write time; no link), and it is
+#     newer than that line, or older by at most 60 SECONDS. Why a grace at all: the orchestrator writes the handoff file
+#     and then logs it as a separate step, so the line that logs the handoff is the last line and is 0 to 1 s newer than
+#     the file (2026-11-22: 17:22:15Z/17:22:16Z, 09:42:14Z/09:42:14Z, 10:46:25Z/10:46:25Z, 18:59:46Z/18:59:46Z; line
+#     times have 1 s resolution), so a strict "newer" never fires. Why 60 s: those two steps are two tool calls, and one
+#     call under load can take tens of seconds; any real work after the handoff (a coder start, a review, a queue run) is
+#     logged as its own line minutes later, which then refuses.
 #  4. No request was written in the last 2 hours: state/restart-request.md, if it exists, was last written over 2 hours
 #     ago and its `time:` line (if readable) is over 2 hours old too.
 # Concurrent runs: checks 2 to 4 and the write run while this run holds state/restart-request.lock, created with an
@@ -29,7 +33,7 @@ function Refuse([string]$why) {
 
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $quietMinutes = 60
-$handoffBeforeMinutes = 5
+$handoffGraceSeconds = 60
 $requestGapHours = 2
 $now = [DateTime]::UtcNow
 
@@ -79,16 +83,16 @@ if (-not (NoLinks $pc)) { Refuse 'state/pc-progress.md is a link; links are not 
 $lines = @([IO.File]::ReadAllLines($pc) | Where-Object { $_.Trim().Length -gt 0 })
 $last = $null
 for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-    if (-not $lines[$i].Contains('(tick-loop)')) { $last = $lines[$i]; break }
+    if (-not $lines[$i].TrimEnd().EndsWith('(tick-loop)', [StringComparison]::Ordinal)) { $last = $lines[$i]; break }
 }
-if ($null -eq $last) { Refuse 'state/pc-progress.md has no line that is not a (tick-loop) line' }
+if ($null -eq $last) { Refuse 'state/pc-progress.md has no line that does not end with (tick-loop)' }
 $lastTime = LineTime $last
 if ($null -eq $lastTime) { Refuse "the last non-(tick-loop) line of state/pc-progress.md has no readable time: '$last'" }
 if (-not (($now - $lastTime).TotalMinutes -gt $quietMinutes)) {
     Refuse ("the last non-(tick-loop) pc-progress line ({0:s}Z) is not over {1} min old" -f $lastTime, $quietMinutes)
 }
-if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {
-    Refuse ("newest handoff $handoffRel ({0:s}Z) is more than {2} min before the last pc-progress line ({1:s}Z): the orchestrator did not stop right after a handoff" -f $handoffTime, $lastTime, $handoffBeforeMinutes)
+if ($handoffTime -lt $lastTime.AddSeconds(-$handoffGraceSeconds)) {
+    Refuse ("newest handoff $handoffRel ({0:s}Z) is more than {2} s before the last pc-progress line ({1:s}Z): the orchestrator did not stop right after a handoff" -f $handoffTime, $lastTime, $handoffGraceSeconds)
 }
 
 # 4. No request in the last 2 hours.
