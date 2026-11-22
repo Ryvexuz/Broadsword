@@ -267,22 +267,55 @@ def section_text(lines, secs, names):
     return "\n".join(out)
 
 
-def claimed_paths(lines, secs):
-    """Paths in the Claims section, plus those of an inline 'Claims: ...' on any line."""
-    found = set()
+def claim_blocks(lines, secs):
+    """Raw text of every Claims block: the Claims section, plus each inline 'Claims: ...' line."""
+    blocks = []
     for name, a, b in secs:
         if name == "claims":
             rest = section_of(lines[a])[1]
             if rest:
-                block = [rest] + [ln for ln in lines[a + 1:b] if ln.startswith((" ", "\t")) and ln.strip()]
+                block = [rest] + [ln for ln in lines[a + 1:b] if ln.startswith((" ", "	")) and ln.strip()]
             else:
                 block = [ln for ln in lines[a + 1:b] if ln.strip()]
-            found |= claim_paths("\n".join(block))
+            blocks.append("\n".join(block))
     for ln in lines:
-        m = re.search(r"\bClaims?:\s*(.*)", ln)
+        m = re.search(r"Claims?:\s*(.*)", ln)
         if m:
-            found |= claim_paths(re.split(r"\.\s+[A-Z]", m.group(1))[0])
+            blocks.append(re.split(r"\.\s+[A-Z]", m.group(1))[0])
+    return blocks
+
+
+def claimed_paths(lines, secs):
+    """Paths in the Claims section, plus those of an inline 'Claims: ...' on any line."""
+    found = set()
+    for block in claim_blocks(lines, secs):
+        found |= claim_paths(block)
     return found
+
+
+# Hot shared files (task t-20261122-050730: one task holding these blocked 31 to 42 of 42 open
+# tasks). Value: True when a claim with a #key suffix is NOT hot, False when the file is hot even then.
+HOT = {
+    "crates/broadsword/src/queue.rs": False,
+    "crates/broadsword/tests/queue.rs": False,
+    "broadsword.toml": True,
+    "crates/broadsword/src/config.rs": True,
+    "crates/broadsword/tests/support/mod.rs": True,
+}
+HOT_REASON_RE = re.compile(r"^\s*(?:[-*]\s+)?Hot file:\s*(.*\S)\s*$")
+HOT_REASON_MIN = 20
+
+
+def hot_claims(lines, secs):
+    """Hot files claimed as a whole file, sorted."""
+    hot = set()
+    for block in claim_blocks(lines, secs):
+        for tok in re.split(r"[\s,;()\[\]`'\"]+", block):
+            tok = tok.strip().rstrip(".:").replace("\\", "/")
+            base, sep, _ = tok.partition("#")
+            if base in HOT and not (sep and HOT[base]):
+                hot.add(base)
+    return sorted(hot)
 
 
 def covers(claims, tok):
@@ -396,6 +429,12 @@ def claim_gaps(text, root=None):
         if old:
             res.append(("R3", "WARN", f"flag(s) {', '.join(sorted(old))} named in Requirements; "
                         f"{TOOLS_RS} (the parser) is not claimed: does a parser or call site there change?"))
+
+    hot = hot_claims(lines, secs)
+    if hot and not any((m := HOT_REASON_RE.match(ln)) and len(m.group(1)) >= HOT_REASON_MIN for ln in lines):
+        res.append(("R6", "FAIL", "whole-file claim on hot shared file(s) " + ", ".join(hot)
+                    + ": claim a #key, split the brief, or add a 'Hot file:' line with a reason "
+                    + f"of at least {HOT_REASON_MIN} characters"))
 
     if CONFIG_KEY_RE.search(req):
         miss = [n for n in CONFIG_NEEDS if not any(c == n or c.endswith("/" + n) for c in claims)]

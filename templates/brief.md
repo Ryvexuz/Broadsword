@@ -10,6 +10,7 @@
 
 **Claim (the only files you may change):** <path>, <path>
 Do not edit any other file. If the task needs one, stop and report it.
+Claim only the files you own; a whole-file claim on a hot shared file (see scripts/brief_lint.py HOT) needs a 'Hot file:' line saying why it cannot be split.
 
 **API you may use:** <for example: anything `pub` in src/lib.rs (for example X, Y)>. <!-- A list is either marked "for example" or is the complete rule. -->
 

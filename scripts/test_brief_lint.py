@@ -250,6 +250,48 @@ def brief(claims, req, done="`python -I scripts/test_a.py` shows OK.", extra="")
             f"**Done check:**\n1. {done}\n{extra}")
 
 
+class HotFileRule(unittest.TestCase):
+    """R6 (t-20261122-050730): a whole-file claim on a hot shared file needs a Hot file: line."""
+
+    REQ = "- change the thing"
+    REASON = "Hot file: the change is one function and cannot be split by key"
+
+    def levels(self, text):
+        return {(r, lv) for r, lv, _ in gaps(text)}
+
+    def test_queue_rs_whole_file_fails_and_names_the_file(self):
+        g = gaps(brief("`crates/broadsword/src/queue.rs`", self.REQ))
+        self.assertIn(("R6", "FAIL"), {(r, lv) for r, lv, _ in g})
+        msg = " ".join(m for r, _, m in g if r == "R6")
+        self.assertIn("crates/broadsword/src/queue.rs", msg)
+        self.assertIn("claim a #key", msg)
+        self.assertIn("split the brief", msg)
+        self.assertIn("Hot file:", msg)
+
+    def test_queue_rs_with_hot_file_line_passes(self):
+        text = brief("`crates/broadsword/src/queue.rs`", self.REQ, extra=self.REASON + "\n")
+        self.assertNotIn(("R6", "FAIL"), self.levels(text))
+
+    def test_short_hot_file_reason_still_fails(self):
+        text = brief("`crates/broadsword/src/queue.rs`", self.REQ, extra="Hot file: because\n")
+        self.assertIn(("R6", "FAIL"), self.levels(text))
+
+    def test_toml_with_key_passes_and_whole_fails(self):
+        self.assertNotIn(("R6", "FAIL"), self.levels(brief("`broadsword.toml#review_parallel`", self.REQ)))
+        self.assertIn(("R6", "FAIL"), self.levels(brief("`broadsword.toml`", self.REQ)))
+
+    def test_config_rs_and_support_mod_with_key_pass(self):
+        for f in ("crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs"):
+            self.assertNotIn(("R6", "FAIL"), self.levels(brief(f"`{f}#k`", self.REQ)), f)
+            self.assertIn(("R6", "FAIL"), self.levels(brief(f"`{f}`", self.REQ)), f)
+
+    def test_queue_files_fail_even_with_a_key(self):
+        self.assertIn(("R6", "FAIL"), self.levels(brief("`crates/broadsword/tests/queue.rs#x`", self.REQ)))
+
+    def test_non_hot_claim_is_clean(self):
+        self.assertNotIn(("R6", "FAIL"), self.levels(brief("`scripts/a.py`", self.REQ)))
+
+
 class ClaimGapRules(unittest.TestCase):
     """R1-R5: one test per rule, each shown failing before the rule existed."""
 
@@ -324,7 +366,7 @@ class ClaimGapRules(unittest.TestCase):
                                                             "`src/serial/migrate/mod.rs`", req))})
 
     def test_r3_new_flag_without_tools_rs_fails_and_plain_flag_warns(self):
-        claims = "`crates/broadsword/src/queue.rs`"
+        claims = "`crates/broadsword/src/jobs.rs`"
         self.assertEqual(self.levels(brief(claims, "- adds a new flag `--per-project` to queue run")),
                          {("R3", "FAIL")})
         self.assertEqual(self.levels(brief(claims, "- `recover --abandon <id>` is refused")), {("R3", "WARN")})
@@ -355,13 +397,13 @@ class ClaimGapRules(unittest.TestCase):
         self.assertIn("could not read", " ".join(m for _, _, m in g))
 
     def test_r3_and_r2_ignore_negated_sentences(self):
-        claims = "`crates/broadsword/src/queue.rs`"
+        claims = "`crates/broadsword/src/jobs.rs`"
         self.assertEqual(self.levels(brief(claims, "- do not add a `--force` flag")), {("R3", "WARN")})  # not FAIL
         self.assertEqual(gaps(brief("`src/a.rs`", "- no new `foo` submodule is needed")), [])
 
     def test_r4_new_required_key_needs_config_toml_and_support(self):
         req = "- a new required setting turns it on"
-        g = gaps(brief("`crates/broadsword/src/queue.rs`", req))
+        g = gaps(brief("`crates/broadsword/src/jobs.rs`", req))
         self.assertIn(("R4", "FAIL"), {(r, lv) for r, lv, _ in g})
         self.assertIn("config.rs, broadsword.toml, tests/support/mod.rs", " ".join(m for _, _, m in g))
         full = ("`crates/broadsword/src/config.rs`, `broadsword.toml`, "
