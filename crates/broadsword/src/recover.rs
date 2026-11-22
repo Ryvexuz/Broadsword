@@ -18,7 +18,9 @@
 //! back every one (a human who means it). Plain `broadsword recover` (`Mode::List`) does the automatic part and only LISTS
 //! interrupted `run` jobs, with the command to roll each back; it changes no project file. The automatic recovery before
 //! a job (`Mode::Auto`) likewise kills orphans and resumes read-only jobs but never rolls back, and
-//! `blocked_by_interrupted_run` then stops new jobs in that run's own source folder until it is recovered.
+//! `blocked_by_interrupted_run` then stops new jobs in that run's own source folder until it is recovered (except a run
+//! killed before its checkpoint was taken, whose command never started: that one is marked `rolled_back` in place, see
+//! `settle_never_started`).
 //! The automatic recovery acts only on jobs of the CALLER's own project and task (`Mode::Auto` carries them, so it cannot
 //! run without them): an interrupted job of another project or task (task-less and tasked never match) is reported on one
 //! line and left exactly as it is, for an explicit `broadsword recover` or a call of that same task. Several agents run
@@ -92,12 +94,66 @@ fn interrupted_run(r: &Record) -> bool {
 /// The block is per folder: the new job's source folder comes from `job::job_source` (the same function the job records
 /// it with) and must equal the interrupted run's recorded `source` exactly. A record with no `source` (older records)
 /// blocks the whole project, and so does a new job whose source cannot be worked out: when in doubt, block.
+/// An interrupted run that never started its command (`settle_never_started`) is settled here instead of blocking.
 pub fn blocked_by_interrupted_run(cfg: &Config, project: &str, task: Option<&str>) -> Option<(String, String)> {
     let mine = job::job_source(cfg, project, task).ok();
     record::load_all(&record::jobs_dir(cfg))
         .into_iter()
-        .find(|r| r.get("project") == project && interrupted_run(r) && blocks_source(r.get("source"), mine.as_deref()))
+        .filter(|r| r.get("project") == project && interrupted_run(r) && blocks_source(r.get("source"), mine.as_deref()))
+        .find(|r| !settle_never_started(cfg, r))
         .map(|r| (r.id().to_string(), shown_source(&r)))
+}
+
+/// A dead `run` whose record still says `checkpoint = pending` never started its command: job.rs saves the checkpoint's
+/// ref into the record before it starts the command (job.rs, the save before the command), so `pending` on disk means no
+/// project file was changed by it. Such a record is marked `rolled_back` in place through the existing rollback path
+/// (`rollback_run`, its `pending` branch), under the record's own lock and after re-reading it, with a line in that job's
+/// log; the record and any checkpoint ref are kept. Returns true when the record no longer blocks. Anything else (a real
+/// checkpoint, a live or unverifiable broadsword, a lock held by another process, a failure) returns false: it still blocks.
+/// The ONE place this is decided; `blocked_by_interrupted_run` is its caller, the only check that refuses a new job.
+fn settle_never_started(cfg: &Config, seen: &Record) -> bool {
+    if seen.get("checkpoint") != "pending" {
+        return false;
+    }
+    let id = seen.id().to_string();
+    let _record_lock = match acquire_record(cfg, &id) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("{e}; it still blocks");
+            return false;
+        }
+    };
+    // `reread_interrupted` re-checks with the same lenient liveness rule: a live (or unreadable) broadsword is never settled.
+    let mut r = match reread_interrupted(cfg, &id) {
+        Ok(r) if r.get("kind") == "run" && r.get("checkpoint") == "pending" => r,
+        Ok(_) => return false,
+        Err(e) => {
+            println!("{e}");
+            return false;
+        }
+    };
+    println!("job {id}: run {} was interrupted before its checkpoint was taken (broadsword pid {} is gone), so its command never started", r.get("project"), r.get("pid"));
+    kill_orphan(&r);
+    let project = r.get("project").to_string();
+    r.set("rolled_back_reason", "interrupted before its checkpoint was taken (checkpoint = pending): the command never started, so no file was changed; settled automatically when a new job checked for interrupted runs");
+    if let Err(e) = rollback_run(cfg, &mut r, &project) {
+        println!("  {e}; it still blocks");
+        return false;
+    }
+    let line = format!(
+        "=== recover ({}) === job {id} was interrupted before its checkpoint was taken (broadsword pid {} is gone): its command never started, so nothing was restored and no file was changed; the record is now rolled_back (kept, as is any checkpoint ref)",
+        pause::now_string(),
+        r.get("pid")
+    );
+    let logged = std::fs::OpenOptions::new().append(true).open(r.get("log")).and_then(|mut f| {
+        use std::io::Write;
+        writeln!(f, "{line}")
+    });
+    if let Err(e) = logged {
+        println!("  warning: could not add the recovery line to the job log `{}`: {e}", r.get("log"));
+    }
+    println!("  marked rolled_back: it no longer blocks new jobs in {}", shown_source(&r));
+    true
 }
 
 /// Does an interrupted run recorded with `recorded` (its source folder, possibly empty) block a job running in `mine`?

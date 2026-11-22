@@ -1535,6 +1535,8 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             }
         }
         rec.set("step", *step);
+        // This save puts a `run`'s checkpoint ref into the record on disk, and it comes BEFORE the command starts: a record
+        // still saying `checkpoint = pending` therefore proves the command never ran (recover::settle_never_started relies on it).
         if let Err(e) = save_record(&rec) {
             eprintln!("broadsword: {e}");
             return end(&mut rec, record::FAILED, EXIT_FAILED);

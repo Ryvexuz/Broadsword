@@ -868,3 +868,54 @@ fn abandon_does_not_wait_for_an_unrelated_recover_but_never_races_one_on_the_sam
     assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
     assert_eq!(Root::field(&r.record(two), "status"), "abandoned");
 }
+
+/// t-20261122-005330: a dead `run` whose record still says `checkpoint = pending` never started its command, so it no longer
+/// blocks: the next job in its folder marks it `rolled_back` in place (record kept, a line added to its job log) and runs.
+#[test]
+fn a_dead_run_that_never_took_its_checkpoint_stops_blocking() {
+    let r = Root::new("pendingdead");
+    r.project("", true);
+    let dead = dead_pid().to_string();
+    let id = "20260101-000001-p-run";
+    let log = r.dir.join("scratch/old-run.log");
+    fs::write(&log, "=== run p ===\n").unwrap();
+    let log_s = log.display().to_string().replace('\\', "/");
+    r.fake_record(id, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("checkpoint", "pending"), ("log", &log_s)]);
+    let out = r.run(&["run", "p", "--", "echo from-new-job"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "a dead run that never started must not block: {so}{se}");
+    assert!(so.contains("from-new-job"), "{so}");
+    let rec = r.record(id);
+    assert_eq!(Root::field(&rec, "status"), "rolled_back", "{rec}");
+    assert_eq!(Root::field(&rec, "checkpoint"), "pending", "the record is kept as it was, only settled: {rec}");
+    assert!(Root::field(&rec, "rolled_back_reason").contains("never started"), "{rec}");
+    let l = fs::read_to_string(&log).unwrap();
+    assert!(l.starts_with("=== run p ===\n"), "the old log is kept: {l}");
+    assert!(l.contains(&format!("job {id} was interrupted before its checkpoint was taken")) && l.contains("nothing was restored"), "{l}");
+}
+
+/// The same pending record is never settled while its broadsword may be alive: a live pid with its own creation time, and a
+/// live pid with no recorded creation time (liveness cannot be verified), both stay `running`. A live pid whose recorded
+/// creation time differs (the pid was reused by another process) is dead, and is settled.
+#[test]
+fn a_pending_run_whose_broadsword_may_be_alive_is_never_settled() {
+    let mut r = Root::new("pendinglive");
+    r.project("", true);
+    let (a, b, c) = (r.sleeper(), r.sleeper(), r.sleeper());
+    let start = |p: u32| Proc::now(p).start.expect("a live process has a creation time");
+    let (sa, sc) = (start(a).to_string(), (start(c) - 1).to_string());
+    let (live, unknown, reused) = ("20260101-000001-p-run", "20260101-000002-p-run", "20260101-000003-p-run");
+    r.fake_record(live, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &a.to_string()), ("pid_start", &sa), ("checkpoint", "pending")]);
+    r.fake_record(unknown, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &b.to_string()), ("pid_start", ""), ("checkpoint", "pending")]);
+    r.fake_record(reused, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &c.to_string()), ("pid_start", &sc), ("checkpoint", "pending")]);
+    let out = r.run(&["run", "p", "--", "echo hi"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{so}{se}");
+    for id in [live, unknown] {
+        let rec = r.record(id);
+        assert_eq!(Root::field(&rec, "status"), "running", "a possibly live job is never marked rolled_back: {rec}\n{so}");
+        assert_eq!(Root::field(&rec, "rolled_back_reason"), "", "{rec}");
+    }
+    assert_eq!(Root::field(&r.record(reused), "status"), "rolled_back", "a reused pid (creation time differs) is dead: {so}");
+    assert!(Proc::now(a).alive() && Proc::now(b).alive() && Proc::now(c).alive(), "no live process is killed");
+}
