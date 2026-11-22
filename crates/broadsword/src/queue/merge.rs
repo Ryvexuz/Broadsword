@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use super::check::{main_check_now, PassInfo};
 use super::entry::load_entry;
 use super::locks::{lane_hold, write_hold};
-use super::{BLOCKED, EXIT_ERROR, EXIT_MERGED_BAD, EXIT_RETRY, MERGED, MERGED_CHECK_FAILED, R, Row, Run, STALE, STEP_MERGE};
-use super::train::{code_num, fail_members, finish_member};
+use super::{BLOCKED, code_num, EXIT_ERROR, EXIT_MERGED_BAD, EXIT_RETRY, MERGED, MERGED_CHECK_FAILED, R, Row, Run, STALE, STEP_MERGE};
+use super::train::{fail_members, finish_member};
 use super::view::{short, some};
 
 /// Did entry `id` end merged_check_failed with its automatic revert DONE and the check after it PASSED, its lane not held? Then
