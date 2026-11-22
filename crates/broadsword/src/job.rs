@@ -1547,7 +1547,12 @@ fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: boo
             rec.set("build_lock_wait_secs", format!("{waited:.1}"));
             build_hold = Some(BuildHold { proof: None, _lock: lock, taken: Instant::now() });
             let outcome = if kind == "run" {
-                buildsrc::prepare_for_run(cfg, &project_dir, &source)
+                buildsrc::prepare_for_run(
+                    cfg,
+                    &project_dir,
+                    &source,
+                    spec.command.as_deref().unwrap_or_default(),
+                )
             } else {
                 buildsrc::prepare(cfg, &project_dir, &source).map(|p| p.lines)
             };

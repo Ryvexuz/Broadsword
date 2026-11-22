@@ -36,6 +36,10 @@
 //! missing or is a `run:` note, and `install` refuses when the bin note for `broadsword` names anything but the main checkout.
 //! Limit: a missing bin note is accepted by `install` (builds from before bin notes existed left none; every build since
 //! writes one), and a bin note is read and cleaned only through a package of the folder being built.
+//! A `run` also invalidates the `broadsword` bin note regardless of its folder's packages: an arbitrary script may build
+//! another checkout into that same exe path. An explicit `--manifest-path` must name the job folder's own Cargo.toml in a
+//! literal cargo command, otherwise the run is refused before changing notes. Cargo's package/manifest pairs are logged
+//! when metadata succeeds; an untraceable run is never evidence that the install binary came from main.
 //!
 //! Limit: only the packages of the folder's own workspace are cleaned (`cargo metadata --no-deps`). A path dependency
 //! that lives outside the workspace is not a member, so it is neither noted nor cleaned and can still be stale.
@@ -980,11 +984,144 @@ pub struct Prepared {
 }
 
 /// Make the shared build folder safe to build `dir` into: for every package of `dir` whose note names another folder (or is
-/// missing), clean that package's artifacts, then record `source` for it. A note `run:<source>` (a `run` in this same folder)
-/// needs no clean; it is rewritten to plain `source`, because the cargo step that follows rebuilds what is out of date and
-/// vouches for it. The caller holds the build lock. Err = nothing may be built (the message says why and what to do).
+/// missing), clean that package's artifacts, then record `source` for it. A note `run:<source>` also requires cleaning:
+/// an arbitrary command may have overwritten the exe without changing Cargo's fingerprint. The caller holds the build
+/// lock. Err = nothing may be built (the message says why and what to do).
 pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, String> {
-    prepare_packages(cfg, dir, source, bins_of(cfg, dir)?, false)
+    let (targets, manifests) = targets_with_manifests(cfg, dir)?;
+    let mut prepared = prepare_packages(cfg, dir, source, targets, false)?;
+    prepared.lines.extend(manifests);
+    Ok(prepared)
+}
+
+/// Read package identities from Cargo, not from a second TOML parser. These lines go into the durable job log along with
+/// the source note. A package outside the job's checkout must not acquire that checkout's note.
+fn targets_with_manifests(cfg: &Config, dir: &Path) -> Result<(PackageBins, Vec<String>), String> {
+    let metadata = metadata_json(cfg, dir)?;
+    let targets = parse_bins(&metadata)?;
+    let parsed =
+        json::parse(&metadata).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let Some(json::J::Arr(packages)) = parsed.get("packages") else {
+        return Err("cargo metadata output: `packages` is not a list".into());
+    };
+    let checkout = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve job checkout {}: {e}", dir.display()))?;
+    let mut lines = Vec::new();
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(json::J::str)
+            .ok_or("cargo metadata output: a package has no name")?;
+        let manifest = package
+            .get("manifest_path")
+            .and_then(json::J::str)
+            .ok_or("cargo metadata output: a package has no manifest_path")?;
+        if manifest.is_empty()
+            || manifest.chars().any(char::is_control)
+            || !Path::new(manifest).is_absolute()
+        {
+            return Err(format!(
+                "cargo metadata output: invalid manifest_path for package `{name}`"
+            ));
+        }
+        let path = Path::new(manifest)
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve manifest for package `{name}`: {e}"))?;
+        if !path.starts_with(&checkout) {
+            return Err(format!(
+                "refusing to note package `{name}` as this checkout's build: manifest {} is outside {}",
+                path.display(),
+                checkout.display()
+            ));
+        }
+        lines.push(format!("build manifest: {} (package: {name})", path.display()));
+    }
+    Ok((targets, lines))
+}
+
+/// Only a literal, single cargo command can prove which manifest a shell's `--manifest-path` names. Do not try to evaluate
+/// shell expansion, scripts, command substitution or a changed working directory. Ambiguous commands are refused, rather
+/// than checking one path and letting the shell build another. Backslashes are literal only on Windows.
+fn guard_run_manifest(dir: &Path, command: &str) -> Result<(), String> {
+    if !command.contains("--manifest-path") {
+        return Ok(());
+    }
+    let refuse = || {
+        "refusing run: cannot attribute --manifest-path to the job checkout; use a literal cargo command naming this checkout's Cargo.toml, or build through the matching Broadsword project/task".to_string()
+    };
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for c in command.chars() {
+        if c.is_control()
+            || "&|;<>$`%!^()*?[]{}~#".contains(c)
+            || (!cfg!(windows) && c == '\\')
+            || (cfg!(windows) && c == '\'')
+        {
+            return Err(refuse());
+        }
+        if Some(c) == quote {
+            quote = None;
+        } else if quote.is_none() && (c == '"' || c == '\'') {
+            quote = Some(c);
+        } else if quote.is_none() && c.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if quote.is_some() {
+        return Err(refuse());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    if !matches!(words.first().map(String::as_str), Some("cargo" | "cargo.exe")) {
+        return Err(refuse());
+    }
+    let mut manifest = None;
+    let mut args = words.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if arg == "--manifest-path" {
+            Some(args.next().ok_or_else(refuse)?.as_str())
+        } else {
+            arg.strip_prefix("--manifest-path=")
+        };
+        if let Some(value) = value {
+            if value.is_empty() || value.starts_with('-') || manifest.replace(value).is_some() {
+                return Err(refuse());
+            }
+        } else if arg.contains("--manifest-path") {
+            return Err(refuse());
+        }
+    }
+    let manifest = manifest.ok_or_else(refuse)?;
+    let path = Path::new(manifest);
+    if !path.is_absolute()
+        && path
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(refuse());
+    }
+    let requested = dir.join(manifest).canonicalize().map_err(|e| {
+        format!("refusing run: cannot resolve --manifest-path {manifest:?}: {e}")
+    })?;
+    let own = dir
+        .join("Cargo.toml")
+        .canonicalize()
+        .map_err(|e| format!("refusing run: cannot resolve the job's Cargo.toml: {e}"))?;
+    if requested != own {
+        return Err(format!(
+            "refusing run: --manifest-path names {}, not this job checkout's manifest {}; nothing was built or noted as main",
+            requested.display(),
+            own.display()
+        ));
+    }
+    Ok(())
 }
 
 /// The preparation a `run` job makes before its command (the command may be `cargo test`, which would otherwise test the
@@ -993,10 +1130,23 @@ pub fn prepare(cfg: &Config, dir: &Path, source: &str) -> Result<Prepared, Strin
 /// may vouch for the result (`install` refuses). Same folder: no clean, so `run -- cargo build` followed by `run -- <the
 /// built exe>` keeps the exe. `run` runs arbitrary commands, so a folder whose packages cannot be listed (a broken
 /// Cargo.toml the command may be there to diagnose) is NOT refused: the line says protection was skipped. A `cargo clean`
-/// that fails (a locked binary) refuses the job, as it does for build, test and check. The caller holds the lock.
-pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<String>, String> {
-    match bins_of(cfg, dir) {
-        Ok(packages) => Ok(prepare_packages(cfg, dir, source, packages, true)?.lines),
+/// that fails (a locked binary) refuses the job, as it does for build, test and check. An explicit foreign or ambiguous
+/// `--manifest-path` refuses the command before any notes change. Every accepted run invalidates the install binary's note,
+/// even when this folder has no package named `broadsword`: a shell command or script may overwrite that shared exe.
+/// The caller holds the lock.
+pub fn prepare_for_run(
+    cfg: &Config,
+    dir: &Path,
+    source: &str,
+    command: &str,
+) -> Result<Vec<String>, String> {
+    guard_run_manifest(dir, command)?;
+    let mut lines = match targets_with_manifests(cfg, dir) {
+        Ok((packages, manifests)) => {
+            let mut lines = prepare_packages(cfg, dir, source, packages, true)?.lines;
+            lines.extend(manifests);
+            lines
+        }
         Err(e) => {
             // The packages cannot be listed (a broken Cargo.toml the command may be there to repair), but whatever the command
             // builds must still never be installable: note every package name still findable, else mark the whole folder.
@@ -1017,9 +1167,16 @@ pub fn prepare_for_run(cfg: &Config, dir: &Path, source: &str) -> Result<Vec<Str
                 (false, true) => format!("noted `{wanted}` for {}", names.join(", ")),
                 (false, false) => format!("noted `{wanted}` for {}, and the folder is marked because a workspace member could not be read", names.join(", ")),
             };
-            Ok(vec![format!("build source: not checked (the stale-binary protection is skipped for this run; {how}): {e}")])
+            vec![format!("build source: not checked (the stale-binary protection is skipped for this run; {how}): {e}")]
         }
-    }
+    };
+    // Last, after preservation/cleaning, but before the caller can spawn the command. This is keyed by the shared exe,
+    // not by the package the user selected. A later main build must clean it even if Cargo would call its fingerprint fresh.
+    write_bin_note(cfg, env!("CARGO_PKG_NAME"), &format!("{RUN_NOTE_PREFIX}{source}"))?;
+    lines.push(
+        "build source: install provenance invalidated; an arbitrary run may build packages outside its job checkout".into(),
+    );
+    Ok(lines)
 }
 
 /// Directory (inside the notes folder) of the folder markers a `run` leaves when its packages could not be listed: ONE file
@@ -1349,6 +1506,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn explicit_run_manifest_must_be_the_job_manifest() {
+        let d = tmp("run-manifest");
+        std::fs::write(d.join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir_all(d.join("copy with spaces")).unwrap();
+        std::fs::write(d.join("copy with spaces/Cargo.toml"), "").unwrap();
+        for command in [
+            "cargo build --manifest-path Cargo.toml",
+            "cargo build --manifest-path=\"./Cargo.toml\"",
+            "cargo build \"--manifest-path\" \"Cargo.toml\"",
+        ] {
+            assert!(guard_run_manifest(&d, command).is_ok(), "{command}");
+        }
+        for command in [
+            "cargo build --manifest-path \"copy with spaces/Cargo.toml\"",
+            "cargo build --manifest-path=copy/Cargo.toml",
+            "cargo build --manifest-path",
+            "cargo build --manifest-path=",
+            "cargo build --manifest-path \"\"",
+            "cargo build --manifest-path Cargo.toml --manifest-path Cargo.toml",
+            "cargo build --manifest-path Cargo.toml && cargo build",
+            "cd copy && cargo build --manifest-path Cargo.toml",
+            "cargo build --manifest-path \"$MANIFEST\"",
+            "cargo build --manifest-path \"%MANIFEST%\"",
+            "cargo build --manifest-path Cargo.toml *",
+            "cargo build --manifest-path Cargo.toml\r",
+            "cargo build --manifest-path Cargo.toml\n",
+            "cargo build --manifest-path Cargo.toml\0",
+            "cargo build --manifest-path \"Cargo.toml",
+            "script --manifest-path Cargo.toml",
+        ] {
+            let error = guard_run_manifest(&d, command).unwrap_err();
+            assert!(
+                error.contains("refusing run") && error.contains("manifest"),
+                "{command:?}: {error}"
+            );
+        }
+        let absolute = d.join("copy with spaces/Cargo.toml").canonicalize().unwrap();
+        assert!(guard_run_manifest(
+            &d,
+            &format!("cargo build --manifest-path \"{}\"", absolute.display())
+        )
+        .is_err());
+        if cfg!(windows) {
+            assert!(guard_run_manifest(&d, r"cargo build --manifest-path .\Cargo.toml").is_ok());
+            assert!(
+                guard_run_manifest(&d, r"cargo build --manifest-path copy\Cargo.toml").is_err()
+            );
+            assert!(guard_run_manifest(&d, r"cargo build --manifest-path C:Cargo.toml").is_err());
+            assert!(guard_run_manifest(&d, r"cargo build --manifest-path \Cargo.toml").is_err());
+        }
+        let huge = format!(
+            "cargo build {} --manifest-path Cargo.toml --manifest-path Cargo.toml",
+            "x".repeat(1024 * 1024)
+        );
+        assert!(
+            guard_run_manifest(&d, &huge).is_err(),
+            "large commands must not bypass duplicate detection"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// With the shared-exe invalidation removed, this succeeds in preparing the unrelated library but check_installable
+    /// incorrectly returns Ok: both Broadsword notes still say main. No command needs to run to exercise the guard.
+    #[test]
+    fn every_run_invalidates_install_at_the_preparation_entry_point() {
+        let d = tmp("run-install-entry");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(
+            d.join("Cargo.toml"),
+            "[package]\nname = \"unrelated\"\nversion = \"0.0.0\"\n[workspace]\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(d.join("member/src")).unwrap();
+        std::fs::write(
+            d.join("member/Cargo.toml"),
+            "[package]\nname = \"unrelated-helper\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("member/src/lib.rs"), "").unwrap();
+        let cfg = cfg_at(&d);
+        let pkg = env!("CARGO_PKG_NAME");
+        write_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        write_bin_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        write_note(&cfg, "unrelated", MAIN_SOURCE).unwrap();
+        write_note(&cfg, "unrelated-helper", MAIN_SOURCE).unwrap();
+        assert!(check_installable(&cfg).is_ok());
+        let lines = prepare_for_run(&cfg, &d, MAIN_SOURCE, "some-script").unwrap();
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("build manifest:")
+                    && l.contains("Cargo.toml")
+                    && l.contains("package: unrelated")
+            }),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("build manifest:") && l.contains("package: unrelated-helper")),
+            "every workspace package has a manifest record: {lines:?}"
+        );
+        assert_eq!(read_note(&cfg, pkg).as_deref(), Some(MAIN_SOURCE));
+        assert_eq!(read_bin_note(&cfg, pkg).as_deref(), Some("run:."));
+        assert!(check_installable(&cfg).unwrap_err().contains("binary target"));
+        // A failure writing the invalidation must fail setup, not let the caller start its command.
+        std::fs::remove_file(notes_dir(&cfg).join(bin_note_file(pkg))).unwrap();
+        std::fs::create_dir(notes_dir(&cfg).join(bin_note_file(pkg))).unwrap();
+        let error = prepare_for_run(&cfg, &d, MAIN_SOURCE, "some-script").unwrap_err();
+        assert!(error.contains("cannot write the build-source note"), "{error}");
+        assert!(!notes_dir(&cfg).join(format!("bin.{pkg}.tmp")).exists());
+        assert!(check_installable(&cfg).is_err());
+        // The metadata-failure fallback must invalidate the same shared exe too.
+        std::fs::remove_dir(notes_dir(&cfg).join(bin_note_file(pkg))).unwrap();
+        write_bin_note(&cfg, pkg, MAIN_SOURCE).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "not a manifest").unwrap();
+        let lines = prepare_for_run(&cfg, &d, MAIN_SOURCE, "repair-script").unwrap();
+        assert!(lines.iter().any(|l| l.contains("not checked")), "{lines:?}");
+        assert_eq!(read_bin_note(&cfg, pkg).as_deref(), Some("run:."));
+        assert!(check_installable(&cfg).is_err());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
