@@ -311,7 +311,7 @@ fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<String, Str
     Ok(job_id)
 }
 
-/// The command line of a fast subset: one build, then the unit tests (`units`: the `--lib` / `--bins` flags `unit_test_flags` found)
+/// The command line of a fast subset: one build, then the unit tests (`units`: the `--lib` / `--bins` flags `targets_of` found)
 /// and each listed test binary.
 fn fast_command(units: &[&str], tests: &[String]) -> String {
     let mut c = "cargo build --offline && cargo test --offline".to_string();
@@ -324,16 +324,22 @@ fn fast_command(units: &[&str], tests: &[String]) -> String {
     c
 }
 
-/// The unit-test flags of the packages `cargo test` in `dir` tests, from `cargo metadata`: `--lib` when a SELECTED package has a
-/// library target, `--bins` when one has a binary target (cargo refuses `--lib` when no selected package has a library: the
-/// Broadsword crate has only binaries). The selected packages are the workspace's default members (`workspace_default_members`:
-/// the root package when the root is one, else `default-members` or every member), never a member cargo does not test.
-fn unit_test_flags(cfg: &Config, dir: &Path) -> Result<Vec<&'static str>, String> {
-    unit_flags_of(&crate::buildsrc::metadata_json(cfg, dir)?)
+/// What cargo will test in a folder, from its `cargo metadata`: the unit-test flags and the test target names of the SELECTED
+/// packages, the workspace's default members (`workspace_default_members`: the root package when the root is one, else
+/// `default-members` or every member), never a member cargo does not test.
+#[derive(Debug, PartialEq, Eq)]
+struct Targets {
+    /// `--lib` when a selected package has a library target, `--bins` when one has a binary target (cargo refuses `--lib` when no
+    /// selected package has a library: the Broadsword crate has only binaries).
+    units: Vec<&'static str>,
+    /// The names of the selected packages' targets of kind `test` (`tests/*.rs` found by cargo, and `[[test]]` targets by their
+    /// `name`): THE ONE SOURCE of valid `merge_fast_tests` names. A file cargo does not build (`autotests = false`, or a path a
+    /// renamed `[[test]]` uses) is never one.
+    tests: Vec<String>,
 }
 
-/// `unit_test_flags` on a `cargo metadata` output. A missing or empty default-member list is an error (the caller runs the full check).
-fn unit_flags_of(metadata: &str) -> Result<Vec<&'static str>, String> {
+/// `Targets` of a `cargo metadata` output. Anything missing or malformed is an error (the caller then runs the full check).
+fn targets_of(metadata: &str) -> Result<Targets, String> {
     use crate::json::J;
     let j = crate::json::parse(metadata).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
     let Some(J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output: `packages` is not a list".into()) };
@@ -342,51 +348,75 @@ fn unit_flags_of(metadata: &str) -> Result<Vec<&'static str>, String> {
     if selected.is_empty() {
         return Err("cargo metadata output: `workspace_default_members` names no package".into());
     }
-    let (mut lib, mut bin) = (false, false);
+    let (mut lib, mut bin, mut tests) = (false, false, Vec::new());
     for p in pkgs.iter().filter(|p| p.get("id").and_then(J::str).is_some_and(|id| selected.contains(&id))) {
-        let Some(crate::json::J::Arr(targets)) = p.get("targets") else { return Err("cargo metadata output: a package has no `targets` list".into()) };
+        let Some(J::Arr(targets)) = p.get("targets") else { return Err("cargo metadata output: a package has no `targets` list".into()) };
         for t in targets {
-            let Some(crate::json::J::Arr(kinds)) = t.get("kind") else { return Err("cargo metadata output: a target has no `kind` list".into()) };
-            for k in kinds.iter().filter_map(crate::json::J::str) {
+            let Some(J::Arr(kinds)) = t.get("kind") else { return Err("cargo metadata output: a target has no `kind` list".into()) };
+            for k in kinds.iter().filter_map(J::str) {
                 lib |= matches!(k, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro");
                 bin |= k == "bin";
+                if k == "test" {
+                    let Some(name) = t.get("name").and_then(J::str) else { return Err("cargo metadata output: a test target has no `name`".into()) };
+                    tests.push(name.to_string());
+                }
             }
         }
     }
-    Ok([(lib, "--lib"), (bin, "--bins")].into_iter().filter(|(on, _)| *on).map(|(_, f)| f).collect())
+    Ok(Targets { units: [(lib, "--lib"), (bin, "--bins")].into_iter().filter(|(on, _)| *on).map(|(_, f)| f).collect(), tests })
+}
+
+/// What the pre-merge check of a listed project runs (`fast_plan`).
+#[derive(Debug, PartialEq, Eq)]
+enum FastPlan {
+    /// Every listed name is a test target cargo metadata lists: run this subset command.
+    Subset(String),
+    /// The names could not be verified (cargo metadata could not run or be read): the FULL check runs, for this reason.
+    Unverifiable(String),
+    /// A listed name is not a test target cargo metadata lists: the check is refused (fails), for this reason.
+    Refused(String),
+}
+
+/// THE ONE CHECK of a project's `merge_fast_tests` names, against `metadata` (the `cargo metadata` output of the commit being
+/// checked, or the error that kept it from running).
+fn fast_plan(project: &str, tests: &[String], metadata: Result<String, String>) -> FastPlan {
+    let t = match metadata.and_then(|m| targets_of(&m)) {
+        Ok(t) => t,
+        Err(m) => return FastPlan::Unverifiable(m),
+    };
+    if let Some(bad) = tests.iter().find(|n| !t.tests.contains(n)) {
+        return FastPlan::Refused(format!("merge_fast_tests: `{bad}` (project {project}) is not a test target cargo metadata lists for the packages cargo tests; its test targets are [{}]", t.tests.join(" ")));
+    }
+    FastPlan::Subset(fast_command(&t.units, tests))
 }
 
 /// THE ONE PRE-MERGE CHECK of an entry's commit in task `task_id`'s worktree (the single entry's own check, and every merge-train
-/// check: tip, bisect and alone). A project listed in `merge_fast_tests` gets the fast subset, ONE `run` job of `fast_command`
-/// through the same job machinery as `check` (disk guard, build lock, log, scrubbed environment, redaction); any other project gets
-/// the full `check`, exactly as before. Returns the job's exit code, normalised so a subset whose command ran and failed is 1 like a
-/// failed check (a refusal or a disk kill keeps its own code: no verdict), and the line that says which check ran. That line ends
-/// the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the reviewer can read a subset as the full suite. The main
-/// check after a merge never comes through here: it is always the full `check` (`s_main_check`).
+/// check: tip, bisect and alone). A project listed in `merge_fast_tests` gets the fast subset when `fast_plan` verifies its names:
+/// ONE `run` job of `fast_command` through the same job machinery as `check` (disk guard, build lock, log, scrubbed environment,
+/// redaction). Names that cannot be verified give the full `check`; a name cargo does not know refuses the check (exit 1, no job).
+/// Any other project gets the full `check`, exactly as before. Returns the exit code, normalised so a subset whose command ran and
+/// failed is 1 like a failed check (a refusal or a disk kill keeps its own code: no verdict), and the line that says which check
+/// ran. That line ends the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the
+/// reviewer can read a subset as the full suite. The main check after a merge never comes through here: it is always the full
+/// `check` (`s_main_check`).
 fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInfo) -> (u8, String) {
-    use crate::config::PreMergeTests;
-    match cfg.merge_fast_subset(project) {
-        PreMergeTests::Full => {
-            let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
-            (code, "check: full".to_string())
-        }
-        PreMergeTests::FullUnverified(why) => {
-            // listed, but its names could not be verified at config load: never an unverified subset, the FULL check runs
+    let full = |info: &mut JobInfo| job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+    let Some(tests) = cfg.merge_fast_subset(project) else {
+        return (full(info), "check: full".to_string());
+    };
+    let metadata = job::job_folder(cfg, project, Some(task_id)).map_err(|(_, m)| m).and_then(|d| crate::buildsrc::metadata_json(cfg, &d));
+    match fast_plan(project, tests, metadata) {
+        FastPlan::Unverifiable(why) => {
             println!("fast subset off for {project}: test names could not be verified ({why}); the FULL check runs instead");
-            let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
-            (code, format!("check: full (fast subset off: test names could not be verified: {why})"))
+            (full(info), format!("check: full (fast subset off: test names could not be verified: {why})"))
         }
-        PreMergeTests::Subset(tests) => {
-            // the unit-test flags come from the worktree's own packages; when they cannot be read the FULL check runs (stricter)
-            let units = match job::job_folder(cfg, project, Some(task_id)).map_err(|(_, m)| m).and_then(|d| unit_test_flags(cfg, &d)) {
-                Ok(u) => u,
-                Err(m) => {
-                    println!("fast subset check of {project}: its unit-test targets could not be read ({m}); the FULL check runs instead");
-                    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
-                    return (code, format!("check: full (merge_fast_tests lists {project}, but its unit-test targets could not be read: {m})"));
-                }
-            };
-            let command = fast_command(&units, tests);
+        FastPlan::Refused(why) => {
+            println!("fast subset check of {project} --task {task_id} REFUSED: {why}");
+            // the reason is the check's summary, so the entry ends check_failed saying why (an empty summary would read as no verdict)
+            info.summary = vec![format!("check: REFUSED before any job ran: {why}")];
+            (1, format!("check: REFUSED ({why}); nothing ran. Fix merge_fast_tests in broadsword.toml"))
+        }
+        FastPlan::Subset(command) => {
             println!("fast subset check of {project} --task {task_id} (merge_fast_tests): {command}; the full check runs on main after the merge");
             let code = job::run_job_info(cfg, JobSpec { kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
             let failed = code != 0 && info.summary.first().is_some_and(|l| l.starts_with("run: FAILED"));
@@ -3602,20 +3632,32 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_subset_names_the_self_project_like_job_and_builds_its_command() {
-        assert_eq!(crate::config::MERGE_FAST_SELF_PROJECT, job::SELF_PROJECT);
+    fn the_fast_subset_builds_its_command() {
         assert_eq!(fast_command(&["--bins"], &["queue".into(), "wtgit".into()]), "cargo build --offline && cargo test --offline --bins --test queue --test wtgit");
         assert_eq!(fast_command(&["--lib", "--bins"], &["t".into()]), "cargo build --offline && cargo test --offline --lib --bins --test t");
     }
 
     #[test]
-    fn unit_flags_count_only_the_default_members() {
-        let pkg = |id: &str, kind: &str| format!("{{\"id\":\"{id}\",\"targets\":[{{\"kind\":[\"{kind}\"]}}]}}");
-        let meta = |defaults: &str| format!("{{\"packages\":[{},{}],\"workspace_default_members\":{defaults}}}", pkg("root", "bin"), pkg("inner", "lib"));
-        assert_eq!(unit_flags_of(&meta("[\"root\"]")).unwrap(), ["--bins"]);
-        assert_eq!(unit_flags_of(&meta("[\"root\",\"inner\"]")).unwrap(), ["--lib", "--bins"]);
-        assert!(unit_flags_of(&meta("[]")).is_err());
-        assert!(unit_flags_of(&format!("{{\"packages\":[{}]}}", pkg("root", "bin"))).is_err());
+    fn targets_count_only_the_default_members() {
+        let pkg = |id: &str, kind: &str, name: &str| format!("{{\"id\":\"{id}\",\"targets\":[{{\"kind\":[\"{kind}\"],\"name\":\"{name}\"}}]}}");
+        let meta = |defaults: &str| format!("{{\"packages\":[{},{},{}],\"workspace_default_members\":{defaults}}}", pkg("root", "bin", "root"), pkg("inner", "lib", "inner"), pkg("t", "test", "foo"));
+        let units = |d: &str| targets_of(&meta(d)).unwrap().units;
+        assert_eq!(units("[\"root\"]"), ["--bins"]);
+        assert_eq!(units("[\"root\",\"inner\"]"), ["--lib", "--bins"]);
+        assert_eq!(targets_of(&meta("[\"root\"]")).unwrap().tests, Vec::<String>::new());
+        assert_eq!(targets_of(&meta("[\"root\",\"t\"]")).unwrap().tests, ["foo"]);
+        assert!(targets_of(&meta("[]")).is_err());
+        assert!(targets_of(&format!("{{\"packages\":[{}]}}", pkg("root", "bin", "root"))).is_err());
+        assert!(targets_of("{\"packages\":[{\"id\":\"a\",\"targets\":[{\"kind\":[\"test\"]}]}],\"workspace_default_members\":[\"a\"]}").is_err(), "a test target with no name");
+    }
+
+    #[test]
+    fn fast_plan_checks_the_names_against_the_metadata_only() {
+        let meta = "{\"packages\":[{\"id\":\"p\",\"targets\":[{\"kind\":[\"lib\"],\"name\":\"p\"},{\"kind\":[\"test\"],\"name\":\"foo\"}]}],\"workspace_default_members\":[\"p\"]}";
+        assert_eq!(fast_plan("p", &["foo".into()], Ok(meta.into())), FastPlan::Subset("cargo build --offline && cargo test --offline --lib --test foo".into()));
+        assert!(matches!(fast_plan("p", &["foo".into(), "bar".into()], Ok(meta.into())), FastPlan::Refused(m) if m.contains("`bar` (project p) is not a test target") && m.contains("[foo]")));
+        assert!(matches!(fast_plan("p", &["foo".into()], Err("cargo metadata failed".into())), FastPlan::Unverifiable(m) if m == "cargo metadata failed"));
+        assert!(matches!(fast_plan("p", &["foo".into()], Ok("not json".into())), FastPlan::Unverifiable(_)));
     }
 
     #[test]

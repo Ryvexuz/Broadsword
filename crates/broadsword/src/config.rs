@@ -140,8 +140,9 @@ pub struct Config {
     /// The merge queue's PRE-merge check for the projects named here is a fast safety subset, ONE `run` job: `cargo build --offline &&
     /// cargo test --offline [--lib] [--bins] --test <name> ...` (queue.rs `pre_merge_check`); the main check after the merge stays the full
     /// `check`. Parsed from the required key `merge_fast_tests` by `parse_merge_fast_tests` and checked by `check_merge_fast_tests`;
-    /// read it only through `merge_fast_subset` (a project not named, or not verified, runs the full check).
-    pub merge_fast_tests: Vec<FastSubset>,
+    /// read it through `merge_fast_subset` (a project not named runs the full check). Its names are checked against cargo metadata
+    /// at each pre-merge check (queue.rs `fast_plan`), never trusted from here.
+    pub merge_fast_tests: Vec<(String, Vec<String>)>,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -213,9 +214,6 @@ pub fn parse_python_tests(v: &str) -> Result<Vec<(String, Vec<String>)>, String>
     Ok(out)
 }
 
-/// The project name `broadsword` itself (the Broadsword repo at `root`); equal to `job::SELF_PROJECT` (a test in queue.rs checks
-/// it). Kept here because config.rs is also compiled on its own (tests/wtgit.rs), without job.rs.
-pub const MERGE_FAST_SELF_PROJECT: &str = "broadsword";
 
 /// Parse the `merge_fast_tests` setting: `"<project>: <test> <test> ...; <project>: ..."`, or `""` when every project runs the full
 /// check before a merge. Each `<test>` is the name of a cargo test binary (`tests/<name>.rs`): letters, digits, `_` and `-`, not
@@ -246,93 +244,14 @@ pub fn parse_merge_fast_tests(v: &str) -> Result<Vec<(String, Vec<String>)>, Str
     Ok(out)
 }
 
-/// The cargo test binaries of the project in `dir`: `tests/<name>.rs` and `tests/<name>/main.rs`, at the top and in each workspace
-/// member under `crates/*/`.
-fn test_binaries(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut at = |d: &Path| {
-        for e in std::fs::read_dir(d.join("tests")).into_iter().flat_map(|rd| rd.flatten()) {
-            let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
-            if path.is_file() {
-                if let Some(stem) = name.strip_suffix(".rs") {
-                    out.push(stem.to_string());
-                }
-            } else if path.join("main.rs").is_file() {
-                out.push(name);
-            }
-        }
-    };
-    at(dir);
-    for e in std::fs::read_dir(dir.join("crates")).into_iter().flat_map(|rd| rd.flatten()) {
-        at(&e.path());
-    }
-    out
-}
-
-/// Whether a `merge_fast_tests` entry's names were checked against the project on disk at config load (`check_merge_fast_tests`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FastStatus {
-    /// Every listed name is a test binary of the project: the subset may run before a merge.
-    Verified,
-    /// The names could not be checked (the reason says why: no Cargo.toml, no discoverable test binary). The subset is OFF for this
-    /// project: its pre-merge check is the FULL check, and the reason is printed and recorded (fail closed: never an unverified subset).
-    Unverifiable(String),
-}
-
-/// One project of `merge_fast_tests`: its test binaries and whether they were verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FastSubset {
-    pub project: String,
-    pub tests: Vec<String>,
-    pub status: FastStatus,
-}
-
-/// What the merge queue's pre-merge check of `project` runs (`Config::merge_fast_subset`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum PreMergeTests<'a> {
-    /// Not listed in `merge_fast_tests`: the full check, as before.
-    Full,
-    /// Listed and verified: the fast subset of these test binaries.
-    Subset(&'a [String]),
-    /// Listed but its names could not be verified at load: the full check, for this reason.
-    FullUnverified(&'a str),
-}
-
-/// THE ONE CHECK of `merge_fast_tests` against the projects on disk, run at every config load: a subset is only safe with
-/// queue_auto_revert on (a broken merge is reverted after the full main check), a non-self project needs a folder in
-/// `projects_dir`, and where the names CAN be checked (a `Cargo.toml` and at least one discoverable test binary) an unknown name
-/// refuses the load. Where they CANNOT be checked (no `Cargo.toml`, as in a unit test's bare folder holding a copy of
-/// broadsword.toml; or no discoverable test binary) the entry is `Unverifiable` and the queue runs the full check for it.
-fn check_merge_fast_tests(list: Vec<(String, Vec<String>)>, auto_revert: bool, root: &Path, projects_dir: &Path) -> Result<Vec<FastSubset>, String> {
-    if list.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !auto_revert {
+/// `merge_fast_tests` checked at config load: a subset is only safe with queue_auto_revert on (a broken merge is reverted after the
+/// full main check). The NAMES are not checked here: config load runs no cargo. They are checked against cargo metadata of the very
+/// commit being checked, at every pre-merge check (queue.rs `fast_plan`): the one source of valid test target names.
+fn check_merge_fast_tests(list: Vec<(String, Vec<String>)>, auto_revert: bool) -> Result<Vec<(String, Vec<String>)>, String> {
+    if !list.is_empty() && !auto_revert {
         return Err("merge_fast_tests needs queue_auto_revert = on: a fast subset before the merge is only safe when a merge whose full main check fails is reverted".into());
     }
-    let mut out = Vec::new();
-    for (project, tests) in list {
-        let dir = if project.eq_ignore_ascii_case(MERGE_FAST_SELF_PROJECT) {
-            root.to_path_buf()
-        } else {
-            let found = std::fs::read_dir(projects_dir).into_iter().flat_map(|rd| rd.flatten()).map(|e| e.path()).find(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&project)));
-            found.ok_or_else(|| format!("merge_fast_tests: project `{project}` is unknown (no folder of that name in {})", projects_dir.display()))?
-        };
-        let status = if !dir.join("Cargo.toml").is_file() {
-            FastStatus::Unverifiable(format!("{} has no Cargo.toml", dir.display()))
-        } else {
-            let have = test_binaries(&dir);
-            if have.is_empty() {
-                FastStatus::Unverifiable(format!("no test binary (tests/<name>.rs) found in {} or its crates/*/", dir.display()))
-            } else if let Some(t) = tests.iter().find(|t| !have.contains(t)) {
-                return Err(format!("merge_fast_tests: `{t}` (project `{project}`) is not a test binary: no tests/{t}.rs in {} or its crates/*/", dir.display()));
-            } else {
-                FastStatus::Verified
-            }
-        };
-        out.push(FastSubset { project, tests, status });
-    }
-    Ok(out)
+    Ok(list)
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -471,7 +390,7 @@ impl Config {
         }
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
         let projects_dir = root.join(inside_root(&m, "projects_dir", true)?);
-        let merge_fast_tests = check_merge_fast_tests(parse_merge_fast_tests(&get_str(&m, "merge_fast_tests")?)?, queue_auto_revert, &root, &projects_dir)?;
+        let merge_fast_tests = check_merge_fast_tests(parse_merge_fast_tests(&get_str(&m, "merge_fast_tests")?)?, queue_auto_revert)?;
         Ok(Config {
             merge_fast_tests,
             python_tests,
@@ -534,14 +453,10 @@ impl Config {
         })
     }
 
-    /// THE ONE place the queue reads `merge_fast_tests`: only a `Verified` entry gives a subset; an unverified one gives the full
-    /// check with its reason.
-    pub fn merge_fast_subset(&self, project: &str) -> PreMergeTests<'_> {
-        match self.merge_fast_tests.iter().find(|s| s.project.eq_ignore_ascii_case(project)) {
-            None => PreMergeTests::Full,
-            Some(FastSubset { tests, status: FastStatus::Verified, .. }) => PreMergeTests::Subset(tests),
-            Some(FastSubset { status: FastStatus::Unverifiable(why), .. }) => PreMergeTests::FullUnverified(why),
-        }
+    /// THE ONE place the queue reads `merge_fast_tests`: the test names listed for `project` (any case), or None (the full check).
+    /// The names are unverified here; queue.rs `fast_plan` checks them against cargo metadata before any subset runs.
+    pub fn merge_fast_subset(&self, project: &str) -> Option<&[String]> {
+        self.merge_fast_tests.iter().find(|(p, _)| p.eq_ignore_ascii_case(project)).map(|(_, t)| t.as_slice())
     }
 
     pub fn load_from(config_dir: &Path) -> Result<Config, String> {
@@ -895,18 +810,16 @@ install_dir=\"build/bin\"\n";
         for bad in ["broadsword", "broadsword:", "a: x; A: y", "a: --lib", "a: ../x", "a: x.rs", "a b: x"] {
             assert!(parse_merge_fast_tests(bad).is_err(), "{bad}");
         }
-        // the shipped value names test binaries that exist in this repo, and needs auto-revert on
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let shipped = Config::from_text(text, &root).unwrap();
-        assert!(matches!(shipped.merge_fast_subset(MERGE_FAST_SELF_PROJECT), PreMergeTests::Subset(t) if !t.is_empty()), "{:?}", shipped.merge_fast_tests);
-        assert_eq!(shipped.merge_fast_subset("not-listed"), PreMergeTests::Full);
-        // a bare folder with no Cargo.toml: the names cannot be checked, so the load succeeds and the subset is OFF (full check)
-        let bare = Config::from_text(text, Path::new("p")).unwrap();
-        assert!(matches!(bare.merge_fast_subset(MERGE_FAST_SELF_PROJECT), PreMergeTests::FullUnverified(why) if why.contains("no Cargo.toml")), "{:?}", bare.merge_fast_tests);
+        // the shipped value lists the self project with test files of this crate (the queue checks the names against cargo metadata
+        // at every pre-merge check; this only keeps the shipped value from naming a file that is gone), and needs auto-revert on
+        let shipped = Config::from_text(text, Path::new("p")).unwrap();
+        let names = shipped.merge_fast_subset("broadsword").expect("the shipped value lists broadsword");
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        assert!(!names.is_empty() && names.iter().all(|n| tests_dir.join(format!("{n}.rs")).is_file()), "{names:?}");
+        assert_eq!(shipped.merge_fast_subset("not-listed"), None);
+        assert_eq!(shipped.merge_fast_subset("BroadSword"), Some(names));
         let off = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "queue_auto_revert") { "queue_auto_revert = \"off\"" } else { l }).collect::<Vec<_>>().join("\n");
-        assert!(Config::from_text(&off, &root).unwrap_err().contains("merge_fast_tests needs queue_auto_revert = on"));
-        let unknown = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "merge_fast_tests") { "merge_fast_tests = \"broadsword: queue nosuch_binary\"".to_string() } else { l.to_string() }).collect::<Vec<_>>().join("\n");
-        assert!(Config::from_text(&unknown, &root).unwrap_err().contains("`nosuch_binary`"));
+        assert!(Config::from_text(&off, Path::new("p")).unwrap_err().contains("merge_fast_tests needs queue_auto_revert = on"));
     }
 
     #[test]

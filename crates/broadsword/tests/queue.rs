@@ -1473,38 +1473,82 @@ fn fast_subset_an_unlisted_project_runs_the_full_check_before_the_merge() {
 }
 
 #[test]
-fn fast_subset_config_refuses_an_unknown_test_binary_and_auto_revert_off() {
+fn fast_subset_config_refuses_auto_revert_off() {
     let r = fast_root("fastcfg");
-    train_set(&r, "merge_fast_tests", "\"p: fast nosuch\"");
-    let o = r.run(&["queue", "list"]);
-    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
-    assert!(o.stderr.contains("merge_fast_tests") && o.stderr.contains("`nosuch`") && o.stderr.contains("not a test binary"), "{}", o.stderr);
     train_set(&r, "merge_fast_tests", "\"p: fast\"");
-    assert_eq!(r.run(&["queue", "list"]).code, 0, "a known name loads");
+    assert_eq!(r.run(&["queue", "list"]).code, 0, "a listed project with auto-revert on loads");
     train_set(&r, "queue_auto_revert", "\"off\"");
     let o = r.run(&["queue", "list"]);
     assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert!(o.stderr.contains("merge_fast_tests needs queue_auto_revert = on"), "{}", o.stderr);
 }
 
-#[test]
-fn fast_subset_unverifiable_names_load_but_the_full_check_runs_with_the_reason() {
-    // p has a Cargo.toml but no tests/ folder: its names cannot be checked, so the config loads, the subset is OFF for p, and the
-    // pre-merge check is the FULL check, saying why (design changed by the orchestrator in round 3: never an unverified subset)
-    let r = revert_root("fastnotests");
-    assert!(r.p().join("Cargo.toml").is_file() && !r.p().join("tests").exists());
-    train_set(&r, "merge_fast_tests", "\"p: nosuch other\"");
-    assert_eq!(r.run(&["queue", "list"]).code, 0, "unverifiable names load");
+/// Queue one notes-only task of `p` with `merge_fast_tests = "p: <names>"` and run it; returns the entry, the run and main before it.
+fn fast_entry(r: &Root, names: &str) -> (String, Out, String) {
+    train_set(r, "merge_fast_tests", &format!("\"p: {names}\""));
     let id = r.started("NOTES.txt");
     r.commit(&r.wt(&id), "NOTES.txt", "notes\n", "task: notes");
     let e = r.add(&id, "low", "sonnet");
+    let before = r.head();
     let o = r.run(&["queue", "run"]);
+    (e, o, before)
+}
+
+/// The pre-merge check of entry `e` was REFUSED because `name` is not a test target cargo metadata lists: nothing ran, nothing
+/// merged, no model was asked.
+fn assert_refused(r: &Root, e: &str, o: &Out, before: &str, name: &str) {
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(e), "check_failed", "{}", r.show(e));
+    let show = r.show(e);
+    assert!(show.contains(&format!("check: REFUSED (merge_fast_tests: `{name}` (project p) is not a test target")), "{show}");
+    assert!(!o.stdout.contains("job: run p "), "no subset job ran: {}", o.stdout);
+    assert_eq!(r.head(), before);
+    assert_eq!(r.calls(), 0);
+}
+
+#[test]
+fn fast_subset_an_unknown_name_refuses_the_pre_merge_check() {
+    let r = fast_root("fastunknown");
+    let (e, o, before) = fast_entry(&r, "fast nosuch");
+    assert_refused(&r, &e, &o, &before, "nosuch");
+}
+
+#[test]
+fn fast_subset_names_come_from_cargo_metadata_not_file_names_autotests_off() {
+    // autotests = false: tests/stale.rs is a stray file, not a test target, so `stale` is refused
+    let r = revert_root("faststale");
+    let p = r.p();
+    fs::write(p.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\nautotests = false\n\n[workspace]\n").unwrap();
+    fs::create_dir_all(p.join("tests")).unwrap();
+    fs::write(p.join("tests/stale.rs"), "#[test]\nfn stale() {}\n").unwrap();
+    git(&p, &["add", "."]);
+    git(&p, &["commit", "-q", "-m", "main: autotests off with a stray tests/stale.rs"]);
+    let (e, o, before) = fast_entry(&r, "stale");
+    assert_refused(&r, &e, &o, &before, "stale");
+}
+
+/// p with one renamed test target: `[[test]] name = "foo"`, path tests/bar.rs.
+fn renamed_root(name: &str) -> Root {
+    let r = revert_root(name);
+    let p = r.p();
+    fs::write(p.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"foo\"\npath = \"tests/bar.rs\"\n\n[workspace]\n").unwrap();
+    fs::create_dir_all(p.join("tests")).unwrap();
+    fs::write(p.join("tests/bar.rs"), "#[test]\nfn foo_ok() {\n    assert_eq!(p::add(2, 2), 4);\n}\n").unwrap();
+    git(&p, &["add", "."]);
+    git(&p, &["commit", "-q", "-m", "main: a renamed test target foo at tests/bar.rs"]);
+    r
+}
+
+#[test]
+fn fast_subset_a_renamed_test_target_is_known_by_its_target_name() {
+    let r = renamed_root("fastfoo");
+    let (e, o, _) = fast_entry(&r, "foo");
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.status(&e), "merged", "{}", r.show(&e));
-    let show = r.show(&e);
-    assert!(show.contains("check: full (fast subset off: test names could not be verified: no test binary"), "{show}");
-    assert!(!show.contains("check: fast subset ("), "{show}");
-    assert!(o.stdout.contains("fast subset off for p") && !o.stdout.contains("--test nosuch"), "{}", o.stdout);
+    assert!(r.show(&e).contains("check: fast subset (foo) = `cargo build --offline && cargo test --offline --lib --test foo`"), "{}", r.show(&e));
+    let r = renamed_root("fastbar");
+    let (e, o, before) = fast_entry(&r, "bar");
+    assert_refused(&r, &e, &o, &before, "bar");
 }
 
 #[test]
