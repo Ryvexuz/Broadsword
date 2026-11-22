@@ -894,6 +894,27 @@ fn a_dead_run_that_never_took_its_checkpoint_stops_blocking() {
     assert!(l.contains(&format!("job {id} was interrupted before its checkpoint was taken")) && l.contains("nothing was restored"), "{l}");
 }
 
+/// Review q-20261122-014101: if the recovery line cannot be written to the job log (a directory in its place), the record is
+/// NOT marked rolled_back: it stays running and the new job stays blocked, so the next check retries it.
+#[test]
+fn a_pending_run_whose_log_cannot_be_written_keeps_blocking() {
+    let r = Root::new("pendinglogbad");
+    r.project("", true);
+    let dead = dead_pid().to_string();
+    let id = "20260101-000001-p-run";
+    let log = r.dir.join("scratch/old-run.log");
+    fs::create_dir_all(&log).unwrap();
+    let log_s = log.display().to_string().replace('\\', "/");
+    r.fake_record(id, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &dead), ("checkpoint", "pending"), ("log", &log_s)]);
+    let out = r.run(&["run", "p", "--", "echo from-new-job"]);
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "an unloggable settle must keep blocking: {so}{se}");
+    assert!(!so.contains("from-new-job"), "{so}");
+    assert!(so.contains("old-run.log") || se.contains("old-run.log"), "the error names the log path: {so}{se}");
+    let rec = r.record(id);
+    assert_eq!(Root::field(&rec, "status"), "running", "{rec}");
+}
+
 /// The same pending record is never settled while its broadsword may be alive: a live pid with its own creation time, and a
 /// live pid with no recorded creation time (liveness cannot be verified), both stay `running`. A live pid whose recorded
 /// creation time differs (the pid was reused by another process) is dead, and is settled.
@@ -905,9 +926,11 @@ fn a_pending_run_whose_broadsword_may_be_alive_is_never_settled() {
     let start = |p: u32| Proc::now(p).start.expect("a live process has a creation time");
     let (sa, sc) = (start(a).to_string(), (start(c) - 1).to_string());
     let (live, unknown, reused) = ("20260101-000001-p-run", "20260101-000002-p-run", "20260101-000003-p-run");
+    let log = r.dir.join("scratch/reused.log");
+    let log_s = log.display().to_string().replace('\\', "/");
     r.fake_record(live, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &a.to_string()), ("pid_start", &sa), ("checkpoint", "pending")]);
     r.fake_record(unknown, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &b.to_string()), ("pid_start", ""), ("checkpoint", "pending")]);
-    r.fake_record(reused, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &c.to_string()), ("pid_start", &sc), ("checkpoint", "pending")]);
+    r.fake_record(reused, &[("project", "p"), ("kind", "run"), ("status", "running"), ("pid", &c.to_string()), ("pid_start", &sc), ("checkpoint", "pending"), ("log", &log_s)]);
     let out = r.run(&["run", "p", "--", "echo hi"]);
     let (so, se) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{so}{se}");

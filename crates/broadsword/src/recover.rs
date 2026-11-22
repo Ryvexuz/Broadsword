@@ -135,22 +135,26 @@ fn settle_never_started(cfg: &Config, seen: &Record) -> bool {
     println!("job {id}: run {} was interrupted before its checkpoint was taken (broadsword pid {} is gone), so its command never started", r.get("project"), r.get("pid"));
     kill_orphan(&r);
     let project = r.get("project").to_string();
-    r.set("rolled_back_reason", "interrupted before its checkpoint was taken (checkpoint = pending): the command never started, so no file was changed; settled automatically when a new job checked for interrupted runs");
-    if let Err(e) = rollback_run(cfg, &mut r, &project) {
-        println!("  {e}; it still blocks");
-        return false;
-    }
+    // The log line comes FIRST: the record is only marked rolled_back once the line is written (the log is created if it is
+    // missing); if the log cannot be written the record stays as it is, still blocking, and the next check retries it.
     let line = format!(
-        "=== recover ({}) === job {id} was interrupted before its checkpoint was taken (broadsword pid {} is gone): its command never started, so nothing was restored and no file was changed; the record is now rolled_back (kept, as is any checkpoint ref)",
+        "=== recover ({}) === job {id} was interrupted before its checkpoint was taken (broadsword pid {} is gone): its command never started, so nothing was restored and no file was changed; the record is being marked rolled_back (kept, as is any checkpoint ref)",
         pause::now_string(),
         r.get("pid")
     );
-    let logged = std::fs::OpenOptions::new().append(true).open(r.get("log")).and_then(|mut f| {
+    let log_path = r.get("log").to_string();
+    let logged = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).and_then(|mut f| {
         use std::io::Write;
         writeln!(f, "{line}")
     });
     if let Err(e) = logged {
-        println!("  warning: could not add the recovery line to the job log `{}`: {e}", r.get("log"));
+        println!("  error: could not write the recovery line to the job log `{log_path}`: {e}; the record is left as it is and still blocks");
+        return false;
+    }
+    r.set("rolled_back_reason", "interrupted before its checkpoint was taken (checkpoint = pending): the command never started, so no file was changed; settled automatically when a new job checked for interrupted runs");
+    if let Err(e) = rollback_run(cfg, &mut r, &project) {
+        println!("  {e}; it still blocks");
+        return false;
     }
     println!("  marked rolled_back: it no longer blocks new jobs in {}", shown_source(&r));
     true
