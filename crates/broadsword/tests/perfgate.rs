@@ -394,19 +394,13 @@ fn a_docs_only_entry_is_not_judged_and_no_bench_is_built_or_run() {
     assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
     assert!(
         o.stdout
-            .contains("perf gate p: not judged: no benched source changed against main main"),
+            .contains("perf gate p: not run: no source change (1 file(s) changed, none under src/, examples/, benches/ or Cargo/build files); no bench ran"),
         "{}",
         o.stdout
     );
+    assert!(o.stdout.contains("no source change"), "{}", o.stdout);
     assert!(
-        o.stdout
-            .contains("only documentation differs: docs/NOTES.md"),
-        "{}",
-        o.stdout
-    );
-    assert!(
-        r.show(&entry)
-            .contains("not judged: no benched source changed"),
+        r.show(&entry).contains("not run: no source change"),
         "the skip is logged in the entry: {}",
         r.show(&entry)
     );
@@ -664,6 +658,10 @@ fn a_docs_only_entry_is_still_skipped_when_a_budget_is_set_and_main_is_far_over_
     let o = r.run(&["queue", "run"]);
     assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
     assert_eq!(r.field(&entry, "status"), "merged", "{}", r.show(&entry));
-    assert!(o.stdout.contains("not judged"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("not run: no source change"),
+        "{}",
+        o.stdout
+    );
     assert_eq!(r.bench_jobs(), 0, "no bench was built");
 }

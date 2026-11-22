@@ -11,12 +11,8 @@
 //! judged. The baseline file now supplies only the cases, each case's `threshold_pct` and `runs_per_case`; its `median_ms` values
 //! are still checked (a broken file fails closed) and kept as a record, but nothing is judged against them.
 //!
-//! NOT JUDGED. When the entry's commit differs from the trunk tip only in documentation (`git diff --name-only --no-renames` of the
-//! two commits: every changed path is under `docs/` or ends in `.md`, and none is under `src/`, `examples/` or `benches/`), the
-//! gate is SKIPPED as "not judged: no benched source changed" and nothing is built or benched. This is an ALLOW-LIST of what cannot
-//! change the bench, not a list of what can: the crash sim's bench also reads `scenarios/` at run time, so every path that is not
-//! documentation (scenarios, Cargo.toml, Cargo.lock, build.rs, `.cargo/`, anything new) is judged. Limit: a Rust file that
-//! `include_str!`s a `.md` outside `src/`, `examples/` and `benches/` is not seen.
+//! NO SOURCE CHANGE. Before building, compare main with the entry (the combined tip for a train).
+//! Source folders and Cargo/build files require a bench; other paths skip it. Unreadable diffs run it.
 //!
 //! FAIL CLOSED. A baseline file that exists but cannot be read, is not valid JSON, or lacks a field the gate needs is a FAILURE
 //! (`perf_failed`), never a pass and never a skip. So is a bench that cannot be built or exits non-zero (on main or on the entry),
@@ -444,10 +440,8 @@ pub fn judge(
     (ok, lines)
 }
 
-/// Can a change of this repo-relative path (`/`-separated, as git prints it) change what the bench measures? Everything is
-/// benched except documentation: a path under `docs/` or ending in `.md`, unless it is under `src/`, `examples/` or `benches/`
-/// (the folders the build reads). An allow-list of what cannot matter (see "NOT JUDGED" in the module doc). Compared without case,
-/// as Windows resolves folder names.
+/// Source folders and Cargo/build files at any depth require a bench, ignoring ASCII case.
+/// Malformed paths conservatively require a bench; backslashes are accepted as separators.
 pub fn is_benched_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     if ["src/", "examples/", "benches/"]
@@ -456,7 +450,29 @@ pub fn is_benched_path(path: &str) -> bool {
     {
         return true;
     }
-    !(p.starts_with("docs/") || p.ends_with(".md"))
+    let p = p.replace('\\', "/");
+    let parts: Vec<_> = p.split('/').collect();
+    parts.iter().any(|c| {
+        c.is_empty()
+            || *c == "."
+            || *c == ".."
+            || c.contains(':')
+            || c.chars().any(char::is_control)
+    }) || parts[..parts.len() - 1]
+        .iter()
+        .any(|c| matches!(*c, "src" | "examples" | "benches"))
+        || parts
+            .last()
+            .is_some_and(|c| matches!(*c, "cargo.toml" | "cargo.lock" | "build.rs"))
+}
+
+/// Shared skip decision for single entries and combined train tips. Diff errors require a bench.
+pub fn no_source_change(project: &str, changed: &Result<Vec<String>, String>) -> Option<Gate> {
+    let paths = changed.as_ref().ok()?;
+    if paths.iter().any(|p| is_benched_path(p)) {
+        return None;
+    }
+    Some(Gate::Skipped(format!("perf gate {project}: not run: no source change ({} file(s) changed, none under src/, examples/, benches/ or Cargo/build files); no bench ran", paths.len())))
 }
 
 /// `git diff --name-only --no-renames -z <from> <to>` in `dir` (two commits, so no working-tree file and no filter is involved;
@@ -487,8 +503,11 @@ fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<String>, String
             String::from_utf8_lossy(&o.stderr).trim()
         ));
     }
-    // a path that is not UTF-8 is kept lossily: it cannot end in `.md` by accident, so it stays benched
-    Ok(o.stdout
+    // Invalid UTF-8 must not turn an unreadable diff into a skip.
+    let names =
+        String::from_utf8(o.stdout).map_err(|e| format!("diff paths are not UTF-8: {e}"))?;
+    Ok(names
+        .as_bytes()
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8_lossy(p).into_owned())
@@ -767,30 +786,12 @@ pub fn run_gate(cfg: &Config, project: &str, task: &str, what: &str) -> Gate {
         Ok(h) => h,
         Err(m) => return no_verdict(m),
     };
-    // nothing benched changed: not judged, nothing built
-    let changed = match changed_paths(&wt, &tip, &entry) {
-        Ok(c) => c,
-        Err(m) => {
-            return no_verdict(format!(
-                "cannot list what the entry changes against main: {m}"
-            ))
-        }
-    };
-    if !changed.iter().any(|p| is_benched_path(p)) {
-        let list = if changed.is_empty() {
-            "no file differs".to_string()
-        } else {
-            format!(
-                "only documentation differs: {}",
-                changed
-                    .iter()
-                    .take(10)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        return Gate::Skipped(format!("perf gate {project}: not judged: no benched source changed against main {trunk} ({}; {list}); no bench was built or ran", short(&tip)));
+    let changed = changed_paths(&wt, &tip, &entry);
+    if let Some(skip) = no_source_change(project, &changed) {
+        return skip;
+    }
+    if let Err(m) = &changed {
+        println!("perf gate {project}: cannot read diff ({m}); running the bench (fail closed)");
     }
     let a = Side {
         label: "main",
@@ -928,6 +929,28 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_change_decision_skips_only_readable_non_source_diffs() {
+        let docs = Ok(vec!["docs/notes.md".into(), "scenarios/box.bsn".into()]);
+        let Some(Gate::Skipped(message)) = no_source_change("p", &docs) else {
+            panic!("non-source diff must skip");
+        };
+        assert_eq!(message, "perf gate p: not run: no source change (2 file(s) changed, none under src/, examples/, benches/ or Cargo/build files); no bench ran");
+        for path in ["src/lib.rs", "crates/x/Cargo.toml", "benches/a.rs"] {
+            assert!(
+                no_source_change("p", &Ok(vec!["docs/a.md".into(), path.into()])).is_none(),
+                "{path} must run the gate"
+            );
+        }
+        assert!(no_source_change("p", &Err("cannot read diff".into())).is_none());
+        for path in ["", "/docs/a", "../docs/a", "C:\\docs\\a", "docs/a\n"] {
+            assert!(
+                is_benched_path(path),
+                "invalid path must not skip: {path:?}"
+            );
+        }
+    }
 
     const REAL: &str = r#"{"crash_sim_sha":"57f2","runs":3,"runs_per_case":10,"loaded":true,
       "cases":{"box":{"median_ms":1.888,"threshold_pct":10},"cube":{"median_ms":1.173,"threshold_pct":18.93},"settle":{"median_ms":5.046,"threshold_pct":14.98}}}"#;
@@ -1214,6 +1237,11 @@ mod tests {
             "notes/x.MD",
             "docs/img/a.png",
             "DOCS/x.txt",
+            "scenarios/box.bsn",
+            ".cargo/config.toml",
+            "scripts/x.py",
+            ".gitattributes",
+            "docsx/a.rs",
         ] {
             assert!(!is_benched_path(p), "{p}");
         }
@@ -1226,12 +1254,10 @@ mod tests {
             "SRC/x.md",
             "Cargo.toml",
             "Cargo.lock",
-            "scenarios/box.bsn",
             "build.rs",
-            ".cargo/config.toml",
-            "scripts/x.py",
-            ".gitattributes",
-            "docsx/a.rs",
+            "crates/x/Cargo.toml",
+            "crates/x/src/lib.rs",
+            r"crates\x\build.rs",
         ] {
             assert!(is_benched_path(p), "{p}");
         }
