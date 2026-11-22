@@ -137,6 +137,10 @@ pub struct Config {
     /// revert`, new commits, never a reset), checks main again, and holds the project's lane (`state/queue/hold-<project>`) when the
     /// revert or that check fails. `"off"`: the failure is reported and nothing is reverted, as before.
     pub queue_auto_revert: bool,
+    /// The merge queue's PRE-merge check for the projects named here is a fast safety subset, ONE `run` job: `cargo build --offline &&
+    /// cargo test --offline [--lib] [--bins] --test <name> ...` (queue.rs `pre_merge_check`); the main check after the merge stays the full
+    /// `check`. Parsed from the required key `merge_fast_tests` by `parse_merge_fast_tests`; a project not named runs the full check.
+    pub merge_fast_tests: Vec<(String, Vec<String>)>,
     /// The shadow second reviewer: `openai` (clients/openai_review.py, recorded only, never gates a merge) or `off`.
     pub shadow_reviewer: String,
     /// The shadow reviewer's model (an OpenAI model name).
@@ -206,6 +210,92 @@ pub fn parse_python_tests(v: &str) -> Result<Vec<(String, Vec<String>)>, String>
         out.push((project.to_string(), scripts));
     }
     Ok(out)
+}
+
+/// The project name `broadsword` itself (the Broadsword repo at `root`); equal to `job::SELF_PROJECT` (a test in queue.rs checks
+/// it). Kept here because config.rs is also compiled on its own (tests/wtgit.rs), without job.rs.
+pub const MERGE_FAST_SELF_PROJECT: &str = "broadsword";
+
+/// Parse the `merge_fast_tests` setting: `"<project>: <test> <test> ...; <project>: ..."`, or `""` when every project runs the full
+/// check before a merge. Each `<test>` is the name of a cargo test binary (`tests/<name>.rs`): letters, digits, `_` and `-`, not
+/// starting with `-` (it goes on a command line). A project named twice (any case), a project with no test, or a bad name is an error.
+pub fn parse_merge_fast_tests(v: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let bad = |why: String| format!("merge_fast_tests = \"{v}\": {why}");
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in v.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (project, tests) = entry.split_once(':').ok_or_else(|| bad(format!("`{entry}` is not `<project>: <test> ...`")))?;
+        let project = project.trim();
+        if project.is_empty() || !project.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            return Err(bad(format!("`{project}` is not a project name")));
+        }
+        if out.iter().any(|(p, _)| p.eq_ignore_ascii_case(project)) {
+            return Err(bad(format!("project `{project}` is named twice")));
+        }
+        let tests: Vec<String> = tests.split_whitespace().map(String::from).collect();
+        if tests.is_empty() {
+            return Err(bad(format!("project `{project}` names no test binary (leave a project that runs the full check out of the list)")));
+        }
+        for t in &tests {
+            if t.starts_with('-') || !t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+                return Err(bad(format!("`{t}` is not a test binary name (letters, digits, `_` and `-`, not starting with `-`)")));
+            }
+        }
+        out.push((project.to_string(), tests));
+    }
+    Ok(out)
+}
+
+/// The cargo test binaries of the project in `dir`: `tests/<name>.rs` and `tests/<name>/main.rs`, at the top and in each workspace
+/// member under `crates/*/`.
+fn test_binaries(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = |d: &Path| {
+        for e in std::fs::read_dir(d.join("tests")).into_iter().flat_map(|rd| rd.flatten()) {
+            let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
+            if path.is_file() {
+                if let Some(stem) = name.strip_suffix(".rs") {
+                    out.push(stem.to_string());
+                }
+            } else if path.join("main.rs").is_file() {
+                out.push(name);
+            }
+        }
+    };
+    at(dir);
+    for e in std::fs::read_dir(dir.join("crates")).into_iter().flat_map(|rd| rd.flatten()) {
+        at(&e.path());
+    }
+    out
+}
+
+/// `merge_fast_tests` checked against the projects on disk (fail closed): a subset is only safe with queue_auto_revert on (a broken
+/// merge is reverted after the full main check), a project must be known, and every name must be a test binary of it. A project
+/// folder with no `Cargo.toml` or no test binary at all (the root of a unit test's folder that only holds a copy of broadsword.toml,
+/// perhaps with a stand-in Cargo.toml) is not the project the list was written for and has nothing to check against, so it is not
+/// checked here; a name it lacks still fails closed when the subset runs (cargo refuses `--test <unknown>`, so the check fails).
+fn check_merge_fast_tests(list: &[(String, Vec<String>)], auto_revert: bool, root: &Path, projects_dir: &Path) -> Result<(), String> {
+    if list.is_empty() {
+        return Ok(());
+    }
+    if !auto_revert {
+        return Err("merge_fast_tests needs queue_auto_revert = on: a fast subset before the merge is only safe when a merge whose full main check fails is reverted".into());
+    }
+    for (project, tests) in list {
+        let dir = if project.eq_ignore_ascii_case(MERGE_FAST_SELF_PROJECT) {
+            root.to_path_buf()
+        } else {
+            let found = std::fs::read_dir(projects_dir).into_iter().flat_map(|rd| rd.flatten()).map(|e| e.path()).find(|p| p.join("Cargo.toml").is_file() && p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(project)));
+            found.ok_or_else(|| format!("merge_fast_tests: project `{project}` is unknown (no folder with a Cargo.toml in {})", projects_dir.display()))?
+        };
+        let have = test_binaries(&dir);
+        if !dir.join("Cargo.toml").is_file() || have.is_empty() {
+            continue;
+        }
+        if let Some(t) = tests.iter().find(|t| !have.contains(t)) {
+            return Err(format!("merge_fast_tests: `{t}` (project `{project}`) is not a test binary: no tests/{t}.rs in {} or its crates/*/", dir.display()));
+        }
+    }
+    Ok(())
 }
 
 fn get_int(m: &HashMap<String, Value>, k: &str) -> Result<u64, String> {
@@ -343,7 +433,11 @@ impl Config {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
+        let merge_fast_tests = parse_merge_fast_tests(&get_str(&m, "merge_fast_tests")?)?;
+        let projects_dir = root.join(inside_root(&m, "projects_dir", true)?);
+        check_merge_fast_tests(&merge_fast_tests, queue_auto_revert, &root, &projects_dir)?;
         Ok(Config {
+            merge_fast_tests,
             python_tests,
             done_check_timeout_seconds: positive("done_check_timeout_seconds")?,
             done_check_tail_lines: positive("done_check_tail_lines")?,
@@ -388,7 +482,7 @@ impl Config {
             alert_command: get_str(&m, "alert_command")?,
             scratch_dir,
             build_dir,
-            projects_dir: root.join(inside_root(&m, "projects_dir", true)?),
+            projects_dir,
             state_dir,
             install_dir,
             mcp_call_timeout_seconds,
@@ -574,6 +668,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
+merge_fast_tests = \"\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -745,6 +840,26 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn merge_fast_tests_is_required_and_validated() {
+        let text = include_str!("../../../broadsword.toml");
+        let e = Config::from_text(&without_key(text, "merge_fast_tests"), Path::new("p")).unwrap_err();
+        assert!(e.contains("merge_fast_tests") && e.contains("missing"), "{e}");
+        assert_eq!(parse_merge_fast_tests("").unwrap(), vec![]);
+        assert_eq!(parse_merge_fast_tests("broadsword: queue  wtgit; crash-sim: t_1").unwrap(), vec![("broadsword".to_string(), vec!["queue".to_string(), "wtgit".to_string()]), ("crash-sim".to_string(), vec!["t_1".to_string()])]);
+        for bad in ["broadsword", "broadsword:", "a: x; A: y", "a: --lib", "a: ../x", "a: x.rs", "a b: x"] {
+            assert!(parse_merge_fast_tests(bad).is_err(), "{bad}");
+        }
+        // the shipped value names test binaries that exist in this repo, and needs auto-revert on
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let shipped = Config::from_text(text, &root).unwrap().merge_fast_tests;
+        assert!(shipped.iter().any(|(p, _)| p == MERGE_FAST_SELF_PROJECT), "{shipped:?}");
+        let off = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "queue_auto_revert") { "queue_auto_revert = \"off\"" } else { l }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&off, &root).unwrap_err().contains("merge_fast_tests needs queue_auto_revert = on"));
+        let unknown = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "merge_fast_tests") { "merge_fast_tests = \"broadsword: queue nosuch_binary\"".to_string() } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+        assert!(Config::from_text(&unknown, &root).unwrap_err().contains("`nosuch_binary`"));
+    }
+
+    #[test]
     fn install_dir_and_mcp_settings_are_validated() {
         let base = "root = \".\"\ndisk_floor_gb=1\ncleanup_every_hours=1\nscratch_max_age_hours=1\ndisk_check_every_seconds=1\nlog_max_mb=1\nram_warn_percent=1\ncpu_warn_percent=1\nalert_command=\"\"\nbuild_dir=\"build\"\njob_disk_reserve_gb=2\njob_disk_poll_seconds=5\nprojects_dir=\"projects\"\nstate_dir=\"state\"\ncheckpoint_ignored_max_mb=50\nmax_resumes=3\nscratch_dir=\"scratch\"\nmcp_call_timeout_seconds=5\nmcp_output_max_kb=5\ntask_lock_wait_seconds = 1\nbuild_lock_wait_seconds = 1\nrecover_lock_wait_seconds = 5
 codex_coder_timeout_seconds = 5
@@ -765,6 +880,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
+merge_fast_tests = \"\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -819,6 +935,7 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
+merge_fast_tests = \"\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40

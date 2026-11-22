@@ -34,6 +34,12 @@
 //! Exit codes of `queue run`: 0 merged, 1 internal error (the entry stays `running`, resumable), 2 bad input, 3 blocked /
 //! conflict / stale, 4 queue busy, 5 rejected / check_failed / perf_failed, 6 merged_check_failed.
 //!
+//! FAST SUBSET (setting `merge_fast_tests`). For a listed project every PRE-merge check (`pre_merge_check`: a single entry's own
+//! check, and a merge train's tip, bisect and alone checks) is one `run` job of `cargo build` plus `cargo test [--lib] [--bins] --test <name>...`;
+//! the record and the reviewer prompt say `check: fast subset (...)` (else `check: full`). The main check after a merge is always the
+//! full `check`, and with queue_auto_revert (required on for a listed project) a failure there is reverted; when that revert leaves
+//! main green (`green_revert`), `queue run --all` goes on with the next entry.
+//!
 //! PERF GATE (perfgate.rs, setting `perf_gate`). It is part of every check of a commit: right after the build and tests pass, the
 //! entry's own project is benched on that commit (`perf_runs` times, as `run` jobs in the task's worktree, each holding the build
 //! lock), when that project has a baseline `<state_dir>/perf/<project>-baseline.json`; a project without one is skipped (printed and
@@ -303,6 +309,88 @@ fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<String, Str
         return Err(format!("exit {code}, job {job_id}: {}", info.summary.join("; ")));
     }
     Ok(job_id)
+}
+
+/// FAST SUBSET (setting `merge_fast_tests`): the test binaries of `project`'s pre-merge subset, or None when it runs the full check.
+fn fast_tests<'a>(cfg: &'a Config, project: &str) -> Option<&'a [String]> {
+    cfg.merge_fast_tests.iter().find(|(p, _)| p.eq_ignore_ascii_case(project)).map(|(_, t)| t.as_slice())
+}
+
+/// The command line of a fast subset: one build, then the unit tests (`units`: the `--lib` / `--bins` flags `unit_test_flags` found)
+/// and each listed test binary.
+fn fast_command(units: &[&str], tests: &[String]) -> String {
+    let mut c = "cargo build --offline && cargo test --offline".to_string();
+    for u in units {
+        c.push_str(&format!(" {u}"));
+    }
+    for t in tests {
+        c.push_str(&format!(" --test {t}"));
+    }
+    c
+}
+
+/// The unit-test flags of the packages in `dir`, from `cargo metadata`: `--lib` when a package has a library target, `--bins` when one
+/// has a binary target (cargo refuses `--lib` for a package without a library: the Broadsword crate has only binaries).
+fn unit_test_flags(cfg: &Config, dir: &Path) -> Result<Vec<&'static str>, String> {
+    let j = crate::json::parse(&crate::buildsrc::metadata_json(cfg, dir)?).map_err(|e| format!("cannot read cargo metadata output: {e}"))?;
+    let Some(crate::json::J::Arr(pkgs)) = j.get("packages") else { return Err("cargo metadata output: `packages` is not a list".into()) };
+    let (mut lib, mut bin) = (false, false);
+    for p in pkgs {
+        let Some(crate::json::J::Arr(targets)) = p.get("targets") else { return Err("cargo metadata output: a package has no `targets` list".into()) };
+        for t in targets {
+            let Some(crate::json::J::Arr(kinds)) = t.get("kind") else { return Err("cargo metadata output: a target has no `kind` list".into()) };
+            for k in kinds.iter().filter_map(crate::json::J::str) {
+                lib |= matches!(k, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro");
+                bin |= k == "bin";
+            }
+        }
+    }
+    Ok([(lib, "--lib"), (bin, "--bins")].into_iter().filter(|(on, _)| *on).map(|(_, f)| f).collect())
+}
+
+/// THE ONE PRE-MERGE CHECK of an entry's commit in task `task_id`'s worktree (the single entry's own check, and every merge-train
+/// check: tip, bisect and alone). A project listed in `merge_fast_tests` gets the fast subset, ONE `run` job of `fast_command`
+/// through the same job machinery as `check` (disk guard, build lock, log, scrubbed environment, redaction); any other project gets
+/// the full `check`, exactly as before. Returns the job's exit code, normalised so a subset whose command ran and failed is 1 like a
+/// failed check (a refusal or a disk kill keeps its own code: no verdict), and the line that says which check ran. That line ends
+/// the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the reviewer can read a subset as the full suite. The main
+/// check after a merge never comes through here: it is always the full `check` (`s_main_check`).
+fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInfo) -> (u8, String) {
+    match fast_tests(cfg, project) {
+        None => {
+            let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+            (code, "check: full".to_string())
+        }
+        Some(tests) => {
+            // the unit-test flags come from the worktree's own packages; when they cannot be read the FULL check runs (stricter)
+            let units = match job::job_folder(cfg, project, Some(task_id)).map_err(|(_, m)| m).and_then(|d| unit_test_flags(cfg, &d)) {
+                Ok(u) => u,
+                Err(m) => {
+                    println!("fast subset check of {project}: its unit-test targets could not be read ({m}); the FULL check runs instead");
+                    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+                    return (code, format!("check: full (merge_fast_tests lists {project}, but its unit-test targets could not be read: {m})"));
+                }
+            };
+            let command = fast_command(&units, tests);
+            println!("fast subset check of {project} --task {task_id} (merge_fast_tests): {command}; the full check runs on main after the merge");
+            let code = job::run_job_info(cfg, JobSpec { kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+            let failed = code != 0 && info.summary.first().is_some_and(|l| l.starts_with("run: FAILED"));
+            let label = format!("check: fast subset ({}) = `{command}`, NOT the full suite: the full check runs on main right after the merge, and a failure there is reverted", tests.join(" "));
+            (if failed { 1 } else { code }, label)
+        }
+    }
+}
+
+/// Did entry `id` end merged_check_failed with its automatic revert DONE and the check after it PASSED, its lane not held? Then
+/// main is green again and `queue run --all` goes on with the next entry; anything else (no revert, a failed one, a held lane, an
+/// entry that cannot be read) stops the drain as before (fail closed).
+fn green_revert(cfg: &Config, id: &str) -> bool {
+    load_entry(cfg, id).is_ok_and(|e| e.status() == MERGED_CHECK_FAILED && e.get("revert_check") == "passed" && lane_hold(cfg, e.get("project")).is_none())
+}
+
+/// An exit code that stops `queue run --all`: an internal error, or merged_check_failed unless its revert left main green.
+fn stops_drain(cfg: &Config, id: &str, code: u8) -> bool {
+    code == EXIT_ERROR || (code == EXIT_MERGED_BAD && !green_revert(cfg, id))
 }
 
 /// HOLD GATE, at the start of every `queue run` (one entry or `--all`), under the lane's run lock: for every held project of the lane, a
@@ -967,7 +1055,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
         // a fresh attempt: forget what the last attempt learned (its log and review file stay)
         for k in [
             "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf", "done_check", "done_check_file",
-            "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended", "pre_merge_sha", "revert_sha",
+            "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended", "pre_merge_sha", "revert_sha", "revert_check",
         ] {
             e.set(k, "");
         }
@@ -1187,7 +1275,9 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
                 }
             }
         }
-        let Some(stop_at) = codes.iter().position(|(_, c, _)| *c == EXIT_ERROR || *c == EXIT_MERGED_BAD).or(if codes.is_empty() { None } else { Some(codes.len() - 1) }) else {
+        // a merged_check_failed whose automatic revert left main green (`green_revert`) does not stop the drain: the next entry is
+        // rebased onto that green main, and the drain's exit code still counts the 6 (`worst_exit`)
+        let Some(stop_at) = codes.iter().position(|(id, c, _)| stops_drain(cfg, id, *c)).or(if codes.is_empty() { None } else { Some(codes.len() - 1) }) else {
             if let Some(c) = claim_err {
                 stopped = format!("the next entry could not be chosen (exit {})", code_num(c));
                 rows.push(Row { id: "-".into(), task: "-".into(), status: "-".into(), code: code_num(c), secs: 0.0, note: stopped.clone(), train: String::new() });
@@ -1199,10 +1289,11 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
         let mut train_code = 0u8;
         // no new train while a half-finished merge is being finished (`resume_first` entries come first): a train only starts once
         // main's last merge has had its main check
-        if train && start < STEP_MERGE && !approved.is_empty() && code != EXIT_ERROR && code != EXIT_MERGED_BAD {
+        let stop = stops_drain(cfg, &id, code);
+        if train && start < STEP_MERGE && !approved.is_empty() && !stop {
             train_code = run_trains(cfg, &mut approved, false, &taken, &mut rows);
         }
-        let hard = if code == EXIT_ERROR || code == EXIT_MERGED_BAD { code } else { train_code };
+        let hard = if stop { code } else { train_code };
         if hard == EXIT_ERROR || hard == EXIT_MERGED_BAD {
             stop_code = hard;
             stopped = if hard == train_code && train_code != 0 { train_stop_note(hard) } else { format!("stopped after entry {id} (exit {code}): {}", if code == EXIT_ERROR { "it stays `running` at its step; fix the cause, then `queue run` resumes it" } else { "main holds a commit whose check failed; a human decides before anything else merges" }) };
@@ -1824,9 +1915,9 @@ impl<'a> Run<'a> {
         }
         println!("queue entry {}: check {project} --task {task_id} ({what}; commit {})", self.e.id(), short(commit));
         let mut info = JobInfo::default();
-        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.clone()) }, &mut info);
-        let mut summary = info.summary.join("\n");
-        let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
+        let (code, which) = pre_merge_check(self.cfg, &project, &task_id, &mut info);
+        let mut summary = format!("{}\n{which}", info.summary.join("\n"));
+        let tail = format!("{which}\n{}", info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default());
         let job_id = info.id.clone().unwrap_or_default();
         // PERF GATE, part of the check: only once the build and tests passed, on the same commit (verified below, after it too)
         let mut perf_fail = String::new();
@@ -2079,9 +2170,9 @@ impl<'a> Run<'a> {
         let (dir, branch) = (self.dir.clone(), self.branch());
         let tip_before = self.g(wtgit::branch_tip(&dir, &branch))?;
         let mut info = JobInfo::default();
-        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id) }, &mut info);
-        let summary = info.summary.join("\n");
-        let tail = info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default();
+        let (code, which) = pre_merge_check(self.cfg, &project, &task_id, &mut info);
+        let summary = format!("{}\n{which}", info.summary.join("\n"));
+        let tail = format!("{which}\n{}", info.log.as_deref().map(|p| read_tail(p, self.cfg.reviewer_check_tail_kb * 1024)).unwrap_or_default());
         self.e.set("check_job", info.id.clone().unwrap_or_default());
         self.e.set("check_exit", code.to_string());
         self.e.set("check_summary", summary.clone());
@@ -2627,7 +2718,11 @@ verdict: {} (answer followed the format: {})
                 let _ = self.log("main_check", &format!("main check failed; reverted {range} as {rsha}; checking main again"));
                 println!("queue entry {id}: main check failed; reverted {range} as {rsha}; check {project} again");
                 match main_check_now(self.cfg, &self.dir, &project) {
-                    Ok(job) => format!("{failed} The merged commits {range} were reverted as {rsha} (one new commit; nothing was reset); main check after the revert passed (job {job}). The task was NOT marked done and its worktree is kept: fix it and queue it again"),
+                    Ok(job) => {
+                        // the one mark `green_revert` trusts: main is green again, so `queue run --all` may go on
+                        self.e.set("revert_check", "passed");
+                        format!("{failed} The merged commits {range} were reverted as {rsha} (one new commit; nothing was reset); main check after the revert passed (job {job}). The task was NOT marked done and its worktree is kept: fix it and queue it again")
+                    }
                     Err(m) => held(self.cfg, &id, &format!("the merged commits {range} were reverted as {rsha}, but the main check after the revert did not pass: {m}")),
                 }
             }
@@ -3422,7 +3517,8 @@ fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time:
             let c2 = if code == EXIT_MERGED_BAD { r.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD) } else { r.internal(&format!("the main check of merge train {train_id} did not complete: {reason}")) };
             finish_member(cfg, r, code_num(c2), t, rows, worst);
         }
-        return code;
+        // the members' rows keep their exit 6; only a revert that left main green lets the drain go on (`green_revert`)
+        return if code == EXIT_MERGED_BAD && green_revert(cfg, &last_id) { 0 } else { code };
     }
     let mut hard = 0u8;
     for (i, (mut r, t)) in members.into_iter().enumerate() {
@@ -3488,6 +3584,13 @@ mod tests {
     fn same_model_ignores_case_and_space() {
         assert!(same_model("Opus", " opus "));
         assert!(!same_model("haiku", "opus"));
+    }
+
+    #[test]
+    fn the_fast_subset_names_the_self_project_like_job_and_builds_its_command() {
+        assert_eq!(crate::config::MERGE_FAST_SELF_PROJECT, job::SELF_PROJECT);
+        assert_eq!(fast_command(&["--bins"], &["queue".into(), "wtgit".into()]), "cargo build --offline && cargo test --offline --bins --test queue --test wtgit");
+        assert_eq!(fast_command(&["--lib", "--bins"], &["t".into()]), "cargo build --offline && cargo test --offline --lib --bins --test t");
     }
 
     #[test]

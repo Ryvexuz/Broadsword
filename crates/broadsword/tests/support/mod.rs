@@ -69,6 +69,8 @@ const BASE: &[(&str, &str)] = &[
     ("queue_per_project", "\"off\""),
     // off unless a test sets it: a failed main check is reported, nothing reverted, exactly as before queue_auto_revert
     ("queue_auto_revert", "\"off\""),
+    // every project runs the full check before a merge unless a test sets it (needs queue_auto_revert on)
+    ("merge_fast_tests", "\"\""),
     // no test project runs Python tests unless its test sets this (SCALING F9)
     ("python_tests", "\"\""),
     ("done_check_timeout_seconds", "600"),

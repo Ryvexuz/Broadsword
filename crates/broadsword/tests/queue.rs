@@ -1391,6 +1391,92 @@ fn auto_revert_off_keeps_the_old_message_and_reverts_nothing() {
     assert!(!hold_file(&r).exists());
 }
 
+// ---- merge_fast_tests: a fast safety subset before the merge, the full check after it ---------------------------------
+
+/// A test binary that passes in the main checkout (under projects/p) and FAILS in a task worktree: only a FULL check of the
+/// worktree runs it, so a pre-merge check that passes proves the subset did not run it.
+const ONLY_IN_MAIN: &str = "#[test]\nfn only_in_main() {\n    assert!(env!(\"CARGO_MANIFEST_DIR\").replace('\\\\', \"/\").contains(\"/projects/p\"));\n}\n";
+
+/// A root with auto-revert on, whose project `p` has two test binaries on main: `fast` (always passes) and `other` (`ONLY_IN_MAIN`).
+fn fast_root(name: &str) -> Root {
+    let r = revert_root(name);
+    r.commit(&r.p(), "tests/fast.rs", "#[test]\nfn fast_ok() {\n    assert_eq!(p::add(2, 2), 4);\n}\n", "main: test binary fast");
+    r.commit(&r.p(), "tests/other.rs", ONLY_IN_MAIN, "main: test binary other");
+    r
+}
+
+#[test]
+fn fast_subset_a_listed_project_runs_the_subset_before_the_merge_and_the_full_check_after_it() {
+    let r = fast_root("fastsub");
+    train_set(&r, "merge_fast_tests", "\"p: fast\"");
+    let id = r.started("NOTES.txt");
+    r.commit(&r.wt(&id), "NOTES.txt", "notes\n", "task: notes");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged", "{}", r.show(&e));
+    let show = r.show(&e);
+    assert!(show.contains("\n  check: fast subset (fast) = `cargo build --offline && cargo test --offline --lib --test fast`, NOT the full suite"), "the record says a subset ran: {show}");
+    assert!(!show.contains("check: full"), "{show}");
+    // the subset is ONE `run` job of the task's worktree; the main check after the merge is the full `check` (it runs `other`)
+    assert!(o.stdout.contains("job: run p ") && o.stdout.contains("cargo build --offline && cargo test --offline --lib --test fast"), "{}", o.stdout);
+    let main_check = o.stdout.find("check p (the main checkout").expect("a main check ran");
+    assert!(o.stdout[main_check..].contains("job: check p "), "the main check is the full check: {}", o.stdout);
+    assert!(show.contains("check on main passed (build: ok"), "{show}");
+    // the reviewer was told which check ran, in the summary and in the check tail
+    let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
+    assert!(stdin.contains("check: fast subset (fast)") && stdin.matches("check: fast subset (fast)").count() >= 2, "{stdin}");
+}
+
+#[test]
+fn fast_subset_an_unlisted_project_runs_the_full_check_before_the_merge() {
+    let r = fast_root("fastfull");
+    let id = r.started("NOTES.txt");
+    r.commit(&r.wt(&id), "NOTES.txt", "notes\n", "task: notes");
+    let e = r.add(&id, "low", "sonnet");
+    let before = r.head();
+    let o = r.run(&["queue", "run"]);
+    // the full check runs `other` in the worktree, where it fails: nothing merges and no model is asked
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "check_failed", "{}", r.show(&e));
+    assert!(r.show(&e).contains("check summary:\n  build: ok") && r.show(&e).contains("\n  check: full\n"), "{}", r.show(&e));
+    assert_eq!(r.head(), before);
+    assert_eq!(r.calls(), 0);
+}
+
+#[test]
+fn fast_subset_config_refuses_an_unknown_test_binary_and_auto_revert_off() {
+    let r = fast_root("fastcfg");
+    train_set(&r, "merge_fast_tests", "\"p: fast nosuch\"");
+    let o = r.run(&["queue", "list"]);
+    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("merge_fast_tests") && o.stderr.contains("`nosuch`") && o.stderr.contains("not a test binary"), "{}", o.stderr);
+    train_set(&r, "merge_fast_tests", "\"p: fast\"");
+    assert_eq!(r.run(&["queue", "list"]).code, 0, "a known name loads");
+    train_set(&r, "queue_auto_revert", "\"off\"");
+    let o = r.run(&["queue", "list"]);
+    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("merge_fast_tests needs queue_auto_revert = on"), "{}", o.stderr);
+}
+
+#[test]
+fn fast_subset_a_green_auto_revert_lets_the_drain_go_on_to_the_next_entry() {
+    let r = revert_root("fastdrain");
+    let a = r.started("src");
+    r.commit(&r.wt(&a), "src/lib.rs", &only_outside_main(), "task: a test that only passes outside main");
+    let ea = r.add(&a, "low", "sonnet");
+    let b = r.started("NOTES.txt");
+    r.commit(&r.wt(&b), "NOTES.txt", "notes\n", "task: notes");
+    let eb = r.add(&b, "low", "sonnet");
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 6, "the worst outcome is still reported: {}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&ea), "merged_check_failed");
+    assert!(r.field(&ea, "reason").contains("main check after the revert passed"), "{}", r.show(&ea));
+    assert!(!hold_file(&r).exists());
+    assert_eq!(r.status(&eb), "merged", "the drain went on after the green revert: {}{}", o.stdout, o.stderr);
+    assert!(!o.stderr.contains("stopped after entry"), "{}", o.stderr);
+}
+
 // ---- crash and resume ---------------------------------------------------------------------
 
 /// The cause of the flaky `a_run_killed_mid_review_is_resumed_by_the_next_queue_run`: a reviewer that dies while its run is alive
