@@ -18,7 +18,7 @@ A. Self-review against the reviewer's rubric. Review your own diff the way the q
 B. Mechanical checks (Rust tasks), through Broadsword only:
   build/bin/broadsword.exe check <project> --task <id>   (must end `test: ok`)
   build/bin/broadsword.exe run <project> --task <id> -- cargo clippy --offline --all-targets
-  build/bin/broadsword.exe run <project> --task <id> -- rustfmt --check --edition 2021 <each .rs file you changed>   (never `cargo fmt` over the whole crate: main is not fmt-clean)
+  build/bin/broadsword.exe run <project> --task <id> -- rustfmt --check --edition <Cargo.toml edition> <each .rs file you changed>   (it also checks the child `mod x;` files: judge only diff hunks inside files you changed; never `cargo fmt` over the whole crate; never run rustfmt or cargo fmt in write mode on files you did not change)
   Fix new warnings and formatting in YOUR files only (main is not yet known to be clean). Never add an allow attribute to silence a lint.
 
 Common reasons the reviewer rejects work here (from 55 recent rejections). Write code that avoids them from the start:

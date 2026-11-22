@@ -24,7 +24,7 @@ orchestrator commits.
 **Self-check before you report.** Before you finish, apply every item below to your own diff and put the results in your
 report. (This is the Broadsword self-check block, adapted to your sandbox: you cannot run commands, so the mechanical
 checks (`broadsword check`, clippy, `rustfmt --check` on the files you changed) are run by the orchestrator after you finish. Write code that
-passes them: no new warnings, your changed files formatted as `rustfmt` would leave them (never reformat files you did not change). Never add an allow attribute to silence a lint.)
+passes them: no new warnings, your changed files formatted as `rustfmt` would leave them (never run rustfmt or cargo fmt in write mode on files you did not change, including files that declare child modules; judge only diff hunks inside your changed files). Never add an allow attribute to silence a lint.)
 
 Self-review against the reviewer's rubric. Review your own diff the way the queue reviewer will: every done-check line,
 every "must never happen" item in the brief, and SPEC_CHECKLIST.md (read it in your working directory if it is there).
