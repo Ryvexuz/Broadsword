@@ -1688,7 +1688,7 @@ mod tests {
     #[test]
     fn queue_run_description_states_the_train_rules_as_queue_rs_does() {
         let full = tool_full(find("queue_run").unwrap());
-        let queue_rs = include_str!("queue.rs");
+        let queue_rs = crate::queue::SOURCE;
         let pairs: &[(&str, &str)] = &[
             ("only in `queue run --all`; 1 = off, every entry as before", "TRAINS FORM ONLY UNDER `--all`"),
             ("form a train of up to merge_train_max entries", "`merge_train_max` sets the most entries one train takes"),
@@ -1734,7 +1734,7 @@ mod tests {
     #[test]
     fn tools_state_the_trunk_rule_and_the_recovery_scope_as_the_code_does() {
         let flat = |src: &str| src.lines().map(|l| l.trim_start().trim_start_matches("//!").trim_start_matches("///").trim_start_matches("//").trim()).collect::<Vec<_>>().join(" ");
-        let (wtgit, worktree, queue, recover) = (flat(include_str!("wtgit.rs")), flat(include_str!("worktree.rs")), flat(include_str!("queue.rs")), flat(include_str!("recover.rs")));
+        let (wtgit, worktree, queue, recover) = (flat(include_str!("wtgit.rs")), flat(include_str!("worktree.rs")), flat(crate::queue::SOURCE), flat(include_str!("recover.rs")));
         let rows: &[(&str, &str, &str, &str)] = &[
             (&wtgit, "the ONE that exists (`git show-ref --verify --quiet refs/heads/<name>` for each)", "worktree_create", "the one of the local branches `main` and `master` that exists"),
             (&worktree, "whatever the main checkout has checked out; a trunk that cannot be told is refused", "worktree_create", "whatever the main checkout has checked out"),
@@ -1767,7 +1767,7 @@ mod tests {
     fn queue_tools_state_the_per_project_lock_as_queue_rs_does() {
         let run = tool_full(find("queue_run").unwrap());
         let cancel = tool_full(find("queue_cancel").unwrap());
-        let queue_rs = include_str!("queue.rs").lines().map(|l| l.trim_start().trim_start_matches("//!").trim_start_matches("///").trim()).collect::<Vec<_>>().join(" ");
+        let queue_rs = crate::queue::SOURCE.lines().map(|l| l.trim_start().trim_start_matches("//!").trim_start_matches("///").trim()).collect::<Vec<_>>().join(" ");
         let pairs: &[(&str, &str, &str)] = &[
             (&run, "format!(\"{}.queue.lock\"", "state/queue/<project>.queue.lock"),
             (&run, "another `queue run` of project `{k}`", "another `queue run` of project `<p>`"),
@@ -1792,7 +1792,7 @@ mod tests {
     fn queue_tools_state_the_perf_gate_as_the_code_does() {
         let run = tool_full(find("queue_run").unwrap());
         let flat = |src: &str| src.lines().map(|l| l.trim_start().trim_start_matches("//!").trim_start_matches("///").trim()).collect::<Vec<_>>().join(" ");
-        let (queue_rs, perf_rs) = (flat(include_str!("queue.rs")), flat(include_str!("perfgate.rs")));
+        let (queue_rs, perf_rs) = (flat(crate::queue::SOURCE), flat(include_str!("perfgate.rs")));
         let pairs: &[(&str, &str, &str)] = &[
             (&queue_rs, "a project without one is skipped (printed and logged", "a project without one is skipped and the skip is logged"),
             (&queue_rs, "no other project is ever benched", "no other project is ever benched"),
@@ -1808,7 +1808,7 @@ mod tests {
             assert!(src.contains(q), "the code no longer says: {q}");
             assert!(run.contains(d), "the queue_run description must say: {d}");
         }
-        assert!(include_str!("queue.rs").contains("pub const PERF_FAILED: &str = \"perf_failed\";"));
+        assert!(crate::queue::SOURCE.contains("pub const PERF_FAILED: &str = \"perf_failed\";"));
         for t in ["queue_list", "queue_add", "queue_cancel"] {
             assert!(tool_full(find(t).unwrap()).contains("perf_failed"), "{t} must name the perf_failed status");
         }

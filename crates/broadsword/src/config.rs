@@ -953,11 +953,18 @@ worktrees_dir = \"worktrees\"\n";
         let unread: Vec<&String> = keys.iter().filter(|k| Config::from_text(&without_key(text, k), Path::new("p")).is_ok()).collect();
         assert!(unread.is_empty(), "keys in broadsword.toml that the loader never reads (delete them, or read them): {unread:?}");
         // 2. some code outside this file uses the field it fills (`cfg.<key>`), so a validated-but-unused key (shared_dir) fails too
+        // every .rs file under src/, subfolders included (src/queue/ holds the merge queue), except this file
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut code = String::new();
-        for e in std::fs::read_dir(&src).unwrap().flatten() {
-            if e.file_name() != "config.rs" && e.path().extension().is_some_and(|x| x == "rs") {
-                code.push_str(&std::fs::read_to_string(e.path()).unwrap());
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p != src.join("config.rs") && p.extension().is_some_and(|x| x == "rs") {
+                    code.push_str(&std::fs::read_to_string(&p).unwrap());
+                }
             }
         }
         // a key may reach the code through an accessor method of Config instead of the field itself

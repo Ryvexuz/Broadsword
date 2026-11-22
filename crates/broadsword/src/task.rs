@@ -755,7 +755,7 @@ mod tests {
     /// to queue.rs, or a change of what it treats as open, fails here until task.rs is updated.
     #[test]
     fn queue_status_lists_match_queue_rs() {
-        let src = include_str!("queue.rs");
+        let src = crate::queue::SOURCE;
         let mut consts: Vec<(String, String)> = Vec::new(); // (NAME, value)
         for l in src.lines() {
             let Some(rest) = l.strip_prefix("pub const ") else { continue };
