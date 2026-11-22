@@ -1949,3 +1949,162 @@ fn with_the_gpt_gate_off_an_opus_coded_high_entry_goes_straight_to_sonnet() {
     assert_eq!(r.field(&entry, "gate"), "claude");
     assert_eq!(r.field(&entry, "review calls"), "1");
 }
+
+// ---- PARALLEL REVIEW (review_parallel > 1, with the merge train on) ---------------------------------------------------------
+
+/// A merge-train root (merge_train_max 4) with review_parallel `n` and three queued entries with disjoint claims; the second one's
+/// diff holds PLANTED_BUG, so the fake reviewer FAILs it. Returns (root, [(task, entry)]).
+fn parallel_root(name: &str, n: u64, shadow: bool) -> (Root, Vec<(String, String)>) {
+    let r = if shadow { Root::with_shadow(name, 60) } else { Root::new(name, 60) };
+    train_set(&r, "merge_train_max", "4");
+    train_set(&r, "review_parallel", &n.to_string());
+    let es = vec![train_one(&r, "src/a.txt", "a\n"), train_one(&r, "src/b.txt", "b PLANTED_BUG\n"), train_one(&r, "src/c.txt", "c\n")];
+    (r, es)
+}
+
+/// Wait for a spawned `queue run` to end; its exit code.
+fn wait_exit(c: &mut Child, secs: u64) -> i32 {
+    let end = Instant::now() + ceiling(secs);
+    loop {
+        if let Some(s) = c.try_wait().unwrap() {
+            return s.code().unwrap_or(-1);
+        }
+        assert!(Instant::now() < end, "timed out waiting for the queue run to end");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The subjects of main's commits, oldest first.
+fn subjects_of(r: &Root) -> Vec<String> {
+    git(&r.p(), &["log", "--reverse", "--format=%s"]).lines().map(String::from).collect()
+}
+
+/// Every entry's own review file names that entry and holds its own verdict: the planted bug's FAIL is only in the second one's;
+/// the first and third merged, in queue order; `calls` reviewer calls each.
+fn assert_own_verdicts(r: &Root, es: &[(String, String)], calls: &str) {
+    for (i, (_, e)) in es.iter().enumerate() {
+        let file = r.field(e, "review file");
+        let review = fs::read_to_string(r.dir.join(&file)).unwrap_or_else(|err| panic!("{e}: review file `{file}`: {err}"));
+        assert!(review.starts_with(&format!("entry: {e}\n")), "{review}");
+        let fail = i == 1;
+        assert_eq!(review.contains("verdict: FAIL"), fail, "{e}: {review}");
+        assert_eq!(review.contains("planted bug"), fail, "{e}: {review}");
+        assert_eq!(r.field(e, "verdict"), if fail { "FAIL" } else { "PASS" }, "{e}");
+        assert_eq!(r.field(e, "review calls"), calls, "{e}");
+    }
+    assert_eq!(r.status(&es[0].1), "merged", "{}", r.show(&es[0].1));
+    assert_eq!(r.status(&es[1].1), "rejected", "{}", r.show(&es[1].1));
+    assert_eq!(r.status(&es[2].1), "merged", "{}", r.show(&es[2].1));
+    assert_eq!(subjects_of(r)[1..], ["task: src/a.txt", "task: src/c.txt"], "merged in queue order");
+    assert_eq!(r.task_status(&es[1].0), "running", "the rejected task stays running");
+    assert_eq!(r.task_status(&es[0].0), "done");
+}
+
+#[test]
+fn review_parallel_3_reviews_three_entries_at_once_and_a_failing_review_leaves_the_others_verdicts_intact() {
+    let (r, es) = parallel_root("par", 3, false);
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let t0 = Instant::now();
+    let mut run = r.spawn(&["queue", "run", "--all"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    // every reviewer stays in its call while the hang file exists: three calls at once means three reviews at the same time
+    wait_for("three reviewer calls at once", 120, || r.calls() == 3);
+    let started = t0.elapsed();
+    for (_, e) in &es {
+        assert_eq!(r.field(e, "step"), "review", "{e}");
+        assert!(r.field(e, "verdict").is_empty(), "{e}: no verdict while its reviewer is held");
+    }
+    // the reviews take as long as the hold, together: hold them 4 s; one after another they would take 3 x 4 s
+    std::thread::sleep(Duration::from_secs(4));
+    fs::remove_file(&hang).unwrap();
+    assert_eq!(wait_exit(&mut run, 240), 5, "the worst outcome is the rejected entry");
+    assert_own_verdicts(&r, &es, "1");
+    assert_eq!(r.calls(), 3, "one reviewer call per entry");
+    let reviews: Vec<u64> = es.iter().map(|(_, e)| recorded_span_secs(&r.show(e), "review:", " by `")).collect();
+    assert!(reviews.iter().all(|s| *s >= 3), "each review was held about 4 s: {reviews:?}");
+    eprintln!("three reviews held 4 s each, all in progress {:.1} s after the run started; review spans {reviews:?} s", started.as_secs_f64());
+}
+
+#[test]
+fn review_parallel_1_keeps_the_serial_order_and_takes_no_entry_while_one_is_in_review() {
+    let (r, es) = parallel_root("par1", 1, false);
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let mut run = r.spawn(&["queue", "run", "--all"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    wait_for("the first reviewer", 120, || r.calls() == 1);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(r.calls(), 1, "one review at a time");
+    assert_eq!(r.field(&es[0].1, "step"), "review");
+    for (_, e) in &es[1..] {
+        assert_eq!(r.status(e), "queued", "{e} is not taken while the entry before it is in review");
+    }
+    fs::remove_file(&hang).unwrap();
+    let code = wait_exit(&mut run, 240);
+    assert_eq!(code, 5);
+    assert_own_verdicts(&r, &es, "1");
+    // the order of events of the serial drain: an entry's run begins only after the entry before it has its verdict
+    let line = |e: &str, what: &str| -> String { r.show(e).lines().map(str::trim).find(|l| l.contains(what)).unwrap_or_else(|| panic!("{e}: no `{what}` line")).to_string() };
+    for w in es.windows(2) {
+        let verdict = line(&w[0].1, " by `");
+        let next = line(&w[1].1, "preconditions: begin");
+        assert!(verdict[..19] <= next[..19], "{} has its verdict ({verdict}) before {} begins ({next})", w[0].1, w[1].1);
+    }
+}
+
+#[test]
+fn a_parallel_drain_killed_mid_review_leaves_each_entry_running_at_review_and_the_next_run_resumes_each() {
+    let (r, es) = parallel_root("parkill", 3, false);
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let mut run = r.spawn(&["queue", "run", "--all"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    wait_for("three reviewer calls at once", 120, || r.calls() == 3);
+    kill_run_only(&mut run); // the drain dies with three reviews in progress
+    for (_, e) in &es {
+        let s = r.status(e);
+        assert!(s.starts_with("running") && s.contains("interrupted"), "{e}: {s}");
+        assert_eq!(r.field(e, "step"), "review", "{e}");
+    }
+    fs::remove_file(&hang).unwrap();
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    for (_, e) in &es {
+        assert!(o.stdout.contains(&format!("queue entry {e}: RESUMING after an interrupted run, from step review")), "{e}: {}", o.stdout);
+    }
+    assert_eq!(r.calls(), 6, "no verdict was recorded, so each reviewer was asked again");
+    assert_own_verdicts(&r, &es, "2");
+}
+
+/// A stand-in for clients/openai_review.py as the SHADOW: appends a `start` row, waits 3 s, appends an `end` row to
+/// fake-out/ledger.tsv (one row pair per call, like the real ledger's one row per call), then answers PASS.
+const FAKE_LEDGER_SHADOW: &str = r#"import json, os, sys, time
+out = os.environ["FAKE_SHADOW_OUT_DIR"]
+os.makedirs(out, exist_ok=True)
+sys.stdin.buffer.read()
+def row(what):
+    with open(os.path.join(out, "ledger.tsv"), "a", encoding="utf-8") as f:
+        f.write(what + "\t" + os.environ.get("OPENAI_REVIEW_CALL_TYPE", "") + "\n")
+row("start")
+time.sleep(3)
+row("end")
+print(json.dumps({"type": "result", "is_error": False, "result": "VERDICT: PASS\nBLOCKING: none\nMINOR: none", "total_cost_usd": 0.5, "usage": {"input_tokens": 70, "output_tokens": 9}, "modelUsage": {"gpt-5.6-sol-2026-01-01": {}}}))
+"#;
+
+#[test]
+fn parallel_reviews_make_their_gpt_calls_one_at_a_time_with_one_ledger_row_pair_per_call() {
+    let (r, es) = parallel_root("parledger", 3, true);
+    let script = r.dir.join("scratch/shadow/fake_ledger.py");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(&script, FAKE_LEDGER_SHADOW).unwrap();
+    let (s, out) = (script.to_string_lossy().into_owned(), r.fake_out.to_string_lossy().into_owned());
+    let o = r.run_env(&["queue", "run", "--all"], &[("BROADSWORD_SHADOW_REVIEWER_SCRIPT", &s), ("FAKE_SHADOW_OUT_DIR", &out)]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("PARALLEL REVIEW of 3 entries"), "{}", o.stdout);
+    assert_own_verdicts(&r, &es, "1");
+    let ledger = fs::read_to_string(r.fake_out.join("ledger.tsv")).unwrap();
+    let rows: Vec<&str> = ledger.lines().collect();
+    assert_eq!(rows, ["start\tshadow", "end\tshadow", "start\tshadow", "end\tshadow", "start\tshadow", "end\tshadow"], "GPT calls one at a time, one row pair per call, none lost or doubled");
+    for (_, e) in &es {
+        assert_eq!(r.field(e, "shadow verdict"), "PASS", "{e}: {}", r.show(e));
+    }
+    assert_eq!(r.calls(), 3, "one gate call per entry");
+}

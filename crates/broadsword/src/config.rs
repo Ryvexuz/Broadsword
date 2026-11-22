@@ -122,6 +122,9 @@ pub struct Config {
     /// (even 1 entry) at the next entry boundary, although entries of that project are still queued. Without it, approved entries of
     /// one project could wait behind another project's stream of entries until the drain ends (the 2026-11-20 starvation).
     pub merge_train_wait_minutes: u64,
+    /// `queue run --all` with the merge train on (merge_train_max > 1): the most entries brought to their review verdict at the same
+    /// time (PARALLEL REVIEW in queue.rs). Everything after the review stays serial and in queue order. 1 = one at a time, as before.
+    pub review_parallel: u64,
     /// The merge queue's perf gate (perfgate.rs): `"on"` runs a project's bench on every checked commit of a project that has a baseline
     /// in `<state_dir>/perf/`, and fails an entry that got slower than a case's `threshold_pct` allows; `"off"` runs no bench.
     pub perf_gate: bool,
@@ -353,6 +356,7 @@ impl Config {
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             merge_train_max: positive("merge_train_max")?,
             merge_train_wait_minutes: positive("merge_train_wait_minutes")?,
+            review_parallel: positive("review_parallel")?,
             perf_gate,
             perf_runs: positive("perf_runs")?,
             queue_per_project,
@@ -549,6 +553,7 @@ reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_wait_minutes = 20
+review_parallel = 1
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
@@ -590,7 +595,7 @@ install_dir=\"build/bin\"\n";
         assert_eq!((c.reviewer_backend.as_str(), c.reviewer_model_low.as_str(), c.reviewer_model_high.as_str()), ("claude", "haiku", "opus"));
         for key in [
             "reviewer_backend", "reviewer_cli", "reviewer_model_low", "reviewer_model_high", "reviewer_model_high_fallback", "reviewer_model_high_gpt", "reviewer_effort_high", "reviewer_timeout_seconds", "reviewer_diff_max_kb", "reviewer_brief_max_kb", "reviewer_check_tail_kb",
-            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms", "merge_train_max", "merge_train_wait_minutes",
+            "queue_lock_wait_seconds", "reviewer_max_calls_per_entry", "max_agents", "max_queued", "queue_entry_read_wait_ms", "merge_train_max", "merge_train_wait_minutes", "review_parallel",
         ] {
             let without: String = text.lines().filter(|l| !l.trim_start().starts_with(key)).collect::<Vec<_>>().join("
 ");
@@ -616,6 +621,8 @@ install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&with("merge_train_max", "merge_train_max = 0"), Path::new("p")).is_err(), "0 would merge nothing: 1 means off");
         assert_eq!(c.merge_train_max, 4, "shipped 4 for the trial (Lazlo 2026-11-19); 1 turns the train off");
         assert!(Config::from_text(&with("merge_train_wait_minutes", "merge_train_wait_minutes = 0"), Path::new("p")).is_err(), "0 would make every approved entry its own train");
+        assert!(Config::from_text(&with("review_parallel", "review_parallel = 0"), Path::new("p")).is_err(), "0 would review nothing: 1 means one at a time");
+        assert_eq!(c.review_parallel, 3, "the shipped review_parallel");
         assert_eq!(c.merge_train_wait_minutes, 20, "the shipped merge_train_wait_minutes");
         assert!(valid_model_name("claude-haiku-4-5") && valid_model_name("opus[1m]") && !valid_model_name("") && !valid_model_name("-x"));
     }
@@ -736,6 +743,7 @@ reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_wait_minutes = 20
+review_parallel = 1
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5
@@ -788,6 +796,7 @@ reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_wait_minutes = 20
+review_parallel = 1
 shadow_reviewer = \"off\"
 shadow_reviewer_model = \"gpt-5.6-sol\"
 shadow_reviewer_timeout_seconds = 5

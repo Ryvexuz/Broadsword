@@ -85,7 +85,11 @@
 //! (`check_deferred = yes`) is checked on its own first if it is ever merged outside a train (`merge_phase`). The two places nb-18
 //! (check from a clean checkout of the exact commit) plugs in are `Run::check_commit` and `Run::check_alone`.
 //!
-//! LOCKS. `queue.lock` is held for the whole `queue run` (minutes), so one entry is processed at a time; a second `queue run` waits
+//! PARALLEL REVIEW (setting `review_parallel`, only with the merge train on, in `queue run --all`): up to review_parallel entries are
+//! brought to their review verdict at once, one worker thread per entry, everything after the review serial and in queue order (see
+//! `drive_all`). review_parallel = 1: one entry at a time, exactly as before.
+//!
+//! LOCKS. `queue.lock` is held for the whole `queue run` (minutes), so one entry is processed at a time (PARALLEL REVIEW: one batch); a second `queue run` waits
 //! `queue_lock_wait_seconds`, then exits 4. `entries.lock` is held for milliseconds, around "is this task already queued, create
 //! the entry" and around choosing the next entry. Order is always queue.lock then entries.lock. The TASK BOARD lock is never held
 //! during the rebase, check, review or merge: it is taken only by `task done` (inside `task::cmd_finish`), which is short.
@@ -1026,37 +1030,66 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
             }
         };
         taken.push(e.id().to_string());
-        let t = std::time::Instant::now();
-        let mut run = match begin(cfg, e) {
-            Ok(mut r) => {
-                r.defer_check = train;
-                r
+        // PARALLEL REVIEW (review_parallel > 1, merge train on): more entries are claimed now, each exactly as the next turn of this
+        // loop would claim it, as long as each is one a train member's worker may take (`parallel_ok`). With review_parallel = 1, or
+        // when only one entry is ready, the batch is this one entry and everything below runs as it always did.
+        let mut batch = vec![e];
+        let mut claim_err = None;
+        if train && cfg.review_parallel > 1 && parallel_ok(&batch[0]) {
+            while (batch.len() as u64) < cfg.review_parallel {
+                match claim(cfg, |all| Ok(next_for_all(all, &taken, train, &lane).filter(parallel_ok))) {
+                    Ok(Some(x)) => {
+                        taken.push(x.id().to_string());
+                        batch.push(x);
+                    }
+                    Ok(None) => break,
+                    Err(c) => {
+                        claim_err = Some(c);
+                        break;
+                    }
+                }
             }
-            Err((id, c)) => {
-                rows.push(row_for(cfg, &id, code_num(c), t));
-                continue;
-            }
-        };
-        let start = run.start_step();
-        let result = (|| -> R<ExitCode> {
-            run.until_review(start)?;
-            run.review_phase(start)?;
-            if train && start <= 3 {
-                run.approve() // MERGE TRAIN: the entry waits at `approved` for its train
-            } else {
-                run.merge_phase(start)
-            }
-        })();
-        let code = code_num(match result {
-            Ok(c) | Err(c) => c,
-        });
-        let id = run.e.id().to_string();
-        if run.e.status() == APPROVED {
-            // approved entries keep their Run until their train has finished with them
-            approved.push((run, t));
-        } else {
-            rows.push(row_for(cfg, &id, code, t));
         }
+        let mut slots: Vec<Slot> = Vec::new();
+        for e in batch {
+            let t = std::time::Instant::now();
+            match begin(cfg, e) {
+                Ok(mut r) => {
+                    r.defer_check = train;
+                    let start = r.start_step();
+                    slots.push(Slot::Run(r, t, start, 0));
+                }
+                Err((id, c)) => slots.push(Slot::Ended(id, code_num(c), t)),
+            }
+        }
+        drive_all(&mut slots, train);
+        // From here on everything is serial and in queue order, exactly as for one entry: the summary rows, the approved list, then
+        // the trains (and so every train check, fast-forward and main check).
+        let mut codes: Vec<(String, u8, usize)> = Vec::new();
+        for slot in slots {
+            match slot {
+                Slot::Ended(id, code, t) => rows.push(row_for(cfg, &id, code, t)),
+                Slot::Run(run, t, start, code) => {
+                    let id = run.e.id().to_string();
+                    if run.e.status() == APPROVED {
+                        // approved entries keep their Run until their train has finished with them
+                        approved.push((run, t));
+                    } else {
+                        rows.push(row_for(cfg, &id, code, t));
+                    }
+                    codes.push((id, code, start));
+                }
+            }
+        }
+        let Some(stop_at) = codes.iter().position(|(_, c, _)| *c == EXIT_ERROR || *c == EXIT_MERGED_BAD).or(if codes.is_empty() { None } else { Some(codes.len() - 1) }) else {
+            if let Some(c) = claim_err {
+                stopped = format!("the next entry could not be chosen (exit {})", code_num(c));
+                rows.push(Row { id: "-".into(), task: "-".into(), status: "-".into(), code: code_num(c), secs: 0.0, note: stopped.clone(), train: String::new() });
+                break;
+            }
+            continue; // every entry of the batch ended before it ran (unknown project): as before, no train for them
+        };
+        let (id, code, start) = codes[stop_at].clone();
         let mut train_code = 0u8;
         // no new train while a half-finished merge is being finished (`resume_first` entries come first): a train only starts once
         // main's last merge has had its main check
@@ -1068,6 +1101,11 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
             stop_code = hard;
             stopped = if hard == train_code && train_code != 0 { train_stop_note(hard) } else { format!("stopped after entry {id} (exit {code}): {}", if code == EXIT_ERROR { "it stays `running` at its step; fix the cause, then `queue run` resumes it" } else { "main holds a commit whose check failed; a human decides before anything else merges" }) };
             settle_approved(cfg, &mut approved, &mut rows);
+            break;
+        }
+        if let Some(c) = claim_err {
+            stopped = format!("the next entry could not be chosen (exit {})", code_num(c));
+            rows.push(Row { id: "-".into(), task: "-".into(), status: "-".into(), code: code_num(c), secs: 0.0, note: stopped.clone(), train: String::new() });
             break;
         }
     }
@@ -1088,6 +1126,118 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
         println!("worst exit: {worst}");
     }
     ExitCode::from(worst)
+}
+
+// ---- PARALLEL REVIEW (review_parallel) ------------------------------------------------------------------------------
+//
+// `queue run --all` with the merge train on (merge_train_max > 1) and review_parallel > 1 claims up to review_parallel entries at
+// once (each with the same `claim` and `next_for_all` the serial loop uses, so the same entries in the same order) and brings them
+// to their review verdict together, one worker thread per entry (`drive_all`):
+//   - each worker owns its entry's Run (its record and its files: <entry>.entry, .review, .shadow.review, .donecheck); no worker
+//     ever reads or writes another entry's record, so a verdict can only be written to its own entry;
+//   - the steps before the review (preconditions, rebase, the deferred check, the done check) run one worker at a time, in queue
+//     order (`Turn`): git writes to the shared repository and done-check jobs never overlap, exactly as in the serial drain;
+//   - the reviews (gate call, then shadow call, per entry, with the same rules, models, timeouts and reviewer_max_calls_per_entry)
+//     run side by side, except that every call through clients/openai_review.py (GPT gate, GPT shadow) holds `GPT_CALL`, so the GPT
+//     daily cap is checked call by call with every earlier call already in the ledger, as in the serial drain;
+//   - a worker only ever ends its entry `approved` or finished (rejected, blocked, stale, ...): `parallel_ok` admits only entries
+//     whose run starts before the merge step, and with the merge train on such a run stops at `approved` (`drive`). No worker
+//     merges, builds a train, checks a train or fast-forwards: all of that runs afterwards, on the main thread, serially, in queue order.
+// The run lock (queue.lock) is held by the drain for all of it; entries.lock is taken for each claim as before. A drain killed
+// mid-review leaves each claimed entry `running` at its recorded step, and the next `queue run` resumes each one as it always does.
+
+/// Can this entry be one of a parallel batch? Only an entry whose run starts before the merge step and that is not a half-finished
+/// train merge: those (and everything after a review) run on the main thread only.
+fn parallel_ok(e: &Record) -> bool {
+    !half_merged(e) && STEPS.iter().position(|s| *s == e.get("step")).unwrap_or(0) < STEP_MERGE
+}
+
+/// One claimed entry of a batch: `Run(run, started, start step, exit code once driven)`, or `Ended(id, exit code, started)` for one
+/// `begin` already ended (its project is unknown).
+enum Slot<'a> {
+    Run(Run<'a>, std::time::Instant, usize, u8),
+    Ended(String, u8, std::time::Instant),
+}
+
+/// Every call through clients/openai_review.py (the GPT gate and the GPT shadow) of this process holds this lock, so parallel
+/// reviews make their GPT calls one at a time: each call's daily-cap check sees every earlier call's ledger row.
+static GPT_CALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpt_call_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPT_CALL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Turns in queue order: `wait(i)` returns once turns 0..i are over; the turn ends when the guard drops (also on an early return).
+struct Turn {
+    next: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+struct TurnGuard<'t>(&'t Turn);
+
+impl Turn {
+    fn wait(&self, i: usize) -> TurnGuard<'_> {
+        let mut n = self.next.lock().unwrap_or_else(|p| p.into_inner());
+        while *n != i {
+            n = self.cv.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        TurnGuard(self)
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.next.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.0.cv.notify_all();
+    }
+}
+
+/// One entry through the steps up to its verdict and, without the merge train, its merge: exactly the serial drain's body. With
+/// `turn`, the steps before the review wait for their turn (PARALLEL REVIEW).
+fn drive(run: &mut Run<'_>, start: usize, train: bool, turn: Option<(&Turn, usize)>) -> u8 {
+    let result = (|| -> R<ExitCode> {
+        {
+            let _t = turn.map(|(t, i)| t.wait(i));
+            run.until_review(start)?;
+        }
+        run.review_phase(start)?;
+        if train && start <= 3 {
+            run.approve() // MERGE TRAIN: the entry waits at `approved` for its train
+        } else {
+            run.merge_phase(start)
+        }
+    })();
+    code_num(match result {
+        Ok(c) | Err(c) => c,
+    })
+}
+
+/// Drive every `Slot::Run` of a batch and record its exit code: one alone on this thread (the serial drain), more side by side,
+/// one worker thread each (PARALLEL REVIEW: they are all `parallel_ok` with the train on, so each stops at its verdict).
+fn drive_all(slots: &mut [Slot<'_>], train: bool) {
+    let runs = slots.iter().filter(|s| matches!(s, Slot::Run(..))).count();
+    if runs <= 1 {
+        for s in slots.iter_mut() {
+            if let Slot::Run(run, _, start, code) = s {
+                *code = drive(run, *start, train, None);
+            }
+        }
+        return;
+    }
+    println!("queue run --all: PARALLEL REVIEW of {runs} entries (review_parallel): their steps up to the review run one after another in queue order, their reviews side by side; trains and merges follow, one at a time");
+    let turn = Turn { next: std::sync::Mutex::new(0), cv: std::sync::Condvar::new() };
+    std::thread::scope(|sc| {
+        let mut i = 0;
+        for s in slots.iter_mut() {
+            if let Slot::Run(run, _, start, code) = s {
+                let (turn, at, start) = (&turn, i, *start);
+                i += 1;
+                sc.spawn(move || {
+                    *code = drive(run, start, train, Some((turn, at)));
+                });
+            }
+        }
+    });
 }
 
 /// A summary row read back from the entry's record (its final status and one-line reason).
@@ -2060,7 +2210,10 @@ impl<'a> Run<'a> {
         let n = self.take_review_call()?;
         self.log("review", &format!("calling the GPT gate `{model}` through {script}{} (call {n} of at most {}, at most {} s); this spends money (plan, then credits under the daily cap) and uses the network", if hook { " [TEST HOOK]" } else { "" }, self.cfg.reviewer_max_calls_per_entry, self.cfg.reviewer_timeout_seconds))?;
         let one_line = |m: &str| m.lines().next().unwrap_or("").chars().take(300).collect::<String>();
-        Ok(match reviewer::call_gpt(self.cfg, &python, &script, model, reviewer::gate_system_prompt(self.e.get("risk")), prompt, "gate", self.e.get("task"), self.cfg.reviewer_timeout_seconds) {
+        let gpt = gpt_call_lock(); // PARALLEL REVIEW: one GPT call at a time (see `GPT_CALL`)
+        let answer = reviewer::call_gpt(self.cfg, &python, &script, model, reviewer::gate_system_prompt(self.e.get("risk")), prompt, "gate", self.e.get("task"), self.cfg.reviewer_timeout_seconds);
+        drop(gpt);
+        Ok(match answer {
             Err(CallError::Timeout(s)) => Err(format!("no answer within {s} s (reviewer_timeout_seconds)")),
             Err(CallError::Start(m) | CallError::Failed(m)) => Err(one_line(&m)),
             Ok(r) => match &r.invalid {
@@ -2093,8 +2246,10 @@ impl<'a> Run<'a> {
             Err(m) => return self.shadow_end("ERROR", &m),
         };
         self.log("shadow", &format!("calling the shadow reviewer `{model}` (recorded only, never gating; at most {} s); this spends money and uses the network", self.cfg.shadow_reviewer_timeout_seconds))?;
+        let gpt = gpt_call_lock(); // PARALLEL REVIEW: one GPT call at a time (see `GPT_CALL`)
         let t0 = std::time::Instant::now();
         let result = reviewer::call_shadow(self.cfg, &python, &script, &model, prompt, self.e.get("task"));
+        drop(gpt);
         let secs = t0.elapsed().as_secs_f64();
         self.e.set("shadow_secs", format!("{secs:.1}"));
         let review = match result {

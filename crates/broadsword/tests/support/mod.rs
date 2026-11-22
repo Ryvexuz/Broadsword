@@ -62,6 +62,8 @@ const BASE: &[(&str, &str)] = &[
     ("reviewer_max_calls_per_entry", "3"),
     ("merge_train_max", "1"),
     ("merge_train_wait_minutes", "20"),
+    // one entry at a time unless a test sets it: the serial drain, exactly as before PARALLEL REVIEW
+    ("review_parallel", "1"),
     ("perf_gate", "\"on\""),
     ("perf_runs", "2"),
     ("queue_per_project", "\"off\""),
