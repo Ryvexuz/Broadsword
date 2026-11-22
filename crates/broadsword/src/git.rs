@@ -1,15 +1,25 @@
 //! Git checkpoints and rollback. Everything runs the `git` program as a child process.
 //!
-//! A snapshot records the exact bytes of a project's working tree: tracked and untracked non-ignored
-//! files as one commit, and ignored files (minus build, scratch, state and `target` folders, and
-//! subject to a size cap) as a second, parentless commit. Files are stored raw (`hash-object -w
-//! --no-filters`) and trees are built with `update-index --index-info` in a temporary index, so no
-//! line-ending or other filter ever touches the content, and the working tree, HEAD, the branch and
-//! the real index are never changed by taking a snapshot. Restoring writes the raw blobs back.
+//! A snapshot of a project's working tree (tracked and untracked non-ignored files) is kept TWICE, built in one place
+//! (`capture`):
+//! - the snapshot COMMIT holds what `git add` of those files would store under the repo's own filters (core.autocrlf,
+//!   `.gitattributes`): `update-index --add` on a copy of the real index, so its tree is the tree a normal commit of the
+//!   same files would have, and `git diff <base> <checkpoint>` shows only real changes;
+//! - a sibling `-raw` commit holds the exact bytes (`hash-object -w --no-filters`, trees built with
+//!   `update-index --index-info` in a temporary index), so no line-ending or other filter ever touches them. Restoring
+//!   writes these raw blobs back, never the filtered ones (a clean filter is not always undone by its smudge: CRLF and LF
+//!   mixed in one file come back all CRLF).
 //!
-//! Refs (a ref cannot be both a file and a folder, so the ignored snapshots live in sibling folders):
-//! - `refs/broadsword/checkpoints/<id>` and `refs/broadsword/checkpoints-ignored/<id>`
-//! - `refs/broadsword/interrupted/<id>/<attempt>` and `refs/broadsword/interrupted-ignored/<id>/<attempt>`
+//! Ignored files (minus build, scratch, state and `target` folders, and subject to a size cap) are one more, parentless,
+//! raw commit (`git add` never stores them). The working tree, HEAD, the branch and the real index are never changed by
+//! taking a snapshot.
+//!
+//! Refs (a ref cannot be both a file and a folder, so the ignored and raw snapshots live in sibling folders):
+//! - `refs/broadsword/checkpoints/<id>`, `refs/broadsword/checkpoints-raw/<id>` and `refs/broadsword/checkpoints-ignored/<id>`
+//! - `refs/broadsword/interrupted/<id>/<attempt>`, `refs/broadsword/interrupted-raw/<id>/<attempt>` and
+//!   `refs/broadsword/interrupted-ignored/<id>/<attempt>`
+//! - a checkpoint commit made before the raw refs existed holds the raw bytes itself; one made since names its raw ref in
+//!   its message (`RAW_MARK`), and rollback refuses when that ref is missing
 //! - `refs/broadsword/index/<id>`: the real index at checkpoint time, minus secret paths
 //! - `refs/broadsword/interrupted-index/<id>/<attempt>`: the real index just before a rollback replaced it, minus secret paths
 //!
@@ -20,7 +30,7 @@
 //! Refs are only ever created (never overwritten or deleted), so no snapshot is ever lost.
 
 use crate::config::{Config, MB};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -28,6 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CHECKPOINT_REFS: &str = "refs/broadsword/checkpoints";
 pub const CHECKPOINT_IGNORED_REFS: &str = "refs/broadsword/checkpoints-ignored";
+pub const CHECKPOINT_RAW_REFS: &str = "refs/broadsword/checkpoints-raw";
+pub const INTERRUPTED_RAW_REFS: &str = "refs/broadsword/interrupted-raw";
+/// The line of a snapshot commit's message that names the ref holding its exact bytes.
+const RAW_MARK: &str = "exact bytes: ";
 pub const INTERRUPTED_REFS: &str = "refs/broadsword/interrupted";
 pub const INTERRUPTED_IGNORED_REFS: &str = "refs/broadsword/interrupted-ignored";
 pub const INDEX_REFS: &str = "refs/broadsword/index";
@@ -327,6 +341,58 @@ fn tree_of(dir: &Path, state: &Path, tag: &str, files: &[String], tracked_modes:
     result
 }
 
+/// NUL-terminated paths, the `-z --stdin` input of `update-index`.
+fn nul_list<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<u8> {
+    let mut v = Vec::new();
+    for p in paths {
+        v.extend_from_slice(p.as_bytes());
+        v.push(0);
+    }
+    v
+}
+
+/// The tree `git add` of exactly these files would give, the real index left unchanged: their blobs go through the repo's
+/// own filters (core.autocrlf, `.gitattributes`) judged against a COPY of the real index, as `git add` judges them (a path
+/// whose index blob already holds CRs keeps them; plain `hash-object` does not read the index and would convert it).
+/// Entries of the copy outside `files` (deleted files, secret paths) are removed by name: no file is read for them.
+/// `core.safecrlf=false` only silences git's line-ending warning or error; it changes no content.
+fn staged_tree_of(dir: &Path, state: &Path, tag: &str, files: &[String]) -> Result<String, String> {
+    let idx = unique_index(state, tag);
+    let result = (|| {
+        let real = PathBuf::from(git_text(dir, &["rev-parse", "--git-path", "index"], None)?);
+        let real = if real.is_absolute() { real } else { dir.join(real) };
+        match std::fs::copy(&real, &idx) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // no index yet: start from an empty one
+            Err(e) => return Err(format!("cannot copy the index {}: {e}", real.display())),
+        }
+        let keep: HashSet<&str> = files.iter().map(String::as_str).collect();
+        let present = String::from_utf8_lossy(&git(dir, &["ls-files", "-z"], Some(&idx), None)?).into_owned();
+        let gone: Vec<&str> = present.split('\0').filter(|p| !p.is_empty() && !keep.contains(p)).collect();
+        if !gone.is_empty() {
+            git(dir, &["update-index", "--force-remove", "-z", "--stdin"], Some(&idx), Some(&nul_list(gone.into_iter())))?;
+        }
+        if !files.is_empty() {
+            let input = nul_list(files.iter().map(String::as_str));
+            git(dir, &["-c", "core.safecrlf=false", "update-index", "--add", "-z", "--stdin"], Some(&idx), Some(&input))?;
+        }
+        git_text(dir, &["write-tree"], Some(&idx))
+    })();
+    let _ = std::fs::remove_file(&idx);
+    result
+}
+
+/// The tree that holds a snapshot commit's exact bytes: the tree of the raw ref its message names (`RAW_MARK`), which must
+/// exist then, or (a commit made before raw refs existed, which stored raw bytes itself) the commit's own tree.
+fn raw_tree_of(dir: &Path, commit_ref: &str) -> Result<String, String> {
+    let msg = git_text(dir, &["log", "-1", "--format=%B", commit_ref, "--"], None)?;
+    match msg.lines().find_map(|l| l.strip_prefix(RAW_MARK)) {
+        Some(raw) => git_text(dir, &["rev-parse", "--verify", &format!("{}^{{tree}}", raw.trim())], None)
+            .map_err(|e| format!("{commit_ref} names its exact bytes in {}, which cannot be read: {e}", raw.trim())),
+        None => git_text(dir, &["rev-parse", "--verify", &format!("{commit_ref}^{{tree}}")], None),
+    }
+}
+
 /// NUL-separated `<meta>\t<path>` records of `ls-tree -z` / `ls-files -s -z`, raw (a path is never re-encoded), with the
 /// path decoded only to test it.
 fn entries(out: &[u8]) -> Vec<(&[u8], String)> {
@@ -368,7 +434,10 @@ fn secret_free_tree(dir: &Path, state: &Path, tag: &str, tree: &str, extra: &[Ve
 }
 
 pub struct Captured {
+    /// What `git add` of the files would store (`staged_tree_of`): the snapshot commit's tree.
     pub tree: String,
+    /// The same files' exact bytes (`tree_of`): what rollback compares and restores.
+    pub raw_tree: String,
     pub ignored_tree: Option<String>,
     /// Ignored files left out because the size cap was reached.
     pub skipped: Vec<(String, u64)>,
@@ -403,7 +472,8 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
         }
         !secret
     });
-    let tree = tree_of(dir, state, tag, &files, &modes)?;
+    let raw_tree = tree_of(dir, state, tag, &files, &modes)?;
+    let tree = staged_tree_of(dir, state, &format!("{tag}-add"), &files)?;
 
     let mut kept = Vec::new();
     let mut skipped = Vec::new();
@@ -428,7 +498,7 @@ pub fn capture(dir: &Path, state: &Path, tag: &str, opts: &Opts) -> Result<Captu
     }
     let ignored_tree = if kept.is_empty() { None } else { Some(tree_of(dir, state, &format!("{tag}-ign"), &kept, &HashMap::new())?) };
     secret_skipped.sort();
-    Ok(Captured { tree, ignored_tree, skipped, secret_skipped })
+    Ok(Captured { tree, raw_tree, ignored_tree, skipped, secret_skipped })
 }
 
 pub struct Checkpoint {
@@ -454,7 +524,11 @@ pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Che
         }
         None => None,
     };
-    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword checkpoint {id}"))?;
+    // The exact bytes first: a checkpoint ref that exists always has its raw ref (rollback refuses without it).
+    let raw_ref = format!("{CHECKPOINT_RAW_REFS}/{id}");
+    let raw_commit = commit_tree(dir, &cap.raw_tree, None, &format!("broadsword checkpoint {id}, exact bytes"))?;
+    create_ref(dir, &raw_ref, &raw_commit)?;
+    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword checkpoint {id}\n\n{RAW_MARK}{raw_ref}"))?;
     let ref_name = format!("{CHECKPOINT_REFS}/{id}");
     create_ref(dir, &ref_name, &commit)?;
     // `write-tree` only writes tree objects; it does not modify the index. It fails on unmerged entries: then none is kept.
@@ -652,9 +726,10 @@ impl Guard<'_> {
 }
 
 /// Roll a project's working tree back to its checkpoint.
-/// 1. Snapshot the CURRENT state (raw bytes, ignored files too) into brand-new refs
-///    `interrupted/<id>/<attempt>`; every attempt gets a new ref, created only if absent and read back
-///    before any file is touched. What to delete and restore is computed from this attempt's snapshot,
+/// 1. Snapshot the CURRENT state (ignored files too) into brand-new refs `interrupted/<id>/<attempt>` (what `git add`
+///    would store) and `interrupted-raw/<id>/<attempt>` (the exact bytes); every attempt gets new refs, created only if
+///    absent and read back before any file is touched. Every comparison and restore below uses the exact bytes: this
+///    attempt's raw tree and the checkpoint's (`raw_tree_of`). What to delete and restore is computed from this attempt's snapshot,
 ///    so edits made after an earlier failed attempt are kept too.
 /// 2. Files that exist now but not in the checkpoint (new non-ignored files) are deleted; they are
 ///    saved. Files that differ from, or are missing since, the checkpoint are restored byte for byte.
@@ -681,13 +756,17 @@ pub fn rollback(
         Some(t) => Some(commit_tree(dir, t, None, &format!("broadsword interrupted ignored files of {id}"))?),
         None => None,
     };
-    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword interrupted work of {id}"))?;
+    let raw_commit = commit_tree(dir, &cap.raw_tree, None, &format!("broadsword interrupted work of {id}, exact bytes"))?;
     let mut attempt = 0u32;
     let (interrupted_ref, interrupted_ignored_ref) = loop {
         attempt += 1;
         let r = format!("{INTERRUPTED_REFS}/{id}/{attempt}");
+        let raw_ref = format!("{INTERRUPTED_RAW_REFS}/{id}/{attempt}");
+        let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword interrupted work of {id}\n\n{RAW_MARK}{raw_ref}"))?;
         match create_ref(dir, &r, &commit) {
             Ok(()) => {
+                create_ref(dir, &raw_ref, &raw_commit)?; // the exact bytes, saved before any file is touched
+
                 let ri = match &ignored_commit {
                     Some(c) => {
                         let ri = format!("{INTERRUPTED_IGNORED_REFS}/{id}/{attempt}");
@@ -706,11 +785,12 @@ pub fn rollback(
     };
 
     let apply = || -> Result<Rollback, String> {
-    let ckpt_tree = git_text(dir, &["rev-parse", "--verify", &format!("{checkpoint_ref}^{{tree}}")], None)?;
+    // Rollback compares and restores EXACT bytes only: the checkpoint's raw tree against this attempt's raw tree.
+    let ckpt_tree = raw_tree_of(dir, checkpoint_ref)?;
     // Every secret file in the folder right now (this attempt's capture lists them by name only, before any blob is made:
     // tracked, untracked or ignored, the job's new ones included) is left exactly as it is, and named.
     let mut secret_skipped = cap.secret_skipped.clone();
-    let main = changes(dir, &cap.tree, &ckpt_tree, &mut secret_skipped)?;
+    let main = changes(dir, &cap.raw_tree, &ckpt_tree, &mut secret_skipped)?;
     let ignored = match (checkpoint_ignored_ref, &cap.ignored_tree) {
         (Some(r), now) => {
             let ckpt_ign = git_text(dir, &["rev-parse", "--verify", &format!("{r}^{{tree}}")], None)?;
@@ -727,7 +807,7 @@ pub fn rollback(
     }
 
     // Every change goes through the Guard; see its documentation.
-    let mut snapshot = tree_blobs(dir, &cap.tree)?;
+    let mut snapshot = tree_blobs(dir, &cap.raw_tree)?;
     if let Some(t) = &cap.ignored_tree {
         snapshot.extend(tree_blobs(dir, t)?);
     }
@@ -993,6 +1073,107 @@ mod tests {
             assert_eq!(fs::read(d.join(n)).unwrap(), b, "{n}");
         }
         assert_eq!(fs::read(d.join("untracked-lf.txt")).unwrap(), b"x\ny\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// An autocrlf=true repo whose working files are CRLF (as a checkout leaves them), with `lf.txt` committed as an LF blob
+    /// (`git add` converts it), `crlfblob.txt` committed as a CRLF blob (`git add` keeps its CRs: git's safe-autocrlf rule,
+    /// which only an index-aware capture gets right) and two untracked files, one with mixed endings.
+    fn crlf_working_tree(tag: &str) -> PathBuf {
+        let d = temp_repo(tag);
+        fs::write(d.join("lf.txt"), b"x\ny\n").unwrap();
+        fs::write(d.join("crlfblob.txt"), b"a\r\nb\r\n").unwrap();
+        git_text(&d, &["add", "-A"], None).unwrap();
+        git_text(&d, &["commit", "-q", "-m", "files"], None).unwrap();
+        git_text(&d, &["config", "core.autocrlf", "true"], None).unwrap();
+        fs::write(d.join("lf.txt"), b"x\r\ny\r\nz\r\n").unwrap();
+        fs::write(d.join("crlfblob.txt"), b"a\r\nb\r\nc\r\n").unwrap();
+        fs::write(d.join("new.txt"), b"n\r\n").unwrap();
+        fs::write(d.join("mixed.txt"), b"m\r\nn\no\r\n").unwrap();
+        d
+    }
+
+    /// The tree `git add -A` + commit would give right now, made in a copy of the index (the real one is not changed).
+    fn add_all_tree(d: &Path, state: &Path) -> String {
+        fs::create_dir_all(state).unwrap();
+        let idx = state.join("expected-index");
+        fs::copy(d.join(".git").join("index"), &idx).unwrap();
+        git(d, &["add", "-A"], Some(&idx), None).unwrap();
+        let t = git_text(d, &["write-tree"], Some(&idx)).unwrap();
+        fs::remove_file(&idx).unwrap();
+        t
+    }
+
+    fn tree(d: &Path, r: &str) -> String {
+        git_text(d, &["rev-parse", &format!("{r}^{{tree}}")], None).unwrap()
+    }
+
+    fn blob(d: &Path, r: &str, p: &str) -> Vec<u8> {
+        git(d, &["cat-file", "blob", &format!("{r}:{p}")], None, None).unwrap()
+    }
+
+    /// A checkpoint of a CRLF working tree under core.autocrlf=true has the tree a normal commit of it would have (crash-sim
+    /// 4.6b: the raw checkpoint a819254 differed from its parent in every CRLF file).
+    #[test]
+    fn checkpoint_tree_equals_a_commit_under_autocrlf() {
+        let d = crlf_working_tree("ckadd");
+        let state = state_for("ckadd");
+        let status_before = status(&d);
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        assert_eq!(status(&d), status_before, "the real index is not changed");
+        let expected = add_all_tree(&d, &state);
+        assert_eq!(tree(&d, &c.ref_name), expected, "checkpoint tree == tree of git add -A");
+        assert_eq!(blob(&d, &c.ref_name, "lf.txt"), b"x\ny\nz\n", "converted like git add");
+        assert_eq!(blob(&d, &c.ref_name, "crlfblob.txt"), b"a\r\nb\r\nc\r\n", "a CRLF index blob keeps its CRs, like git add");
+        // the exact bytes are kept beside it
+        let raw = format!("{CHECKPOINT_RAW_REFS}/j");
+        assert_eq!(blob(&d, &raw, "lf.txt"), b"x\r\ny\r\nz\r\n");
+        assert_eq!(blob(&d, &raw, "mixed.txt"), b"m\r\nn\no\r\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Rollback from such a checkpoint writes back the exact bytes (not the converted blobs), and the interrupted snapshot is
+    /// likewise a git-add tree with the job's exact bytes in its raw ref.
+    #[test]
+    fn rollback_restores_exact_bytes_from_a_filtered_checkpoint() {
+        let d = crlf_working_tree("rbadd");
+        let state = state_for("rbadd");
+        let files = ["tracked.txt", "lf.txt", "crlfblob.txt", "new.txt", "mixed.txt"];
+        let before: Vec<Vec<u8>> = files.iter().map(|f| fs::read(d.join(f)).unwrap()).collect();
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        for f in files {
+            fs::write(d.join(f), b"job\r\nchanged\n").unwrap();
+        }
+        fs::write(d.join("made.txt"), b"made\r\n").unwrap();
+        let expected_int = add_all_tree(&d, &state);
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        for (f, b) in files.iter().zip(&before) {
+            assert_eq!(&fs::read(d.join(f)).unwrap(), b, "{f} restored byte for byte");
+        }
+        assert!(!d.join("made.txt").exists());
+        assert_eq!(tree(&d, &r.interrupted_ref), expected_int, "interrupted tree == tree of git add -A");
+        let raw = format!("{INTERRUPTED_RAW_REFS}/j/1");
+        assert_eq!(blob(&d, &raw, "lf.txt"), b"job\r\nchanged\n");
+        assert_eq!(blob(&d, &raw, "made.txt"), b"made\r\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A checkpoint whose message names a raw ref that is missing is never restored from its filtered tree.
+    #[test]
+    fn rollback_refuses_when_the_named_raw_ref_is_missing() {
+        let d = crlf_working_tree("rbnoraw");
+        let state = state_for("rbnoraw");
+        let cap = capture(&d, &state, "x", &opts()).unwrap();
+        let msg = format!("broadsword checkpoint x\n\n{RAW_MARK}{CHECKPOINT_RAW_REFS}/x");
+        let commit = commit_tree(&d, &cap.tree, head(&d).as_deref(), &msg).unwrap();
+        create_ref(&d, &format!("{CHECKPOINT_REFS}/x"), &commit).unwrap();
+        fs::write(d.join("lf.txt"), b"job\n").unwrap();
+        let e = rollback(&d, &state, "x", &format!("{CHECKPOINT_REFS}/x"), None, &[], None, &opts()).err().expect("refused");
+        assert!(e.contains("cannot be read"), "{e}");
+        assert_eq!(fs::read(d.join("lf.txt")).unwrap(), b"job\n", "nothing restored");
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
