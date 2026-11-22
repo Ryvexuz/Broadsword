@@ -1,6 +1,6 @@
 # ADR 0004: which repos the roadmap's tiers live in, and when ADR 0001's (d2) move happens
 
-**Status: Accepted** by Lazlo on 2026-11-22 04:16Z ("Sure", in reply to the coordinator's question whether he accepts this repo plan, project thread message cmsg_019Gy38ApTnA8WHdHwRbXZzHCzjsN8jfpQFXPqQcqQxSPz). W is named `studio` (projects/studio), a name the coordinator picked under the standing authority for cheap, reversible choices because Lazlo gave none; it was created locally on 2026-11-22 (commit d8adf97 in that repo, nothing pushed). Before that: Proposed. ADR 0001 stays Accepted as it is; this
+**Status: Accepted** by Lazlo on 2026-11-22 04:16Z ("Sure", in reply to the coordinator's question whether he accepts this repo plan, project thread message cmsg_019Gy38ApTnA8WHdHwRbXZzHCzjsN8jfpQFXPqQcqQxSPz). W is named `forge` (projects/forge), a name the coordinator picked under the standing authority for cheap, reversible choices because Lazlo gave none (first created as `studio`, commit d8adf97, and renamed to `forge` in commit ed35623 before any code landed, because `studio` clashed with the stage 11 Studio editor; nothing pushed). Before that: Proposed. ADR 0001 stays Accepted as it is; this
 ADR proposes what to do when its triggers fire, and one new trigger (T6 below) that comes from the product intent.
 
 - Date: 2026-11-19. Board task `t-20261119-225028-2` (brief `[roadmap-ahead] ADR 0004`). First draft: it must be revised
