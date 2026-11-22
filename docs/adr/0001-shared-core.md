@@ -206,6 +206,7 @@ Any one of these fires the move to (d2), through ADR 0002 and the F5 brief below
 1. A second project must run the sim or parse `.bsn` as a library: the pipe in nb-40 cannot hold the viewer's frame
    rate, or the Studio (stage 11) needs the sim in-process.
 2. A third Rust project needs the same `Vec3` or the same parser (for example, racing as its own crate after all).
+   - Fired 2026-11-22: forge core/scene copies Vec3/Mat4 from render (node 2.4 decision D2, plan default: copy). Copies are now crash-sim, render, scene (plus mesh-kernel's own f64 Vec3). Moving to (d2) needs ADR 0002 and Lazlo; not decided here.
 3. A bug is fixed in one copy of the math or of the cube numbering and the other copy has the same bug.
 4. A numerics core is needed by two projects.
 5. A Broadsword change makes relative paths resolve the same in worktrees and main checkouts (for example a worktree
