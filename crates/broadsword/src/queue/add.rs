@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use super::entry::{EXT, is_open, load_entries, process_secrets, queue_dir};
 use super::locks::entries_lock;
 use super::{EXIT_BAD_INPUT, EXIT_ERROR, EXIT_RETRY, QUEUED};
-use super::train::{chained_base, gating_model, left_train_text, short, some, trunk_name};
+use super::train::{chained_base, gating_model, left_train_text, trunk_name};
+use super::view::{short, some};
 
 // ---- add --------------------------------------------------------------------------------
 

@@ -128,10 +128,12 @@ mod add;
 mod entry;
 mod locks;
 mod train;
+mod view;
 
 pub use add::cmd_add;
 pub use entry::queue_dir;
-pub use train::{cmd_cancel, cmd_list, cmd_run, cmd_run_all, cmd_show};
+pub use train::{cmd_cancel, cmd_run, cmd_run_all};
+pub use view::{cmd_list, cmd_show};
 use crate::config::Config;
 use crate::record::Record;
 use crate::reviewer;
@@ -152,6 +154,8 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("locks.rs"),
     "\n",
     include_str!("train.rs"),
+    "\n",
+    include_str!("view.rs"),
 );
 
 pub const QUEUED: &str = "queued";
