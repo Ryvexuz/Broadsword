@@ -125,6 +125,7 @@
 //! in wtgit.rs.
 
 mod entry;
+mod locks;
 mod train;
 
 pub use entry::queue_dir;
@@ -143,6 +144,8 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("mod.rs"),
     "\n",
     include_str!("entry.rs"),
+    "\n",
+    include_str!("locks.rs"),
     "\n",
     include_str!("train.rs"),
 );
