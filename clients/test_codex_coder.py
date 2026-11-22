@@ -872,6 +872,30 @@ class CoderTests(unittest.TestCase):
         self.assertEqual(entry["supported_reasoning_levels"], [{"effort": "ultra", "description": "ultra"}])
         self.assertEqual(cc.CODER_TOOLS, frozenset({"exec_command", "write_stdin", "apply_patch"}))
 
+    def test_catalog_advertises_the_fast_tier_only_when_asked(self):
+        spec = importlib.util.spec_from_file_location("cc_under_test", self.root / "clients" / "codex_coder.py")
+        cc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cc)
+        plain = cc.coder_catalog("gpt-6.1-sol", "high")
+        self.assertEqual(plain, cc.coder_catalog("gpt-6.1-sol", "high", None))
+        self.assertNotIn("service_tiers", plain["models"][0])
+        fast = cc.coder_catalog("gpt-6.1-sol", "high", "fast")
+        self.assertEqual(fast["models"][0]["service_tiers"],
+                         [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}])
+        rest = {k: v for k, v in fast["models"][0].items() if k != "service_tiers"}
+        self.assertEqual(rest, plain["models"][0])
+
+    def test_the_written_catalog_carries_the_tier_only_with_the_flag(self):
+        spec = importlib.util.spec_from_file_location("cc_under_test", self.root / "clients" / "codex_coder.py")
+        cc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cc)
+        for tier, expect in (("fast", True), (None, False)):
+            work = self.root / f"catwork-{tier}"
+            work.mkdir()
+            cc.coder_command("codex", "gpt-6.1-sol", "high", self.root, work, work / "a.txt", tier)
+            entry = json.loads((work / "coder-catalog.json").read_text(encoding="utf-8"))["models"][0]
+            self.assertEqual("service_tiers" in entry, expect)
+
     def test_the_prompt_is_the_template_with_task_claims_and_brief(self):
         self.run_coder("inside")
         stdin = self.seen()["stdin"]

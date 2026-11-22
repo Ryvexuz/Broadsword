@@ -689,10 +689,15 @@ def valid_model(m: str) -> bool:
     return bool(m) and not m.startswith("-") and all(c.isascii() and (c.isalnum() or c in "._-:[]") for c in m)
 
 
-def coder_catalog(model: str, effort: str) -> dict:
+# The catalog's service_tiers entry for `fast`, copied from codex's own model catalog (never read at run time). Without it codex
+# says the configured tier "is not advertised as supported" and omits it from requests.
+FAST_TIER_ENTRY = {"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}
+
+
+def coder_catalog(model: str, effort: str, service_tier=None) -> dict:
     """The model catalog codex is given (model_catalog_json): ONE entry for exactly the requested model, in direct tool mode
     (no code-mode `exec`), with a shell and apply_patch and nothing else (no multi-agent, web search or experimental tools)."""
-    return {"models": [{
+    entry = {
         "slug": model,
         "display_name": model,
         "tool_mode": "direct",
@@ -711,7 +716,10 @@ def coder_catalog(model: str, effort: str) -> dict:
         "support_verbosity": False,
         "truncation_policy": {"mode": "tokens", "limit": 10000},
         "base_instructions": CODER_BASE_INSTRUCTIONS,
-    }]}
+    }
+    if service_tier == "fast":
+        entry["service_tiers"] = [dict(FAST_TIER_ENTRY)]
+    return {"models": [entry]}
 
 
 def check_model_effort(model: str, effort: str) -> None:
@@ -743,7 +751,7 @@ def coder_command(exe: str, model: str, effort: str, worktree: Path, work: Path,
     check_model_effort(model, effort)
     check_service_tier(service_tier)
     catalog = Path(work) / "coder-catalog.json"
-    catalog.write_text(json.dumps(coder_catalog(model, effort)), encoding="utf-8")
+    catalog.write_text(json.dumps(coder_catalog(model, effort, service_tier)), encoding="utf-8")
     wt = toml_literal(str(worktree), "the worktree path")
     profile = f'permissions.{PROFILE}.filesystem={{":minimal"="read", {wt}="write"}}'
     tier = ["-c", f'service_tier="{SERVICE_TIERS[service_tier]}"'] if service_tier else []
