@@ -981,6 +981,11 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
         Err(c) => return c,
     };
     let train = cfg.merge_train_max > 1;
+    if !train && cfg.review_parallel > 1 {
+        // PARALLEL REVIEW needs the merge train: without it each entry merges on the main it was rebased on, so a batch's later
+        // entries would end stale after the first merge and be reviewed again (see `parallel_ok`, `s_merge`)
+        println!("queue run --all: parallel reviews are off because the merge train is off (review_parallel = {}, merge_train_max = {}): entries are reviewed one at a time", cfg.review_parallel, cfg.merge_train_max);
+    }
     let t0 = std::time::Instant::now();
     let mut taken: Vec<String> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();

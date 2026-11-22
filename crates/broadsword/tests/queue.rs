@@ -2052,6 +2052,27 @@ fn review_parallel_1_keeps_the_serial_order_and_takes_no_entry_while_one_is_in_r
 }
 
 #[test]
+fn review_parallel_3_with_the_train_off_says_so_and_reviews_one_at_a_time() {
+    let (r, es) = parallel_root("paroff", 3, false);
+    train_set(&r, "merge_train_max", "1");
+    let hang = r.dir.join("hang.flag");
+    fs::write(&hang, "1").unwrap();
+    let mut run = r.spawn(&["queue", "run", "--all"], &[("FAKE_CLAUDE_HANG_FILE", hang.to_str().unwrap())]);
+    wait_for("the first reviewer", 120, || r.calls() == 1);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(r.calls(), 1, "one review at a time with the train off");
+    for (_, e) in &es[1..] {
+        assert_eq!(r.status(e), "queued", "{e} is not taken while the entry before it is in review");
+    }
+    fs::remove_file(&hang).unwrap();
+    assert_eq!(wait_exit(&mut run, 240), 5);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert!(o.stdout.contains("queue run --all: parallel reviews are off because the merge train is off (review_parallel = 3, merge_train_max = 1): entries are reviewed one at a time"), "{}", o.stdout);
+    assert!(!o.stdout.contains("PARALLEL REVIEW of"), "{}", o.stdout);
+    assert_own_verdicts(&r, &es, "1");
+}
+
+#[test]
 fn a_parallel_drain_killed_mid_review_leaves_each_entry_running_at_review_and_the_next_run_resumes_each() {
     let (r, es) = parallel_root("parkill", 3, false);
     let hang = r.dir.join("hang.flag");
