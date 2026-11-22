@@ -1460,6 +1460,23 @@ fn fast_subset_config_refuses_an_unknown_test_binary_and_auto_revert_off() {
 }
 
 #[test]
+fn fast_subset_config_refuses_a_name_when_the_project_has_no_test_binaries() {
+    // p has a Cargo.toml but no tests/ folder: no listed name can be a test binary, so the first one is refused (fail closed)
+    let r = revert_root("fastnotests");
+    assert!(r.p().join("Cargo.toml").is_file() && !r.p().join("tests").exists());
+    train_set(&r, "merge_fast_tests", "\"p: nosuch other\"");
+    let o = r.run(&["queue", "list"]);
+    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert!(
+        o.stderr.contains("merge_fast_tests")
+            && o.stderr.contains("`nosuch`")
+            && o.stderr.contains("not a test binary"),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
 fn fast_subset_a_green_auto_revert_lets_the_drain_go_on_to_the_next_entry() {
     let r = revert_root("fastdrain");
     let a = r.started("src");

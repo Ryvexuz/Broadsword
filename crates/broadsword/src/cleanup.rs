@@ -178,9 +178,23 @@ mod tests {
         f.set_modified(SystemTime::now() - Duration::from_secs(hours * 3600)).unwrap();
     }
 
+    /// The real settings with no fast subset: a temp root has a stand-in Cargo.toml but none of the repo's test binaries.
     fn cfg(root: &Path) -> Config {
         let text = include_str!("../../../broadsword.toml");
-        Config::from_text(text, root).unwrap()
+        let text: String = text
+            .lines()
+            .map(|l| {
+                if l.split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == "merge_fast_tests")
+                {
+                    "merge_fast_tests = \"\""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Config::from_text(&text, root).unwrap()
     }
 
     #[test]

@@ -270,9 +270,9 @@ fn test_binaries(dir: &Path) -> Vec<String> {
 
 /// `merge_fast_tests` checked against the projects on disk (fail closed): a subset is only safe with queue_auto_revert on (a broken
 /// merge is reverted after the full main check), a project must be known, and every name must be a test binary of it. A project
-/// folder with no `Cargo.toml` or no test binary at all (the root of a unit test's folder that only holds a copy of broadsword.toml,
-/// perhaps with a stand-in Cargo.toml) is not the project the list was written for and has nothing to check against, so it is not
-/// checked here; a name it lacks still fails closed when the subset runs (cargo refuses `--test <unknown>`, so the check fails).
+/// with a `Cargo.toml` whose test-binary list is empty or unreadable has no known test binary, so its first listed name is refused.
+/// Only the `broadsword` root with no `Cargo.toml` at all (a unit test's folder that holds just a copy of broadsword.toml) is not
+/// checked here: it is no cargo project, so the subset cannot run there and the check fails closed when it is tried.
 fn check_merge_fast_tests(list: &[(String, Vec<String>)], auto_revert: bool, root: &Path, projects_dir: &Path) -> Result<(), String> {
     if list.is_empty() {
         return Ok(());
@@ -287,10 +287,10 @@ fn check_merge_fast_tests(list: &[(String, Vec<String>)], auto_revert: bool, roo
             let found = std::fs::read_dir(projects_dir).into_iter().flat_map(|rd| rd.flatten()).map(|e| e.path()).find(|p| p.join("Cargo.toml").is_file() && p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(project)));
             found.ok_or_else(|| format!("merge_fast_tests: project `{project}` is unknown (no folder with a Cargo.toml in {})", projects_dir.display()))?
         };
-        let have = test_binaries(&dir);
-        if !dir.join("Cargo.toml").is_file() || have.is_empty() {
+        if !dir.join("Cargo.toml").is_file() {
             continue;
         }
+        let have = test_binaries(&dir);
         if let Some(t) = tests.iter().find(|t| !have.contains(t)) {
             return Err(format!("merge_fast_tests: `{t}` (project `{project}`) is not a test binary: no tests/{t}.rs in {} or its crates/*/", dir.display()));
         }
