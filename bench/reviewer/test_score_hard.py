@@ -3,9 +3,11 @@
 """
 import json, pathlib, re, shutil, subprocess, sys, tempfile, unittest
 
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
 import score_hard
 
-HERE = pathlib.Path(__file__).resolve().parent
 CASE = score_hard.load_case()
 
 PERFECT = """VERDICT: FAIL

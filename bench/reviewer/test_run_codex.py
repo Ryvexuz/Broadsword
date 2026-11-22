@@ -67,8 +67,9 @@ class RunCodex(unittest.TestCase):
         # canary for the fake codex's version, and the ledger folder inside it (never the real state/)
         (self.tmp / "root" / "broadsword.toml").write_text('state_dir = "state"' + chr(10), encoding="utf-8")
         (self.tmp / "clients").mkdir()
-        (self.tmp / "state" / "canary").mkdir(parents=True)
-        (self.tmp / "state" / "canary" / "last-pass.json").write_text(json.dumps({"codex_version": "codex-cli 9.9.9-test"}), encoding="utf-8")
+        canary_state = rc.review.canary_state_file(self.tmp / "root")
+        canary_state.parent.mkdir(parents=True)
+        canary_state.write_text(json.dumps({"codex_version": "codex-cli 9.9.9-test"}), encoding="utf-8")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         (self.bin / "fake_codex.py").write_text(FAKE_CODEX, encoding="utf-8")
