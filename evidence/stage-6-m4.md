@@ -246,6 +246,8 @@ The doc's PASS rule is the whole file, line for line. Each line against it:
 
 So 4.6b is a FAIL as the doc writes it, on that one line. The check was not edited and not re-run.
 
+Cause (orchestrator, 2026-11-22, from task t-20261122-203503): the B-run checkpoint a819254 stored the CRLF working-tree bytes, because Broadsword's `crates/broadsword/src/git.rs` builds checkpoint trees with `git hash-object -w --no-filters --stdin-paths` and crash-sim has `core.autocrlf=true`. It is not a change to the frozen surface: every one of the 103 changed files differs from F only in line endings (`git diff --ignore-cr-at-eol F a819254` shows 0 differences), and a clean checkout of F under autocrlf, captured with the fixed method, gives F's own tree (119f541). The fix for future checkpoints is t-20261122-203503 (not merged when this was written). Commits cannot change, so 4.6b on this record can never pass, and the B run is not repeated (one B run only). The PASS rule is not met on this record.
+
 What the coder looked at afterwards (read-only git commands, run once, not part of the doc's check): the 25 names are `Cargo.lock`, `Cargo.toml`, 22 files under `src/` and `validation/sweep.py`. The job's `checkpoint_commit` is `a819254de68731b5c950a63fe68c87014d2eed2f`, and its parent is F (the `b_run_parent` line). Two commands, outputs as printed:
 
 - `git diff --stat 6822ee7 a819254de68731b5c950a63fe68c87014d2eed2f` in `projects/crash-sim` ends `103 files changed, 41396 insertions(+), 41395 deletions(-)`, and for `src/vec3.rs`, `Cargo.toml` and `validation/sweep.py` it printed `3 files changed, 773 insertions(+), 773 deletions(-)` (equal insertions and deletions per file).

@@ -25,3 +25,5 @@ The rows are quoted from `projects/crash-sim/docs/M5-SOLVER.md` lines 107 to 110
 2026-11-22 19:50:55Z, in the thread, message `cmsg_019Gy38ApTnA8WHdHwRbXZzHMk1wmBWuaRZB9vKMgoR7pq`, answering `cmsg_019Gy38ApTnA8WHdHwRbXZzHPewFGqYMXJTkhvkGv8REzQ`. His words: "1". He chose option (1): implicit node-beam with sparse CG, the solver numerics copied into crash-sim. Recorded in `state/standing-orders.md` (19:50:55Z entry) and in `state/pc-progress.md` at 19:51:19Z ("m5 = option (1) implicit node-beam + sparse CG, copied (standing-orders). m5 gate: matched W3, decision go").
 
 So: the gate matched W3, W1 (the stop row) did not match, and the decision is go.
+
+What `decision: go` rests on (orchestrator, 2026-11-22): W3's action when W2 does not hold is "ask Lazlo whether to implement (1)". `go` therefore rests on Lazlo's answer "1" above, not on W2 holding; W2 is recorded as not matching. The m4 outcomes (test B FAIL on dv, and 4.6b FAIL on its surface line, see `evidence/stage-6-m4.md`) are results of m4, not prerequisites of this gate: 5.2b asks only that the m4 table was read against W1 to W4 and the row and decision recorded before the first m5 calibration commit.
