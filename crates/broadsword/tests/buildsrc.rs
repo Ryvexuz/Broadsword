@@ -660,6 +660,52 @@ fn another_projects_worktree_with_only_the_same_bin_name_keeps_the_vouched_exe_b
     assert_eq!(prints(&r.dir.join("build/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX))), "MARK-b", "B's own build then wrote the shared path");
 }
 
+fn main_build_with_empty_other_workspace(name: &str) -> (Root, String) {
+    let r = Root::new(name, 120);
+    let t1 = r.task("a", "MARK-t1");
+    r.ok(&["build", "proj"]);
+    fs::write(r.dir.join("projects/other/Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    (r, t1)
+}
+
+/// An empty workspace in another main checkout has no bins to preserve and must not block a worktree's clean.
+#[test]
+fn a_clean_succeeds_when_another_main_is_an_empty_workspace() {
+    let (r, t1) = main_build_with_empty_other_workspace("emptymain");
+    let source = format!("worktrees/proj/{t1}");
+    let o = r.ok(&["build", "proj", "--task", &t1]);
+    assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("last built from projects/proj"), "{}", o.stdout);
+    assert_eq!(r.probe(), "MARK-t1", "the worktree built its own binary after cleaning");
+    assert_eq!(r.note().as_deref(), Some(source.as_str()));
+    assert_eq!(r.bin_note().as_deref(), Some(source.as_str()));
+}
+
+/// The empty-workspace exception applies only to successful metadata, not to a broken manifest.
+#[test]
+fn a_clean_is_refused_when_an_empty_other_workspace_manifest_is_invalid() {
+    let (r, t1) = main_build_with_empty_other_workspace("emptyinvalid");
+    fs::write(r.dir.join("projects/other/Cargo.toml"), "[workspace\nmembers = []\n").unwrap();
+    let o = r.run(&["build", "proj", "--task", &t1]);
+    assert_ne!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("refusing to clean: the packages of project `other` cannot be listed"), "{}", o.stderr);
+    assert!(o.stderr.contains("cargo metadata failed"), "{}", o.stderr);
+    assert_eq!(r.probe(), "MARK-main", "nothing was cleaned or built");
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+    assert_eq!(r.bin_note().as_deref(), Some("projects/proj"));
+}
+
+/// The folder about to be built still needs at least one package, even though other empty mains are skipped.
+#[test]
+fn building_an_empty_workspace_itself_is_refused() {
+    let (r, _) = main_build_with_empty_other_workspace("emptybuild");
+    let o = r.run(&["build", "other"]);
+    assert_ne!(o.code, 0, "{}\n{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("cargo metadata lists no packages in this folder"), "{}", o.stderr);
+    assert_eq!(r.probe(), "MARK-main", "the unrelated main binary was not touched");
+    assert_eq!(r.note().as_deref(), Some("projects/proj"));
+    assert!(!r.dir.join("state/build-sources/other").exists(), "the empty workspace was not recorded as built");
+}
+
 /// Round 10: if any project's packages cannot be listed, a clean is refused (fail closed): nothing then tells whether it would
 /// delete that project's main exe. Here project `other` gets a broken Cargo.toml and a worktree of `proj` would clean.
 #[test]

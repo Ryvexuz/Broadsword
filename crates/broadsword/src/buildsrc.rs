@@ -881,10 +881,11 @@ type PackageBins = Vec<(String, Vec<String>)>;
 
 /// THE list of main checkouts and their packages that a clean must consider before it deletes a package's artifacts from the
 /// shared build folder: every project job.rs knows (`job::list_projects`: `broadsword` at the root and each project folder with
-/// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `bins_of`). An exe
+/// a Cargo.toml), as (its source folder: `.` or `<projects>/<p>`, its packages with their bin targets from `parse_bins`). An exe
 /// path in cargo's folder is shared by every package with a bin of that name, so a clean or build from any folder may remove or
 /// overwrite an exe another project's main checkout built (`keep_mains_sharing_exe_paths` matches by exe name). A project
 /// folder with no Cargo.toml has no packages (cargo built nothing from it) and is left out.
+/// An empty workspace is also skipped: it has no bins to protect (2026-11-22 incident).
 /// Err = some project's packages cannot be listed: the caller refuses the clean (fail closed), because nothing then tells whether
 /// that project's main binaries would be deleted.
 fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, PackageBins)>, String> {
@@ -896,7 +897,12 @@ fn mains_with_packages(cfg: &Config) -> Result<Vec<(String, PackageBins)>, Strin
             continue;
         }
         let main = rel_source(cfg, &dir).map_err(refuse)?;
-        out.push((main, bins_of(cfg, &dir).map_err(refuse)?));
+        let metadata = metadata_json(cfg, &dir).map_err(refuse)?;
+        let parsed = json::parse(&metadata).map_err(|e| refuse(format!("cannot read cargo metadata output: {e}")))?;
+        if matches!(parsed.get("packages"), Some(json::J::Arr(packages)) if packages.is_empty()) {
+            continue;
+        }
+        out.push((main, parse_bins(&metadata).map_err(refuse)?));
     }
     Ok(out)
 }
