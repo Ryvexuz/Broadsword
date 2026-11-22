@@ -311,11 +311,6 @@ fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<String, Str
     Ok(job_id)
 }
 
-/// FAST SUBSET (setting `merge_fast_tests`): the test binaries of `project`'s pre-merge subset, or None when it runs the full check.
-fn fast_tests<'a>(cfg: &'a Config, project: &str) -> Option<&'a [String]> {
-    cfg.merge_fast_tests.iter().find(|(p, _)| p.eq_ignore_ascii_case(project)).map(|(_, t)| t.as_slice())
-}
-
 /// The command line of a fast subset: one build, then the unit tests (`units`: the `--lib` / `--bins` flags `unit_test_flags` found)
 /// and each listed test binary.
 fn fast_command(units: &[&str], tests: &[String]) -> String {
@@ -369,12 +364,19 @@ fn unit_flags_of(metadata: &str) -> Result<Vec<&'static str>, String> {
 /// the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the reviewer can read a subset as the full suite. The main
 /// check after a merge never comes through here: it is always the full `check` (`s_main_check`).
 fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInfo) -> (u8, String) {
-    match fast_tests(cfg, project) {
-        None => {
+    use crate::config::PreMergeTests;
+    match cfg.merge_fast_subset(project) {
+        PreMergeTests::Full => {
             let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
             (code, "check: full".to_string())
         }
-        Some(tests) => {
+        PreMergeTests::FullUnverified(why) => {
+            // listed, but its names could not be verified at config load: never an unverified subset, the FULL check runs
+            println!("fast subset off for {project}: test names could not be verified ({why}); the FULL check runs instead");
+            let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+            (code, format!("check: full (fast subset off: test names could not be verified: {why})"))
+        }
+        PreMergeTests::Subset(tests) => {
             // the unit-test flags come from the worktree's own packages; when they cannot be read the FULL check runs (stricter)
             let units = match job::job_folder(cfg, project, Some(task_id)).map_err(|(_, m)| m).and_then(|d| unit_test_flags(cfg, &d)) {
                 Ok(u) => u,

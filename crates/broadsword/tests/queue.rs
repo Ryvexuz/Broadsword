@@ -1488,20 +1488,23 @@ fn fast_subset_config_refuses_an_unknown_test_binary_and_auto_revert_off() {
 }
 
 #[test]
-fn fast_subset_config_refuses_a_name_when_the_project_has_no_test_binaries() {
-    // p has a Cargo.toml but no tests/ folder: no listed name can be a test binary, so the first one is refused (fail closed)
+fn fast_subset_unverifiable_names_load_but_the_full_check_runs_with_the_reason() {
+    // p has a Cargo.toml but no tests/ folder: its names cannot be checked, so the config loads, the subset is OFF for p, and the
+    // pre-merge check is the FULL check, saying why (design changed by the orchestrator in round 3: never an unverified subset)
     let r = revert_root("fastnotests");
     assert!(r.p().join("Cargo.toml").is_file() && !r.p().join("tests").exists());
     train_set(&r, "merge_fast_tests", "\"p: nosuch other\"");
-    let o = r.run(&["queue", "list"]);
-    assert_ne!(o.code, 0, "{}{}", o.stdout, o.stderr);
-    assert!(
-        o.stderr.contains("merge_fast_tests")
-            && o.stderr.contains("`nosuch`")
-            && o.stderr.contains("not a test binary"),
-        "{}",
-        o.stderr
-    );
+    assert_eq!(r.run(&["queue", "list"]).code, 0, "unverifiable names load");
+    let id = r.started("NOTES.txt");
+    r.commit(&r.wt(&id), "NOTES.txt", "notes\n", "task: notes");
+    let e = r.add(&id, "low", "sonnet");
+    let o = r.run(&["queue", "run"]);
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&e), "merged", "{}", r.show(&e));
+    let show = r.show(&e);
+    assert!(show.contains("check: full (fast subset off: test names could not be verified: no test binary"), "{show}");
+    assert!(!show.contains("check: fast subset ("), "{show}");
+    assert!(o.stdout.contains("fast subset off for p") && !o.stdout.contains("--test nosuch"), "{}", o.stdout);
 }
 
 #[test]
