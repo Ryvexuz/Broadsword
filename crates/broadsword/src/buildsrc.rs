@@ -211,30 +211,47 @@ pub const EXIT_BUSY: u8 = 3;
 /// Take `state/build.lock`. A job holds it while cargo compiles (see the module comment): a build, test or check releases it
 /// once its test executables are copied and runs the tests from the copies; a `run` holds it until its command ends. A second job waits up to `build_lock_wait_seconds`, then is
 /// refused (exit 3, nothing built, cleaned or recorded) with a message that says how long it waited and who held it.
+/// Registered human waiters precede agents; each class is FIFO. Every acquisition, including the nested-run probe,
+/// goes through the same priority arbitration. Priority never changes the caller's configured wait budget.
 ///
 /// Nested run (audit 2026-11-21 22Z fix 3): a `run` job holding this lock sets `scrub::RUN_LOCK_MARKER` = `<job id>:<pid>` on
 /// its command (job.rs), after `run_proof` proved it. A Broadsword call inside that command that asks for this lock would
 /// wait out the whole `build_lock_wait_seconds` for a lock its own parent holds until the call returns: a deadlock. So it is
 /// refused at once (exit 3), but only when `nested_in_holder` proves the lock is held by that very run right now. The marker
-/// never grants the lock: it is read only after one try of the lock found it busy, and with a free lock, a malformed marker or
-/// any doubt about the holder (a stale marker, a stale record), the call behaves exactly as it would without it.
-pub fn lock(cfg: &Config) -> Result<Lock, (u8, String)> {
+/// never grants the lock: it is read only after one priority-aware try found the lock unavailable. With an available lock,
+/// a malformed marker or any doubt about the holder (a stale marker, a stale record), the call behaves as without it.
+pub fn lock(cfg: &Config, priority: lock::Priority) -> Result<Lock, (u8, String)> {
+    let started = std::time::Instant::now();
     let wait = cfg.build_lock_wait_seconds;
     let path = cfg.state_dir.join("build.lock");
     let marker = std::env::var(scrub::RUN_LOCK_MARKER).ok();
     if let Some((job, pid)) = marker.as_deref().and_then(scrub::parse_run_lock_marker) {
-        if let Some(l) = try_once(&path)? {
+        if let Some(l) = try_once(&path, priority)? {
             return Ok(l);
         }
         if nested_in_holder(cfg, marker.as_deref().unwrap_or_default()) {
             return Err((EXIT_BUSY, format!("build folder busy: this command runs inside `broadsword run` job {job}, which holds the build lock (pid {pid}); run it directly, not inside another run. Nothing was built, cleaned or recorded")));
         }
     }
-    lock::acquire(&path, Duration::from_secs(wait), &move |owner| {
-        let who = owner.map(|p| format!(" (pid {p})")).unwrap_or_default();
-        format!("build folder busy: another build, test or check job{who} held the build lock for the whole {wait} s wait (build_lock_wait_seconds); nothing was built, cleaned or recorded. Repeat the call later (the lock frees itself when that job ends)")
+    lock::acquire_priority(
+        &path,
+        Duration::from_secs(wait).saturating_sub(started.elapsed()),
+        priority,
+        &move |owner| {
+            let who = owner.map(|p| format!(" (last recorded holder pid {p})")).unwrap_or_default();
+            format!("build folder busy: the build lock stayed unavailable for the whole {wait} s wait (build_lock_wait_seconds){who}; nothing was built, cleaned or recorded. Repeat the call later (the lock frees itself when its holder ends)")
+        },
+    )
+    .map_err(|e| {
+        (
+            if e.starts_with("build folder busy") {
+                EXIT_BUSY
+            } else {
+                EXIT_FAILED
+            },
+            e,
+        )
     })
-    .map_err(|e| (if e.starts_with("build folder busy") { EXIT_BUSY } else { EXIT_FAILED }, e))
 }
 
 /// The run proof: `state/build.lock.run.id` holds the marker of the last run that proved it held the build lock, and
@@ -279,9 +296,11 @@ fn nested_in_holder(cfg: &Config, marker: &str) -> bool {
 
 const TRY_BUSY: &str = "busy";
 
-/// One try of the lock: `Some` when it was free (and is now held), `None` when it is busy.
-fn try_once(path: &Path) -> Result<Option<Lock>, (u8, String)> {
-    match lock::acquire(path, Duration::ZERO, &|_| TRY_BUSY.to_string()) {
+/// One priority-aware try: `Some` when this waiter could take it (and now holds it), `None` when unavailable.
+fn try_once(path: &Path, priority: lock::Priority) -> Result<Option<Lock>, (u8, String)> {
+    match lock::acquire_priority(path, Duration::ZERO, priority, &|_| {
+        TRY_BUSY.to_string()
+    }) {
         Ok(l) => Ok(Some(l)),
         Err(e) if e == TRY_BUSY => Ok(None),
         Err(e) => Err((EXIT_FAILED, e)),

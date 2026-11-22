@@ -667,7 +667,8 @@ impl Side {
                 manifest.display()
             )));
         };
-        let lock = buildsrc::lock(cfg).map_err(|(_, m)| Stop::NoVerdict(m))?;
+        let lock = buildsrc::lock(cfg, crate::lock::Priority::Agent)
+            .map_err(|(_, m)| Stop::NoVerdict(m))?;
         // under the lock: whoever builds this package from another folder rewrites its note FIRST (buildsrc.rs), so a note that
         // still names this folder means the executable in the build folder is this folder's
         let source = buildsrc::rel_source(cfg, &self.dir).map_err(Stop::NoVerdict)?;

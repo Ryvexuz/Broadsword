@@ -52,7 +52,7 @@ use crate::scrub;
 use crate::record::{self, Record};
 use crate::sys;
 use crate::worktree::{self, JobDirError};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -674,6 +674,7 @@ fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, log: &Log, 
 /// The test step's context: everything `run_child` needs, borrowed from the job.
 struct TestStep<'a> {
     cfg: &'a Config,
+    priority: crate::lock::Priority,
     job_id: &'a str,
     project_dir: &'a Path,
     source: &'a str,
@@ -769,7 +770,7 @@ impl TestStep<'_> {
         if arts.doctests {
             let (waited, lock) = {
                 let asked = Instant::now();
-                match buildsrc::lock(self.cfg) {
+                match buildsrc::lock(self.cfg, self.priority) {
                     Ok(l) => (asked.elapsed().as_secs_f64(), l),
                     Err((_, msg)) => return Err(msg),
                 }
@@ -1318,11 +1319,36 @@ pub struct JobInfo {
 /// Run a job: `kind` is build, test, check or run. Writes a durable record, takes a Git checkpoint
 /// before the first step (`run` only, and the project must be a Git repo), and runs the steps.
 pub fn run_job(cfg: &Config, spec: JobSpec) -> ExitCode {
-    ExitCode::from(run_job_info(cfg, spec, &mut JobInfo::default()))
+    ExitCode::from(run_job_recorded(cfg, spec, &mut JobInfo::default(), true))
 }
 
-/// `run_job` returning the exit code as a number and filling `info`. The code is the one documented for build, test and check.
+/// Internal queue and performance jobs are agents even when the process has a terminal.
+/// Recovery can resume a terminal job, unless the current invocation is `queue run`.
+/// The code is the one documented for build, test and check.
 pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
+    run_job_recorded(cfg, spec, info, false)
+}
+
+fn queue_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter().skip(1); // executable, then the command and subcommand
+    args.next().as_deref() == Some(std::ffi::OsStr::new("queue"))
+        && args.next().as_deref() == Some(std::ffi::OsStr::new("run"))
+}
+
+/// The only classification rule, from the job's own record. Missing provenance fails closed to agent.
+fn build_priority(rec: &Record) -> crate::lock::Priority {
+    if rec.get("started_from_terminal") == "true"
+        && rec.get("started_by_queue") == "false"
+        && rec.get("internal_job") == "false"
+        && rec.get("task").is_empty()
+    {
+        crate::lock::Priority::Human
+    } else {
+        crate::lock::Priority::Agent
+    }
+}
+
+fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: bool) -> u8 {
     let kind = spec.kind.as_str();
     let project_dir = match job_folder(cfg, &spec.name, spec.task.as_deref()) {
         Ok(d) => d,
@@ -1378,6 +1404,11 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
     rec.set("kind", kind);
     rec.set("source", source.as_str());
     rec.set("task", spec.task.as_deref().unwrap_or(""));
+    // Observe our own invocation, never a child's environment. Internal queue/performance calls are agents even in
+    // a terminal; a resumed job can be human when recovery was itself invoked outside `queue run`.
+    rec.set("started_from_terminal", std::io::stdin().is_terminal().to_string());
+    rec.set("started_by_queue", queue_invocation(std::env::args_os()).to_string());
+    rec.set("internal_job", (!direct && spec.resumed_from.is_none()).to_string());
     rec.set("command", command_text);
     rec.set("status", record::RUNNING);
     rec.set("pid", me.to_string());
@@ -1398,6 +1429,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         return EXIT_FAILED;
     }
     let job_id = rec.id().to_string();
+    let priority = build_priority(&rec);
     info.id = Some(job_id.clone());
     info.log = Some(log_path.clone());
     let panic_hook = panic_hook_active(cfg);
@@ -1501,7 +1533,7 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
             // another checkout left), then marks the notes of the folder's packages as `run:<folder>` (before the command, so a
             // crash cannot leave a note that vouches for what the command builds).
             let asked = Instant::now();
-            let lock = match buildsrc::lock(cfg) {
+            let lock = match buildsrc::lock(cfg, priority) {
                 Ok(l) => l,
                 Err((code, msg)) => {
                     eprintln!("broadsword: {msg}");
@@ -1592,7 +1624,21 @@ pub fn run_job_info(cfg: &Config, spec: JobSpec, info: &mut JobInfo) -> u8 {
         let mut py: Option<PyTests> = None;
         let ran = if *step == "test" && kind != "run" {
             let parallel = cfg.test_parallel_binaries as usize;
-            let mut t = TestStep { cfg, job_id: &job_id, project_dir: &project_dir, source: &source, log: &log, free: &mut *free_src, poll, on_live: &mut on_live, secrets: &secrets, parallel, main_bins_failed: &mut main_bins_failed, step_bins: step_bins.as_ref() };
+            let mut t = TestStep {
+                cfg,
+                priority,
+                job_id: &job_id,
+                project_dir: &project_dir,
+                source: &source,
+                log: &log,
+                free: &mut *free_src,
+                poll,
+                on_live: &mut on_live,
+                secrets: &secrets,
+                parallel,
+                main_bins_failed: &mut main_bins_failed,
+                step_bins: step_bins.as_ref(),
+            };
             // the project's Python tests (SCALING F9) run once cargo's tests pass (side by side: in the same pool, after the
             // copies), always after the build lock is released
             match t.run(cmd, &mut build_hold, python_scripts(cfg, name)) {
@@ -1860,5 +1906,53 @@ mod tests {
     #[test]
     fn file_stamp_format() {
         assert_eq!(file_stamp(1_700_000_000), "20231114-221320");
+    }
+
+    #[test]
+    fn build_priority_uses_only_the_jobs_recorded_provenance_and_task() {
+        use crate::lock::Priority::{Agent, Human};
+        for (terminal, queue, internal, task, expected) in [
+            ("true", "false", "false", "", Human),
+            ("true", "false", "false", "t-agent", Agent),
+            ("true", "true", "true", "", Agent), // terminal queue main-check, no task
+            ("true", "true", "false", "", Agent), // recovery during queue run
+            ("true", "false", "true", "", Agent), // internal performance job
+            ("false", "false", "false", "", Agent),
+            ("", "false", "false", "", Agent),
+            ("TRUE", "false", "false", "", Agent),
+            ("true\r", "false", "false", "", Agent),
+            ("true", "", "false", "", Agent),
+            ("true", "false", "", "", Agent),
+        ] {
+            let mut rec = Record::parse(Path::new("unused.rec"), "");
+            rec.set("started_from_terminal", terminal);
+            rec.set("started_by_queue", queue);
+            rec.set("internal_job", internal);
+            rec.set("task", task);
+            assert_eq!(
+                build_priority(&rec),
+                expected,
+                "terminal={terminal:?}, queue={queue:?}, internal={internal:?}, task={task:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_provenance_comes_from_the_invocations_command_not_argument_substrings() {
+        for (args, expected) in [
+            (vec!["broadsword", "queue", "run", "--all"], true),
+            (vec!["broadsword", "queue", "run", "q-1"], true),
+            (vec!["broadsword", "queue", "list"], false),
+            (vec!["broadsword", "run", "proj", "--", "queue", "run"], false),
+            (vec!["broadsword", "recover", "queue"], false),
+            (vec!["broadsword"], false),
+            (vec![], false),
+        ] {
+            assert_eq!(
+                queue_invocation(args.iter().map(|s| std::ffi::OsString::from(*s))),
+                expected,
+                "{args:?}"
+            );
+        }
     }
 }

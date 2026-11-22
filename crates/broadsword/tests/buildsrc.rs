@@ -1,6 +1,6 @@
 //! End-to-end tests for `--task` on build/test/check/run and for the shared-build-folder rules (state/build-sources
-//! notes, `cargo clean -p`, state/build.lock). Every test makes a throwaway Broadsword root under the repo's `scratch/`
-//! with a real Git repo and a tiny cargo project under `projects/`, and runs the real binary there. Never the real repo,
+//! notes, `cargo clean -p`, state/build.lock). Job tests make a throwaway Broadsword root under the repo's `scratch/`
+//! with a real Git repo and a tiny cargo project under `projects/`, and run the real binary there. Never the real repo,
 //! its worktrees or `projects/crash-sim`.
 //!
 //! The project `proj` holds the package `markprobe`: a binary that prints a marker string from its library, and an
@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 mod support;
 use support::bin;
 
+#[path = "../src/lock.rs"]
+mod priority_lock;
+
 // The product's own process-identity code, to plant an owner record naming a live process exactly (start time included).
 #[allow(dead_code)]
 #[path = "../src/sys.rs"]
@@ -24,6 +27,306 @@ const SYNC_GATE: &str = "BROADSWORD_INTERNAL_TEST_BUILD_SYNC_GATE_FILE";
 /// scrub::RUN_LOCK_MARKER: a `run` sets it on its command; `Root::cmd` removes any inherited one so every test starts clean.
 const RUN_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// These races exercise the production lock entry point directly, in separate processes. Readiness is registration
+// (a marker exists under arbitration), not a sleep that guesses when a waiter started.
+struct PriorityRoot {
+    dir: PathBuf,
+}
+
+impl PriorityRoot {
+    fn new(tag: &str) -> Self {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scratch")
+            .join(format!(
+                "bs-priority-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::create_dir(&dir).unwrap();
+        Self { dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join("build.lock")
+    }
+
+    fn registered(&self, count: usize) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let entries = match fs::read_dir(self.dir.join("build.lock.waiters")) {
+                Ok(rd) => rd.collect::<Result<Vec<_>, _>>().unwrap().len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => panic!("cannot read waiter directory: {e}"),
+            };
+            if entries == count {
+                return;
+            }
+            assert!(
+                Instant::now() < end,
+                "registration: expected {count} markers, got {entries}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn spawn(&self, name: &str, human: bool, wait_ms: u64) -> PriorityChild {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "priority_waiter_child", "--nocapture"])
+            .env("BROADSWORD_TEST_PRIORITY_DIR", &self.dir)
+            .env("BROADSWORD_TEST_PRIORITY_NAME", name)
+            .env(
+                "BROADSWORD_TEST_PRIORITY_CLASS",
+                if human { "human" } else { "agent" },
+            )
+            .env("BROADSWORD_TEST_PRIORITY_WAIT_MS", wait_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(self.dir.join(format!("{name}.err"))).unwrap())
+            .spawn()
+            .unwrap();
+        PriorityChild {
+            child,
+            dir: self.dir.clone(),
+            name: name.into(),
+        }
+    }
+}
+
+impl Drop for PriorityRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+struct PriorityChild {
+    child: Child,
+    dir: PathBuf,
+    name: String,
+}
+
+impl PriorityChild {
+    fn taken(&self) {
+        assert!(
+            wait_for(&self.dir.join(format!("{}.taken", self.name)), "taken", 10),
+            "{} never acquired: {}",
+            self.name,
+            fs::read_to_string(self.dir.join(format!("{}.err", self.name))).unwrap()
+        );
+    }
+
+    fn release(&mut self) {
+        fs::write(self.dir.join(format!("{}.release", self.name)), "release").unwrap();
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "{} failed: {}",
+                    self.name,
+                    fs::read_to_string(self.dir.join(format!("{}.err", self.name))).unwrap()
+                );
+                return;
+            }
+            assert!(Instant::now() < end, "{} did not finish", self.name);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for PriorityChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Subprocess helper: no real job or environment-based job classification is involved.
+#[test]
+fn priority_waiter_child() {
+    let Some(dir) = std::env::var_os("BROADSWORD_TEST_PRIORITY_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let name = std::env::var("BROADSWORD_TEST_PRIORITY_NAME").unwrap();
+    let priority = match std::env::var("BROADSWORD_TEST_PRIORITY_CLASS").unwrap().as_str() {
+        "human" => priority_lock::Priority::Human,
+        "agent" => priority_lock::Priority::Agent,
+        other => panic!("invalid test priority {other}"),
+    };
+    let wait = Duration::from_millis(
+        std::env::var("BROADSWORD_TEST_PRIORITY_WAIT_MS")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let started = Instant::now();
+    let lock =
+        priority_lock::acquire_priority(&dir.join("build.lock"), wait, priority, &|_| "busy".into());
+    match lock {
+        Ok(_lock) => {
+            fs::write(dir.join(format!("{name}.taken")), "taken").unwrap();
+            assert!(
+                wait_for(&dir.join(format!("{name}.release")), "release", 10),
+                "helper release gate timed out"
+            );
+        }
+        Err(e) => {
+            assert_eq!(e, "busy", "lock errors must not masquerade as timeouts");
+            assert!(
+                started.elapsed() >= wait,
+                "refused earlier than its own wait clock"
+            );
+            fs::write(dir.join(format!("{name}.timeout")), "timeout").unwrap();
+        }
+    }
+}
+
+fn priority_order(tag: &str, first_human: bool, second_human: bool, second_wins: bool) {
+    let r = PriorityRoot::new(tag);
+    let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
+    let mut first = r.spawn("first", first_human, 20_000);
+    r.registered(1);
+    let mut second = r.spawn("second", second_human, 20_000);
+    r.registered(2);
+    assert!(
+        !r.dir.join("first.taken").exists() && !r.dir.join("second.taken").exists(),
+        "the holder was pre-empted"
+    );
+    drop(holder);
+    let (winner, loser) = if second_wins {
+        (&mut second, &mut first)
+    } else {
+        (&mut first, &mut second)
+    };
+    winner.taken();
+    assert!(
+        !r.dir.join(format!("{}.taken", loser.name)).exists(),
+        "two holders or wrong selection order"
+    );
+    winner.release();
+    loser.taken();
+    loser.release();
+}
+
+#[test]
+fn human_waiter_overtakes_an_earlier_agent_without_preempting_holder() {
+    priority_order("human-first", false, true, true);
+}
+
+#[test]
+fn two_agent_waiters_keep_arrival_order() {
+    priority_order("agents-fifo", false, false, false);
+}
+
+#[test]
+fn two_human_waiters_keep_arrival_order() {
+    priority_order("humans-fifo", true, true, false);
+}
+
+#[test]
+fn humans_cut_in_without_reordering_the_agents_they_pass() {
+    let r = PriorityRoot::new("mixed-fifo");
+    let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
+    let mut a1 = r.spawn("a1", false, 20_000);
+    r.registered(1);
+    let mut u1 = r.spawn("u1", true, 20_000);
+    r.registered(2);
+    let mut a2 = r.spawn("a2", false, 20_000);
+    r.registered(3);
+    let mut u2 = r.spawn("u2", true, 20_000);
+    r.registered(4);
+    drop(holder);
+    u1.taken();
+    for name in ["a1", "a2", "u2"] {
+        assert!(!r.dir.join(format!("{name}.taken")).exists(), "{name} jumped u1");
+    }
+    u1.release();
+    u2.taken();
+    for name in ["a1", "a2"] {
+        assert!(!r.dir.join(format!("{name}.taken")).exists(), "{name} jumped u2");
+    }
+    u2.release();
+    a1.taken();
+    assert!(!r.dir.join("a2.taken").exists(), "a2 jumped a1 after humans cut in");
+    a1.release();
+    a2.taken();
+    a2.release();
+}
+
+#[test]
+fn stale_human_marker_from_a_dead_process_does_not_delay_an_agent() {
+    let r = PriorityRoot::new("dead-human");
+    let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
+    let mut human = r.spawn("human", true, 20_000);
+    r.registered(1);
+    human.child.kill().unwrap();
+    human.child.wait().unwrap();
+    r.registered(1); // The dead process left its marker, but no OS lock on it.
+    drop(holder);
+    drop(
+        priority_lock::acquire_priority(
+            &r.path(),
+            Duration::ZERO,
+            priority_lock::Priority::Agent,
+            &|_| "busy".into(),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn human_cut_in_does_not_refuse_an_agent_before_its_own_wait_expires() {
+    let r = PriorityRoot::new("agent-clock");
+    let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
+    let mut agent = r.spawn("agent", false, 2_000);
+    r.registered(1);
+    let mut human = r.spawn("human", true, 20_000);
+    r.registered(2);
+    drop(holder);
+    human.taken();
+    // The helper checks elapsed >= its configured wait on the timeout path. It must finish even though the human
+    // still holds the lock, rather than treating priority as an immediate refusal or waiting for that human to finish.
+    agent.finish();
+    assert!(wait_for(&r.dir.join("agent.timeout"), "timeout", 1));
+    assert!(!r.dir.join("agent.taken").exists());
+    human.release();
+}
+
+#[test]
+fn zero_wait_probe_cannot_bypass_a_registered_human() {
+    let r = PriorityRoot::new("probe");
+    let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
+    let mut human = r.spawn("human", true, 20_000);
+    r.registered(1);
+    // Freeze selection, then free the resource. A raw try_lock would now incorrectly jump the registered human.
+    let gate = priority_lock::acquire(
+        &r.dir.join("build.lock.queue"),
+        Duration::from_secs(10),
+        &|_| "busy".into(),
+    )
+    .unwrap();
+    drop(holder);
+    assert_eq!(
+        priority_lock::acquire_priority(
+            &r.path(),
+            Duration::ZERO,
+            priority_lock::Priority::Agent,
+            &|_| "busy".into(),
+        )
+        .err()
+        .as_deref(),
+        Some("busy")
+    );
+    drop(gate);
+    human.taken();
+    human.release();
+}
 
 struct Out {
     code: i32,
