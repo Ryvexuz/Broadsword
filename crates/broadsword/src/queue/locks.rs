@@ -7,9 +7,9 @@ use crate::pause;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+use super::check::main_check_now;
 use super::entry::{load_entry, queue_dir};
 use super::{EXIT_BAD_INPUT, EXIT_BUSY, EXIT_ERROR, EXIT_RETRY};
-use super::train::main_check_now;
 
 /// One of the queue's two lock files, waiting at most `queue_lock_wait_seconds`; `Err` is the exit code, message printed.
 fn take(cfg: &Config, file: &str, what: &str) -> Result<Lock, ExitCode> {
