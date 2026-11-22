@@ -242,6 +242,10 @@ def _fold(s: str) -> str:
     return s.casefold() if os.name == "nt" else s
 
 
+# The files that may be claimed by key (`<file>#<key>`); task.rs KEY_CLAIM_FILES keeps the same list.
+KEY_CLAIM_FILES = ("broadsword.toml", "crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs")
+
+
 def normalize_claim(claim: str) -> str:
     """Normalise a board claim, preserving a validated settings-file key suffix."""
     if any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in claim):
@@ -251,8 +255,9 @@ def normalize_claim(claim: str) -> str:
         if re.fullmatch(r"[a-z0-9_]+", key) is None:
             raise Refused("invalid claim: key must match [a-z0-9_]+")
         path = "/".join(rel_parts(path.strip(), "claim"))
-        if _fold(path) not in (_fold("broadsword.toml"), _fold("crates/broadsword/src/config.rs")):
-            raise Refused("key claims are only for broadsword.toml and crates/broadsword/src/config.rs")
+        if _fold(path) not in (_fold(f) for f in KEY_CLAIM_FILES):
+            raise Refused("key claims are only for broadsword.toml, crates/broadsword/src/config.rs and "
+                          "crates/broadsword/tests/support/mod.rs")
         return f"{path}#{key}"
     claim = claim.strip()
     return "*" if claim == "*" else "/".join(rel_parts(claim, "claim"))

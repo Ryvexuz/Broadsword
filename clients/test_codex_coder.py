@@ -80,6 +80,10 @@ if mode == "outside":
     write("other/b.txt")
 if mode == "settings":
     write("broadsword.toml", "alpha = 1\n")
+if mode in ("support", "supportsibling"):
+    write("crates/broadsword/tests/support/mod.rs", "// alpha 1\n")
+if mode == "supportsibling":
+    write("crates/broadsword/tests/support/other.rs", "// not claimed\n")
 if mode == "outsidedir":
     os.makedirs(os.path.join(wt, "emptydir"))
 if mode == "gitfile":
@@ -333,6 +337,24 @@ class CoderTests(unittest.TestCase):
         self.assertEqual(code, 3, res)
         self.assertIn("modified file broadsword.toml", res["changed_paths"])
         self.assertEqual(res["outside_claim"], ["broadsword.toml"])
+        self.assertTrue(res["claim_breach"])
+
+    def test_changed_test_support_under_its_key_claim_is_covered_but_a_sibling_is_a_breach(self):
+        support = self.wt / "crates" / "broadsword" / "tests" / "support"
+        support.mkdir(parents=True, exist_ok=True)
+        (support / "mod.rs").write_text("// alpha 0\n", encoding="utf-8")
+        self.write_task(claims="crates/broadsword/tests/support/mod.rs#alpha")
+        code, res, _ = self.run_coder("support")
+        self.assertEqual(code, 0, res)
+        self.assertIn("modified file crates/broadsword/tests/support/mod.rs", res["changed_paths"])
+        self.assertEqual(res["outside_claim"], [])
+        self.assertFalse(res["claim_breach"])
+        (support / "mod.rs").write_text("// alpha 0\n", encoding="utf-8")
+        code, res, _ = self.run_coder("supportsibling")
+        self.assertEqual(code, 3, res)
+        self.assertIn("modified file crates/broadsword/tests/support/mod.rs", res["changed_paths"])
+        # the folder's times moved for the unclaimed new child, so it is outside the claim too (judge)
+        self.assertEqual(res["outside_claim"], ["crates/broadsword/tests/support", "crates/broadsword/tests/support/other.rs"])
         self.assertTrue(res["claim_breach"])
 
     def test_a_write_outside_the_claim_is_a_claim_breach_exit_3_and_is_left_in_place(self):
@@ -1075,8 +1097,14 @@ class PureTests(unittest.TestCase):
         for key in ("", "Alpha", "a-b", "a.b", "a/b", "a\\b", "a#b", "a b", "a ", "a\t", "a\r", "a\n", "é", "a\u2028b"):
             with self.subTest(key=key), self.assertRaises(cc.Refused):
                 cc.normalize_claim(f"broadsword.toml#{key}")
-        for path in ("src/lib.rs", "config.rs", "nested/broadsword.toml", "crates/broadsword/src/config.rs.bak"):
-            with self.subTest(path=path), self.assertRaisesRegex(cc.Refused, "key claims are only for"):
+        self.assertEqual(cc.normalize_claim(".\\crates/broadsword//tests/./support/mod.rs/#gamma"),
+                         "crates/broadsword/tests/support/mod.rs#gamma")
+        for path in ("src/lib.rs", "config.rs", "nested/broadsword.toml", "crates/broadsword/src/config.rs.bak", "mod.rs",
+                     "crates/broadsword/tests/support", "crates/broadsword/tests/support/mod.rs.bak",
+                     "crates/broadsword/tests/tasks.rs"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                    cc.Refused, "key claims are only for broadsword.toml, crates/broadsword/src/config.rs and "
+                                "crates/broadsword/tests/support/mod.rs"):
                 cc.normalize_claim(f"{path}#k")
         for path in ("../broadsword.toml", "/broadsword.toml", "C:\\broadsword.toml", "crates/../broadsword.toml",
                      "broadsword.toml.", "broadsword.toml?"):
@@ -1089,7 +1117,7 @@ class PureTests(unittest.TestCase):
 
     def test_key_claim_file_coverage_at_the_low_level(self):
         cc = self.cc
-        for file in ("broadsword.toml", "crates/broadsword/src/config.rs"):
+        for file in ("broadsword.toml", "crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs"):
             for key in ("alpha", "beta"):
                 claim = f"{file}#{key}"
                 with self.subTest(claim=claim):

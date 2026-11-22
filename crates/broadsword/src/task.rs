@@ -48,10 +48,14 @@ pub const WHOLE_PROJECT: &str = "*";
 
 // ---- claims -----------------------------------------------------------------------------
 
+/// The files that may be claimed by key (`<file>#<key>`): the settings file, its loader and the shared test support,
+/// which many tasks touch one key at a time. clients/codex_coder.py keeps the same list.
+pub const KEY_CLAIM_FILES: [&str; 3] = ["broadsword.toml", "crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs"];
+
 /// Validate and normalise one claim: a file or folder path relative to the project root.
 /// `/` and `\` are the same, `.` segments and a trailing slash vanish. Absolute paths, drive letters, `..`,
 /// empty claims and patterns (`*`, `?` inside a path) are rejected; `*` alone is the whole project.
-/// Only `broadsword.toml` and `crates/broadsword/src/config.rs` may have a `#<key>` suffix (`[a-z0-9_]+`).
+/// Only the files in [`KEY_CLAIM_FILES`] may have a `#<key>` suffix (`[a-z0-9_]+`).
 pub fn normalize_claim(raw: &str) -> Result<String, String> {
     let bad = |why: &str| Err(format!("invalid claim `{raw}`: {why}"));
     if raw.chars().any(char::is_control) {
@@ -94,8 +98,8 @@ pub fn normalize_claim(raw: &str) -> Result<String, String> {
     }
     let path = out.join("/");
     if let Some(key) = key {
-        if !same(&path, "broadsword.toml") && !same(&path, "crates/broadsword/src/config.rs") {
-            return bad("key claims are only for broadsword.toml and crates/broadsword/src/config.rs");
+        if !KEY_CLAIM_FILES.iter().any(|f| same(&path, f)) {
+            return bad("key claims are only for broadsword.toml, crates/broadsword/src/config.rs and crates/broadsword/tests/support/mod.rs");
         }
         return Ok(format!("{path}#{key}"));
     }
@@ -849,9 +853,10 @@ mod tests {
             let e = normalize_claim(&claim).unwrap_err();
             assert!(e.contains("key must match") || e.contains("control character"), "{claim:?}: {e}");
         }
-        for path in ["src/lib.rs", "config.rs", "other/broadsword.toml", "crates/broadsword/src/config.rs.bak"] {
+        assert_eq!(n(".\\crates/broadsword//tests/./support/mod.rs/#gamma"), "crates/broadsword/tests/support/mod.rs#gamma");
+        for path in ["src/lib.rs", "config.rs", "other/broadsword.toml", "crates/broadsword/src/config.rs.bak", "mod.rs", "crates/broadsword/tests/support", "crates/broadsword/tests/support/mod.rs.bak", "crates/broadsword/tests/tasks.rs"] {
             let e = normalize_claim(&format!("{path}#k")).unwrap_err();
-            assert!(e.contains("key claims are only for broadsword.toml and crates/broadsword/src/config.rs"), "{e}");
+            assert!(e.contains("key claims are only for broadsword.toml, crates/broadsword/src/config.rs and crates/broadsword/tests/support/mod.rs"), "{e}");
         }
         for path in ["../broadsword.toml", "/broadsword.toml", "C:\\broadsword.toml", "crates/../broadsword.toml", "broadsword.toml.", "broadsword.toml?"] {
             assert!(normalize_claim(&format!("{path}#k")).is_err(), "{path}");
@@ -865,12 +870,13 @@ mod tests {
 
     #[test]
     fn key_claim_overlap_matrix() {
-        for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+        for file in KEY_CLAIM_FILES {
             let alpha = format!("{file}#alpha");
             let beta = format!("{file}#beta");
             let mut pairs = vec![(alpha.as_str(), alpha.as_str(), true), (alpha.as_str(), beta.as_str(), false), (file, alpha.as_str(), true), ("*", alpha.as_str(), true)];
-            if file.contains('/') {
-                pairs.extend([("crates", alpha.as_str(), true), ("crates/broadsword/src", alpha.as_str(), true), ("crates/broadsword/srcx", alpha.as_str(), false)]);
+            let sibling = file.rsplit_once('/').map(|(dir, _)| format!("{dir}x"));
+            if let (Some((dir, _)), Some(sibling)) = (file.rsplit_once('/'), sibling.as_deref()) {
+                pairs.extend([("crates", alpha.as_str(), true), (dir, alpha.as_str(), true), (sibling, alpha.as_str(), false)]);
             }
             for (a, b, expected) in pairs {
                 for ci in [false, true] {

@@ -166,7 +166,7 @@ fn a_conflicting_start_exits_3_and_names_the_other_task() {
 
 #[test]
 fn key_claims_on_different_keys_run_together() {
-    for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+    for file in ["broadsword.toml", "crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs"] {
         let r = Root::new("key-claims");
         let alpha = format!("{file}#alpha");
         let beta = format!("{file}#beta");
@@ -218,10 +218,10 @@ fn key_claims_on_different_keys_run_together() {
 #[test]
 fn key_claim_on_other_file_is_refused() {
     let r = Root::new("key-claim-invalid");
-    for claim in ["crates/broadsword/src/task.rs#k", "config.rs#k", "nested/broadsword.toml#k"] {
+    for claim in ["crates/broadsword/src/task.rs#k", "config.rs#k", "nested/broadsword.toml#k", "crates/broadsword/tests/support#k", "crates/broadsword/tests/support/mod.rs.bak#k", "crates/broadsword/tests/tasks.rs#k"] {
         let o = r.run(&["task", "add", "broadsword", "--title", "bad key file", "--claim", claim]);
         assert_eq!(o.code, 2, "{claim}: {}", o.stderr);
-        assert!(o.stderr.contains("key claims are only for broadsword.toml and crates/broadsword/src/config.rs"), "{}", o.stderr);
+        assert!(o.stderr.contains("key claims are only for broadsword.toml, crates/broadsword/src/config.rs and crates/broadsword/tests/support/mod.rs"), "{}", o.stderr);
     }
     for key in ["", "Alpha", "a-b", "a/b", "a\\b", "a#b", "a b", "a ", "a\r", "a\n", "é"] {
         let claim = format!("broadsword.toml#{key}");
@@ -234,12 +234,11 @@ fn key_claim_on_other_file_is_refused() {
 
 #[test]
 fn key_claim_starts_in_a_race_preserve_exclusion_and_independence() {
-    for file in ["broadsword.toml", "crates/broadsword/src/config.rs"] {
+    for file in ["broadsword.toml", "crates/broadsword/src/config.rs", "crates/broadsword/tests/support/mod.rs"] {
         let alpha = format!("{file}#alpha");
         let beta = format!("{file}#beta");
-        let folder = "crates/broadsword/src";
         let mut cases = vec![(alpha.as_str(), alpha.as_str(), false), (file, alpha.as_str(), false), (alpha.as_str(), file, false), (alpha.as_str(), beta.as_str(), true)];
-        if file.contains('/') {
+        if let Some((folder, _)) = file.rsplit_once('/') {
             cases.push((folder, alpha.as_str(), false));
         }
         for (left, right, independent) in cases {
