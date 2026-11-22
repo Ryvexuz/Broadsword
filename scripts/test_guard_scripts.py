@@ -146,6 +146,19 @@ class TestA(unittest.TestCase):
         self.assertRefused("--SUBSTEPS", "10")
         self.assertRefused("--body", "")
 
+    def test_refuses_short_name_paths(self):
+        # 8.3 short names (VALIDA~1.BSN) could hide a test B file name: any "~" in --body is refused.
+        wr(os.path.join(self.root, "scratch", "x~1.bsn"), "x")  # exists, so only the "~" rule can refuse it
+        self.assertRefused("--body", "scratch/x~1.bsn")
+        self.assertRefused("--body", "scratch/VALIDA~1.BSN")
+        self.assertRefused("--body", "SCRATCH~1/x.bsn")
+        # A real short name of a test B file, when this machine can create one without admin.
+        longname = os.path.join(self.root, "scratch", "validation_wall_b.bsn")
+        wr(longname, "x")
+        r = subprocess.run(["fsutil", "file", "setshortname", longname, "VALIDA~1.BSN"], capture_output=True)
+        if r.returncode == 0:
+            self.assertRefused("--body", "scratch/VALIDA~1.BSN")
+
     def test_refuses_link_to_elsewhere(self):
         link = os.path.join(self.root, "scratch", "lnk")
         r = subprocess.run(["cmd", "/c", "mklink", "/J", link, os.path.join(self.root, "elsewhere")], capture_output=True)
@@ -293,6 +306,8 @@ WEAKENINGS = [
      ["test_refuses_body_outside_allowed_folders"]),
     ("ff-reviewed.ps1 without the lock check", {"ff-reviewed.ps1": [("$fs.Lock(0, [long]::MaxValue)", "")]},
      ["test_refuses_held_project_lock", "test_refuses_held_global_lock"]),
+    ("run-test-a.ps1 without the short-name check", {"run-test-a.ps1": [("-match '~'", "-match '\x01'")]},
+     ["test_refuses_short_name_paths"]),
     ("ff-reviewed.ps1 without the clean-main check", {"ff-reviewed.ps1": [("if ($dirty.Count -gt 0) {", "if ($false) {")]},
      ["test_refuses_dirty_main", "test_refuses_untracked_file_in_main"]),
 ]

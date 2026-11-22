@@ -62,6 +62,8 @@ if ($null -ne $substeps -and $substeps -cnotmatch '^[1-9][0-9]{0,5}$') { Refuse 
 $bodyArg = $defaultBody
 if ($null -ne $body) {
     if ($body -match '[\x00-\x1f"*?<>|]') { Refuse '--body has a character that is not allowed in a path' }
+    # 8.3 short names (VALIDA~1.BSN) can hide a test B file name from the marker scan: refuse every "~".
+    if ($body -match '~') { Refuse "--body '$body' contains '~' (8.3 short names are not allowed)" }
     if ([IO.Path]::IsPathRooted($body)) { Refuse '--body must be a path relative to the root' }
     $full = [IO.Path]::GetFullPath((Join-Path $root $body))
     $hit = HasForbidden $full
@@ -75,6 +77,10 @@ if ($null -ne $body) {
     if (-not $okDir) { Refuse "body '$rel' is not in projects/crash-sim/scenarios, worktrees/crash-sim/<task>/scenarios or scratch" }
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Refuse "body '$rel' does not exist" }
     # No junction or symlink between the root and the file: the resolved path is then the path as written.
+    # The final long name the file system reports is scanned for test B markers too.
+    $long = (Get-Item -LiteralPath $full -Force).FullName
+    $hit = HasForbidden $long
+    if ($hit) { Refuse "body path '$long' contains '$hit'" }
     $p = $full
     while ($p.Length -gt $root.Length) {
         $item = Get-Item -LiteralPath $p -Force
