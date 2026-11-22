@@ -105,7 +105,7 @@ def settings(root, candidate):
     projects = relative_path(proposed.get("projects_dir", cfg.get("projects_dir")), "projects_dir")
     scratch = relative_path(cfg.get("scratch_dir"), "scratch_dir")
     build = relative_path(cfg.get("build_dir"), "build_dir")
-    # Reuse the existing command deadline and captured-output setting: no hidden limits.
+    # Reuse the existing command deadline; metadata output has no size limit.
     timeout = positive_integer(cfg, "done_check_timeout_seconds")
     try:
         valid_timeout = math.isfinite(float(timeout)) and timeout <= threading.TIMEOUT_MAX
@@ -113,9 +113,6 @@ def settings(root, candidate):
         valid_timeout = False
     if not valid_timeout:
         raise BadInput("done_check_timeout_seconds exceeds the platform wait range")
-    cap = positive_integer(cfg, "mcp_output_max_kb") * 1024
-    if cap >= sys.maxsize:
-        raise BadInput("mcp_output_max_kb exceeds the platform read range")
     for left, right in ((projects, scratch), (projects, build), (scratch, build)):
         if left.is_relative_to(right) or right.is_relative_to(left):
             raise BadInput(f"managed folders overlap: {left} and {right}")
@@ -124,7 +121,7 @@ def settings(root, candidate):
     for key in ("state_dir", "worktrees_dir", "install_dir"):
         if key in cfg:
             excluded.add(root / relative_path(cfg[key], key))
-    return projects, scratch, build, timeout, cap, excluded
+    return projects, scratch, build, timeout, excluded
 
 
 def lane_name(name):
@@ -264,7 +261,7 @@ def json_float(value):
     return number
 
 
-def metadata(directory, log_dir, timeout, cap, build):
+def metadata(directory, log_dir, timeout, build):
     """The single Cargo entry point; files avoid descendant-held pipe deadlocks."""
     log_dir.mkdir()
     env = os.environ.copy()
@@ -291,17 +288,15 @@ def metadata(directory, log_dir, timeout, cap, build):
             child.wait(timeout=timeout)
             timed_out = True
     with stdout_path.open("rb") as source:
-        out = source.read(min(os.fstat(source.fileno()).st_size, cap + 1))
+        out = source.read()
     with stderr_path.open("rb") as source:
-        err = source.read(min(os.fstat(source.fileno()).st_size, cap + 1))
+        err = source.read()
     first_error = err.decode("utf-8", "replace").splitlines()
     detail = first_error[0] if first_error else ""
     if timed_out:
         return "FAIL", f"{detail} (cargo metadata timed out)" if detail else "cargo metadata timed out"
     if code:
         return "FAIL", detail or f"cargo metadata exited {code} (no stderr)"
-    if len(out) > cap or len(err) > cap:
-        return "FAIL", detail or "cargo metadata output exceeds mcp_output_max_kb"
     try:
         result = json.loads(out, object_pairs_hook=json_object,
                             parse_constant=json_constant, parse_float=json_float)
@@ -327,7 +322,7 @@ def main(argv=None):
         root = existing(args.root, "--root", directory=True)
         added = existing(args.add_project, "--add-project", directory=True) if args.add_project is not None else None
         candidate = existing(args.toml, "--toml") if args.toml is not None else None
-        projects, scratch_rel, build_rel, timeout, cap, excluded = settings(root, candidate)
+        projects, scratch_rel, build_rel, timeout, excluded = settings(root, candidate)
         lanes = discover(root, projects, added)
         parent = root / scratch_rel
         if parent.exists():
@@ -354,7 +349,7 @@ def main(argv=None):
     for name, _, relative in lanes:
         try:
             status, detail = copied.get(name) or metadata(
-                scratch / relative, scratch / f".metadata-{name}", timeout, cap, scratch / build_rel
+                scratch / relative, scratch / f".metadata-{name}", timeout, scratch / build_rel
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             status, detail = "FAIL", str(exc)

@@ -289,14 +289,31 @@ mcp_output_max_kb = 1024
 
     def test_invalid_metadata_never_passes(self):
         for name, marker in (("bad-json", "# BAD_JSON"), ("missing", "# NO_PACKAGES"),
-                             ("wrong-type", "# WRONG_PACKAGES"), ("huge", "# HUGE"),
+                             ("wrong-type", "# WRONG_PACKAGES"),
                              ("duplicate", "# DUPLICATE"), ("nonfinite", "# NONFINITE")):
             self.lane(name, marker)
         code, out, _ = self.go()
         self.assertEqual(code, 1, out)
-        for name in ("bad-json", "missing", "wrong-type", "huge", "duplicate", "nonfinite"):
+        for name in ("bad-json", "missing", "wrong-type", "duplicate", "nonfinite"):
             self.assertIn(f"lane {name} FAIL ", out)
-        self.assertIn("output exceeds mcp_output_max_kb", out)
+
+    def test_valid_metadata_larger_than_two_megabytes_is_ok(self):
+        self.lane("huge", "# HUGE")
+        code, out, err = self.go()
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("lane huge OK non-empty packages\n", out)
+        self.assertTrue(out.endswith("lane-dryrun: ok\n"), out)
+        captured = (self.copied() / ".metadata-huge/stdout").read_bytes()
+        self.assertGreater(len(captured), 2 * 1024 * 1024)
+        self.assertEqual(json.loads(captured)["packages"], [{}])
+
+    def test_low_level_metadata_accepts_large_valid_output(self):
+        self.project(self.root, "# HUGE")
+        status, detail = dryrun.metadata(
+            self.root, self.tmp / "logs", 20, self.tmp / "build"
+        )
+        self.assertEqual((status, detail), ("OK", "non-empty packages"))
+        self.assertGreater((self.tmp / "logs/stdout").stat().st_size, 2 * 1024 * 1024)
 
     def test_bad_toml_and_unsafe_projects_dir_run_nothing(self):
         candidate = self.tmp / "candidate.toml"
@@ -351,7 +368,7 @@ mcp_output_max_kb = 1024
 
     def test_low_level_metadata_handles_missing_cargo(self):
         with mock.patch.object(dryrun.subprocess, "Popen", side_effect=FileNotFoundError("cargo absent")):
-            status, detail = dryrun.metadata(self.root, self.tmp / "logs", 1, 1024, self.tmp / "build")
+            status, detail = dryrun.metadata(self.root, self.tmp / "logs", 1, self.tmp / "build")
         self.assertEqual(status, "FAIL")
         self.assertIn("cargo absent", detail)
 
@@ -359,7 +376,7 @@ mcp_output_max_kb = 1024
         child = mock.Mock()
         child.wait.side_effect = [subprocess.TimeoutExpired("cargo", 1), 0]
         with mock.patch.object(dryrun.subprocess, "Popen", return_value=child):
-            status, detail = dryrun.metadata(self.root, self.tmp / "logs", 1, 1024, self.tmp / "build")
+            status, detail = dryrun.metadata(self.root, self.tmp / "logs", 1, self.tmp / "build")
         self.assertEqual((status, detail), ("FAIL", "cargo metadata timed out"))
         child.kill.assert_called_once()
 
