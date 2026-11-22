@@ -129,6 +129,7 @@ mod cancel;
 mod check;
 mod entry;
 mod locks;
+mod merge;
 mod rebase;
 mod review;
 mod train;
@@ -161,6 +162,8 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("entry.rs"),
     "\n",
     include_str!("locks.rs"),
+    "\n",
+    include_str!("merge.rs"),
     "\n",
     include_str!("rebase.rs"),
     "\n",

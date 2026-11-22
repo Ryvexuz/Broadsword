@@ -5,8 +5,8 @@ use crate::donecheck;
 use crate::{tools, wtgit};
 use std::path::Path;
 use super::entry::queue_dir;
+use super::merge::trunk_checkout;
 use super::{CHECK_FAILED, EXIT_REJECTED, EXIT_RETRY, PERF_FAILED, R, REJECTED, Run, STALE};
-use super::train::trunk_checkout;
 use super::view::{short, some};
 
 /// `check <project>` of the project's main checkout `dir`, only while it has its trunk checked out: the job id when it passed, else why
