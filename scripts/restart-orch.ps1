@@ -6,14 +6,18 @@
 #
 # Checks, all of which must pass (times are UTC; pc-progress lines start with YYYY-MM-DDTHH:MM:SSZ):
 #  1. No argument at all.
-#  2. A newest state/handoff-*.md exists (by last-write time; no link), and it was written AFTER the time of the last
-#     non-empty state/pc-progress.md line that does not contain "(tick-loop)". If that line has no readable time, it
-#     refuses.
-#  3. No line containing "orchestrator" (any case) in state/pc-progress.md is from the last 60 minutes. A line without
-#     a readable time counts as written at the time of the next timed line after it (an upper bound, so it is never
-#     treated as older than it is); one with no timed line after it refuses.
+#  2. The orchestrator went quiet: the last non-empty state/pc-progress.md line that does not contain "(tick-loop)" is
+#     over 60 minutes old. If that line has no readable time, it refuses.
+#  3. It went quiet right after a handoff: a newest state/handoff-*.md exists (by last-write time; no link), and it was
+#     last written no more than 5 minutes BEFORE that line (later than the line is fine). The orchestrator logs its
+#     "handoff written" line about a second after writing the handoff file, so the handoff is usually a little OLDER
+#     than the last line (real pattern: handoff 17:22:15Z, line 17:22:16Z).
 #  4. No request was written in the last 2 hours: state/restart-request.md, if it exists, was last written over 2 hours
 #     ago and its `time:` line (if readable) is over 2 hours old too.
+# Concurrent runs: checks 2 to 4 and the write run while this run holds state/restart-request.lock, created with an
+# exclusive create (FileMode.CreateNew: a second run cannot create it and refuses). The OS removes that lock file when
+# its handle closes (FileOptions.DeleteOnClose), also if the run is killed; it is the only file this script removes,
+# and only the one it just created itself.
 
 $ErrorActionPreference = 'Stop'
 trap { [Console]::Error.WriteLine("restart-orch: REFUSED: unexpected error: $($_.Exception.Message)"); exit 2 }
@@ -25,6 +29,7 @@ function Refuse([string]$why) {
 
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $quietMinutes = 60
+$handoffBeforeMinutes = 5
 $requestGapHours = 2
 $now = [DateTime]::UtcNow
 
@@ -49,9 +54,18 @@ function LineTime([string]$line) {
 # 1. Arguments.
 if ($args.Count -ne 0) { Refuse 'usage: restart-orch.ps1 (no arguments)' }
 
-# 2. The newest handoff and the last non-tick-loop line.
 $state = Join-Path $root 'state'
 if (-not (Test-Path -LiteralPath $state -PathType Container)) { Refuse "'$state' does not exist" }
+if (-not (NoLinks $state)) { Refuse "'$state' is a link; links are not followed" }
+# The lock: an exclusive create, held until this process ends (its handle closes then and the OS removes the file).
+$lockPath = Join-Path $state 'restart-request.lock'
+try {
+    $lock = New-Object IO.FileStream($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+} catch {
+    Refuse "state/restart-request.lock exists (another restart-orch run holds it, or a stale lock is left over): $($_.Exception.Message)"
+}
+
+# 2 and 3. The last non-tick-loop line and the newest handoff.
 $handoffs = @(Get-ChildItem -LiteralPath $state -Filter 'handoff-*.md' -File -Force | Where-Object { $_.Name -cmatch '^handoff-[A-Za-z0-9._-]+\.md$' })
 if ($handoffs.Count -eq 0) { Refuse 'no state/handoff-*.md exists' }
 $newest = $handoffs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -70,26 +84,11 @@ for ($i = $lines.Count - 1; $i -ge 0; $i--) {
 if ($null -eq $last) { Refuse 'state/pc-progress.md has no line that is not a (tick-loop) line' }
 $lastTime = LineTime $last
 if ($null -eq $lastTime) { Refuse "the last non-(tick-loop) line of state/pc-progress.md has no readable time: '$last'" }
-if (-not ($handoffTime -gt $lastTime)) {
-    Refuse ("newest handoff $handoffRel ({0:s}Z) is not newer than the last pc-progress line ({1:s}Z)" -f $handoffTime, $lastTime)
+if (-not (($now - $lastTime).TotalMinutes -gt $quietMinutes)) {
+    Refuse ("the last non-(tick-loop) pc-progress line ({0:s}Z) is not over {1} min old" -f $lastTime, $quietMinutes)
 }
-
-# 3. No orchestrator line in the last 60 minutes.
-$nextTime = $null
-$lastOrch = $null
-for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-    $t = LineTime $lines[$i]
-    if ($null -ne $t) { $nextTime = $t }
-    if ($lines[$i].IndexOf('orchestrator', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-        if ($null -eq $t) {
-            if ($null -eq $nextTime) { Refuse "an orchestrator line has no readable time and no timed line after it: '$($lines[$i])'" }
-            $t = $nextTime
-        }
-        if ($null -eq $lastOrch -or $t -gt $lastOrch) { $lastOrch = $t }
-        if (($now - $t).TotalMinutes -lt $quietMinutes) {
-            Refuse ("an orchestrator line of state/pc-progress.md is from {0:s}Z, under {1} min ago" -f $t, $quietMinutes)
-        }
-    }
+if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {
+    Refuse ("newest handoff $handoffRel ({0:s}Z) is more than {2} min before the last pc-progress line ({1:s}Z): the orchestrator did not stop right after a handoff" -f $handoffTime, $lastTime, $handoffBeforeMinutes)
 }
 
 # 4. No request in the last 2 hours.
@@ -107,9 +106,9 @@ if (Test-Path -LiteralPath $reqPath) {
 }
 
 # Only now is anything written.
-$orchText = if ($null -eq $lastOrch) { 'no orchestrator line at all' } else { 'last orchestrator line {0:s}Z, over {1} min ago' -f $lastOrch, $quietMinutes }
-$reason = ('newest handoff ({0:s}Z) is newer than the last pc-progress line ({1:s}Z); {2}' -f $handoffTime, $lastTime, $orchText)
+$reason = ('the last non-(tick-loop) pc-progress line ({1:s}Z) is over {2} min old and came right after the newest handoff ({0:s}Z)' -f $handoffTime, $lastTime, $quietMinutes)
 $body = "# restart request`n`ntime: $($now.ToString('yyyy-MM-ddTHH:mm:ss'))Z`nhandoff: $handoffRel`nreason: $reason`n"
 [IO.File]::WriteAllText($reqPath, $body)
+$lock.Dispose()
 Write-Output "restart-orch: wrote state/restart-request.md (handoff $handoffRel): $reason"
 exit 0

@@ -4,13 +4,17 @@
 # of this script's folder; there is no override. It never pushes, forces, resets, deletes files or history, reads .env
 # or edits .claude/.
 #
-# What it stops (found by command line, Win32_Process), and only that:
-#  - a powershell.exe whose WHOLE command line is `<powershell> [-NoProfile|-NonInteractive|-WindowStyle Hidden|
-#    -ExecutionPolicy Bypass ...] -File scratch/queue-driver-project.ps1 <project>` (the form start-driver.ps1 uses);
-#  - a broadsword.exe whose PARENT is such a driver and whose whole command line is
-#    `<broadsword.exe> queue run --all --project <project>`.
-# A command line that merely contains these words (a -Command, a grep, another project) does not match. Each process is
-# re-read by pid right before it is stopped, and is stopped only if its creation time is unchanged (no pid reuse).
+# What it stops (found by command line, Win32_Process), and only that: the OUTER driver loop, a powershell.exe whose
+# WHOLE command line is `<powershell> [-NoProfile|-NonInteractive|-WindowStyle Hidden|-ExecutionPolicy Bypass ...]
+# -File <script> <project>` where <script> is THIS root's scratch/queue-driver-project.ps1: either the absolute path
+# <root>\scratch\queue-driver-project.ps1, or the relative `scratch/queue-driver-project.ps1` (the form start-driver.ps1
+# uses) of a process whose current folder (read from the process itself) is <root>. A driver of another copy of the
+# project folder is left alone; a relative-path driver whose current folder cannot be read refuses the whole run.
+# A command line that merely contains these words (a -Command, a grep, another project) does not match.
+# It NEVER stops the driver's child `broadsword.exe queue run --all --project <project>`: a child already running is
+# left to finish its drain (it exits when the project is idle), so a merge in progress is never killed.
+# Each driver is re-read by pid right before it is stopped, and is stopped only if its creation time and command line
+# are unchanged (no pid reuse); the queue is re-checked for a running entry right before each stop too.
 #
 # Checks, all of which must pass:
 #  1. <project> is a plain project name; the only other arguments are --when-idle-wait and --dry-run, each once.
@@ -18,8 +22,6 @@
 #     `status = running` (a merge is in progress). With --when-idle-wait it re-checks every 5 s for up to 30 min and
 #     refuses if an entry is still running then. An entry file that cannot be read refuses.
 # --dry-run runs every check, then only prints what it would stop.
-# Known limit: a driver started with the same relative command line from ANOTHER copy of the project folder also
-# matches (Win32_Process does not report a process's working folder).
 
 $ErrorActionPreference = 'Stop'
 trap { [Console]::Error.WriteLine("stop-driver: REFUSED: unexpected error: $($_.Exception.Message)"); exit 2 }
@@ -76,26 +78,89 @@ if ($running.Count -gt 0) {
     }
 }
 
-# 3. Find the driver and its queue-run child by exact command line.
+# 3. Find THIS root's driver by exact command line and script location.
+if (-not ('BsProcCwd' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class BsProcCwd {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool IsWow64Process(IntPtr h, out bool wow);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, long[] info, int len, out int retLen);
+    static byte[] Read(IntPtr h, long addr, int n) {
+        byte[] b = new byte[n]; IntPtr got;
+        if (!ReadProcessMemory(h, new IntPtr(addr), b, new IntPtr(n), out got) || got.ToInt64() != n) return null;
+        return b;
+    }
+    // The current folder of a 64-bit process (PEB -> ProcessParameters -> CurrentDirectory), or null if unreadable.
+    public static string Get(int pid) {
+        if (IntPtr.Size != 8) return null;
+        IntPtr h = OpenProcess(0x0410, false, pid); // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+        if (h == IntPtr.Zero) return null;
+        try {
+            bool wow;
+            if (!IsWow64Process(h, out wow) || wow) return null;
+            long[] pbi = new long[6]; int rl;
+            if (NtQueryInformationProcess(h, 0, pbi, 48, out rl) != 0) return null;
+            byte[] pp = Read(h, pbi[1] + 0x20, 8); if (pp == null) return null;
+            byte[] us = Read(h, BitConverter.ToInt64(pp, 0) + 0x38, 16); if (us == null) return null;
+            int len = BitConverter.ToUInt16(us, 0);
+            if (len == 0 || len > 65534 || (len % 2) != 0) return null;
+            byte[] s = Read(h, BitConverter.ToInt64(us, 8), len); if (s == null) return null;
+            return System.Text.Encoding.Unicode.GetString(s);
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+}
 $pq = [regex]::Escape($project)
-# The program path and flags match case-insensitively; the project name matches exactly (-cmatch).
-$driverRe = '^(?i:(?:"[^"]*\\)?(?:[^"\s\\]*\\)*powershell(?:\.exe)?"?(?:\s+(?:-NoProfile|-NonInteractive|-WindowStyle\s+Hidden|-ExecutionPolicy\s+Bypass))*\s+-File\s+"?scratch[\\/]queue-driver-project\.ps1"?)\s+' + $pq + '\s*$'
-$childRe = '^(?i:(?:"[^"]*\\)?(?:[^"\s\\]*[\\/])*broadsword\.exe"?)\s+queue\s+run\s+--all\s+--project\s+' + $pq + '\s*$'
+$ownScript = Join-Path $root 'scratch\queue-driver-project.ps1'
+# The program path and flags match case-insensitively; the project name matches exactly (-cmatch). Group 1 or 2 is the
+# -File path, checked below against THIS root.
+$driverRe = '^(?i:(?:"[^"]*\\)?(?:[^"\s\\]*\\)*powershell(?:\.exe)?"?(?:\s+(?:-NoProfile|-NonInteractive|-WindowStyle\s+Hidden|-ExecutionPolicy\s+Bypass))*\s+-File\s+(?:"([^"]+)"|([^"\s]+)))\s+' + $pq + '\s*$'
+function SameFolder([string]$a, [string]$b) {
+    try { $fa = [IO.Path]::GetFullPath($a).TrimEnd('\', '/'); $fb = [IO.Path]::GetFullPath($b).TrimEnd('\', '/') } catch { return $false }
+    return [string]::Equals($fa, $fb, [StringComparison]::OrdinalIgnoreCase)
+}
+# 'own' = this root's driver, 'other' = not this root's, 'unknown' = relative path whose current folder cannot be read.
+function DriverOf($proc) {
+    if ($proc.Name -ne 'powershell.exe' -or -not $proc.CommandLine -or $proc.CommandLine -cnotmatch $driverRe) { return 'none' }
+    $path = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+    if ($path -match '^(?i:scratch[\\/]queue-driver-project\.ps1)$') {
+        $cwd = [BsProcCwd]::Get([int]$proc.ProcessId)
+        if ($null -eq $cwd) { return 'unknown' }
+        if (SameFolder $cwd $root) { return 'own' }
+        return 'other'
+    }
+    if ([IO.Path]::IsPathRooted($path) -and (SameFolder $path $ownScript)) { return 'own' }
+    return 'other'
+}
 $procs = @(Get-CimInstance Win32_Process)
-$drivers = @($procs | Where-Object { $_.Name -eq 'powershell.exe' -and $_.CommandLine -and $_.CommandLine -cmatch $driverRe })
-$driverIds = @($drivers | ForEach-Object { $_.ProcessId })
-$children = @($procs | Where-Object { $_.Name -eq 'broadsword.exe' -and $_.CommandLine -and ($driverIds -contains $_.ParentProcessId) -and $_.CommandLine -cmatch $childRe })
-$targets = @($drivers) + @($children)
+$targets = @()
+foreach ($p in $procs) {
+    $kind = DriverOf $p
+    if ($kind -eq 'unknown') { Refuse "the current folder of driver pid $($p.ProcessId) cannot be read, so it cannot be shown to be this root's driver: $($p.CommandLine)" }
+    if ($kind -eq 'other') { Write-Output "stop-driver: pid $($p.ProcessId) is a driver of another folder; left alone" }
+    if ($kind -eq 'own') { $targets += $p }
+}
+$driverIds = @($targets | ForEach-Object { $_.ProcessId })
+foreach ($c in @($procs | Where-Object { $_.Name -eq 'broadsword.exe' -and ($driverIds -contains $_.ParentProcessId) })) {
+    Write-Output "stop-driver: child pid $($c.ProcessId) is left to finish its drain (never stopped): $($c.CommandLine)"
+}
 if ($targets.Count -eq 0) { Write-Output "stop-driver: no queue driver of '$project' is running; nothing stopped"; exit 0 }
 foreach ($t in $targets) { Write-Output "stop-driver: stop pid $($t.ProcessId): $($t.CommandLine)" }
 if ($dry) { Write-Output 'stop-driver: dry run, nothing stopped'; exit 0 }
 
-# Drivers first, so a driver cannot start a new child after its child is stopped.
+# Only the outer driver loops are stopped; each one re-read and the queue re-checked right before its stop.
 $failed = 0
 foreach ($t in $targets) {
+    $nowRunning = RunningEntries
+    if ($nowRunning.Count -gt 0) { Refuse "queue entry $($nowRunning -join ', ') of '$project' started running; pid $($t.ProcessId) not stopped" }
     $now = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$t.ProcessId)"
     if ($null -eq $now) { continue }
-    if ($now.CreationDate -ne $t.CreationDate -or $now.CommandLine -ne $t.CommandLine) { Write-Output "stop-driver: pid $($t.ProcessId) changed; not stopped"; continue }
+    if ($now.CreationDate -ne $t.CreationDate -or $now.CommandLine -ne $t.CommandLine -or (DriverOf $now) -ne 'own') { Write-Output "stop-driver: pid $($t.ProcessId) changed; not stopped"; continue }
     try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop } catch { $failed++; [Console]::Error.WriteLine("stop-driver: could not stop pid $($t.ProcessId): $($_.Exception.Message)") }
 }
 if ($failed -gt 0) { exit 1 }

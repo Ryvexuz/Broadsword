@@ -11,6 +11,7 @@ started, under a random project name no real driver uses.
     python -I -B scripts/test_guard_scripts_2.py --prove-fail  run it against deliberately weakened copies; each
                                                                weakening must make its named tests FAIL
 """
+import calendar
 import os
 import shutil
 import subprocess
@@ -61,6 +62,34 @@ def age(path, minutes):
 
 def stamp(minutes_ago):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes_ago * 60))
+
+
+def junction(link, target):
+    """A directory junction (mklink /J needs no admin). False if it cannot be made."""
+    os.makedirs(target, exist_ok=True)
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
+    return r.returncode == 0
+
+
+def outside_dir(test):
+    d = os.path.join(os.path.realpath(tempfile.gettempdir()), "gsx" + uuid.uuid4().hex[:10])
+    os.makedirs(d)
+    test.addCleanup(shutil.rmtree, d, True)
+    return d
+
+
+def alive(pid):
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        k.GetExitCodeProcess(h, ctypes.byref(code))
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        k.CloseHandle(h)
 
 
 def make_root():
@@ -184,6 +213,22 @@ class TestVenvInstall(Base):
             rel = self.commit_req(f"requirements-bad{i}.txt", text)
             self.assertRefused(rel, "--dry-run")
 
+    def test_refuses_scratch_junction(self):
+        # F3: the validated copy is written under scratch/venv-install; a junction there would put it elsewhere.
+        out = outside_dir(self)
+        if not junction(os.path.join(self.root, "scratch"), out):
+            self.skipTest("cannot create a junction")
+        self.assertRefused(self.REQ, "--dry-run")
+        self.assertRefused(self.REQ)
+        self.assertEqual(os.listdir(out), [], "something was written through the junction")
+
+    def test_refuses_venv_junction(self):
+        out = outside_dir(self)
+        wr(os.path.join(out, "Scripts", "python.exe"), "")
+        if not junction(os.path.join(self.root, "shared", "venv"), out):
+            self.skipTest("cannot create a junction")
+        self.assertRefused(self.REQ, "--dry-run")
+
     def test_refuses_venv_folder_without_python(self):
         os.makedirs(os.path.join(self.root, "shared", "venv", "Lib"))
         self.assertRefused(self.REQ, "--dry-run")
@@ -296,6 +341,17 @@ class TestAbandonStuck(Base):
         self.assertRefused(self.ID.upper(), "--dry-run")
         self.assertRefused("20261122-120000-other-run", "--dry-run")  # no record
 
+    def test_refuses_build_junction(self):
+        # F4: build/bin/broadsword.exe is run; a junction on build would run a program from elsewhere.
+        out = outside_dir(self)
+        wr(os.path.join(out, "bin", "broadsword.exe"), "")
+        if not junction(os.path.join(self.root, "build"), out):
+            self.skipTest("cannot create a junction")
+        self.rec(pid=self.dead_pid())
+        self.assertRefused(self.ID, "--dry-run")
+        self.assertRefused(self.ID)
+        self.assertNotIn("abandon-stuck", self.pc_text())
+
     def test_refuses_record_with_other_id(self):
         self.rec(pid=self.dead_pid(), rec_id="20261122-120001-demo-run")
         self.assertRefused(self.ID, "--dry-run")
@@ -378,14 +434,74 @@ class TestStopDriver(Base):
             if p.poll() is None:
                 p.kill()
                 p.wait()
+            if p.stdin:
+                p.stdin.close()
 
-    def spawn(self, args):
-        p = subprocess.Popen(["powershell"] + args, cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def spawn(self, args, cwd=None):
+        p = subprocess.Popen(["powershell"] + args, cwd=cwd or self.root, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         return p
 
-    def driver(self, proj=None):
-        return self.spawn(["-NoProfile", "-File", "scratch/queue-driver-project.ps1", proj or self.proj])
+    def driver(self, proj=None, cwd=None, script="scratch/queue-driver-project.ps1"):
+        return self.spawn(["-NoProfile", "-File", script, proj or self.proj], cwd=cwd)
+
+    def other_root(self):
+        other = outside_dir(self)
+        wr(os.path.join(other, "scratch", "queue-driver-project.ps1"), DRIVER_BODY)
+        return other
+
+    def test_leaves_a_driver_of_another_root_alone(self):
+        # F1: the same relative command line, started in another copy of the project folder, is not this root's driver.
+        other = self.other_root()
+        theirs = self.driver(cwd=other)
+        ours = self.driver()
+        time.sleep(1.5)
+        out = self.assertAllowed(self.proj)
+        self.assertIn(f"stop pid {ours.pid}", out)
+        self.assertNotIn(f"stop pid {theirs.pid}", out)
+        self.assertTrue(self.gone(ours), "this root's driver is still running")
+        time.sleep(1)
+        self.assertIsNone(theirs.poll(), "a driver of another folder was stopped")
+
+    def test_absolute_script_path_must_be_under_this_root(self):
+        other = self.other_root()
+        ours_abs = self.driver(cwd=other, script=os.path.join(self.root, "scratch", "queue-driver-project.ps1"))
+        theirs_abs = self.driver(script=os.path.join(other, "scratch", "queue-driver-project.ps1"))
+        time.sleep(1.5)
+        out = self.assertAllowed(self.proj)
+        self.assertIn(f"stop pid {ours_abs.pid}", out)
+        self.assertTrue(self.gone(ours_abs), "this root's driver (absolute path) is still running")
+        time.sleep(1)
+        self.assertIsNone(theirs_abs.poll(), "a driver whose script is in another folder was stopped")
+
+    def test_never_stops_the_queue_run_child(self):
+        # F2: the child `broadsword.exe queue run --all --project <p>` is left to finish its drain. The stand-in child
+        # is cmd.exe renamed broadsword.exe; it waits on the stdin pipe this test holds, so it outlives its driver.
+        exe = os.path.join(self.root, "build", "bin", "broadsword.exe")
+        os.makedirs(os.path.dirname(exe))
+        shutil.copy(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"), exe)
+        wr(os.path.join(self.root, "scratch", "queue-driver-project.ps1"),
+           "$psi = New-Object Diagnostics.ProcessStartInfo((Join-Path (Get-Location) 'build\\bin\\broadsword.exe'), "
+           "\"queue run --all --project $($args[0])\")\n$psi.UseShellExecute = $false\n"
+           "$c = [Diagnostics.Process]::Start($psi)\n"
+           "[IO.File]::WriteAllText((Join-Path (Get-Location) 'child.pid'), [string]$c.Id)\nStart-Sleep -Seconds 120\n")
+        d = self.driver()
+        pidfile = os.path.join(self.root, "child.pid")
+        for _ in range(100):
+            if os.path.exists(pidfile) and rd(pidfile).strip():
+                break
+            time.sleep(0.1)
+        child = int(rd(pidfile).strip())
+        self.addCleanup(subprocess.run, ["taskkill", "/PID", str(child), "/F"], capture_output=True)
+        self.assertTrue(alive(child), "the stand-in child did not start")
+        out = self.assertAllowed(self.proj)
+        self.assertIn(f"stop pid {d.pid}", out)
+        self.assertNotIn(f"stop pid {child}", out)
+        self.assertIn(f"child pid {child} is left to finish its drain", out)
+        self.assertTrue(self.gone(d), "the driver is still running")
+        time.sleep(1)
+        self.assertTrue(alive(child), "the queue-run child was stopped")
 
     def entry(self, eid, status, project=None):
         path = os.path.join(self.q, eid + ".entry")
@@ -493,7 +609,7 @@ class TestRestartOrch(Base):
         text = rd(self.req)
         self.assertIn("handoff: state/handoff-2026-11-22a.md", text)
         self.assertRegex(text, r"(?m)^time: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertIn("reason: newest handoff", text)
+        self.assertIn("reason: the last non-(tick-loop) pc-progress line", text)
         self.assertIn("wrote state/restart-request.md", out)
 
     def test_old_request_does_not_block(self):
@@ -525,18 +641,59 @@ class TestRestartOrch(Base):
         os.remove(os.path.join(self.state, "handoff-2026-11-21z.md"))
         self.assertRefusedNoWrite()
 
-    def test_refuses_recent_orchestrator_line(self):
-        # also a (tick-loop) line counts for this rule
-        self.pc(f"{stamp(180)} fd03 queued", f"{stamp(30)} orchestrator 11 heartbeat (tick-loop)")
+    def test_real_handoff_pattern_fires(self):
+        # F6: the real pattern of 2026-11-22: handoff file written 17:22:15Z, "handoff written" line logged 17:22:16Z,
+        # then only (tick-loop) lines. Shifted to yesterday's date so the line is over 60 min old.
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+        t = calendar.timegm(time.strptime(day + " 17:22:15", "%Y-%m-%d %H:%M:%S"))
+        os.utime(self.handoff, (t, t))
+        age(os.path.join(self.state, "handoff-2026-11-21z.md"), 3 * 1440)
+        self.pc(f"{day}T16:58:02Z fd03 queued",
+                f"{day}T17:22:16Z orchestrator 10 at context budget: handoff state/handoff-2026-11-22a.md written. PAUSED",
+                f"{day}T17:40:00Z AUTO-START t-1 orchestrator relay (tick-loop)",
+                f"{stamp(1)} AUTO-START t-2 (tick-loop)")
+        out = self.assertAllowed()
+        self.assertIn("handoff: state/handoff-2026-11-22a.md", rd(self.req))
+        self.assertIn("wrote state/restart-request.md", out)
+
+    def test_refuses_recent_last_line(self):
+        # The handoff is newer than the line, but the orchestrator wrote that line under 60 min ago.
+        age(self.handoff, 35)
+        self.pc(f"{stamp(180)} orchestrator 10 handoff", f"{stamp(40)} fd04 requeued", f"{stamp(1)} x (tick-loop)")
         self.assertRefusedNoWrite()
-        self.pc(f"{stamp(100)} fd03 queued", f"{stamp(59)} Orchestrator 11 RESUMED (tick-loop)")
+        self.pc(f"{stamp(180)} orchestrator 10 handoff", f"{stamp(59)} fd04 requeued")
         self.assertRefusedNoWrite()
 
-    def test_untimed_orchestrator_line_counts_as_recent(self):
-        self.pc(f"{stamp(180)} fd03 queued", "Z orchestrator 11 RESUMED (tick-loop)", f"{stamp(5)} x (tick-loop)")
+    def test_handoff_up_to_5_min_before_the_line_fires(self):
+        age(self.handoff, 94)
+        self.pc(f"{stamp(180)} x", f"{stamp(90)} orchestrator 10 handoff written", f"{stamp(1)} y (tick-loop)")
+        self.assertAllowed()
+
+    def test_refuses_handoff_over_5_min_before_the_line(self):
+        age(self.handoff, 97)
+        self.pc(f"{stamp(180)} x", f"{stamp(90)} orchestrator 10 handoff written", f"{stamp(1)} y (tick-loop)")
         self.assertRefusedNoWrite()
-        self.pc(f"{stamp(180)} fd03 queued", f"{stamp(170)} y (tick-loop)", "orchestrator 11 RESUMED (tick-loop)")
+
+    def test_refuses_while_another_run_holds_the_lock(self):
+        # F5: the lock file exists (another run, or a stale one): refuse, write nothing.
+        self.good_pc()
+        lock = os.path.join(self.state, "restart-request.lock")
+        wr(lock, "")
         self.assertRefusedNoWrite()
+        self.assertFalse(os.path.exists(self.req))
+
+    def test_concurrent_runs_write_one_request(self):
+        # F5: several runs at once: exactly one passes, the rest refuse; no lock file is left behind.
+        self.good_pc()
+        env = dict(os.environ)
+        procs = [subprocess.Popen(["powershell", "-NoProfile", "-File", self.script], cwd=self.root, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        codes = [p.wait(timeout=120) for p in procs]
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual(sorted(codes), [0, 2, 2, 2], codes)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "restart-request.lock")), "the lock file was left")
 
     def test_refuses_untimed_last_line(self):
         self.pc(f"{stamp(180)} orchestrator 10", "garbled line without a time", f"{stamp(1)} x (tick-loop)")
@@ -565,8 +722,15 @@ WEAKENINGS = [
      {"abandon-stuck.ps1": [("$proc = Get-Process -Id ([int]$pidText) -ErrorAction SilentlyContinue", "$proc = $null")]},
      ["test_refuses_live_fresh_job"]),
     ("abandon-stuck.ps1 without the log-under-root rule",
-     {"abandon-stuck.ps1": [("$logFull.StartsWith($root + $sep, [StringComparison]::OrdinalIgnoreCase) -and ", "")]},
+     {"abandon-stuck.ps1": [("$logFull.StartsWith($root + $sep, [StringComparison]::OrdinalIgnoreCase) -and ", ""),
+                            ("if (-not $p.StartsWith($root.TrimEnd($sep) + $sep, [StringComparison]::OrdinalIgnoreCase)) { return $false }", "")]},
      ["test_refuses_stale_log_outside_root"]),
+    ("abandon-stuck.ps1 without the link check on the program it runs",
+     {"abandon-stuck.ps1": [("if (-not (NoLinks $exe)) {", "if ($false) {")]},
+     ["test_refuses_build_junction"]),
+    ("venv-install.ps1 without the link check on the copy it writes",
+     {"venv-install.ps1": [("AssertNoLinks $copy\n", "")]},
+     ["test_refuses_scratch_junction"]),
     ("read-b-files.ps1 without the link check",
      {"read-b-files.ps1": [("if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse \"'$q'", "if ($false) { Refuse \"'$q'")]},
      ["test_refuses_link_to_results"]),
@@ -579,12 +743,26 @@ WEAKENINGS = [
     ("stop-driver.ps1 without the end anchor on the project name",
      {"stop-driver.ps1": [("+ $pq + '\\s*$'", "+ $pq")]},
      ["test_stops_the_driver_and_nothing_else"]),
-    ("restart-orch.ps1 without the handoff-newer check",
-     {"restart-orch.ps1": [("if (-not ($handoffTime -gt $lastTime)) {", "if ($false) {")]},
-     ["test_refuses_handoff_older_than_last_line"]),
-    ("restart-orch.ps1 without the 60-minute orchestrator check",
-     {"restart-orch.ps1": [("if (($now - $t).TotalMinutes -lt $quietMinutes) {", "if ($false) {")]},
-     ["test_refuses_recent_orchestrator_line", "test_untimed_orchestrator_line_counts_as_recent"]),
+    ("stop-driver.ps1 without the this-root check (any -File path counts as ours)",
+     {"stop-driver.ps1": [("    $path = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }\n", "    return 'own'\n")]},
+     ["test_leaves_a_driver_of_another_root_alone", "test_absolute_script_path_must_be_under_this_root"]),
+    ("stop-driver.ps1 stopping the queue-run child too (the round-1 behaviour)",
+     {"stop-driver.ps1": [("    if ($kind -eq 'own') { $targets += $p }\n",
+                           "    if ($kind -eq 'own') { $targets += $p }\n"
+                           "    if ($p.Name -eq 'broadsword.exe' -and $p.CommandLine -match 'queue\\s+run\\s+--all\\s+--project\\s+' + $pq) { $targets += $p }\n")]},
+     ["test_never_stops_the_queue_run_child"]),
+    ("restart-orch.ps1 without the handoff-just-before-the-line check",
+     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {", "if ($false) {")]},
+     ["test_refuses_handoff_older_than_last_line", "test_refuses_handoff_over_5_min_before_the_line"]),
+    ("restart-orch.ps1 without the 60-minute quiet check",
+     {"restart-orch.ps1": [("if (-not (($now - $lastTime).TotalMinutes -gt $quietMinutes)) {", "if ($false) {")]},
+     ["test_refuses_recent_last_line"]),
+    ("restart-orch.ps1 with the round-1 rule (handoff must be newer than the last line)",
+     {"restart-orch.ps1": [("if ($handoffTime -lt $lastTime.AddMinutes(-$handoffBeforeMinutes)) {", "if (-not ($handoffTime -gt $lastTime)) {")]},
+     ["test_real_handoff_pattern_fires"]),
+    ("restart-orch.ps1 without the lock",
+     {"restart-orch.ps1": [("[IO.FileMode]::CreateNew", "[IO.FileMode]::OpenOrCreate"), ("[IO.FileOptions]::DeleteOnClose", "[IO.FileOptions]::None")]},
+     ["test_refuses_while_another_run_holds_the_lock"]),
     ("restart-orch.ps1 without the 2-hour request check",
      {"restart-orch.ps1": [("if (($now - $reqWritten).TotalHours -lt $requestGapHours) {", "if ($false) {")]},
      ["test_refuses_recent_request"]),

@@ -31,11 +31,17 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sep = [IO.Path]::DirectorySeparatorChar
 $staleMinutes = 30
 
+# The one link check: every path this script reads, writes or runs (the record, the log, build/bin/broadsword.exe,
+# state/pc-progress.md) goes through it. False if <path> is not under the root or any EXISTING component from the root
+# down to <path> (the root itself excluded) is a junction or symlink (a reparse point). Components that do not exist
+# yet are skipped (pc-progress.md is created by the append if missing).
 function NoLinks([string]$path) {
-    $p = $path
-    while ($p.Length -gt $root.Length) {
-        $item = Get-Item -LiteralPath $p -Force
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    $p = [IO.Path]::GetFullPath($path).TrimEnd($sep)
+    if (-not $p.StartsWith($root.TrimEnd($sep) + $sep, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    while ($p.Length -gt $root.TrimEnd($sep).Length) {
+        if (Test-Path -LiteralPath $p) {
+            if ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        }
         $p = [IO.Path]::GetDirectoryName($p)
     }
     return $true
@@ -108,6 +114,9 @@ if ($null -eq $reason) {
 
 # Only now can anything run.
 $exe = Join-Path $root 'build/bin/broadsword.exe'
+$pcPath = Join-Path $root 'state/pc-progress.md'
+if (-not (NoLinks $exe)) { Refuse "the path to build/bin/broadsword.exe has a link; links are not followed" }
+if (-not (NoLinks $pcPath)) { Refuse "the path to state/pc-progress.md has a link; links are not followed" }
 Write-Output "abandon-stuck: $exe recover --abandon $id ($reason)"
 if ($dry) { Write-Output 'abandon-stuck: dry run, nothing executed'; exit 0 }
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { Refuse "$exe does not exist" }
@@ -115,5 +124,6 @@ Set-Location -LiteralPath $root
 & $exe recover --abandon $id
 $code = $LASTEXITCODE
 $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
-[IO.File]::AppendAllText((Join-Path $root 'state/pc-progress.md'), "$stamp abandon-stuck: recover --abandon $id ($reason) -> exit $code`n")
+if (-not (NoLinks $pcPath)) { [Console]::Error.WriteLine("abandon-stuck: state/pc-progress.md became a link; not appended (recover exit $code)"); exit 1 }
+[IO.File]::AppendAllText($pcPath,"$stamp abandon-stuck: recover --abandon $id ($reason) -> exit $code`n")
 exit $code

@@ -36,6 +36,20 @@ function Refuse([string]$why) {
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sep = [IO.Path]::DirectorySeparatorChar
 
+# The one link check: every path this script reads, writes or runs goes through it. It refuses if any EXISTING
+# component from the root down to <path> (the root itself excluded) is a junction or symlink (a reparse point), or if
+# <path> is not under the root. Components that do not exist yet are skipped; they are created by this script.
+function AssertNoLinks([string]$path) {
+    $p = [IO.Path]::GetFullPath($path).TrimEnd($sep)
+    if (-not $p.StartsWith($root.TrimEnd($sep) + $sep, [StringComparison]::OrdinalIgnoreCase)) { Refuse "'$p' is outside the root" }
+    while ($p.Length -gt $root.TrimEnd($sep).Length) {
+        if (Test-Path -LiteralPath $p) {
+            if ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse "'$p' is a link (junction or symlink); links are not followed" }
+        }
+        $p = [IO.Path]::GetDirectoryName($p)
+    }
+}
+
 # 1. Arguments.
 $all = @($args | ForEach-Object { [string]$_ })
 $dry = $false
@@ -55,12 +69,7 @@ $sharedDir = Join-Path $root 'shared'
 if (-not $full.StartsWith($sharedDir + $sep, [StringComparison]::OrdinalIgnoreCase)) { Refuse "'$full' is outside $sharedDir" }
 if ([IO.Path]::GetDirectoryName($full) -ne $sharedDir) { Refuse "'$full' is not directly in $sharedDir" }
 if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Refuse "'$relIn' does not exist" }
-$p = $full
-while ($p.Length -gt $root.Length) {
-    $item = Get-Item -LiteralPath $p -Force
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse "'$p' is a link; links are not followed" }
-    $p = [IO.Path]::GetDirectoryName($p)
-}
+AssertNoLinks $full
 
 # 2. Git: tracked and unmodified. Git environment variables could point git at another repository.
 foreach ($v in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_CEILING_DIRECTORIES') {
@@ -100,11 +109,8 @@ $create = $false
 if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
     if (Test-Path -LiteralPath $venv) { Refuse "'$venv' exists but has no Scripts/python.exe; not touching it" }
     $create = $true
-} else {
-    foreach ($q in @($venv, (Join-Path $venv 'Scripts'), $py)) {
-        if ((Get-Item -LiteralPath $q -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse "'$q' is a link; links are not followed" }
-    }
 }
+AssertNoLinks $py
 
 # Only now can anything run.
 foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } | ForEach-Object { $_.Name })) {
@@ -112,6 +118,7 @@ foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } | F
 }
 $copyDir = Join-Path $root 'scratch/venv-install'
 $copy = Join-Path $copyDir ([Guid]::NewGuid().ToString('N') + '.txt')
+AssertNoLinks $copy
 if ($create) { Write-Output "venv-install: python -I -m venv $venv" }
 Write-Output "venv-install: $py -I -m pip install --isolated --only-binary=:all: -r $copy (validated copy of $relIn)"
 if ($dry) { Write-Output 'venv-install: dry run, nothing executed'; exit 0 }
@@ -121,8 +128,10 @@ if ($create) {
     & python -I -m venv $venv
     if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("venv-install: creating the venv failed ($LASTEXITCODE)"); exit $LASTEXITCODE }
     if (-not (Test-Path -LiteralPath $py -PathType Leaf)) { [Console]::Error.WriteLine("venv-install: $py missing after creating the venv"); exit 1 }
+    AssertNoLinks $py
 }
 [void](New-Item -ItemType Directory -Force -Path $copyDir)
+AssertNoLinks $copy
 [IO.File]::WriteAllBytes($copy, $bytes)
 & $py -I -m pip install --isolated --only-binary=:all: -r $copy
 exit $LASTEXITCODE
