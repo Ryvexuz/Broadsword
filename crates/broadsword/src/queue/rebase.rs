@@ -3,7 +3,8 @@ use crate::worktree::{self, JobDirError};
 use crate::{git, wtgit};
 use std::path::Path;
 use super::{BLOCKED, CONFLICT, EXIT_RETRY, R, Run};
-use super::train::{effort_for, gating_model, trunk_checkout};
+use super::review::{effort_for, gating_model};
+use super::train::trunk_checkout;
 use super::view::{short, some};
 
 impl<'a> Run<'a> {

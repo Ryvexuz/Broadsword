@@ -11,7 +11,8 @@ use super::entry::{EXT, is_open, load_entries, process_secrets, queue_dir};
 use super::locks::entries_lock;
 use super::{EXIT_BAD_INPUT, EXIT_ERROR, EXIT_RETRY, QUEUED};
 use super::rebase::{chained_base, left_train_text};
-use super::train::{gating_model, trunk_name};
+use super::review::gating_model;
+use super::train::trunk_name;
 use super::view::{short, some};
 
 // ---- add --------------------------------------------------------------------------------
