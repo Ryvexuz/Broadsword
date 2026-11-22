@@ -125,14 +125,16 @@
 //! in wtgit.rs.
 
 mod add;
+mod cancel;
 mod entry;
 mod locks;
 mod train;
 mod view;
 
 pub use add::cmd_add;
+pub use cancel::cmd_cancel;
 pub use entry::queue_dir;
-pub use train::{cmd_cancel, cmd_run, cmd_run_all};
+pub use train::{cmd_run, cmd_run_all};
 pub use view::{cmd_list, cmd_show};
 use crate::config::Config;
 use crate::record::Record;
@@ -148,6 +150,8 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("mod.rs"),
     "\n",
     include_str!("add.rs"),
+    "\n",
+    include_str!("cancel.rs"),
     "\n",
     include_str!("entry.rs"),
     "\n",
