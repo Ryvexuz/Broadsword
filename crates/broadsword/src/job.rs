@@ -461,7 +461,8 @@ fn python_record(py: &PyTests) -> String {
 }
 
 mod teststep;
-pub use teststep::{parse_artifacts, test_copies_dir, Artifacts};
+#[cfg(test)]
+pub use teststep::parse_artifacts;
 use teststep::{refresh_main_bins, TestStep};
 
 // ---- commands ---------------------------------------------------------------------------
