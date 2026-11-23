@@ -47,7 +47,9 @@ pub const EXIT_BUSY: u8 = 4;
 pub const WHOLE_PROJECT: &str = "*";
 
 mod claims;
-pub use claims::{KEY_CLAIM_FILES, normalize_claim, normalize_claims, overlaps, overlaps_with};
+pub use claims::{normalize_claims, overlaps};
+#[cfg(test)]
+pub use claims::{KEY_CLAIM_FILES, normalize_claim, overlaps_with};
 
 // ---- conflicts and transitions ----------------------------------------------------------
 
