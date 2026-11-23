@@ -1475,7 +1475,7 @@ fn refused_job_records_its_lock_wait() {
 /// Now the run fails before its command starts and says why: no run command ever runs without the fail-fast marker.
 #[test]
 fn run_that_cannot_prove_its_lock_never_starts_its_command() {
-    let r = Root::new("noproof", 30);
+    let r = Root::new("noproof", 180);
     fs::create_dir_all(r.dir.join("state/build.lock.run.id")).unwrap();
     let flag = r.scratch("noproof-started.txt");
     let flag_s = flag.to_string_lossy().replace('\\', "/");
@@ -1486,7 +1486,10 @@ fn run_that_cannot_prove_its_lock_never_starts_its_command() {
     let o = r.run(&args);
     let took = started.elapsed();
     let all = format!("{}\n{}", o.stdout, o.stderr);
-    assert!(took < Duration::from_secs(20), "the run took {took:?} (the lock wait is 30 s)\n{all}");
+    // The fail-fast path is not instant (checkpoint, lock and build-folder preparation: 6-17 s alone, 23-31 s with several full
+    // checks running); it does not scale with the lock wait (16-17 s at a 30 s wait, 6-8 s at 180 s). A run that wrongly waited out
+    // the lock takes at least the 180 s wait, so a bound well under it proves the point, and 90 s leaves a margin that load cannot eat.
+    assert!(took < Duration::from_secs(90), "the run took {took:?} (the lock wait is 180 s)\n{all}");
     assert_eq!(o.code, 1, "the run fails (EXIT_FAILED)\n{all}");
     assert!(all.contains("cannot prove this run holds the build lock"), "{all}");
     assert!(!flag.exists(), "the run's command never started\n{all}");
