@@ -371,7 +371,7 @@ pub(super) const JOBS: Tool = Tool {
         handler: |cfg, _| Ok(recover::cmd_list(cfg)),
 };
 
-pub(super) const TOOLS: Tool = Tool {
+pub(super) const TOOLS_TOOL: Tool = Tool {
         name: "tools",
         summary: "List these tools, or describe one in full.",
         description: "Returns this registry: every tool Broadsword offers, with its inputs, outputs, exit codes and flags. Give a tool name to get that one tool in full (description, inputs, outputs, exit codes, command-line form). Set json to get JSON instead of text: the same tool objects an MCP client already sees in tools/list. Use it to re-check what Broadsword can do. It only reads and returns immediately.",

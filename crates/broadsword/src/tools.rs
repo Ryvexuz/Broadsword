@@ -217,7 +217,7 @@ pub static TOOLS: &[Tool] = &[
     job_tools::RECOVER,
     job_tools::ABANDON,
     job_tools::JOBS,
-    job_tools::TOOLS,
+    job_tools::TOOLS_TOOL,
     job_tools::INSTALL,
     board_tools::TASK_ADD,
     board_tools::TASK_START,
