@@ -503,15 +503,12 @@ fn task_builds_the_worktrees_code_and_main_afterwards_is_not_stale() {
     assert!(o.stdout.contains("cleaned `markprobe`") && o.stdout.contains("last built from projects/proj"), "{}", o.stdout);
     assert_eq!(r.probe(), "MARK-t1", "the shared folder holds the worktree's binary");
     assert_eq!(r.note().as_deref(), Some(source.as_str()));
-    let new_records: Vec<_> = r
-        .job_records()
-        .into_iter()
-        .filter(|p| !before.contains(p))
-        .collect();
+    let after = r.job_records();
+    let new_records: Vec<_> = after.iter().filter(|p| !before.contains(p)).collect();
     assert_eq!(
         new_records.len(),
         1,
-        "expected exactly one new job record: {new_records:?}"
+        "expected exactly one new job record from the --task build; new: {new_records:?}; before: {before:?}; after: {after:?}"
     );
     let rec = fs::read_to_string(&new_records[0]).unwrap();
     assert!(rec.contains(&format!("source = {source}")) && rec.contains(&format!("task = {t1}")), "{rec}");
