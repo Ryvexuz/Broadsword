@@ -209,7 +209,9 @@ mod buildlock;
 pub use buildlock::{lock, run_proof, EXIT_BUSY};
 
 mod packages;
-pub use packages::{bins_of, cargo, clean_command, metadata_json, note_folder, parse_bins, parse_packages, Profile, CLEAN_PROFILES, RUN_NOTE_PREFIX};
+pub use packages::{bins_of, cargo, clean_command, metadata_json, note_folder, parse_bins, Profile, CLEAN_PROFILES, RUN_NOTE_PREFIX};
+#[cfg(test)]
+pub use packages::parse_packages;
 use packages::{guard_build_dir, link_in_path};
 
 mod kept;
