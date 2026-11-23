@@ -18,6 +18,11 @@ Output: TSV, header `project path lines commits claims waited_tasks wait_hours f
 commits, lines (all descending); last line `hotspots: S split, H hot; board waits T task-hours from K tasks in W h`
 plus `; N records skipped` (task records that could not be read).
 
+Claims are counted as given on the board, independent of Git: a claim `f` or `f#k` names path f (a claim on a new,
+deleted, untracked or other-suffix file, such as a .json or .bat, or `broadsword.toml#key`, still counts toward the
+board total and gets its own row with lines 0 when the file is missing). Only the per-file size, churn and flag columns
+come from `git ls-files`.
+
 Waits: a started task that waited over 60 s (started - created) waited on a file when another started task of the same
 project, whose claim collides on that file, ran during the wait (started..ended, or to the waiter's start if not
 ended). A claim `f#k` collides only with the same key or a whole-file claim of f; a folder claim covers every file
@@ -174,8 +179,26 @@ def collide(a, b):
     return bool(a & b)
 
 
+def claimed_extras(project_tasks, files):
+    """Claimed paths (the part before `#key`, trailing / dropped) that are not tracked files and not a folder holding one:
+    new, deleted, untracked or other-suffix files and new folders. Waits on them count like waits on tracked files."""
+    tracked = set(files)
+    folders = {f.rsplit("/", 1)[0] for f in files if "/" in f}
+    for f in list(folders):
+        while "/" in f:
+            f = f.rsplit("/", 1)[0]
+            folders.add(f)
+    extras = set()
+    for t in project_tasks:
+        for c in t["claims"]:
+            path = c.partition("#")[0].strip().rstrip("/")
+            if path and path not in tracked and path not in folders:
+                extras.add(path)
+    return sorted(extras)
+
+
 def waits(project_tasks, files):
-    """({file: {task id: wait seconds}}, {task id: longest wait seconds}) for one project."""
+    """({file: {task id: wait seconds}}, {task id: longest wait seconds}) for one project; `files` is every path to test."""
     per_file, per_task = {}, {}
     started = [t for t in project_tasks if t["started"] is not None]
     for w in started:
@@ -216,19 +239,22 @@ def build_report(root, cfg, hours, until):
     rows, task_waits = [], {}
     for name, repo in projects(root, cfg["projects_dir"]):
         files = list_files(repo)
+        extras = claimed_extras([t for t in tasks if t["project"] == name], files)
         commits = commit_counts(repo, start, until)
         ptasks = [t for t in tasks if t["project"] == name]
-        per_file, per_task = waits(ptasks, files)
+        per_file, per_task = waits(ptasks, files + extras)
         for tid, secs in per_task.items():
             task_waits[(name, tid)] = secs
-        for f in files:
+        for f in files + extras:
             n_commits = commits.get(f, 0)
             n_claims = sum(1 for t in ptasks if claim_on(t["claims"], f) is not None)
             w = per_file.get(f, {})
             wait_h = sum(w.values()) / 3600
             lines = count_lines(repo / f)
             if lines is None:
-                continue
+                if f not in extras:
+                    continue
+                lines = 0
             fl = flag(cfg, lines, wait_h, n_claims, n_commits)
             if not (n_commits or n_claims or w or fl):
                 continue

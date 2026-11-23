@@ -134,6 +134,21 @@ class HotspotTests(unittest.TestCase):
         self.assertEqual(rows["dir/c.py"]["claims"], 2)
         self.assertEqual(rows["a.rs"]["claims"], 0)
 
+    def test_waits_on_untracked_and_other_suffix_claims_count(self):
+        # claims on files that are not in `git ls-files` (new .json, .bat, a missing .rs, a toml key) still count
+        w = self.w
+        w.task("A", ["new/data.json", "run.bat", "gone.rs", "broadsword.toml#k"], T0 - 9 * HOUR, T0 - 9 * HOUR, T0 - 7 * HOUR)
+        w.task("B", ["new/data.json"], T0 - 10 * HOUR, T0 - 6 * HOUR, T0 - 5 * HOUR)  # waits 2h on the json
+        w.task("C", ["run.bat"], T0 - 9 * HOUR, T0 - 8 * HOUR, T0 - 5 * HOUR)  # waits 1h on A (T0-9h..T0-8h)
+        w.task("D", ["broadsword.toml#k"], T0 - 8 * HOUR, T0 - 6 * HOUR, T0 - 5 * HOUR)  # waits 1h on A (T0-8h..T0-7h)
+        w.task("E", ["broadsword.toml#other"], T0 - 8 * HOUR, T0 - 6 * HOUR, T0 - 5 * HOUR)  # other key: no wait
+        rows, last, _ = w.report()
+        self.assertAlmostEqual(rows["new/data.json"]["wait"], 2.0, places=2)
+        self.assertEqual(rows["new/data.json"]["lines"], 0)
+        self.assertAlmostEqual(rows["run.bat"]["wait"], 1.0, places=2)
+        self.assertAlmostEqual(rows["broadsword.toml"]["wait"], 1.0, places=2)
+        self.assertIn("board waits 4.0 task-hours from 3 tasks in 48 h", last)
+
     def test_other_project_does_not_collide(self):
         w = self.w
         w.task("A", ["a.rs"], T0 - 9 * HOUR, T0 - 9 * HOUR, T0 - 3 * HOUR, project="other")

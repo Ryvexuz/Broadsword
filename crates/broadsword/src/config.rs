@@ -790,7 +790,8 @@ install_dir=\"build/bin\"\n";
             assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
             let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("
 ");
-            assert!(Config::from_text(&zero, Path::new("p")).is_err(), "{key} = 0");
+            let e = Config::from_text(&zero, Path::new("p")).unwrap_err();
+            assert!(e.contains(key), "{key} = 0: {e}");
         }
     }
 
@@ -1008,19 +1009,19 @@ worktrees_dir = \"worktrees\"\n";
             }
         }
         let used = |name: &str| code.match_indices(&format!(".{name}")).any(|(i, _)| !code[i + 1 + name.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'));
-        // a key the Rust code never reads may be read by a Python client under clients/ or script under scripts/, by its exact quoted name
+        // a key the Rust code never reads may be read by a Python client under clients/, by its exact quoted name
         let mut py = String::new();
-        for dir in ["clients", "scripts"] {
-            for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(dir)).unwrap().flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".py") && !name.starts_with("test_") {
-                    py.push_str(&std::fs::read_to_string(e.path()).unwrap());
-                }
+        for e in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../clients")).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".py") && !name.starts_with("test_") {
+                py.push_str(&std::fs::read_to_string(e.path()).unwrap());
             }
         }
-        let used_by_python = |k: &str| py.contains(&format!("\"{k}\""));
+        // the hotspot_* keys are read only by scripts/hotspots.py (exactly that file, exactly those keys)
+        let hotspots_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/hotspots.py")).unwrap();
+        let used_by_python = |k: &str| py.contains(&format!("\"{k}\"")) || (k.starts_with("hotspot_") && hotspots_py.contains(&format!("\"{k}\"")));
         let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k)) && !used_by_python(k)).collect();
-        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py or scripts/*.py reads by its quoted name: {unused:?}");
+        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name (hotspot_* keys: scripts/hotspots.py): {unused:?}");
     }
 
     #[test]
