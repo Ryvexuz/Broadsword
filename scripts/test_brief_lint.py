@@ -292,6 +292,81 @@ class HotFileRule(unittest.TestCase):
         self.assertNotIn(("R6", "FAIL"), self.levels(brief("`scripts/a.py`", self.REQ)))
 
 
+class ReportClaimRules(unittest.TestCase):
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_report_"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "broadsword.toml").write_text("hotspot_lines = 3\n", encoding="utf-8")
+        (self.root / "state").mkdir()
+
+    def report(self, rows):
+        (self.root / "state/hotspots.tsv").write_text(
+            "project\tpath\tlines\tcommits\tclaims\twaited_tasks\twait_hours\tflag\n"
+            + "".join(f"broadsword\t{path}\t4\t0\t0\t0\t0\t{flag}\n"
+                      for path, flag in rows), encoding="utf-8")
+
+    def check(self, claim, extra=""):
+        return bl.claim_gaps(brief(claim, "- change the thing", extra=extra), str(self.root))
+
+    def test_report_flags_require_reason_and_accept_split_first(self):
+        for flag in ("split", "hot"):
+            with self.subTest(flag=flag):
+                self.report([("scripts/large.py", flag)])
+                self.assertIn(("R6", "FAIL"), {(r, lv) for r, lv, _ in self.check("`scripts/large.py`")})
+                for extra in ("Split first: t-20261123-224420\n",
+                              HotFileRule.REASON + "\n"):
+                    self.assertEqual(self.check("`scripts/large.py`", extra), [])
+                self.assertEqual(self.check("`scripts/large.py#key`"), [])
+        self.report([("scripts/large.py", "")])
+        self.assertEqual(self.check("`scripts/large.py`"), [])
+
+    def test_report_does_not_override_original_hot_rules(self):
+        self.report([(path, "split") for path in bl.HOT])
+        self.assertEqual(self.check("`broadsword.toml#key`"), [])
+        result = self.check("`crates/broadsword/src/queue.rs#key`",
+                            "Split first: t-20261123-224420\n")
+        self.assertIn(("R6", "FAIL"), {(r, lv) for r, lv, _ in result})
+
+    def test_missing_and_unreadable_report_keep_old_result(self):
+        for unreadable in (False, True):
+            if unreadable:
+                (self.root / "state/hotspots.tsv").mkdir()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.check("`scripts/large.py`"), [])
+            self.assertEqual(out.getvalue(), "hotspots: no report\n")
+
+    def test_folder_claims_fail_but_individual_files_pass(self):
+        for path in ("src", "tests", "src/", "tests///", "crates/broadsword/src",
+                     "crates/broadsword/tests", "crates/broadsword/tests/",
+                     "crates\\broadsword\\tests\\"):
+            with self.subTest(path=path):
+                result = self.check(f"`{path}`")
+                self.assertIn(("R7", "FAIL"), {(r, lv) for r, lv, _ in result})
+                self.assertIn("covers a whole src/ or tests/ folder; claim the files",
+                              " ".join(m for _, _, m in result))
+        self.assertEqual(self.check("`crates/broadsword/tests/tasks.rs`"), [])
+
+    def test_size_warning_is_advisory_and_strictly_over_setting(self):
+        self.report([])
+        for count in (2, 3, 4):
+            with self.subTest(count=count):
+                (self.root / "large.py").write_text("x\n" * count, encoding="utf-8")
+                result = self.check("`large.py`")
+                expected = [] if count <= 3 else [
+                    ("R8", "WARN", "warning: large.py has 4 lines; "
+                     "put new code in a new module (PLAN.md R4)")]
+                self.assertEqual(result, expected)
+        self.assertEqual(self.check("`large.py#key`"), expected)
+
+    def test_invalid_size_setting_is_reported(self):
+        for value in ("0", "-1", "true", "inf", '"3"'):
+            (self.root / "broadsword.toml").write_text(
+                f"hotspot_lines = {value}\n", encoding="utf-8")
+            result = self.check("`large.py`")
+            self.assertTrue(any(r == "R8" and "hotspot_lines" in msg for r, _, msg in result))
+
+
 class ClaimGapRules(unittest.TestCase):
     """R1-R5: one test per rule, each shown failing before the rule existed."""
 
@@ -308,13 +383,15 @@ class ClaimGapRules(unittest.TestCase):
 
     def test_r1_prefix_and_basename_cover(self):
         text = brief("`src/` (folder), `crates/x/tests/y.rs`", "- edit `src/a/b.rs` and `y.rs`")
-        self.assertEqual(gaps(text), [])
+        self.assertEqual({(r, lv) for r, lv, _ in gaps(text)}, {("R7", "FAIL")})
 
     def test_r1_folder_is_not_covered_by_a_file_inside_it(self):
         text = brief("`src/jobs/mod.rs`", "- add the stubs under `src/jobs/`")
         self.assertIn(("R1", "FAIL"), self.levels(text))
         self.assertEqual(gaps(brief("`src/jobs/`", "- add the stubs under `src/jobs/`")), [])
-        self.assertEqual(gaps(brief("`src/`", "- add the stubs under `src/jobs/`")), [])
+        self.assertEqual({(r, lv) for r, lv, _ in
+                          gaps(brief("`src/`", "- add the stubs under `src/jobs/`"))},
+                         {("R7", "FAIL")})
 
     def test_r1_a_path_with_a_folder_is_not_covered_by_a_longer_claim_ending_the_same_way(self):
         self.assertIn(("R1", "FAIL"), self.levels(brief("`crates/x/src/jobs.rs`", "- edit `src/jobs.rs`")))
@@ -377,6 +454,7 @@ class ClaimGapRules(unittest.TestCase):
     def _parser_repo(self, source):
         d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_r3_"))
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "broadsword.toml").write_text("hotspot_lines = 1500\n", encoding="utf-8")
         f = d / "crates" / "broadsword" / "src" / "tools.rs"
         f.parent.mkdir(parents=True)
         f.write_text(source, encoding="utf-8")
@@ -414,6 +492,7 @@ class ClaimGapRules(unittest.TestCase):
         import subprocess
         d = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_lint_r5_"))
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "broadsword.toml").write_text("hotspot_lines = 1500\n", encoding="utf-8")
         (d / "a.rs").write_text("fn guard_refusal() {}\n", encoding="utf-8")
         (d / "b.rs").write_text("guard_refusal();\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(d), "init", "-q"], check=True)

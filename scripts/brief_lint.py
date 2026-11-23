@@ -39,6 +39,11 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
             tests/support/mod.rs claimed.
   R5  WARN  only with --root: each backticked function or symbol (snake_case, `::` or `()`) of
             Requirements or the Done check, and the files `git grep` finds it in that are not claimed.
+  R6  FAIL  hot whole-file claims need a Hot file: reason. With --root, flagged hotspot
+            report entries also accept Split first: <task id>; original HOT rules take precedence.
+  R7  FAIL  whole src/ or tests/ claims, at the root or under crates/<name>/.
+  R8  WARN  with --root, claimed files over broadsword.toml's hotspot_lines; unreadable
+            settings or files are reported as warnings.
 
 Plan preflight (only with --root <repo> --preflight-ref <main branch>; `--queue-list <file>` holds
 `broadsword queue list` output). Each rule prints `FAIL preflight-Pn` with the missing list; a brief with
@@ -66,10 +71,13 @@ A brief with no Claims line or no Done check section fails (fail closed).
 Exit codes: 0 every brief passes, 1 some rule failed, 2 usage error or unreadable file.
 """
 import argparse
+import csv
 import os
+import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 
 COMMANDS = {"broadsword", "python", "python3", "cargo", "git", "pytest", "npm", "bash", "sh",
             "powershell", "pwsh"}
@@ -130,8 +138,8 @@ def claim_paths(text):
     """Distinct path-like tokens in `text` (backticks or not), each path of a span on its own."""
     paths = set()
     for tok in re.split(r"[\s,;()\[\]`'\"]+", text):
-        tok = tok.strip().rstrip(".:")
-        if tok and PATH_RE.match(tok):
+        tok = re.sub(r"[/\\]{2,}", "/", tok.strip().rstrip(".:"))
+        if tok and (PATH_RE.match(tok) or tok in {"src", "tests"}):
             paths.add(tok.replace("\\", "/"))
     return paths
 
@@ -306,14 +314,26 @@ HOT_REASON_RE = re.compile(r"^\s*(?:[-*]\s+)?Hot file:\s*(.*\S)\s*$")
 HOT_REASON_MIN = 20
 
 
-def hot_claims(lines, secs):
+def report_hot(root):
+    """Read the report's flagged paths; absence is advisory, never a lint failure."""
+    try:
+        with open(pathlib.Path(root) / "state" / "hotspots.tsv", encoding="utf-8", newline="") as f:
+            return {row["path"].replace("\\", "/") for row in csv.DictReader(f, delimiter="\t")
+                    if row.get("flag") in {"split", "hot"} and row.get("path")}
+    except (OSError, UnicodeError, KeyError, csv.Error):
+        print("hotspots: no report")
+        return set()
+
+
+def hot_claims(lines, secs, reported=()):
     """Hot files claimed as a whole file, sorted."""
     hot = set()
     for block in claim_blocks(lines, secs):
         for tok in re.split(r"[\s,;()\[\]`'\"]+", block):
             tok = tok.strip().rstrip(".:").replace("\\", "/")
             base, sep, _ = tok.partition("#")
-            if base in HOT and not (sep and HOT[base]):
+            if (base in HOT and not (sep and HOT[base])) or (
+                    base not in HOT and base in reported and not sep):
                 hot.add(base)
     return sorted(hot)
 
@@ -353,7 +373,7 @@ def named_paths(text):
     return out
 
 
-def claim_gaps(text, root=None):
+def claim_gaps(text, root=None, reported=None):
     """Return [(rule, level, message)] for R1-R5; level is FAIL or WARN. Empty when clean."""
     lines = text.splitlines()
     secs = split_sections(lines)
@@ -430,11 +450,25 @@ def claim_gaps(text, root=None):
             res.append(("R3", "WARN", f"flag(s) {', '.join(sorted(old))} named in Requirements; "
                         f"{TOOLS_RS} (the parser) is not claimed: does a parser or call site there change?"))
 
-    hot = hot_claims(lines, secs)
-    if hot and not any((m := HOT_REASON_RE.match(ln)) and len(m.group(1)) >= HOT_REASON_MIN for ln in lines):
-        res.append(("R6", "FAIL", "whole-file claim on hot shared file(s) " + ", ".join(hot)
+    if reported is None:
+        reported = report_hot(root) if root else set()
+    hot = hot_claims(lines, secs, reported)
+    reason = any((m := HOT_REASON_RE.match(ln)) and len(m.group(1)) >= HOT_REASON_MIN for ln in lines)
+    split_first = any(re.fullmatch(r"\s*(?:[-*]\s+)?Split first:\s+t-\d{8}-\d{6}\s*", ln)
+                      for ln in lines)
+    # The original HOT entries retain their existing reason and key-claim rules.
+    blocked = [path for path in hot if not reason and (path in HOT or not split_first)]
+    if blocked:
+        res.append(("R6", "FAIL", "whole-file claim on hot shared file(s) " + ", ".join(blocked)
                     + ": claim a #key, split the brief, or add a 'Hot file:' line with a reason "
-                    + f"of at least {HOT_REASON_MIN} characters"))
+                    + f"of at least {HOT_REASON_MIN} characters; report entries also accept Split first: <task id>"))
+
+    for path in sorted(claims):
+        if re.fullmatch(r"(?:crates/[^/]+/)?(?:src|tests)/*", path):
+            res.append(("R7", "FAIL", f"folder claim {path} covers a whole src/ or tests/ folder; claim the files"))
+
+    if root:
+        res.extend(size_warnings(claim_blocks(lines, secs), root))
 
     if CONFIG_KEY_RE.search(req):
         miss = [n for n in CONFIG_NEEDS if not any(c == n or c.endswith("/" + n) for c in claims)]
@@ -469,6 +503,41 @@ def claim_gaps(text, root=None):
                 res.append(("R5", "WARN", f"`{s}` is defined or used in unclaimed: "
                             + ", ".join(f"{f}:{n}" for f, n in hits.items())))
     return res
+
+
+def size_warnings(blocks, root):
+    """Count claimed files by streaming; never read a path outside the supplied root."""
+    base = pathlib.Path(root).resolve()
+    try:
+        with open(base / "broadsword.toml", "rb") as f:
+            limit = tomllib.load(f)["hotspot_lines"]
+        if type(limit) is not int or limit < 1:
+            raise ValueError("hotspot_lines must be a positive integer")
+    except (OSError, ValueError, KeyError) as e:
+        return [("R8", "WARN", f"cannot read hotspot_lines: {e}")]
+    paths = claim_paths("\n".join(blocks))
+    # Key claims still name files for the size advisory.
+    paths |= {tok.split("#", 1)[0].replace("\\", "/")
+              for block in blocks for tok in re.split(r"[\s,;()\[\]`'\"]+", block)
+              if "#" in tok and PATH_RE.fullmatch(tok.split("#", 1)[0])}
+    warnings = []
+    for path in sorted(paths):
+        target = (base / path).resolve()
+        if not target.is_relative_to(base):
+            warnings.append(("R8", "WARN", f"cannot count claimed path outside root: {path}"))
+            continue
+        if not target.is_file():
+            continue
+        try:
+            with target.open("rb") as f:
+                count = sum(1 for _ in f)
+        except OSError as e:
+            warnings.append(("R8", "WARN", f"cannot count {path}: {e}"))
+            continue
+        if count > limit:
+            warnings.append(("R8", "WARN", f"warning: {path} has {count} lines; "
+                             "put new code in a new module (PLAN.md R4)"))
+    return warnings
 
 
 PF_SKIP_RE = re.compile(r"^(?:scratch|state|build|worktrees|projects)/")
@@ -658,6 +727,7 @@ def main(argv):
             print(f"brief_lint: cannot read {a.queue_list}: {e}", file=sys.stderr)
             return 2
     failed = 0
+    reported = report_hot(a.root) if a.root else set()
     for path in a.briefs:
         try:
             with open(path, encoding="utf-8") as f:
@@ -666,7 +736,7 @@ def main(argv):
             print(f"brief_lint: cannot read {path}: {e}", file=sys.stderr)
             return 2
         res = lint(text, a.max_lines, a.max_bullets, a.max_files, a.max_done_lines)
-        gaps = claim_gaps(text, a.root)
+        gaps = claim_gaps(text, a.root, reported)
         pre = preflight(text, a.root, a.preflight_ref, queue_text) if a.preflight_ref else []
         bad = [r for r in res if not r[1]] + [g for g in gaps if g[1] == "FAIL"] + pre
         print(f"{path}: {'ok' if not bad else str(len(bad)) + ' rule(s) failed'}")
