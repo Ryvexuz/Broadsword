@@ -510,7 +510,7 @@ fn task_builds_the_worktrees_code_and_main_afterwards_is_not_stale() {
         1,
         "expected exactly one new job record from the --task build; new: {new_records:?}; before: {before:?}; after: {after:?}"
     );
-    let rec = fs::read_to_string(&new_records[0]).unwrap();
+    let rec = fs::read_to_string(new_records[0]).unwrap();
     assert!(rec.contains(&format!("source = {source}")) && rec.contains(&format!("task = {t1}")), "{rec}");
 
     // the stale-binary case: main again, cargo would say `Finished` for main's still-fresh build and leave t1's binary
