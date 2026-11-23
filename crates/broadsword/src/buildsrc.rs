@@ -1113,7 +1113,12 @@ mod tests {
 
     #[test]
     fn the_only_clean_in_this_file_is_the_guarded_one() {
-        let code = [include_str!("buildsrc.rs"), include_str!("buildsrc/packages.rs")].map(|s| s.split("#[cfg(test)]").next().unwrap()).concat();
+        let marker = "#[cfg(test)]\nmod tests";
+        let parent = include_str!("buildsrc.rs").replace("\r\n", "\n");
+        let (parent_code, _) = parent.split_once(marker).expect("buildsrc.rs has its inline test module");
+        let child = include_str!("buildsrc/packages.rs").replace("\r\n", "\n");
+        assert!(!child.contains(marker), "packages.rs has no inline test module, so all of it is code");
+        let code = [parent_code, child.as_str()].concat();
         assert_eq!(code.matches(".arg(\"clean\")").count(), 1);
         assert_eq!(code.matches("\"clean\"").count(), 1);
     }
