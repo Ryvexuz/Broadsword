@@ -139,8 +139,19 @@ def claim_paths(text):
     paths = set()
     for tok in re.split(r"[\s,;()\[\]`'\"]+", text):
         tok = re.sub(r"[/\\]{2,}", "/", tok.strip().rstrip(".:"))
-        if tok and (PATH_RE.match(tok) or tok in {"src", "tests"}):
+        if tok and PATH_RE.match(tok):
             paths.add(tok.replace("\\", "/"))
+    # A bare src/tests is a claim only as a whole backticked span or as the first word of a
+    # comma/semicolon/line item; elsewhere ("plus the tests") it is prose.
+    bare = {"src", "tests"}
+    for span in re.findall(r"`([^`]*)`", text):
+        if span.strip() in bare:
+            paths.add(span.strip())
+    for item in re.split(r"[,;\n]", text):
+        item = re.sub(r"^[\s*_>#-]*(?:claims?\s*:[\s*_]*)?", "", item, flags=re.I)
+        words = item.split()
+        if words and words[0].strip("`.:") in bare:
+            paths.add(words[0].strip("`.:"))
     return paths
 
 

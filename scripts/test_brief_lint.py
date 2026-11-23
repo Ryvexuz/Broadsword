@@ -347,6 +347,18 @@ class ReportClaimRules(unittest.TestCase):
                               " ".join(m for _, _, m in result))
         self.assertEqual(self.check("`crates/broadsword/tests/tasks.rs`"), [])
 
+    def test_bare_src_or_tests_word_in_prose_is_not_a_folder_claim(self):
+        for line in ("scripts/x.py (plus the tests)", "scripts/x.py (and the src)",
+                     "scripts/x.py, plus the tests", "scripts/x.py; see src for context"):
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line), [])
+
+    def test_bare_folder_claim_items_still_fail(self):
+        for line in ("scripts/x.py, tests", "scripts/x.py, src (folder)", "tests, scripts/x.py",
+                     "scripts/x.py, `tests`"):
+            with self.subTest(line=line):
+                self.assertIn(("R7", "FAIL"), {(r, lv) for r, lv, _ in self.check(line)})
+
     def test_size_warning_is_advisory_and_strictly_over_setting(self):
         self.report([])
         for count in (2, 3, 4):
