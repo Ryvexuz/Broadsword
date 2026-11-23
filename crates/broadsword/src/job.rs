@@ -461,7 +461,7 @@ fn python_record(py: &PyTests) -> String {
 }
 
 mod teststep;
-pub use teststep::{parse_artifacts, test_copies_dir, Artifact, Artifacts};
+pub use teststep::{parse_artifacts, test_copies_dir, Artifacts};
 use teststep::{copy_exe, package_envs, refresh_main_bins, rerun_arg, same_path, Copied, FailLine, Finished, PoolEnd, PoolItem, TestStep};
 
 impl TestStep<'_> {
