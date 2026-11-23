@@ -19,7 +19,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "the spawn helper itself: scrub::command applies the scrubbed environment",
     ),
     (
-        "buildsrc.rs",
+        "buildsrc/packages.rs",
         "Command::new(std::env::var(\"CARGO\")",
         1,
         "already scrubbed via scrub::apply (buildsrc::cargo, the cargo factory)",
