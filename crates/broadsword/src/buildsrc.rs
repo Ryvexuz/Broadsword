@@ -206,7 +206,7 @@ fn write_file_note(cfg: &Config, file: &str, source: &str) -> Result<(), String>
 }
 
 mod buildlock;
-pub use buildlock::{lock, run_proof, EXIT_BUSY, EXIT_FAILED};
+pub use buildlock::{lock, run_proof, EXIT_BUSY};
 
 // ---- package names ----------------------------------------------------------------------
 
