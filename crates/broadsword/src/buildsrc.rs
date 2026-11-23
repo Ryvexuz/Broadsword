@@ -1113,8 +1113,7 @@ mod tests {
 
     #[test]
     fn the_only_clean_in_this_file_is_the_guarded_one() {
-        let src = include_str!("buildsrc.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        let code = [include_str!("buildsrc.rs"), include_str!("buildsrc/packages.rs")].map(|s| s.split("#[cfg(test)]").next().unwrap()).concat();
         assert_eq!(code.matches(".arg(\"clean\")").count(), 1);
         assert_eq!(code.matches("\"clean\"").count(), 1);
     }
