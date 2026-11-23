@@ -425,4 +425,3 @@ pub(super) const INSTALL: Tool = Tool {
         to_args: |_| vec!["install".into()],
         handler: |cfg, _| install::cmd_install(cfg),
 };
-
