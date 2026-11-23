@@ -93,4 +93,3 @@ pub fn open_queue_entries(cfg: &Config) -> Result<Vec<OpenEntry>, String> {
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
-
