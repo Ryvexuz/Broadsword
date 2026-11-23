@@ -283,6 +283,26 @@ fn create_ref(dir: &Path, name: &str, commit: &str) -> Result<(), String> {
     }
 }
 
+/// Publish a snapshot: the exact bytes (`raw_tree`, a parentless commit) at `raw_ref` FIRST, then the `git add` tree at
+/// `snapshot_ref`, whose message names `raw_ref` (`RAW_MARK`). Every checkpoint and interrupted snapshot goes through here,
+/// so a snapshot ref only ever exists once its raw ref was created by this same call: if creating the raw ref fails (or
+/// the process dies there), no snapshot ref is made. Returns the snapshot commit.
+fn publish_snapshot(
+    dir: &Path,
+    snapshot_ref: &str,
+    raw_ref: &str,
+    tree: &str,
+    raw_tree: &str,
+    parent: Option<&str>,
+    title: &str,
+) -> Result<String, String> {
+    let raw_commit = commit_tree(dir, raw_tree, None, &format!("{title}, exact bytes"))?;
+    create_ref(dir, raw_ref, &raw_commit)?;
+    let commit = commit_tree(dir, tree, parent, &format!("{title}\n\n{RAW_MARK}{raw_ref}"))?;
+    create_ref(dir, snapshot_ref, &commit)?;
+    Ok(commit)
+}
+
 fn unique_index(state: &Path, tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     state.join(format!("tmp-index-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
@@ -524,13 +544,11 @@ pub fn checkpoint(dir: &Path, state: &Path, id: &str, opts: &Opts) -> Result<Che
         }
         None => None,
     };
-    // The exact bytes first: a checkpoint ref that exists always has its raw ref (rollback refuses without it).
+    // The exact bytes first (publish_snapshot): a checkpoint ref that exists always has its raw ref (rollback refuses without it).
     let raw_ref = format!("{CHECKPOINT_RAW_REFS}/{id}");
-    let raw_commit = commit_tree(dir, &cap.raw_tree, None, &format!("broadsword checkpoint {id}, exact bytes"))?;
-    create_ref(dir, &raw_ref, &raw_commit)?;
-    let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword checkpoint {id}\n\n{RAW_MARK}{raw_ref}"))?;
     let ref_name = format!("{CHECKPOINT_REFS}/{id}");
-    create_ref(dir, &ref_name, &commit)?;
+    let title = format!("broadsword checkpoint {id}");
+    let commit = publish_snapshot(dir, &ref_name, &raw_ref, &cap.tree, &cap.raw_tree, parent.as_deref(), &title)?;
     // `write-tree` only writes tree objects; it does not modify the index. It fails on unmerged entries: then none is kept.
     // A secret file someone staged is left out of the stored tree (and listed with the other secret files by name).
     let mut secret_skipped = cap.secret_skipped;
@@ -756,17 +774,15 @@ pub fn rollback(
         Some(t) => Some(commit_tree(dir, t, None, &format!("broadsword interrupted ignored files of {id}"))?),
         None => None,
     };
-    let raw_commit = commit_tree(dir, &cap.raw_tree, None, &format!("broadsword interrupted work of {id}, exact bytes"))?;
+    let title = format!("broadsword interrupted work of {id}");
     let mut attempt = 0u32;
     let (interrupted_ref, interrupted_ignored_ref) = loop {
         attempt += 1;
         let r = format!("{INTERRUPTED_REFS}/{id}/{attempt}");
         let raw_ref = format!("{INTERRUPTED_RAW_REFS}/{id}/{attempt}");
-        let commit = commit_tree(dir, &cap.tree, parent.as_deref(), &format!("broadsword interrupted work of {id}\n\n{RAW_MARK}{raw_ref}"))?;
-        match create_ref(dir, &r, &commit) {
-            Ok(()) => {
-                create_ref(dir, &raw_ref, &raw_commit)?; // the exact bytes, saved before any file is touched
-
+        // raw ref first, then the snapshot ref (publish_snapshot), both before any file is touched
+        match publish_snapshot(dir, &r, &raw_ref, &cap.tree, &cap.raw_tree, parent.as_deref(), &title) {
+            Ok(_) => {
                 let ri = match &ignored_commit {
                     Some(c) => {
                         let ri = format!("{INTERRUPTED_IGNORED_REFS}/{id}/{attempt}");
@@ -777,8 +793,8 @@ pub fn rollback(
                 };
                 break (r, ri);
             }
-            Err(e) if ref_exists(dir, &r) && attempt < 10_000 => {
-                let _ = e; // an earlier attempt owns this ref: try the next number
+            Err(e) if (ref_exists(dir, &raw_ref) || ref_exists(dir, &r)) && attempt < 10_000 => {
+                let _ = e; // an earlier attempt owns this number (its raw ref or its snapshot ref): try the next one
             }
             Err(e) => return Err(e),
         }
@@ -1157,6 +1173,32 @@ mod tests {
         let raw = format!("{INTERRUPTED_RAW_REFS}/j/1");
         assert_eq!(blob(&d, &raw, "lf.txt"), b"job\r\nchanged\n");
         assert_eq!(blob(&d, &raw, "made.txt"), b"made\r\n");
+        let _ = fs::remove_dir_all(&state);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Raw before snapshot (review q-20261123-184131): when the interrupted raw ref cannot be created, rollback stops with no
+    /// interrupted snapshot ref and no file touched. A ref `interrupted-raw/j` (a file where the folder must be) makes
+    /// `interrupted-raw/j/<n>` impossible to create for every attempt.
+    #[test]
+    fn rollback_never_publishes_a_snapshot_without_its_raw_ref() {
+        let d = crlf_working_tree("rbrawfirst");
+        let state = state_for("rbrawfirst");
+        let c = checkpoint(&d, &state, "j", &opts()).unwrap();
+        assert!(ref_exists(&d, &format!("{CHECKPOINT_RAW_REFS}/j")), "the checkpoint has its raw ref");
+        fs::write(d.join("lf.txt"), b"job\r\n").unwrap();
+        let blocker = format!("{INTERRUPTED_RAW_REFS}/j");
+        create_ref(&d, &blocker, &c.commit).unwrap();
+        let e = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).err().expect("refused");
+        assert!(!ref_exists(&d, &format!("{INTERRUPTED_REFS}/j/1")), "no interrupted snapshot without its raw ref: {e}");
+        assert_eq!(fs::read(d.join("lf.txt")).unwrap(), b"job\r\n", "nothing restored");
+        // and a stale raw ref left by an earlier attempt only moves this attempt to the next number
+        git_text(&d, &["update-ref", "-d", &blocker], None).unwrap();
+        create_ref(&d, &format!("{INTERRUPTED_RAW_REFS}/j/1"), &c.commit).unwrap();
+        let r = rollback(&d, &state, "j", &c.ref_name, c.ignored_ref.as_deref(), &c.skipped, c.index_tree.as_deref(), &opts()).unwrap();
+        assert_eq!(r.interrupted_ref, format!("{INTERRUPTED_REFS}/j/2"));
+        assert_eq!(blob(&d, &format!("{INTERRUPTED_RAW_REFS}/j/2"), "lf.txt"), b"job\r\n");
+        assert_eq!(raw_tree_of(&d, &r.interrupted_ref).unwrap(), tree(&d, &format!("{INTERRUPTED_RAW_REFS}/j/2")));
         let _ = fs::remove_dir_all(&state);
         fs::remove_dir_all(&d).unwrap();
     }
