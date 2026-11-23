@@ -196,7 +196,9 @@ pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
 }
 
 mod queue_view;
-pub use queue_view::{ENDED_QUEUE_STATUSES, OPEN_QUEUE_STATUSES, OpenEntry, WAITING_QUEUE_STATUSES, open_queue_entries};
+pub use queue_view::{WAITING_QUEUE_STATUSES, open_queue_entries};
+#[cfg(test)]
+pub use queue_view::{ENDED_QUEUE_STATUSES, OPEN_QUEUE_STATUSES};
 
 pub fn save(r: &Record) -> Result<(), String> {
     r.save().map_err(|e| format!("cannot write task record {}: {e}", r.path.display()))
