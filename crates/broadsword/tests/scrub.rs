@@ -43,7 +43,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "already scrubbed via scrub::apply (shell_command's caller, the job step)",
     ),
     (
-        "job.rs",
+        "job/teststep.rs",
         "Command::new(&c.copy)",
         1,
         "already scrubbed via scrub::apply (command_for, the copied test executables)",
