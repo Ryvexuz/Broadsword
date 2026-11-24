@@ -5,7 +5,6 @@ use crate::job::{self, JobInfo, JobSpec};
 use crate::wtgit;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 /// Only nonempty lists of canonical, relative Git paths outside Rust's inputs qualify.
 /// Source text is deliberately searched without parsing: comments and strings count too.
@@ -80,7 +79,8 @@ fn parse_paths(bytes: &[u8]) -> Result<Vec<String>, String> {
 fn changed_paths(dir: &Path) -> Result<Vec<String>, String> {
     let trunk = wtgit::trunk_branch(dir)?;
     // Include both sides of renames: moving a Cargo or .rs file is still a Rust change.
-    let output = Command::new("git")
+    // The ONE spawn helper (tests/scrub.rs): git gets the scrubbed environment like every other child.
+    let output = crate::scrub::command_in(dir, "git")?
         .args([
             "diff",
             "--name-only",
