@@ -861,24 +861,20 @@ class OptInClaimRules(unittest.TestCase):
         self.assertEqual(self.rules(text, root)[0][0], "R10")
         self.assertEqual(self.rules(self.claimed("`large.py`, `new/` (new folder)"), root)[0][0], "R10")
 
-    def test_r10_new_file_elsewhere_does_not_cover(self):
+    def test_r10_new_file_in_another_folder_covers(self):
         root = self.root()
-        (root / "scripts").mkdir()
-        (root / "scripts" / "large.py").write_bytes(b"x\n" * 1200)
-        for new_file, fails in (("docs/other.md", True), ("scripts2/part.py", True),
-                                ("scripts/../docs/other.md", True),
-                                ("scripts/large_part.py", False),
-                                ("scripts/parts/large_part.py", False),
-                                ("scripts\\parts\\large_part.py", False)):
+        (root / "crates" / "x" / "src").mkdir(parents=True)
+        (root / "crates" / "x" / "src" / "big.rs").write_bytes(b"x\n" * 1200)
+        for new_file in ("crates/x/tests/new_case.rs", "docs/other.md", "scripts2/part.py",
+                         "crates/x/src/parts/p.rs"):
             with self.subTest(new_file=new_file):
-                text = self.claimed(f"\n- `scripts/large.py`\n- `{new_file}` (new)")
+                text = self.claimed(f"\n- `crates/x/src/big.rs`\n- `{new_file}` (new)")
                 lines = text.splitlines()
-                expected = [
-                    ("R10", "FAIL", "scripts/large.py has 1200 lines (over 1000); "
-                     "claim wiring only or a (new) file for the new module")] if fails else []
                 self.assertEqual(bl.big_claim_gaps(
-                    lines, bl.split_sections(lines), root, 1000), expected)
-                self.assertEqual(self.rules(text, root), expected)
+                    lines, bl.split_sections(lines), root, 1000), [])
+                self.assertEqual(self.rules(text, root), [])
+        text = self.claimed("\n- `crates/x/src/big.rs`\n- `crates/x/tests/t.rs`")
+        self.assertEqual(self.rules(text, root)[0][0], "R10")
 
     def test_r10_literal_newlines_and_configurable_boundary(self):
         root = self.root()
@@ -938,6 +934,16 @@ class OptInClaimRules(unittest.TestCase):
                 self.assertEqual(self.rules(text.replace("- **Model:** GPT high\n", "")), [])
         self.assertEqual(self.rules(self.text() + "\n## Notes\nPROTOCOL is prose.\n"), [])
         self.assertEqual(self.rules(self.text() + "\n## Pasted\n\n"), [])
+
+    def test_r11_lowercase_local_paths_do_not_trigger(self):
+        for path in ("crates/foo/src/protocol.rs", "docs/stage7-notes.md"):
+            with self.subTest(path=path):
+                text = self.text(model="GPT high") + f"\n## Reference\nRead `{path}`.\n"
+                self.assertEqual(self.rules(text), [])
+
+    def test_r11_exact_token_path_triggers(self):
+        text = self.text(model="GPT high") + "\n## Reference\nRead `docs/STAGE7.md`.\n"
+        self.assertEqual([(r, lv) for r, lv, _ in self.rules(text)], [("R11", "FAIL")])
 
     def test_r9_r11_crlf_no_board_block(self):
         text = GOOD.replace("**Board:**", "## Metadata")

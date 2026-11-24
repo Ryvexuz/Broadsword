@@ -49,8 +49,8 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
   R9  FAIL  with --min-hard-cases, Risk: high in Board needs that many Hard cases list items,
             each naming a backticked snake_case test also named in the Done check.
   R10 FAIL  with --root and --big-file-lines, an existing claimed file over that newline
-            count needs "wiring" in its own Claims bullet or a claimed (new) file in
-            the same folder or a subfolder of that folder.
+            count needs "wiring" in its own Claims bullet or a claimed (new) file
+            anywhere in the same project (any folder).
             New files are not counted; outside-root or unreadable paths WARN.
   R11 FAIL  with --min-pasted-lines, a GPT Model in Board naming an outside-repo path
             needs a Pasted or Pasted protocol section with that many non-empty body lines.
@@ -556,7 +556,7 @@ def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_
     if min_pasted_lines is not None and any(
             "gpt" in v.lower() for v in board.get("model", [])):
         outside = re.search(r"(?<![\w./\\])\.\.[/\\]\S+", text) or any(
-            any(marker in p.lower() for marker in ("stage7", "protocol"))
+            any(marker in p for marker in ("STAGE7", "PROTOCOL", "protocol.md"))
             for span in TICKS_RE.findall(text) for p in claim_paths(span))
         pasted = max((sum(bool(ln.strip()) for ln in lines[a + 1:b])
                       for name, a, b in secs if name in {"pasted", "pasted protocol"}), default=0)
@@ -654,8 +654,7 @@ def big_claim_gaps(lines, secs, root, limit):
         except (OSError, ValueError, RuntimeError) as e:
             res.append(("R10", "WARN", f"cannot count {path}: {e}"))
             continue
-        if count > limit and not wiring and not any(
-                new_target.is_relative_to(target.parent) for new_target in new_targets):
+        if count > limit and not wiring and not new_targets:
             res.append(("R10", "FAIL", f"{path} has {count} lines (over {limit}); "
                         "claim wiring only or a (new) file for the new module"))
     return res
