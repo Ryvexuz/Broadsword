@@ -14,7 +14,8 @@
 #     content reads or diff; no checkout conversion runs. An LF blob with CRLF working bytes refuses, even with
 #     core.autocrlf=true; use byte-identical checkouts (for example, -text). skip-worktree cannot hide a change.
 #  3. The bytes pip gets are ONLY the committed blob `git cat-file blob <rev>:<file>` (raw bytes from git), never the
-#     working file. They are ASCII, and every line (a final newline is allowed, nothing else is skipped: no blank line,
+#     working file. They are ASCII; every CR is part of a CRLF; a bare CR refuses. Every line
+#     (a final newline is allowed, nothing else is skipped: no blank line,
 #     no comment) is exactly `name==version`: no URL, no `-e`, no `-r`, no `--index-url` or any other option, no extras,
 #     no markers. Their SHA-256 is taken once.
 #  4. If shared/venv/Scripts/python.exe is missing, shared/venv must not exist either; then `python -I -m venv shared/venv`
@@ -37,15 +38,28 @@
 # Known limit: this cannot detect an outside copy of a name+version also present inside; disabling pip config prevents
 # config-directed installs outside the venv in the first place.
 # --dry-run runs the pre-install guards, then only prints the commands; it creates and installs nothing.
+# The caller's GIT_* and PIP_* variables are restored on every exit.
 #
 # Parameters are read from $args by hand (no param block), so PowerShell's prefix matching cannot accept an
 # abbreviation or a stray argument.
 
 $ErrorActionPreference = 'Stop'
-trap { [Console]::Error.WriteLine("venv-install: REFUSED: unexpected error: $($_.Exception.Message)"); exit 2 }
+$script:callerEnv = $null
+trap { [Console]::Error.WriteLine("venv-install: REFUSED: unexpected error: $($_.Exception.Message)"); Restore-CallerEnv; exit 2 }
+
+function Restore-CallerEnv {
+    if ($null -eq $script:callerEnv) { return }
+    foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'GIT_*' -or $_.Name -like 'PIP_*' })) {
+        if (-not $script:callerEnv.ContainsKey($v.Name)) { Remove-Item -LiteralPath "Env:$($v.Name)" }
+    }
+    foreach ($name in $script:callerEnv.Keys) {
+        Set-Item -LiteralPath "Env:$name" -Value $script:callerEnv[$name]
+    }
+}
 
 function Refuse([string]$why) {
     [Console]::Error.WriteLine("venv-install: REFUSED: $why")
+    Restore-CallerEnv
     exit 2
 }
 
@@ -89,6 +103,12 @@ AssertNoLinks $full
 
 # 2. Git: tracked and unmodified. Discard caller Git routing/config/trace variables, including variables that
 # redirect reads or write trace files. Disable optional index refresh writes on these read-only checks.
+# A case-insensitive map records values and existence, including the three variables set below.
+$snapshot = @{}
+foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'GIT_*' -or $_.Name -like 'PIP_*' })) {
+    $snapshot[$v.Name] = $v.Value
+}
+$script:callerEnv = $snapshot
 foreach ($v in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'GIT_*' } | ForEach-Object { $_.Name })) {
     Remove-Item -LiteralPath "Env:$v"
 }
@@ -168,9 +188,12 @@ if ($bytes.Length -eq 0) { Refuse "'$relIn' is empty" }
 foreach ($b in $bytes) {
     if ($b -gt 126 -or ($b -lt 32 -and $b -ne 10 -and $b -ne 13)) { Refuse "'$relIn' has a byte that is not printable ASCII ($b)" }
 }
+for ($i = 0; $i -lt $bytes.Length; $i++) {
+    if ($bytes[$i] -eq 13 -and ($i + 1 -ge $bytes.Length -or $bytes[$i + 1] -ne 10)) { Refuse "'$relIn' has a CR that is not part of a CRLF line ending (byte $i)" }
+}
 $text = [Text.Encoding]::ASCII.GetString($bytes)
-if ($text.EndsWith("`n")) { $text = $text.Substring(0, $text.Length - 1) }
-if ($text.EndsWith("`r")) { $text = $text.Substring(0, $text.Length - 1) }
+if ($text.EndsWith("`r`n")) { $text = $text.Substring(0, $text.Length - 2) }
+elseif ($text.EndsWith("`n")) { $text = $text.Substring(0, $text.Length - 1) }
 $n = 0
 foreach ($raw in $text.Split("`n")) {
     $n++
@@ -245,13 +268,13 @@ foreach ($p in $copy, $report, $checkPy) { AssertNoLinks $p }
 if ($create) { Write-Output "venv-install: python -I -m venv $venv" }
 Write-Output "venv-install: $relIn at $rev, sha256 $hash"
 Write-Output "venv-install: PIP_CONFIG_FILE=nul $py -I -m pip install --isolated --only-binary=:all: --disable-pip-version-check --report $report -r $copy (the committed bytes)"
-if ($dry) { Write-Output 'venv-install: dry run, nothing executed'; exit 0 }
+if ($dry) { Write-Output 'venv-install: dry run, nothing executed'; Restore-CallerEnv; exit 0 }
 
 Set-Location -LiteralPath $root
 if ($create) {
     & python -I -m venv $venv
-    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("venv-install: creating the venv failed ($LASTEXITCODE)"); exit $LASTEXITCODE }
-    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) { [Console]::Error.WriteLine("venv-install: $py missing after creating the venv"); exit 1 }
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("venv-install: creating the venv failed ($LASTEXITCODE)"); Restore-CallerEnv; exit $LASTEXITCODE }
+    if (-not (Test-Path -LiteralPath $py -PathType Leaf)) { [Console]::Error.WriteLine("venv-install: $py missing after creating the venv"); Restore-CallerEnv; exit 1 }
     AssertNoLinks $py
 }
 [void](New-Item -ItemType Directory -Force -Path $copyDir)
@@ -268,12 +291,13 @@ try {
     $sha.Dispose()
     if ($again -ne $hash) { Refuse "the copy '$copy' does not hash to the committed bytes ($again, not $hash)" }
     & $py -I -m pip install --isolated --only-binary=:all: --disable-pip-version-check --report $report -r $copy
-    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("venv-install: pip failed ($LASTEXITCODE)"); exit $LASTEXITCODE }
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("venv-install: pip failed ($LASTEXITCODE)"); Restore-CallerEnv; exit $LASTEXITCODE }
     AssertNoLinks $report
     & $py -I $checkPy $venv $report $copy
     $code = $LASTEXITCODE
-    if ($code -ne 0) { [Console]::Error.WriteLine("venv-install: POST-CHECK FAILED: something pip installed is not in $venv (see above)"); exit 3 }
+    if ($code -ne 0) { [Console]::Error.WriteLine("venv-install: POST-CHECK FAILED: something pip installed is not in $venv (see above)"); Restore-CallerEnv; exit 3 }
 } finally {
     foreach ($s in $held) { $s.Dispose() }
 }
+Restore-CallerEnv
 exit 0

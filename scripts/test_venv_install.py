@@ -131,6 +131,61 @@ class TestVenvInstall(Base):
         git(self.root, "commit", "-q", "-m", name)
         return "shared/" + name
 
+    def same_session(self, rel, *extra):
+        env = dict(os.environ)
+        env.update(GIT_ENV)
+        call = " ".join("'" + arg.replace("'", "''") + "'" for arg in (self.script, rel, *extra))
+        command = (
+            "& { "
+            "$env:GIT_DIR = 'keep-git'; $env:PIP_INDEX_URL = 'keep-pip'; "
+            "foreach ($name in 'GIT_OPTIONAL_LOCKS', 'GIT_NO_LAZY_FETCH', 'PIP_CONFIG_FILE') { "
+            "if (Test-Path -LiteralPath \"Env:$name\") { Remove-Item -LiteralPath \"Env:$name\" } }; "
+            f"& {call}; "
+            'Write-Output "code=$LASTEXITCODE"; '
+            'Write-Output "GIT_DIR=$env:GIT_DIR"; '
+            'Write-Output "PIP_INDEX_URL=$env:PIP_INDEX_URL"; '
+            'Write-Output "ADDED=$env:GIT_OPTIONAL_LOCKS|$env:GIT_NO_LAZY_FETCH|$env:PIP_CONFIG_FILE"'
+            " }"
+        )
+        return subprocess.run(["powershell", "-NoProfile", "-Command", command], cwd=self.root, env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_dry_run_leaves_the_callers_git_and_pip_variables(self):
+        r = self.same_session(self.REQ, "--dry-run")
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        lines = r.stdout.splitlines()
+        for expected in ("code=0", "GIT_DIR=keep-git", "PIP_INDEX_URL=keep-pip", "ADDED=||"):
+            self.assertIn(expected, lines, (r.stdout, r.stderr))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "shared", "venv")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "scratch")))
+
+    def test_refusal_leaves_the_callers_git_and_pip_variables(self):
+        rel = self.commit_req("requirements-badline.txt", "numpy\n")
+        r = self.same_session(rel, "--dry-run")
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        lines = r.stdout.splitlines()
+        for expected in ("code=2", "GIT_DIR=keep-git", "PIP_INDEX_URL=keep-pip", "ADDED=||"):
+            self.assertIn(expected, lines, (r.stdout, r.stderr))
+        self.assertIn("not exactly name==version", r.stderr)
+
+    def test_refuses_a_bare_cr(self):
+        for name, text in (
+            ("requirements-double-cr.txt", "numpy==2.1.0\r\r\n"),
+            ("requirements-final-cr.txt", "numpy==2.1.0\r"),
+            ("requirements-inner-cr.txt", "numpy==2.1.0\rscipy==1.14.1\n"),
+        ):
+            rel = self.commit_req(name, text)
+            r = self.assertRefused(rel, "--dry-run")
+            self.assertIn("not part of a CRLF", r.stderr, name)
+
+    def test_final_crlf_is_one_line_ending(self):
+        rel = self.commit_req("requirements-final-crlf.txt", "numpy==2.1.0\r\nscipy==1.14.1\r\n")
+        out = self.assertAllowed(rel, "--dry-run")
+        self.assertIn("dry run, nothing executed", out)
+        rel = self.commit_req("requirements-blank-crlf.txt", "numpy==2.1.0\r\n\r\n")
+        r = self.assertRefused(rel, "--dry-run")
+        self.assertIn("not exactly name==version", r.stderr)
+
     def test_accepts_tracked_pinned_file_dry_run(self):
         out = self.assertAllowed(self.REQ, "--dry-run")
         self.assertIn("python -I -m venv", out)
@@ -432,6 +487,13 @@ class TestVenvInstallReal(Base):
 
 # --prove-fail changes copies only; each named test must reach a failing behavioural assertion.
 WEAKENINGS = [
+    ("without the caller-environment restore",
+     {"venv-install.ps1": [("function Restore-CallerEnv {", "function Restore-CallerEnv { return;")]},
+     ["test_dry_run_leaves_the_callers_git_and_pip_variables",
+      "test_refusal_leaves_the_callers_git_and_pip_variables"]),
+    ("without the bare-CR rule",
+     {"venv-install.ps1": [("$bytes[$i] -eq 13 -and", "$false -and")]},
+     ["test_refuses_a_bare_cr"]),
     ("without the unmodified checks",
      {"venv-install.ps1": [
          ("if ($LASTEXITCODE -ne 0) { Refuse \"'$relIn' is modified",
