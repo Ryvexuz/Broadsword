@@ -876,6 +876,19 @@ class OptInClaimRules(unittest.TestCase):
         text = self.claimed("\n- `crates/x/src/big.rs`\n- `crates/x/tests/t.rs`")
         self.assertEqual(self.rules(text, root)[0][0], "R10")
 
+    def test_r10_only_exact_new_markers_count(self):
+        # r4 (opus q-20261124-120557): a descriptive "(new ...)" note is not a marker, and a path only
+        # counts as marked where it starts at a boundary.
+        root = self.root()
+        for claim in ("`large.py` (new parser fn)", "`large.py` (new rules in claim_gaps)",
+                      "`large.py`, `x/large.py/` (new folder)", "`large.py`, `other.py` (newer)"):
+            with self.subTest(claim=claim):
+                self.assertEqual(self.rules(self.claimed(claim), root)[0][0], "R10")
+        for claim in ("`large.py`, `part.py` (new)", "`large.py`, `part.py` (NEW)",
+                      "`large.py`, `part.py`(new)"):
+            with self.subTest(claim=claim):
+                self.assertEqual(self.rules(self.claimed(claim), root), [])
+
     def test_r10_literal_newlines_and_configurable_boundary(self):
         root = self.root()
         text = self.claimed("`large.py`")

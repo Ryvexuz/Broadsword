@@ -611,11 +611,14 @@ def big_claim_gaps(lines, secs, root, limit):
                   if t and (pathlib.PureWindowsPath(t).drive or t.startswith("/"))}
         for path in named:
             paths[path] = paths.get(path, False) or bool(re.search(r"\bwiring\b", item, re.I))
-            marker = re.search(re.escape(path) + r"[`'\"]*\s*\(\s*new\b([^)]*)\)",
+            # Exact markers only (r4, opus finding at q-20261124-120557): "(new)" or "(new folder)", right after the
+            # path, and the path must start at a boundary so `a.py` is not matched inside `x/a.py/`. A descriptive
+            # note such as "(new parser fn)" is not a marker.
+            marker = re.search(r"(?:^|[\s,;(\[`'\"])" + re.escape(path) + r"[`'\"]*\s*\((new|new folder)\)",
                                item.replace("\\", "/"), re.I)
             if marker:
                 new.add(path)
-                if not path.endswith("/") and not re.search(r"\bfolder\b", marker.group(1), re.I):
+                if not path.endswith("/") and marker.group(1).lower() != "new folder":
                     new_files.add(path)
     res = []
     try:
