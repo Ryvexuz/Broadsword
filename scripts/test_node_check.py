@@ -366,9 +366,12 @@ class PipeEncoding(unittest.TestCase):
             text = raw.getvalue().decode("cp1252")
             self.assertEqual(code, 0)
             self.assertEqual(text.count("result: PASS"), 2)
-            # and the same through a real child process on a pipe, whatever this machine's default encoding
+            # and the same through a real child process on a pipe, whatever this machine's default encoding.
+            # The child must not inherit a Broadsword job's markers: when this test itself runs inside a job (the merge
+            # queue's python-only check), node_check would refuse the nested run with exit 2 (the in_job guard).
+            child_env = {k: v for k, v in os.environ.items() if k.upper() not in ("BROADSWORD_JOB", "CARGO_TARGET_DIR")}
             r = subprocess.run([sys.executable, "-I", "-B", str(SCRIPT), "1.2", "--root", str(root), "--run", "--all"],
-                               capture_output=True, timeout=120)
+                               capture_output=True, timeout=120, env=child_env)
             self.assertNotIn("UnicodeEncodeError", r.stderr.decode("utf-8", "replace"))
             self.assertEqual(r.returncode, 0)
         finally:
