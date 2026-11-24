@@ -6,7 +6,7 @@ use crate::wtgit;
 use std::fs;
 use std::path::Path;
 
-/// Only nonempty lists of canonical, relative Git paths outside Rust's inputs qualify.
+/// Only nonempty lists of canonical, relative Git paths on the no-Rust allow-list qualify.
 /// Source text is deliberately searched without parsing: comments and strings count too.
 pub(super) fn no_rust_paths(paths: &[String], rust_literals: &str) -> Result<(), String> {
     if paths.is_empty() {
@@ -20,24 +20,31 @@ pub(super) fn no_rust_paths(paths: &[String], rust_literals: &str) -> Result<(),
         }
         // Case aliases must not bypass the guard on Windows.
         let lower = path.to_ascii_lowercase();
-        if ["crates/", "projects/", ".github/", ".claude/", "build/"]
-            .iter()
-            .any(|prefix| lower.starts_with(*prefix))
-        {
-            return bad("rule (a): protected directory");
-        }
-        if [
-            "cargo.toml",
-            "cargo.lock",
-            "broadsword.toml",
-            "agents.md",
-            "claude.md",
-            "rust-toolchain.toml",
+        let allowed_location = [
+            "docs/",
+            "evidence/",
+            "templates/",
+            "scripts/",
+            "clients/",
+            "bench/",
         ]
-        .contains(&lower.as_str())
-            || lower.ends_with(".rs")
-        {
-            return bad("rule (b): Rust, Cargo, settings or instructions file");
+        .iter()
+        .any(|prefix| lower.starts_with(*prefix))
+            || (!lower.contains('/')
+                && lower.ends_with(".md")
+                && !matches!(lower.as_str(), "agents.md" | "claude.md"));
+        let allowed_extension = [".md", ".txt", ".py", ".json", ".csv", ".tsv", ".ps1"]
+            .iter()
+            .any(|extension| lower.ends_with(*extension));
+        let allowed_segments = lower.split('/').all(|part| {
+            !part.starts_with('.')
+                && !matches!(
+                    part,
+                    "cargo.toml" | "cargo.lock" | "rust-toolchain" | "rust-toolchain.toml"
+                )
+        });
+        if !(allowed_location && allowed_extension && allowed_segments) {
+            return bad("allow-list rule: unapproved location, extension or path segment");
         }
         if folded_literals.contains(lower.as_str()) {
             return bad("rule (c): path occurs in Rust source text");
@@ -98,8 +105,9 @@ fn changed_paths(dir: &Path) -> Result<Vec<String>, String> {
     parse_paths(&output.stdout)
 }
 
-/// Read every Rust source of the commit being checked, not the running binary's checkout.
-/// Linked entries are rejected; an empty or unreadable source tree is not evidence.
+/// Read Rust sources of the commit being checked, not the running binary's checkout.
+/// Only queue/no_rust.rs is excluded: its test literals must not disqualify docs and scripts.
+/// Linked entries are rejected; an empty or unreadable remaining source tree is not evidence.
 fn rust_sources(dir: &Path) -> Result<String, String> {
     let mut source = dir.to_path_buf();
     for part in ["crates", "broadsword", "src"] {
@@ -117,6 +125,7 @@ fn rust_sources(dir: &Path) -> Result<String, String> {
 }
 
 fn read_sources(source: &Path) -> Result<String, String> {
+    let own_source = source.join("queue").join("no_rust.rs");
     let mut pending = vec![source.to_path_buf()];
     let mut text = String::new();
     let mut found = false;
@@ -139,7 +148,7 @@ fn read_sources(source: &Path) -> Result<String, String> {
             }
             if kind.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
+            } else if path != own_source && path.extension().is_some_and(|ext| ext == "rs") {
                 let content = fs::read_to_string(&path)
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
                 text.push_str(&content);
@@ -274,7 +283,7 @@ mod tests {
     #[test]
     fn any_rs_or_crates_path_fails() {
         for path in ["main.rs", "docs/example.rs", "MAIN.RS"] {
-            rejected(path, "rule (b)");
+            rejected(path, "allow-list rule");
         }
         for path in [
             "crates/readme.md",
@@ -284,7 +293,7 @@ mod tests {
             ".claude/agents/coder.md",
             "build/notes.txt",
         ] {
-            rejected(path, "rule (a)");
+            rejected(path, "allow-list rule");
         }
     }
 
@@ -299,7 +308,7 @@ mod tests {
             "rust-toolchain.toml",
             "CARGO.TOML",
         ] {
-            rejected(path, "rule (b)");
+            rejected(path, "allow-list rule");
         }
     }
 
@@ -333,7 +342,110 @@ mod tests {
 
     #[test]
     fn projects_path_fails() {
-        rejected("projects/crash-sim/README.md", "rule (a)");
+        rejected("projects/crash-sim/README.md", "allow-list rule");
+    }
+
+    #[test]
+    fn nested_cargo_files_fail() {
+        for path in [
+            "vendor/foo/Cargo.toml",
+            "tools/x/Cargo.lock",
+            "docs/Cargo.toml",
+            "scripts/Cargo.lock",
+            "docs/Cargo.toml/notes.md",
+            "clients/CARGO.LOCK/test.py",
+        ] {
+            rejected(path, "allow-list rule");
+        }
+    }
+
+    #[test]
+    fn dot_folders_fail() {
+        for path in [
+            ".cargo/config.toml",
+            "docs/.cargo/config.json",
+            "scripts/.hidden.py",
+            "evidence/.hidden/report.md",
+        ] {
+            rejected(path, "allow-list rule");
+        }
+    }
+
+    #[test]
+    fn rust_toolchain_fails() {
+        for path in [
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            "docs/rust-toolchain",
+            "templates/rust-toolchain.toml",
+            "docs/rust-toolchain/notes.md",
+            "bench/RUST-TOOLCHAIN.TOML/results.csv",
+        ] {
+            rejected(path, "allow-list rule");
+        }
+    }
+
+    #[test]
+    fn unknown_top_folder_fails() {
+        for path in [
+            "assets/x.md",
+            "vendor/notes.md",
+            "tools/helper.py",
+            "doc/queue.md",
+            "docs-extra/queue.md",
+            "notes.txt",
+            "helper.py",
+        ] {
+            rejected(path, "allow-list rule");
+        }
+    }
+
+    #[test]
+    fn root_markdown_passes() {
+        assert_eq!(
+            no_rust_paths(&paths(&["README.md", "RETRO.md", "Notes.MD"]), ""),
+            Ok(())
+        );
+        for path in ["agents.md", "CLAUDE.MD", ".notes.md"] {
+            rejected(path, "allow-list rule");
+        }
+    }
+
+    #[test]
+    fn allow_list_requires_both_location_and_extension() {
+        for folder in ["docs", "evidence", "templates", "scripts", "clients", "bench"] {
+            for extension in ["md", "txt", "py", "json", "csv", "tsv", "ps1"] {
+                let path = format!("{folder}/nested/file.{extension}");
+                assert_eq!(no_rust_paths(&paths(&[&path]), ""), Ok(()), "{path}");
+                assert_eq!(
+                    no_rust_paths(&paths(&[&path.to_ascii_uppercase()]), ""),
+                    Ok(()),
+                    "{path}"
+                );
+            }
+            for name in ["file.rs", "file.toml", "file.lock", "file", "file.md.rs"] {
+                rejected(&format!("{folder}/{name}"), "allow-list rule");
+            }
+        }
+    }
+
+    #[test]
+    fn own_test_literals_do_not_count() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = "docs/no_rust_own_test_literal_probe.md";
+        let own = fs::read_to_string(root.join("crates/broadsword/src/queue/no_rust.rs"))
+            .expect("this test's source can be read");
+        assert!(
+            own.contains(path),
+            "the probe must actually occur in this module"
+        );
+        let literals = rust_sources(&root).expect("the remaining Rust sources can be read");
+        assert!(!literals.contains(path), "this module must be excluded");
+        assert_eq!(no_rust_paths(&paths(&[path]), &literals), Ok(()));
+        assert!(
+            no_rust_paths(&paths(&[path]), &own).is_err(),
+            "including this module would conservatively reject its test literal"
+        );
     }
 
     #[test]
