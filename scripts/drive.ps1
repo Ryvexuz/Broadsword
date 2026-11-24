@@ -13,8 +13,8 @@
 #   Baseline: 2026-11-21 night session, Lazlo hit wrong-folder errors and a deleted program (the brief of this task;
 #   no counted log of it exists, so the baseline is that report, not a number from state/pc-progress.md).
 #   Judged by: the next drive sessions; the script is kept if a session needs no manual path fixing, and reverted
-#   if it fails on a step the manual commands of STAGE6 3.7/3.8 would not. Tests cover --dry-run only
-#   (scripts/test_drive_ps1.py); a real run, with a window, has not been exercised by the coder.
+#   if it fails on a step the manual commands of STAGE6 3.7/3.8 would not. Tests cover --dry-run and
+#   copy failures (scripts/test_drive_ps1.py); a real run with a window has not been exercised by the coder.
 
 param([switch]$DryRun)
 
@@ -74,7 +74,23 @@ if (Test-Path -LiteralPath $mainBinsExe) {
     if (-not $DryRun) {
         if (-not (Test-Path -LiteralPath $buildExe)) { Fail "the build did not produce $buildExe" }
         New-Item -ItemType Directory -Force -Path $driveDir | Out-Null
-        Copy-Item -LiteralPath $buildExe -Destination $scratchExe -Force
+        try {
+            Copy-Item -LiteralPath $buildExe -Destination $scratchExe -Force -ErrorAction Stop
+        } catch {
+            Fail "copying $buildExe to $scratchExe failed: $($_.Exception.Message)"
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $scratchExe -PathType Leaf -ErrorAction Stop)) {
+                Fail "the copy $scratchExe does not match $buildExe (stale or replaced)"
+            }
+            $scratchHash = (Get-FileHash -LiteralPath $scratchExe -Algorithm SHA256 -ErrorAction Stop).Hash
+            $buildHash = (Get-FileHash -LiteralPath $buildExe -Algorithm SHA256 -ErrorAction Stop).Hash
+            if (-not $scratchHash -or -not $buildHash -or $scratchHash -ne $buildHash) {
+                Fail "the copy $scratchExe does not match $buildExe (stale or replaced)"
+            }
+        } catch {
+            Fail "the copy $scratchExe does not match $buildExe (stale or replaced): $($_.Exception.Message)"
+        }
     }
 }
 # Relative to projects\render (two levels below root), written out because Windows PowerShell 5.1 has no GetRelativePath.

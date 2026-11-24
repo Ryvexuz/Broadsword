@@ -1,5 +1,5 @@
-"""Tests for scripts/drive.ps1. They only ever run it with --dry-run (or with a bad argument, which is refused
-before any step): nothing is built, no window opens. Each test copies drive.ps1 into a temp root's scripts folder, so
+"""Tests for scripts/drive.ps1. Dry runs and early real-run failures open no viewer.
+Copy-step tests use cmd.exe in place of the build runner. Each test copies drive.ps1 into a temp root's scripts folder, so
 the root the script finds from its own path is the temp root and a stray write would show up there.
 
   python -I -B scripts/test_drive_ps1.py -v
@@ -9,6 +9,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import pathlib
+import os
 import re
 import shutil
 import subprocess
@@ -100,6 +101,57 @@ class DriveDryRun(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("drive: FAIL broadsword not found", r.stdout)
         self.assertNotIn("[1/5]", r.stdout)
+
+
+@unittest.skipIf(POWERSHELL is None, "powershell not found")
+class DriveCopyStep(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name).resolve() / "root"
+        (self.root / "scripts").mkdir(parents=True)
+        shutil.copy(SCRIPT, self.root / "scripts" / "drive.ps1")
+        bsw = self.root / "build" / "bin" / "broadsword.exe"
+        bsw.parent.mkdir(parents=True)
+        shutil.copy(pathlib.Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe", bsw)
+        build_exe = self.root / "build" / "release" / "crash-sim.exe"
+        build_exe.parent.mkdir(parents=True)
+        build_exe.write_bytes(b"new")
+        self.scratch_exe = self.root / "scratch" / "drive" / "crash-sim.exe"
+        self.scratch_exe.parent.mkdir(parents=True)
+
+    def run_copy(self):
+        return subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(self.root / "scripts" / "drive.ps1")],
+            cwd=self.root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_locked_old_exe_fails_before_the_viewer(self):
+        import msvcrt
+
+        self.scratch_exe.write_bytes(b"old")
+        with self.scratch_exe.open("r+b") as locked:
+            msvcrt.locking(locked.fileno(), msvcrt.LK_NBLCK, 3)
+            try:
+                r = self.run_copy()
+            finally:
+                locked.seek(0)
+                msvcrt.locking(locked.fileno(), msvcrt.LK_UNLCK, 3)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("drive: FAIL copying", r.stdout)
+        self.assertNotIn("[3/5]", r.stdout)
+
+    def test_folder_in_place_of_the_exe_fails(self):
+        self.scratch_exe.mkdir()
+        r = self.run_copy()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("drive: FAIL the copy", r.stdout)
+        self.assertNotIn("[3/5]", r.stdout)
 
 
 if __name__ == "__main__":
