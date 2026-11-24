@@ -353,6 +353,10 @@ impl Config {
         for k in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits"] {
             positive(k)?;
         }
+        // read only by scripts/stall_restart.py, which loads these keys itself: validated here (missing or 0 refused at load), not stored
+        for k in ["stall_restart_lines", "stall_restart_timeout_seconds"] {
+            positive(k)?;
+        }
         let reviewer_backend = get_str(&m, "reviewer_backend")?;
         if reviewer_backend != "claude" {
             return Err(format!("reviewer_backend = \"{reviewer_backend}\": only \"claude\" is supported"));
@@ -644,6 +648,8 @@ hotspot_window_hours = 48
 hotspot_wait_hours = 1
 hotspot_claims = 5
 hotspot_commits = 5
+stall_restart_lines = 3
+stall_restart_timeout_seconds = 60
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -785,7 +791,7 @@ install_dir=\"build/bin\"\n";
     fn hotspot_keys_are_required_and_positive() {
         let text = include_str!("../../../broadsword.toml");
         assert!(Config::from_text(text, Path::new("p")).is_ok());
-        for key in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits"] {
+        for key in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits", "stall_restart_lines", "stall_restart_timeout_seconds"] {
             let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
             assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
             let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("
@@ -877,6 +883,8 @@ hotspot_window_hours = 48
 hotspot_wait_hours = 1
 hotspot_claims = 5
 hotspot_commits = 5
+stall_restart_lines = 3
+stall_restart_timeout_seconds = 60
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -937,6 +945,8 @@ hotspot_window_hours = 48
 hotspot_wait_hours = 1
 hotspot_claims = 5
 hotspot_commits = 5
+stall_restart_lines = 3
+stall_restart_timeout_seconds = 60
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
@@ -1019,9 +1029,11 @@ worktrees_dir = \"worktrees\"\n";
         }
         // the hotspot_* keys are read only by scripts/hotspots.py (exactly that file, exactly those keys)
         let hotspots_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/hotspots.py")).unwrap();
-        let used_by_python = |k: &str| py.contains(&format!("\"{k}\"")) || (k.starts_with("hotspot_") && hotspots_py.contains(&format!("\"{k}\"")));
+        // the stall_restart_* keys are read only by scripts/stall_restart.py (exactly that file, exactly those keys)
+        let stall_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/stall_restart.py")).unwrap();
+        let used_by_python = |k: &str| py.contains(&format!("\"{k}\"")) || (k.starts_with("hotspot_") && hotspots_py.contains(&format!("\"{k}\""))) || (k.starts_with("stall_restart_") && stall_py.contains(&format!("\"{k}\"")));
         let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k)) && !used_by_python(k)).collect();
-        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name (hotspot_* keys: scripts/hotspots.py): {unused:?}");
+        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name (hotspot_* keys: scripts/hotspots.py; stall_restart_* keys: scripts/stall_restart.py): {unused:?}");
     }
 
     #[test]
