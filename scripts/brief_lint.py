@@ -49,7 +49,8 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
   R9  FAIL  with --min-hard-cases, Risk: high in Board needs that many Hard cases list items,
             each naming a backticked snake_case test also named in the Done check.
   R10 FAIL  with --root and --big-file-lines, an existing claimed file over that newline
-            count needs "wiring" in its own Claims bullet or a claimed (new) file.
+            count needs "wiring" in its own Claims bullet or a claimed (new) file in
+            the same folder or a subfolder of that folder.
             New files are not counted; outside-root or unreadable paths WARN.
   R11 FAIL  with --min-pasted-lines, a GPT Model in Board naming an outside-repo path
             needs a Pasted or Pasted protocol section with that many non-empty body lines.
@@ -543,7 +544,8 @@ def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_
         for i, item in enumerate(items, 1):
             names = [s for s in TICKS_RE.findall(item)
                      if re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", s)]
-            if not any(re.search(rf"(?<!\w){re.escape(n)}(?!\w)", done_text) for n in names):
+            if not any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", done_text)
+                       for n in names):
                 untied.extend(names or [f"item {i} (no test name)"])
         if len(items) < min_hard_cases or untied:
             res.append(("R9", "FAIL", f"hard cases: need >= {min_hard_cases} items each naming "
@@ -583,7 +585,7 @@ def board_fields(lines):
 
 
 def big_claim_gaps(lines, secs, root, limit):
-    """R10: keep wiring local to a claim item, and count literal newlines in existing files."""
+    """R10: require local wiring or a local new file; count literal newlines in existing files."""
     blocks = claim_blocks(lines, secs)
     items = []
     for block in blocks:
@@ -620,6 +622,17 @@ def big_claim_gaps(lines, secs, root, limit):
         base = pathlib.Path(root).resolve()
     except (OSError, ValueError, RuntimeError) as e:
         return [("R10", "WARN", f"cannot resolve root: {e}")]
+    new_targets = set()
+    for path in sorted(new_files):
+        try:
+            target = (base / path).resolve()
+            win = pathlib.PureWindowsPath(path)
+            if (win.drive and os.name != "nt") or not target.is_relative_to(base):
+                res.append(("R10", "WARN", f"claimed path outside root: {path}"))
+                continue
+            new_targets.add(target)
+        except (OSError, ValueError, RuntimeError) as e:
+            res.append(("R10", "WARN", f"cannot resolve new claim {path}: {e}"))
     for path, wiring in sorted(paths.items()):
         if path in new:
             continue
@@ -641,7 +654,8 @@ def big_claim_gaps(lines, secs, root, limit):
         except (OSError, ValueError, RuntimeError) as e:
             res.append(("R10", "WARN", f"cannot count {path}: {e}"))
             continue
-        if count > limit and not wiring and not new_files:
+        if count > limit and not wiring and not any(
+                new_target.is_relative_to(target.parent) for new_target in new_targets):
             res.append(("R10", "FAIL", f"{path} has {count} lines (over {limit}); "
                         "claim wiring only or a (new) file for the new module"))
     return res

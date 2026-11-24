@@ -791,9 +791,16 @@ class OptInClaimRules(unittest.TestCase):
         self.assertEqual(self.rules(text), [
             ("R9", "FAIL", "hard cases: need >= 3 items each naming a test from the Done check "
              "(found 3, untied: test_missing)")])
-        # A substring in a different test name is not a tie.
-        text = self.text().replace("unittest test_edge_one ", "unittest test_edge_one_more ")
-        self.assertIn("untied: test_edge_one)", self.rules(text)[0][2])
+
+    def test_r9_prefix_name_is_not_tied(self):
+        for name in ("test_edge_one_more", "prefix_test_edge_one", "9test_edge_one"):
+            with self.subTest(name=name):
+                text = self.text().replace("unittest test_edge_one ", f"unittest {name} ")
+                self.assertEqual(self.rules(text), [
+                    ("R9", "FAIL", "hard cases: need >= 3 items each naming a test from the Done check "
+                     "(found 3, untied: test_edge_one)")])
+        text = self.text().replace("unittest test_edge_one ", "unittest Suite.test_edge_one ")
+        self.assertEqual(self.rules(text), [])
 
     def test_r9_headings_case_empty_and_missing_names(self):
         for heading in ("# Hard cases", "###### HARD CASES", "**Hard cases**"):
@@ -853,6 +860,25 @@ class OptInClaimRules(unittest.TestCase):
         text = self.claimed("`large.py`") + "\n## Notes\nUse wiring only.\n"
         self.assertEqual(self.rules(text, root)[0][0], "R10")
         self.assertEqual(self.rules(self.claimed("`large.py`, `new/` (new folder)"), root)[0][0], "R10")
+
+    def test_r10_new_file_elsewhere_does_not_cover(self):
+        root = self.root()
+        (root / "scripts").mkdir()
+        (root / "scripts" / "large.py").write_bytes(b"x\n" * 1200)
+        for new_file, fails in (("docs/other.md", True), ("scripts2/part.py", True),
+                                ("scripts/../docs/other.md", True),
+                                ("scripts/large_part.py", False),
+                                ("scripts/parts/large_part.py", False),
+                                ("scripts\\parts\\large_part.py", False)):
+            with self.subTest(new_file=new_file):
+                text = self.claimed(f"\n- `scripts/large.py`\n- `{new_file}` (new)")
+                lines = text.splitlines()
+                expected = [
+                    ("R10", "FAIL", "scripts/large.py has 1200 lines (over 1000); "
+                     "claim wiring only or a (new) file for the new module")] if fails else []
+                self.assertEqual(bl.big_claim_gaps(
+                    lines, bl.split_sections(lines), root, 1000), expected)
+                self.assertEqual(self.rules(text, root), expected)
 
     def test_r10_literal_newlines_and_configurable_boundary(self):
         root = self.root()
