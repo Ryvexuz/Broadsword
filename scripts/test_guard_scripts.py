@@ -249,6 +249,13 @@ class TestFF(unittest.TestCase):
         wr(os.path.join(self.repo, "a.txt"), "dirty")
         self.assertRefused("demo", self.c2)
 
+    def test_refusal_after_locking_releases_both_locks(self):
+        wr(os.path.join(self.repo, "a.txt"), "dirty")
+        self.assertRefused("demo", self.c2)
+        for n in ("queue.lock", "demo.queue.lock"):
+            with open(os.path.join(self.q, n), "r+b") as f:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+
     def test_refuses_untracked_file_in_main(self):
         wr(os.path.join(self.repo, "stray.txt"), "x")
         self.assertRefused("demo", self.c2)
@@ -269,9 +276,38 @@ class TestFF(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def test_lock_is_taken_before_the_entry_is_read(self):
+        with open(os.path.join(self.q, "demo.queue.lock"), "r+b") as f:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            os.remove(os.path.join(self.q, "q-1.entry"))
+            r = self.run_ff("demo", self.c2)
+            self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+            self.assertIn("queue lock", r.stderr)
+            self.assertNotIn("no approved queue entry", r.stderr)
+            self.assertEqual(self.head(), self.c1, "main moved on a refusal")
+
+    def test_missing_project_lock_is_created_and_held(self):
+        path = os.path.join(self.q, "demo.queue.lock")
+        os.remove(path)
+        r = self.run_ff("demo", self.c2)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertEqual(self.head(), self.c2)
+        self.assertTrue(os.path.isfile(path), "project lock was not created")
+        with open(path, "r+b") as f:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+
+    def test_missing_global_lock_is_created(self):
+        path = os.path.join(self.q, "queue.lock")
+        os.remove(path)
+        r = self.run_ff("demo", self.c2)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertEqual(self.head(), self.c2)
+        self.assertTrue(os.path.isfile(path), "global lock was not created")
+
     def test_refuses_when_locks_cannot_be_checked(self):
         os.remove(os.path.join(self.q, "queue.lock"))
         os.remove(os.path.join(self.q, "demo.queue.lock"))
+        os.mkdir(os.path.join(self.q, "demo.queue.lock"))
         self.assertRefused("demo", self.c2)
 
     def test_refuses_non_fast_forward(self):
@@ -306,6 +342,8 @@ WEAKENINGS = [
      ["test_refuses_body_outside_allowed_folders"]),
     ("ff-reviewed.ps1 without the lock check", {"ff-reviewed.ps1": [("$fs.Lock(0, [long]::MaxValue)", "")]},
      ["test_refuses_held_project_lock", "test_refuses_held_global_lock"]),
+    ("ff-reviewed.ps1 skipping a missing lock file", {"ff-reviewed.ps1": [("[IO.FileMode]::OpenOrCreate", "[IO.FileMode]::Open")]},
+     ["test_missing_project_lock_is_created_and_held", "test_missing_global_lock_is_created"]),
     ("run-test-a.ps1 without the short-name check", {"run-test-a.ps1": [("-match '~'", "-match '\x01'")]},
      ["test_refuses_short_name_paths"]),
     ("ff-reviewed.ps1 without the clean-main check", {"ff-reviewed.ps1": [("if ($dirty.Count -gt 0) {", "if ($false) {")]},
