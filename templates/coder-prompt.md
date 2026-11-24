@@ -1,6 +1,7 @@
 You are the Coder for one task in the Broadsword project (root <ROOT>). First read `.claude/agents/coder.md` in the root for your role rules, then the brief at `<BRIEF>`.
 
 Your task id is <TASK>. Its Git worktree is already made: <ROOT>/worktrees/<PROJECT>/<TASK> (branch task/<TASK>). Work ONLY in that folder, and only on the files the brief claims. Other agents may work in sibling worktrees: do not touch them, the main checkout, or the board.
+Put new code in a new module file; an existing file over about 1,000 lines gets wiring only (about 20 lines); if your change would push a file past 1,500 lines, stop and report so a split is boarded first.
 
 Build and test ONLY through Broadsword, never plain cargo:
   <ROOT>/build/bin/broadsword.exe test <PROJECT> --task <TASK>

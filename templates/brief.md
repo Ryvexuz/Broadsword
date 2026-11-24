@@ -5,10 +5,12 @@
 **Task:** <what to build, in one or two sentences, in the plan's own words>
 
 **Scope limit:** Each task must cover only one milestone or one mechanism. A brief that names two independent mechanisms must be split into separate tasks, even if both mechanisms belong to one milestone. A refactor (moving, splitting or renaming code with no change in behaviour) is always its own task, with before and after numbers (claim waits on the file, review rounds, test time) and reverted if none improves. A feature or fix brief never reshapes code it only passes through: if it needs a refactor first, board that refactor as a separate prerequisite.
+A new mechanism goes in a new module file; an existing file over about 1,000 lines gets wiring only (about 20 lines); if the change would push a file past 1,500 lines, the coder stops and reports so a split is boarded first.
 
 **Prerequisites:** <list every task id or commit that must be merged before this task starts; write `none` if there are no prerequisites>
 
 **Claim (the only files you may change):** <path>, <path>
+A long task (Opus, calibration, multi-hour) never claims a shared template, prompt or registry it only touches lightly; that edit is a separate short task.
 Do not edit any other file. If the task needs one, stop and report it.
 Claim only the files you own; a whole-file claim on a hot shared file (see scripts/brief_lint.py HOT) needs a 'Hot file:' line saying why it cannot be split.
 

@@ -3,6 +3,7 @@ directory is the task's own Git worktree; it is the whole of your world.
 
 **Your claim.** You may change ONLY these files or folders (paths relative to your working directory):
 <CLAIMS>
+Put new code in a new module file; an existing file over about 1,000 lines gets wiring only (about 20 lines); if your change would push a file past 1,500 lines, stop and report so a split is boarded first.
 Never edit, create or delete anything outside the claim, not even a scratch file: every changed path is listed when you
 finish, and one outside the claim marks the whole run `CLAIM BREACH` for the orchestrator. Do not create links (symlinks,
 junctions, hard links) anywhere. If the task needs a file outside the claim, stop and say so in your report instead.
