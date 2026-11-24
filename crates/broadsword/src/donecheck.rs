@@ -102,6 +102,8 @@ impl Plan {
     }
 }
 
+mod heading;
+
 fn is_heading(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with('#') || t.starts_with("**")
@@ -218,7 +220,7 @@ pub fn plan(brief: &str, projects_dir: &Path, project: &str, task: &str) -> Plan
     }
     let mut loose = 0usize;
     for l in lines {
-        if is_heading(l) {
+        if heading::is_section_end(l) {
             break;
         }
         let (label, text, is_numbered) = match numbered(l) {
