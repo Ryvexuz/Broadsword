@@ -478,7 +478,10 @@ mod tests {
                 classify(&job),
                 "the live fixture must count before changing its pid"
             );
-            let mut child = crate::scrub::command_in(std::path::Path::new("."), "cmd")
+            // A config_root fixture, never ".": in a linked worktree "." loads the MAIN checkout's broadsword.toml,
+            // which lacks any required key this branch adds (scrub::planted::config_root).
+            let root = crate::scrub::planted::config_root("slot-gate-gone");
+            let mut child = crate::scrub::command_in(&root, "cmd")
                 .expect("the spawn helper builds the command")
                 .args(["/C", "exit 0"])
                 .spawn()
