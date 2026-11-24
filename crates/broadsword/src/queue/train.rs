@@ -12,6 +12,8 @@ use super::{APPROVED, badness, BLOCKED, CHECK_FAILED, code_num, CONFLICT, EXIT_E
 use super::rebase::{chain_bases_of, chained_base, left_train_text};
 use super::view::{short, some};
 
+mod lanes;
+
 impl<'a> Run<'a> {
     /// The claims of this entry's task, as a train compares them. A task that cannot be read claims everything (`*`), so it never
     /// shares a train.
@@ -416,13 +418,24 @@ pub(super) fn run_trains<'a>(cfg: &'a Config, approved: &mut Vec<(Run<'a>, std::
             }
         };
         let ready = |p: &str| flush || short.iter().any(|(s, _)| s == p);
+        let order = if cfg.merge_train_lanes > 1 {
+            lanes::queue_order(approved)
+        } else {
+            Vec::new()
+        };
         let Some(group) = take_group(approved, max, &ready) else { break };
         if !flush && group.len() < max {
             let project = group[0].0.e.get("project").to_string();
             let why = short.iter().find(|(s, _)| *s == project).map(|(_, w)| w.as_str()).unwrap_or("-");
             println!("merge train for project {project}: {} of at most {max} entries, not waiting for more: {why}", group.len());
         }
-        hard = run_train(cfg, group, rows);
+        let count = lanes::lane_count(cfg, group[0].0.e.get("project"));
+        hard = if count > 1 {
+            let batch = lanes::take_more(group, approved, max, count, order);
+            lanes::run_lanes(cfg, batch, approved, rows)
+        } else {
+            run_train(cfg, group, rows)
+        };
     }
     hard
 }

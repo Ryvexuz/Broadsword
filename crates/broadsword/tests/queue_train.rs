@@ -974,3 +974,332 @@ fn a_chain_rebase_a_killed_drain_left_half_done_is_aborted_and_the_entry_still_m
     assert_eq!(train_subjects(&r)[1..], ["task: a", "task: b"]);
 }
 
+/// Read a single-line field directly from a durable record, including fields queue show does not display.
+fn lane_field(path: &Path, key: &str) -> String {
+    let text = fs::read_to_string(path).unwrap();
+    let value = text
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+        .unwrap_or("");
+    let mut chars = value.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        out.push(if c == '\\' {
+            match chars.next() {
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some(c) => c,
+                None => '\\',
+            }
+        } else {
+            c
+        });
+    }
+    out
+}
+
+fn lane_entry_field(r: &Root, entry: &str, key: &str) -> String {
+    lane_field(&r.dir.join("state/queue").join(format!("{entry}.entry")), key)
+}
+
+fn lane_jobs(r: &Root) -> Vec<PathBuf> {
+    let mut jobs: Vec<_> = fs::read_dir(r.dir.join("state/jobs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "rec") && lane_field(p, "kind") == "check"
+        })
+        .collect();
+    jobs.sort();
+    jobs
+}
+
+fn lane_interval(job: &Path) -> (u64, u64) {
+    let start = lane_field(job, "started").parse().unwrap();
+    let end = lane_field(job, "ended").parse().unwrap();
+    assert!(
+        end >= start,
+        "{}: started={start}, ended={end}",
+        job.display()
+    );
+    (start, end)
+}
+
+/// A real test in p records the commit it actually executed against, after checking for the planted breaking file.
+/// Proof files live outside every worktree, so they do not make the worktrees dirty.
+fn lane_root(name: &str, lanes: u64, breaking: Option<usize>) -> (Root, Vec<(String, String)>) {
+    let r = train_root(name, 2);
+    train_set(&r, "merge_train_lanes", &lanes.to_string());
+    // All four genuinely reviewed entries are approved before trains start.
+    train_set(&r, "review_parallel", "4");
+    let test = r#"
+#[cfg(test)]
+mod lane_proof {
+    #[test]
+    fn proves_the_commit_and_sleeps() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let git = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
+        assert!(git.status.success());
+        let tip = String::from_utf8(git.stdout).unwrap().trim().to_string();
+        assert_eq!(tip.len(), 40);
+        let gate = dir.join("../../../lane-hang.flag");
+        for _ in 0..600 {
+            if !gate.exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!gate.exists(), "lane test gate timed out");
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(!dir.join("broken.txt").exists(), "the breaking entry must never reach main");
+        let proof = dir.join("../../../lane-proof");
+        std::fs::create_dir_all(&proof).unwrap();
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(proof.join(format!("{}-{tip}", dir.file_name().unwrap().to_str().unwrap())), at.to_string()).unwrap();
+    }
+}
+"#;
+    r.commit(&r.p(), "src/lib.rs", &lib_with(test), "lane proof fixture");
+    let entries = ["a.txt", "b.txt", "c.txt", "d.txt"]
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            train_one(
+                &r,
+                if breaking == Some(i) { "broken.txt" } else { file },
+                "x\n",
+            )
+        })
+        .collect();
+    (r, entries)
+}
+
+fn assert_lane_check_covers(r: &Root, entry: &str) {
+    let tip = lane_entry_field(r, entry, "train_checked");
+    let job = lane_entry_field(r, entry, "train_job");
+    assert_eq!(tip.len(), 40, "{entry}: train_checked={tip}");
+    assert!(!job.is_empty(), "{entry}: no passing job");
+    let record = r.dir.join("state/jobs").join(format!("{job}.rec"));
+    assert_eq!(lane_field(&record, "status"), "done", "{job} must have passed");
+    let task = lane_field(&record, "task");
+    assert!(!task.is_empty(), "{job}: must be a pre-merge check");
+    let proof = r.dir.join("lane-proof").join(format!("{task}-{tip}"));
+    let at: u64 = fs::read_to_string(&proof)
+        .unwrap_or_else(|e| {
+            panic!(
+                "missing proof of the checked commit {}: {e}",
+                proof.display()
+            )
+        })
+        .parse()
+        .unwrap();
+    let (start, end) = lane_interval(&record);
+    assert!(
+        start <= at && at <= end,
+        "{job}: proof at {at} must be inside [{start}, {end}]"
+    );
+    assert_eq!(
+        git_out(&r.p(), &["merge-base", "--is-ancestor", &tip, "main"]).code,
+        0,
+        "{entry}: the passing checked commit must be on main"
+    );
+}
+
+fn passing_lane_case(lanes: u64) {
+    let (r, entries) = lane_root(&format!("passing-lanes-{lanes}"), lanes, None);
+    let started = Instant::now();
+    let o = r.run(&["queue", "run", "--all"]);
+    eprintln!(
+        "merge_train_lanes={lanes}: queue run --all wall time {:.3} s",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(o.code, 0, "{}{}", o.stdout, o.stderr);
+    for (_, e) in &entries {
+        assert_eq!(r.status(e), "merged", "{e}: {}", r.field(e, "reason"));
+        assert_lane_check_covers(&r, e);
+    }
+    let jobs = lane_jobs(&r);
+    let checks: Vec<_> = jobs
+        .iter()
+        .filter(|p| !lane_field(p, "task").is_empty())
+        .collect();
+    let main_checks = jobs
+        .iter()
+        .filter(|p| lane_field(p, "task").is_empty())
+        .count();
+    assert_eq!(checks.len(), 2, "two distinct pre-merge records: {jobs:?}");
+    assert_ne!(lane_field(checks[0], "id"), lane_field(checks[1], "id"));
+    let logs: Vec<_> = checks.iter().map(|p| lane_field(p, "log")).collect();
+    assert!(!logs[0].is_empty() && !logs[1].is_empty());
+    assert_ne!(logs[0], logs[1], "two jobs must never share a log");
+    for log in &logs {
+        let path = Path::new(log);
+        assert!(
+            if path.is_absolute() {
+                path.exists()
+            } else {
+                r.dir.join(path).exists()
+            },
+            "{log}"
+        );
+    }
+    let (a, b) = (lane_interval(checks[0]), lane_interval(checks[1]));
+    let overlap = a.0.max(b.0) < a.1.min(b.1);
+    eprintln!("merge_train_lanes={lanes}: pre-merge intervals {a:?}, {b:?}; overlap={overlap}; main_checks={main_checks}");
+    let forwards = git(&r.p(), &["reflog", "show", "--format=%gs", "main"])
+        .lines()
+        .filter(|l| l.contains("Fast-forward"))
+        .count();
+    let trains: Vec<_> = entries
+        .iter()
+        .map(|(_, e)| lane_entry_field(&r, e, "train"))
+        .collect();
+    if lanes == 2 {
+        assert!(overlap, "lane check intervals must overlap: {a:?}, {b:?}");
+        assert_eq!(main_checks, 1);
+        assert_eq!(
+            forwards, 1,
+            "main fast-forwards once, to lane 2's checked tip"
+        );
+        assert!(trains.iter().all(|id| !id.is_empty() && id == &trains[0]));
+        assert_eq!(
+            r.head(),
+            lane_entry_field(&r, &entries[3].1, "train_checked")
+        );
+        for (i, (_, e)) in entries.iter().enumerate() {
+            assert_eq!(
+                lane_entry_field(&r, e, "train_lane"),
+                format!("{} of 2", i / 2 + 1)
+            );
+        }
+        assert!(
+            o.stdout.contains("2 lanes checked at once (2, 2 entries); lanes 1..2 merged in one fast-forward"),
+            "{}",
+            o.stdout
+        );
+    } else {
+        assert!(
+            !overlap,
+            "serial train intervals must not overlap: {a:?}, {b:?}"
+        );
+        assert_eq!(main_checks, 2);
+        assert_eq!(forwards, 2);
+        assert_eq!(trains[0], trains[1]);
+        assert_eq!(trains[2], trains[3]);
+        assert_ne!(trains[0], trains[2]);
+        assert!(entries
+            .iter()
+            .all(|(_, e)| lane_entry_field(&r, e, "train_lane").is_empty()));
+        assert!(!o.stdout.contains("lanes checked at once"));
+    }
+}
+
+#[test]
+fn two_lanes_check_at_once_and_merge_in_one_fast_forward() {
+    passing_lane_case(2);
+}
+
+#[test]
+fn merge_train_lanes_1_checks_one_train_at_a_time() {
+    passing_lane_case(1);
+}
+
+#[test]
+fn a_failing_first_lane_merges_nothing_its_check_did_not_cover() {
+    let (r, entries) = lane_root("failing-first-lane", 2, Some(0));
+    let breaking = r.branch_tip(&entries[0].0);
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(
+        r.status(&entries[0].1),
+        "check_failed",
+        "{}",
+        r.show(&entries[0].1)
+    );
+    assert_eq!(
+        git_out(&r.p(), &["merge-base", "--is-ancestor", &breaking, "main"]).code,
+        1
+    );
+    assert!(!r.p().join("broken.txt").exists());
+    for (_, e) in &entries[1..] {
+        assert_eq!(r.status(e), "merged", "{e}: {}", r.field(e, "reason"));
+        assert_lane_check_covers(&r, e);
+    }
+    assert!(
+        !git(&r.p(), &["log", "--format=%s", "main"])
+            .lines()
+            .any(|l| l == "task: broken.txt"),
+        "no rebased version of the breaking commit ever reached main"
+    );
+    assert!(o.stdout.contains("lane 1 failed"), "{}", o.stdout);
+}
+
+#[test]
+fn a_failing_second_lane_merges_only_the_passing_prefix() {
+    let (r, entries) = lane_root("failing-second-lane", 2, Some(2));
+    let o = r.run(&["queue", "run", "--all"]);
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert_eq!(r.status(&entries[2].1), "check_failed");
+    for i in [0, 1, 3] {
+        assert_eq!(r.status(&entries[i].1), "merged");
+        assert_lane_check_covers(&r, &entries[i].1);
+    }
+    assert_eq!(
+        lane_entry_field(&r, &entries[0].1, "train"),
+        lane_entry_field(&r, &entries[1].1, "train")
+    );
+    assert_ne!(
+        lane_entry_field(&r, &entries[0].1, "train"),
+        lane_entry_field(&r, &entries[3].1, "train")
+    );
+    assert!(
+        o.stdout.contains("lanes 1..1 merged in one fast-forward; lane 2 failed"),
+        "{}",
+        o.stdout
+    );
+    assert!(!git(&r.p(), &["log", "--format=%s", "main"])
+        .lines()
+        .any(|l| l == "task: broken.txt"));
+}
+
+#[test]
+fn a_lane_whose_checked_worktree_changes_holds_every_speculative_successor() {
+    let (r, entries) = lane_root("entry-blocked-lane", 2, None);
+    let gate = r.dir.join("lane-hang.flag");
+    fs::write(&gate, "wait for the worktree mutation").unwrap();
+    let mut child = r.spawn(&["queue", "run", "--all"], &[]);
+    let end = Instant::now() + ceiling(120);
+    while jobs_of(&r, "check") < 2 {
+        if Instant::now() >= end {
+            kill_tree(&mut child);
+            panic!("both lane checks did not start");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::write(
+        r.wt(&entries[1].0).join("stray.txt"),
+        "not in the checked commit",
+    )
+    .unwrap();
+    fs::remove_file(gate).unwrap();
+    let code = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code().unwrap();
+        }
+        if Instant::now() >= end {
+            kill_tree(&mut child);
+            panic!("lane drain did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, 3);
+    assert_eq!(r.status(&entries[1].1), "blocked");
+    for i in [0, 2, 3] {
+        assert_eq!(
+            r.status(&entries[i].1),
+            "approved",
+            "no speculative successor merges"
+        );
+    }
+    assert_eq!(jobs_of(&r, "check"), 2, "no check of main");
+    assert!(!git(&r.p(), &["reflog", "show", "--format=%gs", "main"]).contains("Fast-forward"));
+}
+

@@ -118,6 +118,8 @@ pub struct Config {
     /// `queue run --all` merge train: the most review-PASSed entries (one project, claims that do not overlap) merged by one check, one
     /// fast-forward and one main check. 1 = off: every entry is checked, merged and main-checked on its own.
     pub merge_train_max: u64,
+    /// Concurrent stacked, claim-disjoint merge trains; 1 keeps the serial train.
+    pub merge_train_lanes: u64,
     /// `queue run --all` merge train: a project whose oldest approved entry has waited this many minutes gets a train of what it has
     /// (even 1 entry) at the next entry boundary, although entries of that project are still queued. Without it, approved entries of
     /// one project could wait behind another project's stream of entries until the drain ends (the 2026-11-20 starvation).
@@ -425,6 +427,7 @@ impl Config {
             queue_lock_wait_seconds: positive("queue_lock_wait_seconds")?,
             reviewer_max_calls_per_entry: positive("reviewer_max_calls_per_entry")?,
             merge_train_max: positive("merge_train_max")?,
+            merge_train_lanes: positive("merge_train_lanes")?,
             merge_train_wait_minutes: positive("merge_train_wait_minutes")?,
             review_parallel: positive("review_parallel")?,
             perf_gate,
@@ -629,6 +632,7 @@ redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
+merge_train_lanes = 1
 merge_train_wait_minutes = 20
 review_parallel = 1
 shadow_reviewer = \"off\"
@@ -860,6 +864,20 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn merge_train_lanes_is_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        let load = |s: &str| Config::from_text(s, Path::new("p"));
+        assert_eq!(load(text).unwrap().merge_train_lanes, 2);
+        let e = load(&without_key(text, "merge_train_lanes")).unwrap_err();
+        assert!(e.contains("merge_train_lanes") && e.contains("missing"), "{e}");
+        for bad in ["0", "-1", "\"NaN\"", "\"inf\"", "\"\"", "\"1.5\""] {
+            let changed = text.replace("merge_train_lanes = 2", &format!("merge_train_lanes = {bad}"));
+            let e = load(&changed).unwrap_err();
+            assert!(e.contains("merge_train_lanes"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
     fn merge_fast_tests_is_required_and_validated() {
         let text = include_str!("../../../broadsword.toml");
         let e = Config::from_text(&without_key(text, "merge_fast_tests"), Path::new("p")).unwrap_err();
@@ -890,6 +908,7 @@ redact_min_chars = 6
 reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
+merge_train_lanes = 1
 merge_train_wait_minutes = 20
 review_parallel = 1
 shadow_reviewer = \"off\"
