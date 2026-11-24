@@ -131,6 +131,7 @@ mod entry;
 mod locks;
 mod merge;
 mod no_rust;
+mod postcheck;
 mod rebase;
 mod review;
 mod train;
@@ -174,6 +175,8 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("merge.rs"),
     "\n",
     include_str!("no_rust.rs"),
+    "\n",
+    include_str!("postcheck.rs"),
     "\n",
     include_str!("rebase.rs"),
     "\n",
@@ -537,7 +540,8 @@ pub fn cmd_run_all(cfg: &Config, project: Option<&str>) -> ExitCode {
             break;
         }
     }
-    let worst = worst_exit(rows.iter().map(|r| r.code), stop_code);
+    let settled = postcheck::settle(cfg, &mut rows, &mut stop_code);
+    let worst = worst_exit(rows.iter().map(|r| r.code), worst_exit([stop_code].into_iter(), settled));
     if rows.is_empty() {
         println!("the queue is empty{}: nothing is queued, interrupted or stale", in_project(&lane));
     } else {
