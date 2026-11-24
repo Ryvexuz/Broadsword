@@ -175,6 +175,7 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("merge.rs"),
     "\n",
     include_str!("no_rust.rs"),
+    "\n",
     include_str!("postcheck.rs"),
     "\n",
     include_str!("rebase.rs"),
