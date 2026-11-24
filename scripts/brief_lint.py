@@ -5,6 +5,8 @@ Usage:
 
 The four limits are required flags (nothing is hard-coded here; the settings rule). The
 measured values (state/staging/selfcheck/NOTES.md) are 30, 8 and 2; the done-check cap is 10.
+Optional claim-gap limits: --min-hard-cases N, --big-file-lines N, --min-pasted-lines N.
+Each enables only its own rule; omitted limits leave R9-R11 off.
 
 Rules, each printed as `PASS` or `FAIL` per brief:
   lines     non-blank lines at most --max-lines; the first --max-done-lines lines of the done check
@@ -44,6 +46,13 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
   R7  FAIL  whole src/ or tests/ claims, at the root or under crates/<name>/.
   R8  WARN  with --root, claimed files over broadsword.toml's hotspot_lines; unreadable
             settings or files are reported as warnings.
+  R9  FAIL  with --min-hard-cases, Risk: high in Board needs that many Hard cases list items,
+            each naming a backticked snake_case test also named in the Done check.
+  R10 FAIL  with --root and --big-file-lines, an existing claimed file over that newline
+            count needs "wiring" in its own Claims bullet or a claimed (new) file.
+            New files are not counted; outside-root or unreadable paths WARN.
+  R11 FAIL  with --min-pasted-lines, a GPT Model in Board naming an outside-repo path
+            needs a Pasted or Pasted protocol section with that many non-empty body lines.
 
 Plan preflight (only with --root <repo> --preflight-ref <main branch>; `--queue-list <file>` holds
 `broadsword queue list` output). Each rule prints `FAIL preflight-Pn` with the missing list; a brief with
@@ -72,6 +81,7 @@ Exit codes: 0 every brief passes, 1 some rule failed, 2 usage error or unreadabl
 """
 import argparse
 import csv
+import io
 import os
 import pathlib
 import re
@@ -384,13 +394,19 @@ def named_paths(text):
     return out
 
 
-def claim_gaps(text, root=None, reported=None):
-    """Return [(rule, level, message)] for R1-R5; level is FAIL or WARN. Empty when clean."""
+def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_lines=None,
+               min_pasted_lines=None):
+    """Return [(rule, level, message)] for R1-R11; level is FAIL or WARN. Empty when clean."""
+    for name, value in (("min_hard_cases", min_hard_cases), ("big_file_lines", big_file_lines),
+                        ("min_pasted_lines", min_pasted_lines)):
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"{name} must be a positive integer")
     lines = text.splitlines()
     secs = split_sections(lines)
     claims = claimed_paths(lines, secs)
     req = section_text(lines, secs, {"requirements"})
     dn = section_text(lines, secs, {"done check"})
+    done_text = dn
     res = []
 
     # A command in the Done check reads and runs paths; it does not edit them.
@@ -513,6 +529,121 @@ def claim_gaps(text, root=None, reported=None):
             if hits:
                 res.append(("R5", "WARN", f"`{s}` is defined or used in unclaimed: "
                             + ", ".join(f"{f}:{n}" for f, n in hits.items())))
+    board = board_fields(lines)
+    if min_hard_cases is not None and any(
+            re.match(r"high\b", v, re.I) for v in board.get("risk", [])):
+        hard = section_text(lines, secs, {"hard cases"})
+        items = []
+        for ln in hard.splitlines():
+            if ITEM_RE.match(ln):
+                items.append(ln)
+            elif items and ln.strip():
+                items[-1] += " " + ln.strip()
+        untied = []
+        for i, item in enumerate(items, 1):
+            names = [s for s in TICKS_RE.findall(item)
+                     if re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", s)]
+            if not any(re.search(rf"(?<!\w){re.escape(n)}(?!\w)", done_text) for n in names):
+                untied.extend(names or [f"item {i} (no test name)"])
+        if len(items) < min_hard_cases or untied:
+            res.append(("R9", "FAIL", f"hard cases: need >= {min_hard_cases} items each naming "
+                        f"a test from the Done check (found {len(items)}, "
+                        f"untied: {', '.join(untied) or 'none'})"))
+    if big_file_lines is not None and root is not None:
+        res.extend(big_claim_gaps(lines, secs, root, big_file_lines))
+    if min_pasted_lines is not None and any(
+            "gpt" in v.lower() for v in board.get("model", [])):
+        outside = re.search(r"(?<![\w./\\])\.\.[/\\]\S+", text) or any(
+            any(marker in p.lower() for marker in ("stage7", "protocol"))
+            for span in TICKS_RE.findall(text) for p in claim_paths(span))
+        pasted = max((sum(bool(ln.strip()) for ln in lines[a + 1:b])
+                      for name, a, b in secs if name in {"pasted", "pasted protocol"}), default=0)
+        if outside and pasted < min_pasted_lines:
+            res.append(("R11", "FAIL", f"pasted protocol: GPT brief names an outside-repo path; "
+                        f"need >= {min_pasted_lines} non-empty Pasted lines (found {pasted})"))
+    return res
+
+
+def board_fields(lines):
+    """Read Board/Board block fields without treating its Claims bullet as a new block."""
+    fields = {}
+    active = False
+    for ln in lines:
+        sec = section_of(ln)
+        if sec and sec[0] in {"board", "board block"}:
+            active = True
+            continue
+        field = KEY_RE.match(ln.replace("**", ""))
+        if sec and not ITEM_RE.match(ln) and (
+                HEADING_RE.match(ln) or sec[0] not in {"claims", "risk", "model", "title", "project"}):
+            active = False
+        if active and field:
+            fields.setdefault(norm(field.group(1)), []).append(field.group(2).strip())
+    return fields
+
+
+def big_claim_gaps(lines, secs, root, limit):
+    """R10: keep wiring local to a claim item, and count literal newlines in existing files."""
+    blocks = claim_blocks(lines, secs)
+    items = []
+    for block in blocks:
+        current = ""
+        for ln in block.splitlines():
+            if ITEM_RE.match(ln) or not ln.startswith((" ", "\t")):
+                if current:
+                    items.append(current)
+                current = ln
+            else:
+                current += " " + ln.strip()
+        if current:
+            items.append(current)
+    paths = {}
+    new = set()
+    new_files = set()
+    for item in items:
+        named = claim_paths(item)
+        named |= {s.replace("\\", "/") for s in TICKS_RE.findall(item)
+                  if re.fullmatch(r"[\w./\\:#-]+", s)}
+        # claim_paths intentionally ignores drive letters and absolute POSIX paths for R1-R8.
+        named |= {t.replace("\\", "/") for t in re.split(r"[\s,;()\[\]`'\"]+", item)
+                  if t and (pathlib.PureWindowsPath(t).drive or t.startswith("/"))}
+        for path in named:
+            paths[path] = paths.get(path, False) or bool(re.search(r"\bwiring\b", item, re.I))
+            marker = re.search(re.escape(path) + r"[`'\"]*\s*\(\s*new\b([^)]*)\)",
+                               item.replace("\\", "/"), re.I)
+            if marker:
+                new.add(path)
+                if not path.endswith("/") and not re.search(r"\bfolder\b", marker.group(1), re.I):
+                    new_files.add(path)
+    res = []
+    try:
+        base = pathlib.Path(root).resolve()
+    except (OSError, ValueError, RuntimeError) as e:
+        return [("R10", "WARN", f"cannot resolve root: {e}")]
+    for path, wiring in sorted(paths.items()):
+        if path in new:
+            continue
+        try:
+            win = pathlib.PureWindowsPath(path)
+            target = (base / path).resolve()
+            if (win.drive and os.name != "nt") or not target.is_relative_to(base):
+                res.append(("R10", "WARN", f"cannot count claimed path outside root: {path}"))
+                continue
+            try:
+                target.stat()
+            except FileNotFoundError:
+                continue
+            if not target.is_file():
+                continue
+            with target.open("rb") as f:
+                count = sum(chunk.count(b"\n")
+                            for chunk in iter(lambda: f.read(io.DEFAULT_BUFFER_SIZE), b""))
+        except (OSError, ValueError, RuntimeError) as e:
+            res.append(("R10", "WARN", f"cannot count {path}: {e}"))
+            continue
+        if count > limit and not wiring and not new_files:
+            res.append(("R10", "FAIL", f"{path} has {count} lines (over {limit}); "
+                        "claim wiring only or a (new) file for the new module"))
     return res
 
 
@@ -713,6 +844,9 @@ def main(argv):
     p.add_argument("--max-bullets", type=positive, required=True)
     p.add_argument("--max-files", type=positive, required=True)
     p.add_argument("--max-done-lines", type=positive, required=True)
+    p.add_argument("--min-hard-cases", type=positive, help="enable R9 with this minimum item count")
+    p.add_argument("--big-file-lines", type=positive, help="enable R10 with --root and this newline limit")
+    p.add_argument("--min-pasted-lines", type=positive, help="enable R11 with this minimum body line count")
     p.add_argument("--root", default=None, help="repo to search for R5 (git grep); omit to skip R5")
     p.add_argument("--preflight-ref", default=None,
                    help="git ref (the main branch) of --root; turns on the plan preflight P0-P5")
@@ -747,7 +881,8 @@ def main(argv):
             print(f"brief_lint: cannot read {path}: {e}", file=sys.stderr)
             return 2
         res = lint(text, a.max_lines, a.max_bullets, a.max_files, a.max_done_lines)
-        gaps = claim_gaps(text, a.root, reported)
+        gaps = claim_gaps(text, a.root, reported, min_hard_cases=a.min_hard_cases,
+                          big_file_lines=a.big_file_lines, min_pasted_lines=a.min_pasted_lines)
         pre = preflight(text, a.root, a.preflight_ref, queue_text) if a.preflight_ref else []
         bad = [r for r in res if not r[1]] + [g for g in gaps if g[1] == "FAIL"] + pre
         print(f"{path}: {'ok' if not bad else str(len(bad)) + ' rule(s) failed'}")

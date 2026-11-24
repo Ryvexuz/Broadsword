@@ -14,6 +14,7 @@ import pathlib
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = pathlib.Path(os.environ.get("BRIEF_LINT_UNDER_TEST", str(HERE / "brief_lint.py")))
@@ -758,6 +759,193 @@ class Cli(unittest.TestCase):
     def test_limits_are_required_flags(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(bl.main([self.write("g.md", GOOD)]), 2)
+
+
+class OptInClaimRules(unittest.TestCase):
+    FLAGS = ["--min-hard-cases", "3", "--big-file-lines", "1000", "--min-pasted-lines", "10"]
+    NAMES = ("test_edge_one", "test_edge_two", "test_edge_three")
+
+    def text(self, risk="high", model="gpt high", count=3, heading="## Hard cases"):
+        board = f"**Board:**\n- **Risk:** {risk}\n- **Model:** {model}"
+        text = GOOD.replace("**Board:**", board)
+        items = "".join(f"{i}. check `{name}`\n"
+                        for i, name in enumerate(self.NAMES[:count], 1))
+        text = text.replace("**Requirements:**", heading + "\n" + items + "\n**Requirements:**")
+        return text.replace("1. `python -I scripts/test_a.py`",
+                            "1. `python -m unittest " + " ".join(self.NAMES) + "`")
+
+    def rules(self, text, root=None, **limits):
+        values = dict(min_hard_cases=3, big_file_lines=1000, min_pasted_lines=10)
+        values.update(limits)
+        return [g for g in bl.claim_gaps(text, root, reported=set(), **values)
+                if g[0] in {"R9", "R10", "R11"}]
+
+    def test_r9_two_items_fail(self):
+        self.assertEqual(self.rules(self.text(count=2)), [
+            ("R9", "FAIL", "hard cases: need >= 3 items each naming a test from the Done check "
+             "(found 2, untied: none)")])
+        self.assertEqual(self.rules(self.text()), [])
+
+    def test_r9_untied_item_fails(self):
+        text = self.text().replace("check `test_edge_three`", "check `test_missing`")
+        self.assertEqual(self.rules(text), [
+            ("R9", "FAIL", "hard cases: need >= 3 items each naming a test from the Done check "
+             "(found 3, untied: test_missing)")])
+        # A substring in a different test name is not a tie.
+        text = self.text().replace("unittest test_edge_one ", "unittest test_edge_one_more ")
+        self.assertIn("untied: test_edge_one)", self.rules(text)[0][2])
+
+    def test_r9_headings_case_empty_and_missing_names(self):
+        for heading in ("# Hard cases", "###### HARD CASES", "**Hard cases**"):
+            with self.subTest(heading=heading):
+                self.assertEqual(self.rules(self.text(risk="HIGH", heading=heading)), [])
+                self.assertIn("found 0", self.rules(self.text(count=0, heading=heading))[0][2])
+        text = self.text().replace("check `test_edge_two`", "check an edge")
+        self.assertIn("item 2 (no test name)", self.rules(text)[0][2])
+        self.assertIn("need >= 4", self.rules(self.text(), min_hard_cases=4)[0][2])
+        plain = self.text(count=2).replace("**Risk:**", "rIsK:")
+        self.assertEqual(self.rules(plain)[0][0], "R9")
+        no_section = self.text(count=0).replace("## Hard cases\n", "")
+        self.assertIn("found 0", self.rules(no_section)[0][2])
+        huge = no_section + "\n## Notes\n" + "prose " * io.DEFAULT_BUFFER_SIZE
+        self.assertIn("found 0", self.rules(huge)[0][2])
+
+    def test_r9_low_missing_or_outside_board_risk_is_not_checked(self):
+        for text in (self.text(risk="low", count=0),
+                     self.text(count=0).replace("- **Risk:** high\n", ""),
+                     self.text(risk="low", count=0) + "\n## Notes\n- Risk: high\n",
+                     GOOD + "\n**Requirements:**\n- Risk: high\n- Model: gpt\n`../x/a.md`\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.rules(text), [])
+
+    def root(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_r10_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "broadsword.toml").write_text("hotspot_lines = 10000\n", encoding="utf-8")
+        (root / "large.py").write_bytes(b"x\r\n" * 1200)
+        return root
+
+    def claimed(self, claim):
+        return GOOD.replace("`scripts/a.py` (new), `scripts/test_a.py` (new)", claim)
+
+    def test_r10_wiring_claim_passes(self):
+        root = self.root()
+        for word in ("wiring only", "WIRING"):
+            with self.subTest(word=word):
+                self.assertEqual(self.rules(self.claimed(f"`large.py` ({word})"), root), [])
+        self.assertEqual(self.rules(self.claimed("`large.py`"), root)[0][0], "R10")
+
+    def test_r10_big_file_without_new_module_fails(self):
+        root = self.root()
+        text = self.claimed("`large.py`")
+        self.assertEqual(self.rules(text, root), [
+            ("R10", "FAIL", "large.py has 1200 lines (over 1000); "
+             "claim wiring only or a (new) file for the new module")])
+        self.assertEqual(self.rules(text), [])  # --root is required for R10.
+        self.assertEqual(self.rules(text, root, big_file_lines=None), [])
+        self.assertEqual(self.rules(self.claimed("`large.py`, `new_module.py` (new)"), root), [])
+        self.assertEqual(self.rules(self.claimed("`large.py`, `Makefile` (new)"), root), [])
+
+    def test_r10_wiring_stays_in_own_claim_bullet(self):
+        root = self.root()
+        text = self.claimed("\n- `large.py`\n- `small.py` (wiring only)")
+        self.assertEqual(self.rules(text, root)[0][0], "R10")
+        text = self.claimed("`large.py`") + "\n## Notes\nUse wiring only.\n"
+        self.assertEqual(self.rules(text, root)[0][0], "R10")
+        self.assertEqual(self.rules(self.claimed("`large.py`, `new/` (new folder)"), root)[0][0], "R10")
+
+    def test_r10_literal_newlines_and_configurable_boundary(self):
+        root = self.root()
+        text = self.claimed("`large.py`")
+        for count in (999, 1000, 1001):
+            (root / "large.py").write_bytes(b"x\n" * count + b"unterminated")
+            result = self.rules(text, root)
+            self.assertEqual(bool(result), count > 1000, result)
+        self.assertEqual(self.rules(text, root, big_file_lines=1001), [])
+        (root / "large.py").write_bytes(b"x" * (io.DEFAULT_BUFFER_SIZE * 100) + b"\n")
+        self.assertEqual(self.rules(text, root, big_file_lines=1), [])
+
+    def test_r10_new_file_not_opened_and_unreadable_warns(self):
+        root = self.root()
+        for mark, expected in ((" (new)", []), ("", [("R10", "WARN")])):
+            text = self.claimed("`large.py`" + mark)
+            lines = text.splitlines()
+            with mock.patch.object(pathlib.Path, "open", side_effect=PermissionError("denied")) as opened:
+                result = bl.big_claim_gaps(lines, bl.split_sections(lines), root, 1000)
+            self.assertEqual([(r, lv) for r, lv, _ in result], expected)
+            self.assertEqual(opened.call_count, bool(expected))
+            if expected:
+                self.assertIn("denied", result[0][2])
+
+    def test_r10_outside_paths_warn_without_opening(self):
+        root = self.root()
+        for path in ("../outside.py", "..\\outside.py", "Z:\\outside.py", "/outside.py"):
+            text = self.claimed(f"`{path}`")
+            lines = text.splitlines()
+            with self.subTest(path=path), mock.patch.object(pathlib.Path, "open") as opened:
+                result = bl.big_claim_gaps(lines, bl.split_sections(lines), root, 1000)
+                self.assertEqual([(r, lv) for r, lv, _ in result], [("R10", "WARN")])
+                self.assertIn("outside root", result[0][2])
+                opened.assert_not_called()
+
+    def test_r11_pasted_section(self):
+        text = self.text() + "\n## Reference\nRead `../render/docs/STAGE7.md`.\n"
+        for heading in ("## Pasted", "**Pasted protocol**"):
+            for count in (3, 9, 10, 12):
+                with self.subTest(heading=heading, count=count):
+                    pasted = text + heading + "\n" + "protocol line\n\n" * count
+                    result = self.rules(pasted)
+                    self.assertEqual([(r, lv) for r, lv, _ in result],
+                                     [("R11", "FAIL")] if count < 10 else [])
+                    if count < 10:
+                        self.assertIn(f"found {count}", result[0][2])
+        self.assertEqual(self.rules(text + "## Pasted\n" + "line\n" * 10,
+                                    min_pasted_lines=12)[0][0], "R11")
+
+    def test_r11_path_triggers_and_non_gpt_exemption(self):
+        for path in ("../render/docs/readme.md", "`docs/STAGE7.md`", "`docs/PROTOCOL.txt`",
+                     "`protocol.md`", "`..\\render\\docs\\a.md`"):
+            with self.subTest(path=path):
+                text = self.text(model="GPT high") + "\n## Reference\n" + path
+                self.assertEqual(self.rules(text)[0][0], "R11")
+                self.assertEqual(self.rules(text.replace("GPT high", "opus")), [])
+                self.assertEqual(self.rules(text.replace("- **Model:** GPT high\n", "")), [])
+        self.assertEqual(self.rules(self.text() + "\n## Notes\nPROTOCOL is prose.\n"), [])
+        self.assertEqual(self.rules(self.text() + "\n## Pasted\n\n"), [])
+
+    def test_r9_r11_crlf_no_board_block(self):
+        text = GOOD.replace("**Board:**", "## Metadata")
+        text += "\n- Risk: high\n- Model: gpt\n`../render/docs/STAGE7.md`\n## Hard cases\n"
+        self.assertEqual(self.rules(text.replace("\n", "\r\n")), [])
+        self.assertEqual(self.rules(self.text().replace("\n", "\r\n")), [])
+        guarded = self.text(count=2) + "\n## Reference\n`../render/docs/STAGE7.md`\n"
+        self.assertEqual([r for r, _, _ in self.rules(guarded.replace("\n", "\r\n"))], ["R9", "R11"])
+
+    def test_new_rules_default_off_and_validate_limits(self):
+        text = self.text(count=0) + "\n## Reference\n`../render/docs/STAGE7.md`\n"
+        self.assertEqual(bl.claim_gaps(text), [])
+        for key in ("min_hard_cases", "big_file_lines", "min_pasted_lines"):
+            for value in (0, -1, True, "", float("nan"), float("inf")):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    bl.claim_gaps(text, **{key: value})
+        root = self.root()
+        p = root / "brief.md"
+        p.write_text(self.text(count=2), encoding="utf-8")
+        code, out, _ = run_cli(Cli.FLAGS + ["--min-hard-cases", "3", str(p)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL claimgap-R9", out)
+        p.write_text(self.text() + "\n## Reference\n`../a.md`\n", encoding="utf-8")
+        code, out, _ = run_cli(Cli.FLAGS + ["--min-pasted-lines", "10", str(p)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL claimgap-R11", out)
+        for flag in self.FLAGS[::2]:
+            for value in ("0", "-1", "nan", "inf", "", "1.5"):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(bl.main(Cli.FLAGS + [flag, value, str(p)]), 2)
+        p.write_text(self.claimed("`large.py`"), encoding="utf-8")
+        code, out, _ = run_cli(Cli.FLAGS + self.FLAGS + ["--root", str(root), str(p)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL claimgap-R10", out)
 
 
 if __name__ == "__main__":
