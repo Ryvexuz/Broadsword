@@ -11,7 +11,7 @@ What it does, in this order (each step fails closed with exit 2 and writes nothi
  3. Runs the test through `broadsword run <project> --task <task> -- ...` (so the disk guard, shared build folder and job log apply).
     Test name forms: `<cargo test filter>` (`cargo test --offline <filter>`), or `py:<scripts/test_x.py>::<test name>`
     (`python -I -B -m unittest discover -s <dir> -p <file> -k <name> -v`). The run counts only when it exits 0 AND reports at least one
-    test run and passed (`test result: ok. N passed` with N >= 1, or `Ran N tests` with N >= 1 and `OK`): a filter that matches nothing
+    test run and passed (`test result: ok. N passed` with N >= 1, or `Ran N tests` with N >= 1 and a bare `OK` line): a filter that matches nothing
     never passes. A failing test is recorded (ruling `not_asked`) and no model is called.
  3b. If the run passed: asks the tie-break model for a RULING through clients/openai_review.py (the existing review client: same
     daily cap, ledger and canary; its answer must come from the requested model). The prompt holds ONLY the finding, the diff and the
@@ -219,8 +219,10 @@ def test_passed(out: str, code: int) -> tuple:
     if cargo and sum(cargo) >= 1:
         return True, f"{sum(cargo)} passed"
     m = re.search(r"^Ran (\d+) tests? in ", out, re.M)
-    if m and int(m.group(1)) >= 1 and re.search(r"^OK\b", out, re.M):
+    if m and int(m.group(1)) >= 1 and re.search(r"^OK[ \t]*$", out, re.M):
         return True, f"{m.group(1)} unittest(s) OK"
+    if re.search(r"^OK[ \t]+\(", out, re.M):
+        return False, "unittest reported OK with a qualifier (skipped or expected failure): the proof test did not run as a plain pass"
     return False, "exit 0 but no test reported as run and passed (the name may match nothing)"
 
 

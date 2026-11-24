@@ -166,6 +166,18 @@ class DisputeTests(unittest.TestCase):
         self.assertEqual(rd.test_passed("Ran 0 tests in 0.000s\n\nOK\n", 0)[0], False)
         self.assertEqual(rd.test_passed("Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", 0)[0], False)
 
+    def test_skipped_or_expected_failure_is_not_a_pass(self):
+        reason = "unittest reported OK with a qualifier (skipped or expected failure): the proof test did not run as a plain pass"
+        for out in (
+            "test_x ... skipped 'no'\n\nRan 1 test in 0.001s\n\nOK (skipped=1)\n",
+            "Ran 1 test in 0.001s\n\nOK (expected failures=1)\n",
+            "Ran 2 tests in 0.1s\n\nOK (skipped=1)\n",
+            "Ran 1 test in 0.001s\n\nOK (other qualifier)\n",
+        ):
+            with self.subTest(out=out):
+                self.assertEqual(rd.test_passed(out, 0), (False, reason))
+        self.assertEqual(rd.test_passed("Ran 1 test in 0.001s\n\nOK  \n", 0)[0], True)
+
     def test_test_must_be_on_an_added_line(self):
         with self.assertRaises(rd.Refused) as c:
             self.env.go(test="some_other_test")
