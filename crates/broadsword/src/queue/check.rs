@@ -17,7 +17,7 @@ pub(super) fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<
         return Err(format!("the check of main was refused before it started, exit {code}"));
     }
     let mut info = JobInfo::default();
-    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
+    let code = job::run_job_info(cfg, JobSpec { flaky: None, kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
     let job_id = info.id.clone().unwrap_or_else(|| "none".into());
     if code != 0 {
         return Err(format!("exit {code}, job {job_id}: {}", info.summary.join("; ")));
@@ -115,7 +115,7 @@ fn fast_plan(project: &str, tests: &[String], metadata: Result<String, String>) 
 /// reviewer can read a subset as the full suite. The main check after a merge never comes through here: it is always the full
 /// `check` (`s_main_check`).
 fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInfo) -> (u8, String) {
-    let full = |info: &mut JobInfo| job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+    let full = |info: &mut JobInfo| job::run_job_info(cfg, JobSpec { flaky: crate::flake::for_check(cfg, project, None), kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
     let Some(tests) = cfg.merge_fast_subset(project) else {
         return (full(info), "check: full".to_string());
     };
@@ -136,7 +136,7 @@ fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInf
         }
         FastPlan::Subset(command) => {
             println!("fast subset check of {project} --task {task_id} (merge_fast_tests): {command}; the full check runs on main after the merge");
-            let code = job::run_job_info(cfg, JobSpec { kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
+            let code = job::run_job_info(cfg, JobSpec { flaky: None, kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
             let failed = code != 0 && info.summary.first().is_some_and(|l| l.starts_with("run: FAILED"));
             let label = format!("check: fast subset ({}) = `{command}`, NOT the full suite: the full check runs on main right after the merge, and a failure there is reverted", tests.join(" "));
             (if failed { 1 } else { code }, label)

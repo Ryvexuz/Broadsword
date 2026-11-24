@@ -41,8 +41,9 @@ pub(super) fn enabled(cfg: &Config, project: &str) -> bool {
         && matches!(baseline.try_exists(), Ok(false))
 }
 
-pub(super) fn check_spec(project: &str) -> JobSpec {
+pub(super) fn check_spec(project: &str, flaky: Option<crate::flake::Entries>) -> JobSpec {
     JobSpec {
+        flaky,
         kind: "check".into(),
         name: project.to_string(),
         command: None,
@@ -53,9 +54,9 @@ pub(super) fn check_spec(project: &str) -> JobSpec {
     }
 }
 
-fn run_check(cfg: &Config, project: &str) -> (u8, JobInfo) {
+fn run_check(cfg: &Config, project: &str, flaky: Option<crate::flake::Entries>) -> (u8, JobInfo) {
     let mut info = JobInfo::default();
-    let code = job::run_job_info(cfg, check_spec(project), &mut info);
+    let code = job::run_job_info(cfg, check_spec(project, flaky), &mut info);
     (code, info)
 }
 
@@ -113,11 +114,12 @@ fn start_slot(
         return finish(cfg, train, members, Err(c), rows, worst);
     }
     let project = last.e.get("project").to_string();
+    let flaky = crate::flake::for_check(cfg, &project, Some(last.e.get("pre_merge_sha")));
     let trunk = last.e.get("main_branch").to_string();
     let owned_cfg = cfg.clone();
     let owned_project = project.clone();
     let check = match std::thread::Builder::new()
-        .spawn(move || run_check(&owned_cfg, &owned_project))
+        .spawn(move || run_check(&owned_cfg, &owned_project, flaky))
     {
         Ok(h) => h,
         Err(e) => {

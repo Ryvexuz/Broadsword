@@ -1,4 +1,5 @@
 use super::*;
+mod flakerun;
 
 // ---- the test step: compile under the lock, test from copies ------------------------------
 
@@ -165,6 +166,7 @@ pub(super) type FailLine = Box<dyn Fn(&str) -> String>;
 
 /// One child the shared pool runs (a copied test executable or a Python test script).
 pub(super) struct PoolItem {
+    pub(super) flaky_target: Option<String>,
     /// The `     Running ...` line printed before its output.
     pub(super) title: String,
     pub(super) cmd: Command,
@@ -213,6 +215,8 @@ pub(super) fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, 
 
 /// The test step's context: everything `run_child` needs, borrowed from the job.
 pub(super) struct TestStep<'a> {
+    pub(super) flaky: Option<&'a crate::flake::Entries>,
+    pub(super) flake_report: &'a mut crate::flake::Report,
     pub(super) cfg: &'a Config,
     pub(super) priority: crate::lock::Priority,
     pub(super) job_id: &'a str,
@@ -291,7 +295,8 @@ impl TestStep<'_> {
                 let _ = writeln!(f, "{line}");
             }
         }
-        // 3. run the copies, in cargo's order; a failure stops the step with cargo's exit code (and, as in cargo, no doc-test
+        self.flaky_absent(&copied);
+        // 3. run the copies, in cargo's order; an unrecovered failure stops the step (and, as in cargo, no doc-test
         // runs after a failure). Side by side (parallel > 1), the Python tests run in the same pool, after the copies.
         let (result, side_py) = if self.parallel > 1 {
             match self.run_side_by_side(&copied, scripts, &mut kept) {
@@ -418,7 +423,14 @@ impl TestStep<'_> {
         for c in copied {
             self.note(&format!("     Running {} ({})", c.art.src_path, c.copy.display()));
             let cmd = self.command_for(c);
-            let r = self.child(cmd)?;
+            let mut r = self.child(cmd)?;
+            self.flaky_output(&rerun_arg(&c.art), &r.stdout);
+            if matches!(r.outcome, Outcome::Exited(code) if code != Some(0)) {
+                if let Some((outcome, stdout)) = self.flaky_rerun(c, &r.stdout)? {
+                    r.outcome = outcome;
+                    r.stdout = stdout;
+                }
+            }
             kept.push_str(&r.stdout);
             match r.outcome {
                 Outcome::Exited(Some(0)) => {}
@@ -441,6 +453,7 @@ impl TestStep<'_> {
         for c in copied {
             let (rerun, src) = (rerun_arg(&c.art), c.art.src_path.clone());
             items.push(PoolItem {
+                flaky_target: Some(rerun.clone()),
                 title: format!("     Running {} ({})", c.art.src_path, c.copy.display()),
                 cmd: self.command_for(c),
                 fail_line: Box::new(move |why| format!("error: test failed, to rerun pass `{rerun}` ({why}, {src})")),
@@ -459,6 +472,7 @@ impl TestStep<'_> {
             for s in scripts {
                 let shown = format!("{PYTHON} -I -B {s}");
                 items.push(PoolItem {
+                    flaky_target: None,
                     title: format!("     Running {shown}"),
                     cmd: python_command(self.cfg, self.project_dir, s),
                     fail_line: Box::new(move |why| format!("error: python test failed: `{shown}` ({why})")),
@@ -473,6 +487,9 @@ impl TestStep<'_> {
         };
         let (cargo, python) = ran.split_at(copied.len());
         if cargo.iter().any(|f| f.as_ref().is_none_or(|f| f.code != Some(0))) {
+            if self.flaky.is_some() {
+                self.flaky_none("test_parallel_binaries is above 1");
+            }
             return Ok((Outcome::Exited(Some(101)), py));
         }
         if let PyTests::Ok { secs, .. } = &mut py {
@@ -563,7 +580,7 @@ impl TestStep<'_> {
         self.note(&format!("broadsword: running {n} test child(ren), up to {width} at once ({setting})"));
         let start = Instant::now();
         let mut items: Vec<Option<PoolItem>> = items.into_iter().map(Some).collect();
-        let mut lines: Vec<(String, FailLine, bool)> = Vec::with_capacity(n);
+        let mut lines: Vec<(String, FailLine, bool, Option<String>)> = Vec::with_capacity(n);
         let mut live: Vec<Live> = Vec::new();
         let mut draining: Vec<Draining> = Vec::new();
         let wait = Duration::from_secs(self.cfg.test_output_wait_seconds);
@@ -575,7 +592,11 @@ impl TestStep<'_> {
             // start what the width allows; after a failure nothing new starts
             let mut changed = false;
             while !failed && next < n && live.len() < width {
-                let PoolItem { title, mut cmd, fail_line, counts } = items[next].take().expect("each item starts once");
+                let Some(PoolItem { title, mut cmd, fail_line, counts, flaky_target }) = items[next].take() else {
+                    kill_all(&mut live, &mut draining);
+                    (self.on_live)(&[]);
+                    return Err("test pool item was already started".into());
+                };
                 let spawned = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
                 let mut child = match spawned {
                     Ok(c) => c,
@@ -588,7 +609,7 @@ impl TestStep<'_> {
                 let (out, err): (Buf, Buf) = (Arc::new(Mutex::new(Some(Vec::new()))), Arc::new(Mutex::new(Some(Vec::new()))));
                 let readers = vec![reader(child.stdout.take().expect("piped"), Arc::clone(&out)), reader(child.stderr.take().expect("piped"), Arc::clone(&err))];
                 live.push(Live { idx: next, child, out, err, readers, from: start.elapsed().as_secs_f64() });
-                lines.push((title, fail_line, counts));
+                lines.push((title, fail_line, counts, flaky_target));
                 next += 1;
                 changed = true;
             }
@@ -679,8 +700,11 @@ impl TestStep<'_> {
     }
 
     /// Print one finished pool child: its `Running` line with its time, its stdout and stderr whole, and its failure line.
-    fn print_one(&self, line: &(String, FailLine, bool), f: Option<&Finished>, out: &str, err: &str, kept: &mut String) {
-        let (title, fail_line, counts) = line;
+    fn print_one(&mut self, line: &(String, FailLine, bool, Option<String>), f: Option<&Finished>, out: &str, err: &str, kept: &mut String) {
+        let (title, fail_line, counts, flaky_target) = line;
+        if let Some(target) = flaky_target {
+            self.flaky_output(target, out);
+        }
         let secs = f.map(|f| f.to - f.from).unwrap_or(0.0);
         self.note(&format!("{title} [{secs:.1} s]"));
         print!("{out}");
