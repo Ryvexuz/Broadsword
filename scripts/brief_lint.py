@@ -344,7 +344,7 @@ def hot_claims(lines, secs, reported=()):
             tok = tok.strip().rstrip(".:").replace("\\", "/")
             base, sep, _ = tok.partition("#")
             if (base in HOT and not (sep and HOT[base])) or (
-                    base not in HOT and base in reported and not sep):
+                    base not in HOT and base in reported):
                 hot.add(base)
     return sorted(hot)
 

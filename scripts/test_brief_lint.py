@@ -316,7 +316,10 @@ class ReportClaimRules(unittest.TestCase):
                 for extra in ("Split first: t-20261123-224420\n",
                               HotFileRule.REASON + "\n"):
                     self.assertEqual(self.check("`scripts/large.py`", extra), [])
-                self.assertEqual(self.check("`scripts/large.py#key`"), [])
+                self.assertIn(("R6", "FAIL"),
+                              {(r, lv) for r, lv, _ in self.check("`scripts/large.py#key`")})
+                self.assertEqual(self.check("`scripts/large.py#key`",
+                                            "Split first: t-20261123-224420\n"), [])
         self.report([("scripts/large.py", "")])
         self.assertEqual(self.check("`scripts/large.py`"), [])
 
