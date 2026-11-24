@@ -251,13 +251,14 @@ def check(root, capability, roadmap):
 PLAN_SECTIONS = 8
 HEADING_RE = re.compile(r"^#{2,3}\s+(\d+)[.):]?\s")
 CHECK_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*check\s+\S+")
-NONE_RE = re.compile(r"^\W*none\b", re.I)
+NONE_RE = re.compile(r"^\W*(?:none\b|no\s+(?:open\s+)?decisions?\b)", re.I)
 
 
 def plan_info(text):
     """(check_count, sections_present, section4_has_decision) for one docs/nodes/<n>.md text.
     A section is present when a '##' or '###' heading starts with its number 1 to 8. A check is a fenced block whose info
-    string is `check <id>`. Section 4 lists a decision for Lazlo when its body mentions Lazlo and is not just 'none'."""
+    string is `check <id>`. Section 4 lists a decision for Lazlo when its body mentions Lazlo and does not start with
+    'none' or 'no [open] decision(s)'."""
     lines = text.splitlines()
     checks = sum(1 for l in lines if CHECK_FENCE_RE.match(l))
     present, bodies, current, in_fence = set(), {}, None, False

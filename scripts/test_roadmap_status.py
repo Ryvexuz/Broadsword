@@ -8,6 +8,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import os
+import importlib.util
 import pathlib
 import re
 import subprocess
@@ -17,6 +18,9 @@ import unittest
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = HERE / "roadmap_status.py"
 REAL_ROOT = HERE.parent
+_spec = importlib.util.spec_from_file_location("_roadmap_under_test", SCRIPT)
+rs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rs)
 
 CAP = """# Cap
 
@@ -256,6 +260,16 @@ class T(unittest.TestCase):
     FULL_PLAN = "# Plan\n\n" + "".join(
         f"## {i}. Section {i}\n\n" + ("```check c1\nbroadsword test x\nPASS: ok\n```\n\n```check c2\ncmd\nPASS: ok\n```\n\n" if i == 1 else "")
         + ("Crate foo: a decision for Lazlo.\n\n" if i == 4 else "text\n\n") for i in range(1, 9))
+
+    def test_no_decisions_wording_is_not_a_decision(self):
+        for body, expected in (
+            ("No decisions needed from Lazlo.", False),
+            ("No open decisions for Lazlo.", False),
+            ("Lazlo decides D7.", True),
+        ):
+            with self.subTest(body=body):
+                _, _, decision = rs.plan_info(f"## 4. External needs\n\n{body}\n")
+                self.assertEqual(decision, expected)
 
     def test_plans_none_exist(self):
         code, out = self.run_plans({})

@@ -79,6 +79,21 @@ class ModelRows(unittest.TestCase):
 
 
 class Completion(unittest.TestCase):
+    def test_fix_rounds_count_only_entries_after_a_rejection(self):
+        for statuses, expected in (
+            (("check_failed", "rejected", "merged"), 1),
+            (("rejected", "rejected", "merged"), 2),
+            (("perf_failed", "merged_check_failed", "conflict", "cancelled", "merged"), 0),
+        ):
+            with self.subTest(statuses=statuses):
+                entries = [entry(f"q-{i:04d}", "t1", status=status, created=str(100 - i))
+                           for i, status in enumerate(statuses, 1)]
+                r = self.costs([task("t1")], list(reversed(entries)), [])["t1"]
+                self.assertEqual(r["rounds"], len(statuses))
+                self.assertEqual(r["fix_rounds"], expected)
+                out = self.completion_text([task("t1")], entries, [])
+                self.assertRegex(out, rf"fix rounds\s+{expected} / {expected}")
+
     def costs(self, tasks, entries, runs, verdicts=()):
         by = {}
         for e in entries:

@@ -132,12 +132,12 @@ def count_in(root, rev, needle, timeout):
 
 
 def added_date(root, raw, timeout):
-    """UTC date of the newest commit that introduced this row's `| Since | Change |` prefix (more occurrences than its
+    """UTC committer date of the newest commit that introduced this row's `| Since | Change |` prefix (more occurrences than its
     parent had), so a row removed and later re-added is dated by the re-add. Today if HEAD does not hold it (not committed)."""
     s = raw.strip()
     cut = [m.start() for m in re.finditer(r"\|", s)]
     needle = s[: cut[2] + 1] if len(cut) > 2 else s
-    res = git_out(root, ["log", "--format=%at %H", "-S", needle, "--", "RETRO.md"], timeout)
+    res = git_out(root, ["log", "--format=%ct %H", "-S", needle, "--", "RETRO.md"], timeout)
     if res.returncode != 0:
         raise ValueError(f"git log -S in {root}: {res.stderr.decode('utf-8', 'replace').strip()[:300]}")
     today = dt.datetime.now(dt.timezone.utc).date()

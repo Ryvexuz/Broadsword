@@ -8,6 +8,7 @@ sys.dont_write_bytecode = True
 
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -43,10 +44,12 @@ class Repo:
         self.git("add", "broadsword.toml")
         self.commit("init", today() - dt.timedelta(days=30))
 
-    def git(self, *args, date=None):
+    def git(self, *args, date=None, committer_date=None):
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
         if date:
             env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"{date.isoformat()}T12:00:00Z"
+        if committer_date:
+            env["GIT_COMMITTER_DATE"] = f"{committer_date.isoformat()}T12:00:00Z"
         subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True, env=env)
 
     def commit(self, msg, date):
@@ -79,6 +82,16 @@ def row(since, change, status):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_row_is_dated_by_commit_date_not_author_date(self):
+        raw = row("S5", "Commit date", "open, before: pre after: post-better")
+        self.r.retro([raw])
+        self.r.git("add", "RETRO.md")
+        self.r.git("commit", "-qm", "retro", date=dt.date(2026, 11, 1), committer_date=dt.date(2026, 11, 10))
+        spec = importlib.util.spec_from_file_location("_ledger_under_test", HERE / "ledger_check.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.added_date(self.r.root, raw, mod.GIT_TIMEOUT), dt.date(2026, 11, 10))
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.r = Repo(self._tmp.name)

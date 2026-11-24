@@ -32,7 +32,7 @@ Cost to completion (per coder model, over the tasks in range): everything a task
   is left out of that median. Printed as "coder $", "review $" and "total $": coder $ is summed from an optional cost_usd column of agent-runs.tsv (not recorded today, so
   it shows "-", unknown, and total $ is then not shown, never review $ alone or $0); Codex (shadow) tokens are plan
   allowance, shown as tokens, never as $0. Also per coder: first-pass PASS rate under the gating reviewer, BLOCKING lines
-  per first review split by the adjudicated verdict in state/shadow-verdicts.tsv, and fix rounds (rounds - 1).
+  per first review split by the adjudicated verdict in state/shadow-verdicts.tsv, and fix rounds (entries after a rejected one).
 Reusable by other scripts: model_rows() (per model and role: runs, seconds, tokens, $; coder use = role "coder" seconds
   / window), read_runs(), task_costs().
 """
@@ -343,7 +343,9 @@ def task_costs(tasks, entries_by_task, runs, verdicts):
         first = next((e for e in es if e.get("verdict")), None)
         fid = str(first.get("id", "")).strip().lower() if first else None
         adj = [v for v in verdicts if first and str(v.get("entry", "")).strip().lower() == fid]  # case and spaces never hide an adjudication
-        out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "coder_runs": len(coder_rs),
+        ordered = sorted(es, key=lambda e: e["id"])
+        fix_rounds = sum(previous.get("status") == "rejected" for previous in ordered[:-1])
+        out.append({"id": tid, "model": model, "state": state, "rounds": len(es), "fix_rounds": fix_rounds, "coder_runs": len(coder_rs),
                     "wall": (ended - (started or created)) if ended and (started or created) else None,
                     "claude": claude, "openai": openai, "usd": usd, "usd_unknown": usd_unknown, "coder_usd": coder_usd,
                     "first_reviewer": first.get("reviewer_model") if first else None,
@@ -424,7 +426,7 @@ def completion(tasks, entries, runs):
                 for v in r["first_adjudicated"]:
                     split[v] = split.get(v, 0) + 1
             print(f"  BLOCKING, 1st review under {reviewer}  {lines} in {len(firsts)} reviews; adjudicated {dict(sorted(split.items())) or 'none'}, not adjudicated {max(lines - sum(split.values()), 0)}")
-        m, w = stats([r["rounds"] - 1 for r in done if r["rounds"]])
+        m, w = stats([r["fix_rounds"] for r in done if r["rounds"]])
         print(f"  fix rounds          {fmt(m, g)} / {fmt(w)}")
 
 
