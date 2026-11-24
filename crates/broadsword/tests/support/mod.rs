@@ -19,6 +19,7 @@ pub fn bin() -> &'static str {
 /// Every key of `broadsword.toml` with the value the tests use, as raw TOML (strings keep their quotes). A new required setting
 /// is added HERE, once, and every test root gets it.
 const BASE: &[(&str, &str)] = &[
+    ("flaky_tests_file", "\"\""),
     ("root", "\".\""),
     ("disk_floor_gb", "1"),
     ("cleanup_every_hours", "1"),

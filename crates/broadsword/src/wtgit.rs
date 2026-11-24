@@ -78,6 +78,28 @@ pub fn head_commit(dir: &Path) -> Result<String, String> {
     ok(dir, &["rev-parse", "HEAD"])
 }
 
+/// Read a committed blob without filters, never a working file or an enclosing repository.
+pub fn file_at(dir: &Path, rev: &str, path: &str) -> Result<Option<String>, String> {
+    if norm(&ok(dir, &["rev-parse", "--show-toplevel"])?) != norm(&dir.to_string_lossy()) {
+        return Err("the configured root is not its repository's top level".into());
+    }
+    check_list_path(path)?;
+    if rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid blob revision (expected a commit id)".into());
+    }
+    if ok(dir, &["ls-tree", "--name-only", rev, "--", path])?.is_empty() {
+        return Ok(None);
+    }
+    let o = crate::scrub::command_in(dir, "git")?
+        .args(["cat-file", "blob", &format!("{rev}:{path}")])
+        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null()).output().map_err(|e| format!("git cat-file: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("git cat-file failed: {}", String::from_utf8_lossy(&o.stderr)));
+    }
+    String::from_utf8(o.stdout).map(Some).map_err(|e| format!("blob is not UTF-8: {e}"))
+}
+
 /// The branch names a project's trunk may have. The trunk is the one of these that exists in the project's repo.
 pub const TRUNK_NAMES: [&str; 2] = ["main", "master"];
 
@@ -719,6 +741,18 @@ pub fn commit_file(main_dir: &Path, msg_file: &Path) -> Result<(), String> {
 pub fn commit_subjects(dir: &Path, range: &str) -> Result<Vec<(String, String)>, String> {
     let out = ok(dir, &["log", "--format=%H %s", range])?;
     Ok(out.lines().filter_map(|l| l.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())).or_else(|| (!l.is_empty()).then(|| (l.to_string(), String::new())))).collect())
+}
+
+/// `flaky_tests_file`: "" (off) or a relative path with only plain components. Here, not in flake.rs, so the
+/// #[path]-included test crate tests/wtgit.rs (config.rs + wtgit.rs) builds.
+pub fn check_list_path(path: &str) -> Result<String, String> {
+    if !path.is_empty()
+        && (path.contains(['\\', ':']) || path.chars().any(char::is_control)
+            || path.split('/').any(|p| p.is_empty() || p == "." || p == ".."))
+    {
+        return Err("flaky_tests_file: must be a relative path with only plain components (no root, drive, backslash or `..`)".into());
+    }
+    Ok(path.to_string())
 }
 
 #[cfg(test)]

@@ -182,6 +182,7 @@ pub struct Config {
     pub done_check_tail_lines: u64,
     /// The test step runs up to this many copied test executables (and Python test scripts) at once; 1 = one after another.
     pub test_parallel_binaries: u64,
+    pub flaky_tests_file: String,
     /// Side by side, a test child that has exited has its output pipes waited for at most this many seconds (a process it
     /// started may hold them open); then its output is printed as far as it got, marked TRUNCATED. Never blocks the pool.
     pub test_output_wait_seconds: u64,
@@ -446,6 +447,7 @@ impl Config {
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
             test_parallel_binaries: positive("test_parallel_binaries")?,
+            flaky_tests_file: crate::wtgit::check_list_path(&get_str(&m, "flaky_tests_file")?)?,
             test_output_wait_seconds: positive("test_output_wait_seconds")?,
             recover_lock_wait_seconds: positive("recover_lock_wait_seconds")?,
             sweep_older_than_days: positive("sweep_older_than_days")?,
@@ -659,6 +661,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+flaky_tests_file = \"\"
 python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500
@@ -950,6 +953,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+flaky_tests_file = \"\"
 python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500
@@ -1014,6 +1018,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+flaky_tests_file = \"\"
 python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500

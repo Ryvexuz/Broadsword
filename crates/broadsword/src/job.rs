@@ -481,6 +481,7 @@ pub fn steps_for(kind: &str) -> &'static [&'static str] {
 }
 
 pub struct JobSpec {
+    pub flaky: Option<crate::flake::Entries>,
     pub kind: String,
     pub name: String,
     /// Command line, for kind `run` only.
@@ -521,11 +522,11 @@ fn end(rec: &mut Record, status: &str, code: u8) -> u8 {
 }
 
 pub fn cmd_job(cfg: &Config, kind: &str, name: &str, task: Option<&str>) -> ExitCode {
-    run_job(cfg, JobSpec { kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
+    run_job(cfg, JobSpec { flaky: None, kind: kind.into(), name: name.into(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
 }
 
 pub fn cmd_run(cfg: &Config, name: &str, task: Option<&str>, command: &[&str]) -> ExitCode {
-    run_job(cfg, JobSpec { kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
+    run_job(cfg, JobSpec { flaky: None, kind: "run".into(), name: name.into(), command: Some(command.join(" ")), first_step: 0, resumed_from: None, resume_count: 0, task: task.map(String::from) })
 }
 
 /// The folder a job runs in: the project's main checkout, or (`--task`) the task's worktree. `Err` is the exit code and the
@@ -887,9 +888,12 @@ fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: boo
             }
         };
         let mut py: Option<PyTests> = None;
+        let mut flake_report = crate::flake::Report::default();
         let ran = if *step == "test" && kind != "run" {
             let parallel = cfg.test_parallel_binaries as usize;
             let mut t = TestStep {
+                flaky: spec.flaky.as_ref(),
+                flake_report: &mut flake_report,
                 cfg,
                 priority,
                 job_id: &job_id,
@@ -917,6 +921,7 @@ fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: boo
         } else {
             run_child(cfg, cmd, &log, &mut *free_src, poll, &mut |pid| on_live(&[pid]), &secrets)
         };
+        let _ = flake_report.record(String::new(), &mut rec);
         let run = match ran {
             Ok(r) => r,
             Err(e) => {
@@ -957,7 +962,7 @@ fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: boo
             }
             None => (line, ok),
         };
-        summary.push(line);
+        summary.push(flake_report.record(line, &mut rec));
         if !ok {
             all_ok = false;
             break; // check never tests a failed build
