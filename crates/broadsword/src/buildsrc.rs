@@ -698,7 +698,9 @@ mod tests {
         let (parent_code, _) = parent.split_once(marker).expect("buildsrc.rs has its inline test module");
         let child = include_str!("buildsrc/packages.rs").replace("\r\n", "\n");
         assert!(!child.contains(marker), "packages.rs has no inline test module, so all of it is code");
-        let code = [parent_code, child.as_str()].concat();
+        let prepare = include_str!("buildsrc/prepare_step.rs").replace("\r\n", "\n");
+        assert!(!prepare.contains(marker), "prepare_step.rs has no inline test module, so all of it is code");
+        let code = [parent_code, child.as_str(), prepare.as_str()].concat();
         assert_eq!(code.matches(".arg(\"clean\")").count(), 1);
         assert_eq!(code.matches("\"clean\"").count(), 1);
     }
