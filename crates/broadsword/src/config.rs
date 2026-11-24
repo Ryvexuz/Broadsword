@@ -139,8 +139,6 @@ pub struct Config {
     /// revert`, new commits, never a reset), checks main again, and holds the project's lane (`state/queue/hold-<project>`) when the
     /// revert or that check fails. `"off"`: the failure is reported and nothing is reverted, as before.
     pub queue_auto_revert: bool,
-    /// Background train main check; the next fast-forward and the drain's end wait for its result.
-    pub queue_main_check_async: bool,
     /// The merge queue's PRE-merge check for the projects named here is a fast safety subset, ONE `run` job: `cargo build --offline &&
     /// cargo test --offline [--lib] [--bins] --test <name> ...` (queue.rs `pre_merge_check`); the main check after the merge stays the full
     /// `check`. Parsed from the required key `merge_fast_tests` by `parse_merge_fast_tests` and checked by `check_merge_fast_tests`;
@@ -398,11 +396,6 @@ impl Config {
             "off" => false,
             other => return Err(format!("queue_auto_revert = \"{other}\": must be \"on\" or \"off\"")),
         };
-        let queue_main_check_async = match get_str(&m, "queue_main_check_async")?.as_str() {
-            "on" => true,
-            "off" => false,
-            other => return Err(format!("queue_main_check_async = \"{other}\": must be \"on\" or \"off\"")),
-        };
         let shadow_reviewer = get_str(&m, "shadow_reviewer")?;
         if shadow_reviewer != "openai" && shadow_reviewer != "off" {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
@@ -441,7 +434,6 @@ impl Config {
             perf_runs: positive("perf_runs")?,
             queue_per_project,
             queue_auto_revert,
-            queue_main_check_async,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -653,7 +645,6 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
-queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
@@ -775,20 +766,6 @@ install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&with("queue_per_project = \"on\""), Path::new("p")).unwrap().queue_per_project);
         for bad in ["queue_per_project = true", "queue_per_project = \"yes\"", "queue_per_project = \"\"", "queue_per_project = 1"] {
             assert!(Config::from_text(&with(bad), Path::new("p")).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn queue_main_check_async_is_required_and_validated() {
-        let text = include_str!("../../../broadsword.toml");
-        let e = Config::from_text(&without_key(text, "queue_main_check_async"), Path::new("p")).unwrap_err();
-        assert!(e.contains("queue_main_check_async") && e.contains("missing"), "{e}");
-        for value in ["maybe", "", "ON", "on\\r", "off\\n"] {
-            let e = Config::from_text(&real_toml_with(&[("queue_main_check_async", value)]), Path::new("p")).unwrap_err();
-            assert!(e.contains("queue_main_check_async"), "{e}");
-        }
-        for (value, expected) in [("on", true), ("off", false)] {
-            assert_eq!(Config::from_text(&real_toml_with(&[("queue_main_check_async", value)]), Path::new("p")).unwrap().queue_main_check_async, expected);
         }
     }
 
@@ -944,7 +921,6 @@ perf_gate = \"on\"
 perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
-queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
@@ -1009,7 +985,6 @@ perf_runs = 5
 queue_per_project = \"off\"
 queue_auto_revert = \"on\"
 merge_fast_tests = \"\"
-queue_main_check_async = \"off\"
 python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40

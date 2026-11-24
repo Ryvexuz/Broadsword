@@ -153,14 +153,6 @@ impl<'a> Run<'a> {
     // -- step 6: main check -----------------------------------------------------------------
 
     fn s_main_check(&mut self) -> R<()> {
-        self.prepare_main_check()?;
-        let mut info = JobInfo::default();
-        let spec: JobSpec = super::postcheck::check_spec(self.e.get("project"));
-        let code = job::run_job_info(self.cfg, spec, &mut info);
-        self.judge_main_check(code, info)
-    }
-
-    pub(super) fn prepare_main_check(&mut self) -> R<()> {
         self.set_step("main_check")?;
         let project = self.e.get("project").to_string();
         let sha = self.e.get("main_sha").to_string();
@@ -181,14 +173,8 @@ impl<'a> Run<'a> {
             return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("the check was refused before it started, exit {code}"), ""), EXIT_MERGED_BAD));
         }
         println!("queue entry {}: check {project} (the main checkout, on its trunk `{mb}`)", self.e.id());
-        Ok(())
-    }
-
-    pub(super) fn judge_main_check(&mut self, code: u8, info: JobInfo) -> R<()> {
-        let (project, sha, mb) = (self.e.get("project"), self.e.get("main_sha"), self.e.get("main_branch"));
-        let loud = |code: String, extra: &str| {
-            format!("commit {sha} is ALREADY on `{mb}` of project `{project}`, and `check {project}` there did not pass ({code}){extra}. Main was NOT reset or reverted. A human decides: fix forward, or `git revert` the commit. The task was NOT marked done and its worktree is kept")
-        };
+        let mut info = JobInfo::default();
+        let code = job::run_job_info(self.cfg, JobSpec { kind: "check".into(), name: project.clone(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
         if code != 0 {
             let extra = if info.summary.is_empty() { String::new() } else { format!(": {}", info.summary.join("; ")) };
             let job_id = info.id.clone().unwrap_or_else(|| "none".into());
@@ -359,10 +345,9 @@ pub(super) fn trunk_name(dir: &Path) -> String {
 /// merged. Returns 0, EXIT_ERROR (internal), or EXIT_MERGED_BAD (the main check failed after the fast-forward: loud, main not reset).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>, std::time::Instant)>, tip: &str, head: &str, pass: &PassInfo, rows: &mut Vec<Row>, worst: &mut u8) -> u8 {
-    let settled = super::postcheck::settle(cfg, rows, worst);
     let n = members.len();
     if n == 0 {
-        return settled;
+        return 0;
     }
     let dir = members[0].0.dir.clone();
     let trunk = members[0].0.e.get("main_branch").to_string();
@@ -374,7 +359,7 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
                 let c = r.leave_train(BLOCKED, &format!("{m}; merge train {train_id} merged nothing"), EXIT_RETRY);
                 finish_member(cfg, r, code_num(c), t, rows, worst);
             }
-            return settled;
+            return 0;
         }
     };
     if now != head {
@@ -383,18 +368,18 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
             let c = r.leave_train(STALE, &format!("main moved from {} to {} while merge train {train_id} was being checked; nothing was merged. Run `queue run --entry {id}` to rebase again", short(head), short(&now)), EXIT_RETRY);
             finish_member(cfg, r, code_num(c), t, rows, worst);
         }
-        return settled;
+        return 0;
     }
     let dirty = match wtgit::status_porcelain_plain(&dir) {
         Ok(d) => d,
-        Err(m) => return super::postcheck::barrier_error(cfg, members, &m, rows, worst, settled),
+        Err(m) => return fail_members(cfg, members, &m, rows, worst),
     };
     if !dirty.is_empty() {
         for (mut r, t) in members {
             let c = r.leave_train(BLOCKED, &format!("the main checkout got uncommitted or untracked changes while merge train {train_id} was checked ({}); nothing merged", some(&dirty)), EXIT_RETRY);
             finish_member(cfg, r, code_num(c), t, rows, worst);
         }
-        return settled;
+        return 0;
     }
     // BEFORE the fast-forward: every member records step `merge`, so a drain killed from here on leaves each one a half-finished
     // merge (`half_merged`) that the next run resumes at its step, never one that is chained into a new train while its commits may
@@ -404,10 +389,7 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
             let c = r.leave_train(BLOCKED, &format!("lane {} held: {why}; merge train {train_id} merged nothing. Clear with a passing check of main, then queue run", r.e.get("project")), EXIT_RETRY);
             finish_member(cfg, r, code_num(c), t, rows, worst);
         }
-        return settled;
-    }
-    if settled != 0 {
-        return super::postcheck::stop_members(cfg, members, rows, worst, settled);
+        return 0;
     }
     let mut members = members;
     for (r, _) in members.iter_mut() {
@@ -459,9 +441,6 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
         let _ = r.log("merge", &format!("merge train {train_id}, position {} of {n}: main fast-forwarded {} -> {} (the train tip, checked by job {}); reviewed through CLI {}", i + 1, short(head), short(tip), if pass.job.is_empty() { "?" } else { pass.job.as_str() }, if cli.is_empty() { "(none recorded)" } else { cli.as_str() }));
     }
     println!("merge train {train_id}: main fast-forwarded {} -> {} ({n} entr{}, one check, one fast-forward)", short(head), short(tip), if n == 1 { "y" } else { "ies" });
-    if super::postcheck::enabled(cfg, members[0].0.e.get("project")) {
-        return super::postcheck::start(cfg, train_id, members, tip, rows, worst);
-    }
     // TP2 SEAM: tp2 (main == checked commit -> only a build on main) is not merged at this base, so this ONE main check is the full
     // `check` of main, run by the last entry (its commit is the tip); the others record that it covers them.
     if let Err(c) = members[last].0.s_main_check() {
