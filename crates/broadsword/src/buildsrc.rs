@@ -229,10 +229,9 @@ use mainbins::{keep_mains_sharing_exe_paths, mains_with_packages, PackageBins};
 use mainbins::keep_main_bins;
 
 mod prepare_step;
-pub use prepare_step::{
-    package_name_in, prepare, prepare_for_run, unlisted_markers, workspace_members_in, Prepared,
-    UNLISTED_DIR,
-};
+pub use prepare_step::{package_name_in, prepare, prepare_for_run, unlisted_markers};
+#[cfg(test)]
+pub use prepare_step::workspace_members_in;
 use prepare_step::unlisted_dir;
 #[cfg(test)]
 use prepare_step::{guard_run_manifest, marker_file, write_unlisted_marker};
