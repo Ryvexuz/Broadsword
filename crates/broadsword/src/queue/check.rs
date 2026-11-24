@@ -105,10 +105,11 @@ fn fast_plan(project: &str, tests: &[String], metadata: Result<String, String>) 
 }
 
 /// THE ONE PRE-MERGE CHECK of an entry's commit in task `task_id`'s worktree (the single entry's own check, and every merge-train
-/// check: tip, bisect and alone). A project listed in `merge_fast_tests` gets the fast subset when `fast_plan` verifies its names:
+/// check: tip, bisect and alone). A listed project may run only Python tests for a proven no-Rust diff (`no_rust`); otherwise it
+/// gets the fast subset when `fast_plan` verifies its names:
 /// ONE `run` job of `fast_command` through the same job machinery as `check` (disk guard, build lock, log, scrubbed environment,
 /// redaction). Names that cannot be verified give the full `check`; a name cargo does not know refuses the check (exit 1, no job).
-/// Any other project gets the full `check`, exactly as before. Returns the exit code, normalised so a subset whose command ran and
+/// Any other project gets the full `check`, exactly as before. Returns the exit code, normalised so a Python or subset command that
 /// failed is 1 like a failed check (a refusal or a disk kill keeps its own code: no verdict), and the line that says which check
 /// ran. That line ends the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the
 /// reviewer can read a subset as the full suite. The main check after a merge never comes through here: it is always the full
@@ -118,6 +119,9 @@ fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInf
     let Some(tests) = cfg.merge_fast_subset(project) else {
         return (full(info), "check: full".to_string());
     };
+    if let Some(result) = super::no_rust::pre_merge_check(cfg, project, task_id, info) {
+        return result;
+    }
     let metadata = job::job_folder(cfg, project, Some(task_id)).map_err(|(_, m)| m).and_then(|d| crate::buildsrc::metadata_json(cfg, &d));
     match fast_plan(project, tests, metadata) {
         FastPlan::Unverifiable(why) => {
