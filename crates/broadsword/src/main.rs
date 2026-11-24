@@ -35,6 +35,7 @@ mod recover;
 mod record;
 mod reviewer;
 mod scrub;
+mod slot_gate;
 mod sys;
 mod task;
 mod tools;

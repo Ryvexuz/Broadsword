@@ -356,6 +356,12 @@ pub fn cmd_start(cfg: &Config, id: &str, owner: &str, worktree: bool) -> ExitCod
             }
             Ok(_) => {}
         }
+        if let Err(reason) = crate::slot_gate::check_start(cfg) {
+            return fail(
+                EXIT_CONFLICT,
+                format!("cannot start {id}: {reason}; start it when the merge check ends"),
+            );
+        }
         // The merge queue, read without its locks (read-only; every entry is written atomically). An entry that cannot be
         // read or makes no sense fails the start: counting it as closed could break either cap below.
         let open_entries = match open_queue_entries(cfg) {
