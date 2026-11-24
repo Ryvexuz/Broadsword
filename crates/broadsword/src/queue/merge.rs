@@ -155,7 +155,8 @@ impl<'a> Run<'a> {
     fn s_main_check(&mut self) -> R<()> {
         self.prepare_main_check()?;
         let mut info = JobInfo::default();
-        let spec: JobSpec = super::postcheck::check_spec(self.e.get("project"));
+        let flaky = crate::flake::for_check(self.cfg, self.e.get("project"), Some(self.e.get("pre_merge_sha")));
+        let spec: JobSpec = super::postcheck::check_spec(self.e.get("project"), flaky);
         let code = job::run_job_info(self.cfg, spec, &mut info);
         self.judge_main_check(code, info)
     }

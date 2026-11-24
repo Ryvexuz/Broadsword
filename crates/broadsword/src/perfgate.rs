@@ -622,6 +622,7 @@ impl Side {
         let code = job::run_job_info(
             cfg,
             JobSpec {
+                flaky: None,
                 kind: "run".into(),
                 name: project.to_string(),
                 command: Some(BUILD_COMMAND.to_string()),
