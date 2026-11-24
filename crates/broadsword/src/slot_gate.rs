@@ -85,9 +85,7 @@ fn read_with_retry(
             Ok(text) => return text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
             Err(_) => {
-                let Some(remaining) = read_wait.checked_sub(scan_started.elapsed()) else {
-                    return None;
-                };
+                let remaining = read_wait.checked_sub(scan_started.elapsed())?;
                 if remaining.is_zero() {
                     return None;
                 }
