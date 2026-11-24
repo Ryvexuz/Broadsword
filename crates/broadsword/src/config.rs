@@ -998,6 +998,7 @@ hotspot_claims = 5
 hotspot_commits = 5
 stall_restart_lines = 3
 stall_restart_timeout_seconds = 60
+merge_train_lanes = 1
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
             let t = format!("{base}scratch_dir = \"{bad}\"\n");
