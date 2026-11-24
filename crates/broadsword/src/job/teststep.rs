@@ -163,7 +163,7 @@ pub(super) struct Copied {
 /// Makes a pool child's `error: ...` failure line from its exit text.
 pub(super) type FailLine = Box<dyn Fn(&str) -> String>;
 
-/// One child the side-by-side pool runs (a copied test executable or a Python test script).
+/// One child the shared pool runs (a copied test executable or a Python test script).
 pub(super) struct PoolItem {
     /// The `     Running ...` line printed before its output.
     pub(super) title: String,
@@ -237,7 +237,7 @@ pub(super) struct TestStep<'a> {
 
 
 impl TestStep<'_> {
-    fn note(&self, line: &str) {
+    pub(super) fn note(&self, line: &str) {
         eprintln!("{line}");
         if let Ok(mut f) = self.log.lock() {
             let _ = writeln!(f, "{line}");
@@ -331,9 +331,10 @@ impl TestStep<'_> {
                 return Ok((done(r.outcome, kept), None));
             }
         }
-        // 5. the Python tests: already run beside the copies, or now, one after another
+        // 5. the Python tests: already run beside the copies, or now, after cargo and doc-tests passed
         let py = match side_py {
             Some(py) => py,
+            None if self.cfg.python_parallel > 1 && scripts.len() >= 2 => self.run_python_pool(scripts)?,
             None => self.run_python(scripts)?,
         };
         Ok((done(Outcome::Exited(Some(0)), kept), Some(py)))
@@ -466,7 +467,7 @@ impl TestStep<'_> {
             }
             PyTests::Ok { count: scripts.len(), secs: 0.0 }
         };
-        let ran = match self.run_pool(items, kept)? {
+        let ran = match self.run_pool(items, kept, self.parallel, "test_parallel_binaries")? {
             PoolEnd::DiskDropped(f) => return Ok((Outcome::DiskDropped(f), PyTests::Killed(f))),
             PoolEnd::Ran(r) => r,
         };
@@ -487,7 +488,8 @@ impl TestStep<'_> {
         Ok((Outcome::Exited(Some(0)), py))
     }
 
-    /// Run `items` up to `parallel` at once, in list order. Each child's stdout and stderr are collected apart from the others,
+    /// Run `items` up to `width` at once, in list order. `setting` names the key that chose the width in the pool's note.
+    /// Each child's stdout and stderr are collected apart from the others,
     /// redacted, and printed whole (and written to the log) in LIST order, each as soon as every item before it has been printed,
     /// so the output reads like a serial run. `counts` items add their stdout to `kept`. After a failure nothing new starts; the
     /// running ones finish and are printed. The disk floor is polled every `poll` and a drop kills every running child's tree;
@@ -496,7 +498,13 @@ impl TestStep<'_> {
     /// round, and frees its slot at once. When its readers end (its pipes closed) its output is complete; if a process it started
     /// still holds a pipe after `test_output_wait_seconds`, its output is taken as far as it got and marked TRUNCATED (the
     /// reader threads are left to end on their own). The disk poll and the other children go on meanwhile.
-    fn run_pool(&mut self, items: Vec<PoolItem>, kept: &mut String) -> Result<PoolEnd, String> {
+    pub(super) fn run_pool(
+        &mut self,
+        items: Vec<PoolItem>,
+        kept: &mut String,
+        width: usize,
+        setting: &str,
+    ) -> Result<PoolEnd, String> {
         /// A child's collected stdout or stderr. `None` once closed (its output was taken at a cut, or the pool gave up on it):
         /// the reader thread then reads and DISCARDS until EOF, so a process that keeps writing never grows memory.
         type Buf = Arc<Mutex<Option<Vec<u8>>>>;
@@ -551,8 +559,8 @@ impl TestStep<'_> {
             draining.clear();
         }
         let n = items.len();
-        let width = self.parallel.max(1);
-        self.note(&format!("broadsword: running {n} test child(ren), up to {width} at once (test_parallel_binaries)"));
+        let width = width.max(1);
+        self.note(&format!("broadsword: running {n} test child(ren), up to {width} at once ({setting})"));
         let start = Instant::now();
         let mut items: Vec<Option<PoolItem>> = items.into_iter().map(Some).collect();
         let mut lines: Vec<(String, FailLine, bool)> = Vec::with_capacity(n);

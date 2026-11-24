@@ -170,6 +170,8 @@ pub struct Config {
     /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
     /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
     pub python_tests: Vec<(String, Vec<String>)>,
+    /// Scripts at once after cargo's tests and doc-tests, when test_parallel_binaries is 1.
+    pub python_parallel: usize,
     /// The merge queue's DONE CHECK (donecheck.rs): a done-check command the queue runs is killed (its whole tree) after this long.
     pub done_check_timeout_seconds: u64,
     /// The merge queue's DONE CHECK: the last N lines of each command's output go to the reviewer and the `.donecheck` file.
@@ -402,6 +404,8 @@ impl Config {
         Ok(Config {
             merge_fast_tests,
             python_tests,
+            python_parallel: usize::try_from(positive("python_parallel")?)
+                .map_err(|_| "python_parallel: does not fit this platform's pool width")?,
             done_check_timeout_seconds: positive("done_check_timeout_seconds")?,
             done_check_tail_lines: positive("done_check_tail_lines")?,
             shadow_reviewer,
@@ -642,6 +646,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500
 hotspot_window_hours = 48
@@ -788,6 +793,31 @@ install_dir=\"build/bin\"\n";
     }
 
     #[test]
+    fn python_parallel_is_required_and_positive() {
+        let text = include_str!("../../../broadsword.toml");
+        assert!(Config::from_text(text, Path::new("p")).unwrap().python_parallel >= 1);
+        let without = without_key(text, "python_parallel");
+        let e = Config::from_text(&without, Path::new("p")).unwrap_err();
+        assert!(e.contains("python_parallel") && e.contains("missing"), "{e}");
+        for bad in ["0", "-1", "\"\"", "\"3\"", "\"NaN\"", "\"inf\""] {
+            let e = Config::from_text(
+                &format!("{without}\npython_parallel = {bad}\n"),
+                Path::new("p"),
+            )
+            .unwrap_err();
+            assert!(e.contains("python_parallel"), "{bad}: {e}");
+        }
+        for width in [1, 3] {
+            let c = Config::from_text(
+                &format!("{without}\npython_parallel = {width}\n"),
+                Path::new("p"),
+            )
+            .unwrap();
+            assert_eq!(c.python_parallel, width);
+        }
+    }
+
+    #[test]
     fn hotspot_keys_are_required_and_positive() {
         let text = include_str!("../../../broadsword.toml");
         assert!(Config::from_text(text, Path::new("p")).is_ok());
@@ -877,6 +907,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500
 hotspot_window_hours = 48
@@ -939,6 +970,7 @@ python_tests = \"\"
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
+python_parallel = 1
 test_output_wait_seconds = 10
 hotspot_lines = 1500
 hotspot_window_hours = 48
