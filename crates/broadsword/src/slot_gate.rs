@@ -478,7 +478,8 @@ mod tests {
                 classify(&job),
                 "the live fixture must count before changing its pid"
             );
-            let mut child = std::process::Command::new("cmd")
+            let mut child = crate::scrub::command_in(std::path::Path::new("."), "cmd")
+                .expect("the spawn helper builds the command")
                 .args(["/C", "exit 0"])
                 .spawn()
                 .expect("start a short-lived process");
