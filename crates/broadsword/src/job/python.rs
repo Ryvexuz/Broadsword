@@ -47,7 +47,6 @@ impl TestStep<'_> {
             .map(|s| {
                 let shown = format!("{PYTHON} -I -B {s}");
                 PoolItem {
-                    flaky_target: None,
                     title: format!("     Running {shown}"),
                     cmd: python_command(self.cfg, self.project_dir, s),
                     fail_line: Box::new(move |why| format!("error: python test failed: `{shown}` ({why})")),
@@ -117,8 +116,6 @@ mod tests {
         let mut on_live = |pids: &[u32]| live.push(pids.to_vec());
         let mut main_bins_failed = None;
         let result = TestStep {
-            flaky: None,
-            flake_report: &mut crate::flake::Report::default(),
             cfg: &cfg,
             priority: crate::lock::Priority::Agent,
             job_id: tag,
