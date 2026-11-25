@@ -428,7 +428,9 @@ fn lock_holder_helper() {
 
 #[test]
 fn a_killed_lock_holder_frees_the_board_at_once() {
-    let r = Root::with_wait("kill", Some(2));
+    // Lock wait 20 s, bound 10 s: a start after the kill may take over 2 s under load (2.24 s and 2.81 s in queue main
+    // checks 2026-11-25), while a stale lock still waits the full 20 s (and then fails the code check too).
+    let r = Root::with_wait("kill", Some(20));
     let a = r.add("p", "a", &["src"]);
     let mut holder = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "lock_holder_helper", "--nocapture"])
@@ -449,7 +451,7 @@ fn a_killed_lock_holder_frees_the_board_at_once() {
     let t = Instant::now();
     let o = r.start(&a, "x");
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(t.elapsed() < Duration::from_secs(2), "no stale timeout after a kill: took {:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(10), "no stale timeout after a kill: took {:?}", t.elapsed());
 }
 
 #[test]
