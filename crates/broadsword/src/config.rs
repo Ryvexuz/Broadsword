@@ -141,6 +141,7 @@ pub struct Config {
     pub queue_auto_revert: bool,
     /// Background train main check; the next fast-forward and the drain's end wait for its result.
     pub queue_main_check_async: bool,
+    pub main_full_check_every_minutes: u64,
     /// The merge queue's PRE-merge check for the projects named here is a fast safety subset, ONE `run` job: `cargo build --offline &&
     /// cargo test --offline [--lib] [--bins] --test <name> ...` (queue.rs `pre_merge_check`); the main check after the merge stays the full
     /// `check`. Parsed from the required key `merge_fast_tests` by `parse_merge_fast_tests` and checked by `check_merge_fast_tests`;
@@ -442,6 +443,7 @@ impl Config {
             queue_per_project,
             queue_auto_revert,
             queue_main_check_async,
+            main_full_check_every_minutes: get_int(&m, "main_full_check_every_minutes")?,
             max_agents: positive("max_agents")?,
             max_queued: positive("max_queued")?,
             queue_entry_read_wait_ms: positive("queue_entry_read_wait_ms")?,
@@ -656,6 +658,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
@@ -947,6 +950,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1
@@ -1011,6 +1015,7 @@ queue_auto_revert = \"on\"
 merge_fast_tests = \"\"
 queue_main_check_async = \"off\"
 python_tests = \"\"
+main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
 test_parallel_binaries = 1

@@ -29,6 +29,143 @@ struct Pending {
 // including its join and judgment: no second starter can see an empty slot during settlement.
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MainPlan {
+    Build(String),
+    Full(String),
+}
+
+/// Pure policy only: callers continue to run the full check until the wiring lands.
+pub(super) fn main_check_plan(
+    cfg: &Config,
+    project: &str,
+    merged: &str,
+    checked: &str,
+    check_summary: &str,
+    last_full: Option<u64>,
+    now: u64,
+) -> MainPlan {
+    let full = |reason: &str| MainPlan::Full(format!("full ({reason})"));
+    if full_pass_path(cfg, project).is_err() {
+        return full("invalid project name");
+    }
+    if merged.is_empty() || checked.is_empty() || merged != checked {
+        return full("main differs from the checked commit");
+    }
+    if !matches!(merged.len(), 40 | 64) || !merged.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return full("main or checked commit is not a full SHA");
+    }
+    let mut has_full = false;
+    for line in check_summary.lines() {
+        if ["check: fast subset", "check: python only", "check: REFUSED"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            return full("the pre-merge check was not the full suite");
+        }
+        has_full |= line == "check: full" || line.starts_with("check: full (");
+    }
+    if !has_full {
+        return full("the pre-merge check was not the full suite");
+    }
+    let minutes = cfg.main_full_check_every_minutes;
+    if minutes == 0 {
+        return full("main_full_check_every_minutes is 0");
+    }
+    let Some(last) = last_full else {
+        return full("no recorded full main check");
+    };
+    let Some(elapsed) = now.checked_sub(last) else {
+        return full("recorded full main check is in the future");
+    };
+    // Division is equivalent to elapsed < minutes * 60 for integer minutes, without
+    // overflowing even when a Config constructed by a caller contains u64::MAX.
+    if elapsed / 60 >= minutes {
+        return full(&format!("last full main check over {minutes} min ago"));
+    }
+    MainPlan::Build(format!(
+        "build (main == checked commit {}, full check passed {} min ago)",
+        short(merged),
+        elapsed / 60
+    ))
+}
+
+fn full_pass_path(cfg: &Config, project: &str) -> Result<std::path::PathBuf, String> {
+    if project.is_empty()
+        || project.contains("..")
+        || project.ends_with('.')
+        || !project
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err("invalid project name for full main check record".into());
+    }
+    Ok(super::entry::queue_dir(cfg).join(format!("main-full-check-{project}")))
+}
+
+pub(super) fn record_full_pass(cfg: &Config, project: &str, now: u64) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let path = full_pass_path(cfg, project)?;
+    let dir = super::entry::queue_dir(cfg);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create full main check record directory: {e}"))?;
+    let temp = dir.join(format!(
+        "main-full-check-{project}.tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    // create_new never follows or truncates a pre-existing temp path.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| format!("create full main check temp record: {e}"))?;
+    let result = (|| {
+        writeln!(file, "{now}")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)
+    })();
+    if let Err(e) = result {
+        let cleanup = std::fs::remove_file(&temp);
+        return Err(match cleanup {
+            Ok(()) => format!("write full main check record: {e}"),
+            Err(cleanup) => {
+                format!("write full main check record: {e}; remove temp record: {cleanup}")
+            }
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn last_full_pass(cfg: &Config, project: &str) -> Option<u64> {
+    use std::io::Read;
+
+    let path = full_pass_path(cfg, project).ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    // A u64's decimal digits plus a newline; read one extra byte to reject oversized
+    // records without allocating memory proportional to corrupt input.
+    let max_len = u64::MAX.to_string().len() + 1;
+    let mut text = String::new();
+    file.take((max_len + 1) as u64)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > max_len {
+        return None;
+    }
+    let digits = text.strip_suffix('\n').unwrap_or(&text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 pub(super) fn enabled(cfg: &Config, project: &str) -> bool {
     let baseline = perfgate::baseline_path(cfg, project);
     cfg.queue_main_check_async
@@ -352,6 +489,197 @@ mod tests {
             std::path::Path::new("postcheck-unused"),
         )
         .unwrap()
+    }
+
+    const CHECKED: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn plan(cfg: &Config, summary: &str, last: Option<u64>, now: u64) -> MainPlan {
+        main_check_plan(cfg, "p", CHECKED, CHECKED, summary, last, now)
+    }
+
+    #[test]
+    fn plan_is_build_only_for_the_identical_fully_checked_commit_within_the_hour() {
+        let mut cfg = config();
+        assert_eq!(cfg.main_full_check_every_minutes, 60);
+        for summary in ["check: full", "job: passed\ncheck: full (all tests)\n"] {
+            assert_eq!(
+                plan(&cfg, summary, Some(60), 180),
+                MainPlan::Build(format!(
+                    "build (main == checked commit {}, full check passed 2 min ago)",
+                    &CHECKED[..10]
+                ))
+            );
+        }
+        assert!(matches!(
+            plan(&cfg, "check: full\r\n", Some(0), 3599),
+            MainPlan::Build(_)
+        ));
+        assert!(matches!(
+            plan(&cfg, "check: full", Some(u64::MAX), u64::MAX),
+            MainPlan::Build(_)
+        ));
+        cfg.main_full_check_every_minutes = 1;
+        assert!(matches!(
+            plan(&cfg, "check: full", Some(0), 59),
+            MainPlan::Build(_)
+        ));
+        assert!(matches!(
+            plan(&cfg, "check: full", Some(0), 60),
+            MainPlan::Full(_)
+        ));
+        cfg.main_full_check_every_minutes = u64::MAX;
+        assert!(matches!(
+            plan(&cfg, "check: full", Some(0), u64::MAX),
+            MainPlan::Build(_)
+        ));
+
+        let text = include_str!("../../../../broadsword.toml");
+        for value in ["-1", "1.5", "\"\"", "18446744073709551616"] {
+            let invalid = text.replace(
+                "main_full_check_every_minutes = 60",
+                &format!("main_full_check_every_minutes = {value}"),
+            );
+            assert!(
+                Config::from_text(&invalid, std::path::Path::new("unused")).is_err(),
+                "invalid setting accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fast_subset_or_python_only_pre_check_always_gets_the_full_main_check() {
+        let cfg = config();
+        for summary in [
+            "",
+            "check: fullish",
+            " check: full",
+            "check: full ",
+            "check: fast subset (lib)",
+            "check: python only",
+            "check: REFUSED",
+            "check: full\ncheck: fast subset (lib)",
+            "check: python only\ncheck: full",
+            "check: full (all)\ncheck: REFUSED: missing tests",
+        ] {
+            assert_eq!(
+                plan(&cfg, summary, Some(0), 1),
+                MainPlan::Full("full (the pre-merge check was not the full suite)".into()),
+                "summary: {summary:?}"
+            );
+        }
+        let huge = format!("{}\ncheck: full\ncheck: REFUSED", "log\n".repeat(100_000));
+        assert!(matches!(
+            plan(&cfg, &huge, Some(0), 1),
+            MainPlan::Full(_)
+        ));
+    }
+
+    #[test]
+    fn a_different_merged_commit_gets_the_full_check() {
+        let cfg = config();
+        for (merged, checked) in [(CHECKED, ""), ("", CHECKED), ("", ""), (CHECKED, "other")] {
+            assert_eq!(
+                main_check_plan(&cfg, "p", merged, checked, "check: full", Some(0), 1),
+                MainPlan::Full("full (main differs from the checked commit)".into())
+            );
+        }
+        for invalid in ["short", "éééééééééééééééééééé", "not-a-sha\n"] {
+            assert!(matches!(
+                main_check_plan(&cfg, "p", invalid, invalid, "check: full", Some(0), 1),
+                MainPlan::Full(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_hour_old_or_missing_or_future_record_gets_the_full_check() {
+        let cfg = config();
+        for (last, now, reason) in [
+            (Some(0), 3600, "last full main check over 60 min ago"),
+            (Some(0), u64::MAX, "last full main check over 60 min ago"),
+            (None, 1, "no recorded full main check"),
+            (Some(2), 1, "recorded full main check is in the future"),
+        ] {
+            assert_eq!(
+                plan(&cfg, "check: full", last, now),
+                MainPlan::Full(format!("full ({reason})"))
+            );
+        }
+    }
+
+    #[test]
+    fn setting_zero_always_gets_the_full_check() {
+        let mut cfg = config();
+        cfg.main_full_check_every_minutes = 0;
+        assert_eq!(
+            plan(&cfg, "check: full", Some(1), 1),
+            MainPlan::Full("full (main_full_check_every_minutes is 0)".into())
+        );
+        let text = include_str!("../../../../broadsword.toml").replace(
+            "main_full_check_every_minutes = 60",
+            "main_full_check_every_minutes = 0",
+        );
+        assert_eq!(
+            Config::from_text(&text, std::path::Path::new("unused"))
+                .unwrap()
+                .main_full_check_every_minutes,
+            0
+        );
+    }
+
+    #[test]
+    fn the_record_round_trips_and_garbage_reads_as_none() {
+        let root = crate::scrub::planted::config_root("postcheck-full-pass");
+        let cfg = Config::load_from(&root).unwrap();
+        let path = full_pass_path(&cfg, "p").unwrap();
+        assert_eq!(path.file_name().unwrap(), "main-full-check-p");
+        assert_eq!(last_full_pass(&cfg, "p"), None);
+        for now in [0, 1, u64::MAX] {
+            record_full_pass(&cfg, "p", now).unwrap();
+            assert_eq!(last_full_pass(&cfg, "p"), Some(now));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{now}\n"));
+            assert_eq!(last_full_pass(&cfg, "other"), None);
+            assert!(std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp-")));
+        }
+        for garbage in [
+            "",
+            "garbage",
+            "-1",
+            "+1",
+            "1.0",
+            "NaN",
+            "18446744073709551616",
+            "1\n2",
+            "1\r\n",
+            " 1",
+        ] {
+            std::fs::write(&path, garbage).unwrap();
+            assert_eq!(last_full_pass(&cfg, "p"), None, "{garbage:?}");
+        }
+        std::fs::write(&path, "9".repeat(100_000)).unwrap();
+        assert_eq!(last_full_pass(&cfg, "p"), None);
+        for project in ["", ".", "p.", "../p", "p..q", "a/b", "a\\b", "C:p", "p\r", "p\n"] {
+            assert!(record_full_pass(&cfg, project, 1).is_err(), "{project:?}");
+            assert_eq!(last_full_pass(&cfg, project), None);
+            assert!(matches!(
+                main_check_plan(&cfg, project, CHECKED, CHECKED, "check: full", Some(0), 1),
+                MainPlan::Full(_)
+            ));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(last_full_pass(&cfg, "p"), None);
+        assert!(record_full_pass(&cfg, "p", 2).is_err());
+        assert!(
+            path.is_dir(),
+            "failed replacement must leave the target intact"
+        );
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".tmp-")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
