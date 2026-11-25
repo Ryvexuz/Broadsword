@@ -125,6 +125,7 @@
 //! in wtgit.rs.
 
 mod add;
+mod advisory;
 mod cancel;
 mod check;
 mod entry;
@@ -163,7 +164,7 @@ pub(crate) const SOURCE: &str = concat!(
     include_str!("mod.rs"),
     "\n",
     include_str!("add.rs"),
-    "\n",
+    concat!("\n", include_str!("advisory.rs"), "\n"),
     include_str!("cancel.rs"),
     "\n",
     include_str!("check.rs"),
