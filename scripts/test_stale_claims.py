@@ -34,6 +34,11 @@ class StaleClaimsTests(unittest.TestCase):
         self.git("worktree", "add", str(self.worktree), "task/held")
         self.tasks = self.root / "state" / "tasks"
         self.tasks.mkdir(parents=True)
+        # Model a task checkout separately from the main checkout's board.
+        self.checkout = self.root / "reporter"
+        (self.checkout / "scripts").mkdir(parents=True)
+        self.script = self.checkout / "scripts" / SCRIPT.name
+        shutil.copyfile(SCRIPT, self.script)
         self.config()
         self.record()
 
@@ -60,7 +65,7 @@ class StaleClaimsTests(unittest.TestCase):
         text = 'state_dir = "state"\nprojects_dir = "projects"\n'
         if value is not None:
             text += f"stale_claim_hours = {value}\n"
-        (self.root / "broadsword.toml").write_text(text, encoding="utf-8")
+        (self.checkout / "broadsword.toml").write_text(text, encoding="utf-8")
 
     def record(self, name="held", **overrides):
         fields = dict(id=name, project="broadsword", owner="coder-codex", status="running",
@@ -73,7 +78,7 @@ class StaleClaimsTests(unittest.TestCase):
 
     def run_report(self, now=NOW):
         return subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--root", str(self.root), "--now", str(now)],
+            [sys.executable, "-I", str(self.script), "--root", str(self.root), "--now", str(now)],
             capture_output=True, text=True, env=self.env)
 
     def summary(self, stale=1, running=1, skipped=0):
@@ -145,6 +150,13 @@ class StaleClaimsTests(unittest.TestCase):
                 self.assertIn("stale_claim_hours", proc.stderr)
                 self.assertEqual(proc.stdout, "")
 
+    def test_settings_come_from_script_checkout(self):
+        # The main checkout may not yet have the task checkout's new key.
+        (self.root / "broadsword.toml").write_text(
+            'state_dir = "wrong-state"\nprojects_dir = "wrong-projects"\n',
+            encoding="utf-8")
+        self.assert_report([HEADER, self.row(), self.summary()])
+
     def test_report_writes_nothing(self):
         path = self.worktree / "tracked.txt"
         path.write_text("dirty index must not refresh\n", encoding="utf-8")
@@ -197,7 +209,7 @@ class StaleClaimsTests(unittest.TestCase):
 
     def test_default_root_is_main_checkout(self):
         proc = subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--now", str(NOW)],
+            [sys.executable, "-I", str(self.script), "--now", str(NOW)],
             cwd=self.worktree, capture_output=True, text=True, env=self.env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "\n".join([HEADER, self.row(), self.summary()]) + "\n")

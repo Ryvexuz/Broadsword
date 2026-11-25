@@ -1,4 +1,7 @@
-"""Report running claims with no recent commit or worktree edit; never mutate state."""
+"""Report running claims without mutation.
+
+Settings come from this script's checkout; --root selects the board and repos.
+"""
 import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -173,7 +176,7 @@ def main():
             root = Path(os.fsdecode(out).strip()).parent
         else:
             root = Path(args.root).resolve()
-        cfg = settings(root)
+        cfg = settings(Path(__file__).resolve().parents[1])
         now = timestamp(args.now if args.now is not None else time.time())
         print("\n".join(report(root, cfg, now)))
     except (OSError, ValueError) as exc:
