@@ -81,6 +81,7 @@ A brief with no Claims line or no Done check section fails (fail closed).
 Exit codes: 0 every brief passes, 1 some rule failed, 2 usage error or unreadable file.
 """
 import argparse
+import importlib.util
 import csv
 import io
 import os
@@ -89,6 +90,10 @@ import re
 import subprocess
 import sys
 import tomllib
+
+_bspec = importlib.util.spec_from_file_location("brief_preflight", pathlib.Path(__file__).with_name("brief_preflight.py"))
+_brief = importlib.util.module_from_spec(_bspec)
+_bspec.loader.exec_module(_brief)
 
 COMMANDS = {"broadsword", "python", "python3", "cargo", "git", "pytest", "npm", "bash", "sh",
             "powershell", "pwsh"}
@@ -863,6 +868,10 @@ def main(argv):
     p.add_argument("--min-hard-cases", type=positive, help="enable R9 with this minimum item count")
     p.add_argument("--big-file-lines", type=positive, help="enable R10 with --root and this newline limit")
     p.add_argument("--min-pasted-lines", type=positive, help="enable R11 with this minimum body line count")
+    p.add_argument("--gpt-preflight", action="store_true", help="enable B1 and B3")
+    p.add_argument("--brief-max-kb", type=positive, help="B2 byte cap, requires --size-pct")
+    p.add_argument("--size-pct", type=positive, help="B2 cap percentage")
+    p.add_argument("--cap-margin-pct", type=positive, help="B4 cap margin, requires --root")
     p.add_argument("--root", default=None, help="repo to search for R5 (git grep); omit to skip R5")
     p.add_argument("--preflight-ref", default=None,
                    help="git ref (the main branch) of --root; turns on the plan preflight P0-P5")
@@ -880,6 +889,10 @@ def main(argv):
         print("brief_lint: --queue-list needs --preflight-ref", file=sys.stderr)
         return 2
     queue_text = None
+    if ((a.brief_max_kb is None) != (a.size_pct is None) or
+            (a.cap_margin_pct is not None and not a.root)):
+        print("brief_lint: --brief-max-kb and --size-pct need each other; --cap-margin-pct needs --root", file=sys.stderr)
+        return 2
     if a.queue_list:
         try:
             with open(a.queue_list, encoding="utf-8") as f:
@@ -900,7 +913,9 @@ def main(argv):
         gaps = claim_gaps(text, a.root, reported, min_hard_cases=a.min_hard_cases,
                           big_file_lines=a.big_file_lines, min_pasted_lines=a.min_pasted_lines)
         pre = preflight(text, a.root, a.preflight_ref, queue_text) if a.preflight_ref else []
+        bs = _brief.check(text, path, a, split_sections, claimed_paths, claim_blocks, claim_paths)
         bad = [r for r in res if not r[1]] + [g for g in gaps if g[1] == "FAIL"] + pre
+        bad += bs
         print(f"{path}: {'ok' if not bad else str(len(bad)) + ' rule(s) failed'}")
         for rule, ok, msg in res:
             print(f"  {'PASS' if ok else 'FAIL'} {rule}: {msg}")
@@ -908,6 +923,10 @@ def main(argv):
             print(f"  {level} claimgap-{rule}: {msg}")
         if not any(g[1] == "FAIL" for g in gaps):
             print("  PASS claimgap")
+        for rule, level, msg in bs:
+            print(f"  {level} brief-{rule}: {msg}")
+        if not bs and (a.gpt_preflight or a.brief_max_kb or a.cap_margin_pct):
+            print("  PASS brief")
         if a.preflight_ref:
             for rule, level, msg in pre:
                 print(f"  {level} preflight-{rule}: {msg}")
