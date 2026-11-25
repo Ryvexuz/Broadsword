@@ -22,6 +22,8 @@ mod buildsrc;
 mod cleanup;
 mod config;
 mod donecheck;
+#[cfg(test)]
+mod flake;
 mod git;
 mod install;
 mod job;
