@@ -89,6 +89,7 @@ const BASE: &[(&str, &str)] = &[
     ("hotspot_commits", "5"),
     ("stall_restart_lines", "3"),
     ("stall_restart_timeout_seconds", "60"),
+    ("stale_claim_hours", "4"),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),
