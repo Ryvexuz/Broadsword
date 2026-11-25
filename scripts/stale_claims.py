@@ -150,9 +150,14 @@ def report(root, cfg, now):
             continue
         running += 1
         last, note = last_activity(root, cfg, task)
+        try:
+            utc = datetime.fromtimestamp(int(last), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (OSError, OverflowError, ValueError) as exc:
+            skipped.append(
+                f"skipped {cell(path)}: last_activity_utc: {cell(exc)}")
+            continue
         idle = now - last
         if idle >= cfg["stale_claim_hours"] * 3600:
-            utc = datetime.fromtimestamp(int(last), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             claims = ",".join(task.get("claims", "").split("\\n"))
             rows.append((idle, [
                 task.get("id", path.stem), task.get("project", ""), task.get("owner", ""),

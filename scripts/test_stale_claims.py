@@ -3,10 +3,12 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shutil
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).with_name("stale_claims.py").resolve()
@@ -140,6 +142,32 @@ class StaleClaimsTests(unittest.TestCase):
         self.assert_report([
             HEADER, f"skipped {escaped}: started: required integer Unix seconds",
             self.row(), self.summary(skipped=1)])
+
+    def test_unconvertible_timestamp_is_skipped_and_counted(self):
+        # Force the Windows conversion failure on every platform, without
+        # narrowing the accepted Unix timestamp range.
+        namespace = runpy.run_path(str(self.script))
+        report = namespace["report"]
+        latest = namespace["MAX_TIMESTAMP"]
+        path = self.record("unsupported", started=str(latest - HOURS * 3600),
+                           branch="", worktree="")
+        escaped = str(path).replace("\\", "\\\\")
+        for error in (OSError, OverflowError, ValueError):
+            with self.subTest(error=error.__name__):
+                def convert(value, zone):
+                    if value == latest - HOURS * 3600:
+                        raise error("platform timestamp conversion failed")
+                    return datetime.fromtimestamp(value, zone)
+
+                with patch.dict(report.__globals__, datetime=Mock(fromtimestamp=convert)):
+                    lines = report(
+                        self.root, namespace["settings"](self.checkout),
+                        namespace["timestamp"](latest))
+                self.assertEqual(lines, [
+                    HEADER,
+                    f"skipped {escaped}: last_activity_utc: platform timestamp conversion failed",
+                    self.row(hours=f"{(latest - START) / 3600:.1f}"),
+                    self.summary(running=2, skipped=1)])
 
     def test_missing_or_zero_setting_exits_2(self):
         for value in (None, "0", "-1", "true", '"4"', "4.0"):
