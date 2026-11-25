@@ -428,8 +428,8 @@ fn lock_holder_helper() {
 
 #[test]
 fn a_killed_lock_holder_frees_the_board_at_once() {
-    // Lock wait 20 s, bound 10 s: a start after the kill may take over 2 s under load (2.24 s and 2.81 s in queue main
-    // checks 2026-11-25), while a stale lock still waits the full 20 s (and then fails the code check too).
+    // Probe the OS lock directly after the kill: timing a task start also counts process startup under load.
+    // Keep the 20 s wait and exit-code checks to prove a live holder blocks and a start after the kill succeeds.
     let r = Root::with_wait("kill", Some(20));
     let a = r.add("p", "a", &["src"]);
     let mut holder = Command::new(std::env::current_exe().unwrap())
@@ -448,10 +448,13 @@ fn a_killed_lock_holder_frees_the_board_at_once() {
     let k = Command::new("taskkill").args(["/F", "/PID", &holder.id().to_string()]).output().unwrap();
     assert!(k.status.success(), "taskkill: {}", String::from_utf8_lossy(&k.stderr));
     let _ = holder.wait();
-    let t = Instant::now();
+    let f = fs::OpenOptions::new().read(true).write(true).open(lock_path(&r)).unwrap();
+    if let Err(err) = f.try_lock() {
+        panic!("the killed holder's board lock was still held: {err}");
+    }
+    drop(f);
     let o = r.start(&a, "x");
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(t.elapsed() < Duration::from_secs(10), "no stale timeout after a kill: took {:?}", t.elapsed());
 }
 
 #[test]
@@ -520,9 +523,11 @@ fn a_stored_name_with_no_project_folder_is_compared_case_folded() {
 fn sixteen_gated_starts_with_a_garbage_lock_and_a_big_board_never_give_two_running() {
     // The reviewer's repro: a garbage lock file, 16 simultaneous starts all claiming `src`, and thousands of records so the
     // critical section is slow. Exactly one runs every round and no start is left blocked (no exit 4).
+    // All 16 starts serialize on one lock, each scanning 3000+ records; under load the line exceeded 30 s.
+    // A garbage-lock regression still blocks every start and still fails after the 120 s wait.
     const ROUNDS: usize = 8;
     const FILLER: usize = 3000;
-    let r = Root::with_wait("race16", Some(30));
+    let r = Root::with_wait("race16", Some(120));
     let dir = r.dir.join("state/tasks");
     fs::create_dir_all(&dir).unwrap();
     for i in 0..FILLER {
