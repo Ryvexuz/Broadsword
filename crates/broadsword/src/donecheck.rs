@@ -505,12 +505,7 @@ pub fn run_one(cfg: &Config, exe: &Path, dir: &Path, args: &[String], limits: &L
         })
         .collect();
     let kill_all = |child: &mut std::process::Child| {
-        // the child has not been waited on, so its pid is still ours: take the whole tree down (cargo, rustc, shells), then
-        // whatever it started that is no longer in its tree
-        sys::kill_tree(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        group.kill();
+        kill::everything(&group, child, sys::kill_tree); // Kill the job before the blocking tree backstop.
     };
     let deadline = start + limits.timeout;
     let tick = Duration::from_millis(50);
@@ -783,6 +778,7 @@ mod group {
         }
     }
 }
+mod kill;
 
 /// The result of the whole done check.
 #[derive(Debug, Clone)]
