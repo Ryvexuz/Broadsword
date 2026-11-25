@@ -52,12 +52,13 @@ mod tests {
         (g, child, dir)
     }
 
+    // A killed process's handles close asynchronously on Windows, so removal retries for up to 10 s (sharing violations).
     fn cleanup(dir: &Path) {
-        std::fs::remove_file(dir.join("up.txt")).unwrap();
-        if dir.join("late.txt").exists() {
-            std::fs::remove_file(dir.join("late.txt")).unwrap();
+        let start = Instant::now();
+        while let Err(e) = ["up.txt", "late.txt"].iter().map(|f| dir.join(f)).filter(|f| f.exists()).try_for_each(std::fs::remove_file).and_then(|_| std::fs::remove_dir(dir)) {
+            assert!(start.elapsed() < Duration::from_secs(10), "cannot clean {}: {e}", dir.display());
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
