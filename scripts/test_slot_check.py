@@ -1,5 +1,5 @@
-"""Tests for scripts/slot_check.py. Each test builds a temp root with a broadsword.toml, fake queue entries and a
-fake broadsword (a small Python script standing in for build/bin/broadsword.exe), and runs slot_check.main on it.
+"""Tests for scripts/slot_check.py. Integration tests build a temp root with a broadsword.toml, queue entries
+and a fake broadsword CLI, then run slot_check.main. Claim tests exercise the blame helpers directly.
 
   python -I -B scripts/test_slot_check.py -v
 """
@@ -86,7 +86,10 @@ class SlotCheckTests(unittest.TestCase):
     def test_no_flag_without_ready_tasks(self):
         running = [task("t0", "a.rs")]
         lines = Board(3, running, [task("o1", "a.rs")], [("t0", "queued")], ram=90.0, cpu=90.0).run()
-        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(lines[1:], [
+            "holders: t0 blocks 1 (held: a.rs x1)",
+            "blocked by own claim: a.rs x1",
+        ])
         self.assertIn("ready tasks (claims free) 0", lines[0])
 
     def test_headroom_flag(self):
@@ -108,6 +111,77 @@ class SlotCheckTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 slot_check.broadsword_cmd(pathlib.Path(d))
 
+    def test_blame_preserves_summary_flag_and_loop_lines(self):
+        entries = [("h", "queued")] + [("h", "rejected")] * 3
+        self.assertEqual(Board(1, [task("h", "a.rs")],
+                               [task("blocked", "a.rs"), task("ready", "b.rs")], entries).run(), [
+            "slots: board running 1/1, waiting in queue 1, active coders 0, "
+            "ready tasks (claims free) 1, RAM 80.0% CPU 80.0%",
+            "FLAG: only 0 active coders of cap 1 while 1 ready tasks wait (board full of queued work)",
+            "holders: h blocks 1 (held: a.rs x1)",
+            "blocked by own claim: a.rs x1",
+            "LOOP: h has 3 failed queue rounds: adjudicate, then split or escalate once; no plain retry",
+        ])
+
+
+class ClaimBlameTests(unittest.TestCase):
+    def blame(self, running, opened):
+        return slot_check.blame_lines(slot_check.rows("".join(running)), slot_check.rows("".join(opened)))
+
+    def test_different_keys_do_not_overlap(self):
+        a, b = "broadsword.toml#python_tests", "broadsword.toml#max_agents"
+        self.assertFalse(slot_check.claims_overlap(a, b))
+        self.assertEqual(self.blame([task("h", a)], [task("o", b)]), [])
+
+    def test_whole_file_overlaps_every_key(self):
+        for key in ("python_tests", "max_agents"):
+            a, b = "broadsword.toml", f"broadsword.toml#{key}"
+            with self.subTest(key=key):
+                self.assertTrue(slot_check.claims_overlap(a, b))
+                self.assertTrue(slot_check.claims_overlap(b, a))
+        self.assertEqual(self.blame(
+            [task("h", "broadsword.toml#python_tests, broadsword.toml#max_agents")],
+            [task("o", "broadsword.toml")]), [
+                "holders: h blocks 1 (held: broadsword.toml#max_agents x1)",
+                "blocked by own claim: broadsword.toml (whole file) x1",
+            ])
+
+    def test_folder_overlap_is_by_segment(self):
+        for a, b, expected in [
+            ("src", "src/a.rs", True), ("src", "srcx/a.rs", False),
+            ("src", "srcx", False), ("SRC", "src/Nested/a.rs", True),
+            ("src", "src/a.rs#key", True), ("src/a.rs#key", "src/a.rs/child", False),
+        ]:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(slot_check.claims_overlap(a, b), expected)
+                self.assertEqual(slot_check.claims_overlap(b, a), expected)
+
+    def test_own_claim_line_counts_the_blocked_side(self):
+        self.assertEqual(self.blame(
+            [task("h", "broadsword.toml#python_tests")],
+            [task("o1", "broadsword.toml, unrelated.rs"),
+             task("o2", "broadsword.toml"),
+             task("o3", "broadsword.toml#max_agents")]), [
+                "holders: h blocks 2 (held: broadsword.toml#python_tests x2)",
+                "blocked by own claim: broadsword.toml (whole file) x2",
+            ])
+
+    def test_rankings_top_three_and_distinct_task_counts(self):
+        self.assertEqual(self.blame(
+            [task("h4", "d"), task("h3", "c"), task("h2", "b"), task("h1", "a, a")],
+            [task("o1", "a, a, b, c, d"), task("o2", "a")]), [
+                "holders: h1 blocks 2 (held: a x2); h2 blocks 1 (held: b x1); h3 blocks 1 (held: c x1)",
+                "blocked by own claim: a x2; b x1; c x1",
+            ])
+
+    def test_wildcard_case_and_project_isolation(self):
+        self.assertTrue(slot_check.claims_overlap("*", "anything"))
+        self.assertTrue(slot_check.claims_overlap("anything", "*"))
+        self.assertTrue(slot_check.claims_overlap("BROADsword.toml#MAX_AGENTS", "broadsword.toml#max_agents"))
+        self.assertEqual(self.blame([task("h", "*", "other")], [task("o", "a")]), [])
+        self.assertEqual(self.blame([], [task("o", "*")]), [])
+        self.assertEqual(self.blame([task("h", "*")], []), [])
+
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
