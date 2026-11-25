@@ -28,8 +28,8 @@ const SYNC_GATE: &str = "BROADSWORD_INTERNAL_TEST_BUILD_SYNC_GATE_FILE";
 const RUN_MARKER: &str = "BROADSWORD_RUN_HOLDS_BUILD_LOCK";
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-// These races exercise the production lock entry point directly, in separate processes. Readiness is registration
-// (a marker exists under arbitration), not a sleep that guesses when a waiter started.
+// These races exercise the production lock entry point directly, in separate processes. Children signal readiness
+// before go() starts their wait; registration then confirms a marker exists under arbitration.
 struct PriorityRoot {
     dir: PathBuf,
 }
@@ -81,16 +81,22 @@ impl PriorityRoot {
                 if human { "human" } else { "agent" },
             )
             .env("BROADSWORD_TEST_PRIORITY_WAIT_MS", wait_ms.to_string())
+            .env("BROADSWORD_TEST_PRIORITY_GO", self.dir.join(format!("{name}.go")))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(self.dir.join(format!("{name}.err"))).unwrap())
             .spawn()
             .unwrap();
-        PriorityChild {
+        let child = PriorityChild {
             child,
             dir: self.dir.clone(),
             name: name.into(),
-        }
+        };
+        assert!(
+            wait_for(&self.dir.join(format!("{name}.ready")), "ready", 120),
+            "{name} never became ready"
+        );
+        child
     }
 }
 
@@ -107,6 +113,10 @@ struct PriorityChild {
 }
 
 impl PriorityChild {
+    fn go(&self) {
+        fs::write(self.dir.join(format!("{}.go", self.name)), "go").unwrap();
+    }
+
     fn taken(&self) {
         assert!(
             wait_for(&self.dir.join(format!("{}.taken", self.name)), "taken", 10),
@@ -165,6 +175,13 @@ fn priority_waiter_child() {
             .parse()
             .unwrap(),
     );
+    let go = PathBuf::from(std::env::var_os("BROADSWORD_TEST_PRIORITY_GO").unwrap());
+    fs::write(dir.join(format!("{name}.ready")), "ready").unwrap();
+    let end = Instant::now() + Duration::from_secs(120);
+    while !go.exists() {
+        assert!(Instant::now() < end, "go gate timed out: {}", go.display());
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let started = Instant::now();
     let lock =
         priority_lock::acquire_priority(&dir.join("build.lock"), wait, priority, &|_| "busy".into());
@@ -191,8 +208,10 @@ fn priority_order(tag: &str, first_human: bool, second_human: bool, second_wins:
     let r = PriorityRoot::new(tag);
     let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
     let mut first = r.spawn("first", first_human, 20_000);
-    r.registered(1);
     let mut second = r.spawn("second", second_human, 20_000);
+    first.go();
+    r.registered(1);
+    second.go();
     r.registered(2);
     assert!(
         !r.dir.join("first.taken").exists() && !r.dir.join("second.taken").exists(),
@@ -234,12 +253,16 @@ fn humans_cut_in_without_reordering_the_agents_they_pass() {
     let r = PriorityRoot::new("mixed-fifo");
     let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
     let mut a1 = r.spawn("a1", false, 20_000);
-    r.registered(1);
     let mut u1 = r.spawn("u1", true, 20_000);
-    r.registered(2);
     let mut a2 = r.spawn("a2", false, 20_000);
-    r.registered(3);
     let mut u2 = r.spawn("u2", true, 20_000);
+    a1.go();
+    r.registered(1);
+    u1.go();
+    r.registered(2);
+    a2.go();
+    r.registered(3);
+    u2.go();
     r.registered(4);
     drop(holder);
     u1.taken();
@@ -264,6 +287,7 @@ fn stale_human_marker_from_a_dead_process_does_not_delay_an_agent() {
     let r = PriorityRoot::new("dead-human");
     let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
     let mut human = r.spawn("human", true, 20_000);
+    human.go();
     r.registered(1);
     human.child.kill().unwrap();
     human.child.wait().unwrap();
@@ -285,8 +309,10 @@ fn human_cut_in_does_not_refuse_an_agent_before_its_own_wait_expires() {
     let r = PriorityRoot::new("agent-clock");
     let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
     let mut agent = r.spawn("agent", false, 2_000);
-    r.registered(1);
     let mut human = r.spawn("human", true, 20_000);
+    agent.go();
+    r.registered(1);
+    human.go();
     r.registered(2);
     drop(holder);
     human.taken();
@@ -303,6 +329,7 @@ fn zero_wait_probe_cannot_bypass_a_registered_human() {
     let r = PriorityRoot::new("probe");
     let holder = priority_lock::acquire(&r.path(), Duration::ZERO, &|_| "busy".into()).unwrap();
     let mut human = r.spawn("human", true, 20_000);
+    human.go();
     r.registered(1);
     // Freeze selection, then free the resource. A raw try_lock would now incorrectly jump the registered human.
     let gate = priority_lock::acquire(
