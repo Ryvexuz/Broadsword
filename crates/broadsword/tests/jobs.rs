@@ -991,11 +991,11 @@ fn a_grandchild_holding_a_test_executables_output_open_never_blocks_the_pool() {
     let r = Root::new("sidepipe", 1, 0);
     r.set("test_parallel_binaries", "4");
     let gpid = r.dir.join("scratch/grandchild.pid");
-    // a starts a process that inherits (and so holds open) a's stdout for 40 s, then a passes and exits at once
+    // a starts a process that inherits (and so holds open) a's stdout for 120 s, then a passes and exits at once
     let a = r#"
 #[test]
 fn a() {
-    let c = if cfg!(windows) { std::process::Command::new("ping").args(["-n", "40", "127.0.0.1"]).spawn() } else { std::process::Command::new("sleep").arg("40").spawn() };
+    let c = if cfg!(windows) { std::process::Command::new("ping").args(["-n", "120", "127.0.0.1"]).spawn() } else { std::process::Command::new("sleep").arg("120").spawn() };
     let c = c.unwrap();
     std::fs::write(r"GPID", c.id().to_string()).unwrap();
     std::io::Write::write_all(&mut std::io::stdout(), b"a started a grandchild\n").unwrap();
@@ -1007,6 +1007,7 @@ fn a() {
     let (so_f, se_f) = (r.dir.join("scratch/so.txt"), r.dir.join("scratch/se.txt"));
     let start = Instant::now();
     let status = r.cmd(&["test", "sidepipe"]).stdout(fs::File::create(&so_f).unwrap()).stderr(fs::File::create(&se_f).unwrap()).status().unwrap();
+    let end = std::time::SystemTime::now();
     let took = start.elapsed();
     let (so, se) = (fs::read_to_string(&so_f).unwrap(), fs::read_to_string(&se_f).unwrap());
     if let Ok(p) = fs::read_to_string(&gpid) {
@@ -1014,7 +1015,10 @@ fn a() {
         let _ = if cfg!(windows) { Command::new("taskkill").args(["/F", "/PID", &p]).output() } else { Command::new("kill").arg(&p).output() };
     }
     assert_eq!(status.code(), Some(0), "{so}{se}");
-    assert!(took < Duration::from_secs(25), "the pool waited {took:?} on a pipe a grandchild held (test_output_wait_seconds = 2): {so}{se}");
+    let modified = fs::metadata(&gpid).unwrap_or_else(|e| panic!("grandchild pid file missing or unreadable: {e}")).modified().expect("grandchild pid file modification time unavailable");
+    let window = end.duration_since(modified).expect("grandchild pid file modification time is after command completion");
+    println!("pool window after grandchild started: {window:?}; whole command: {took:?} (build included)");
+    assert!(window < Duration::from_secs(90), "the pool waited {window:?} after the grandchild started (whole command {took:?}, build included); a pool that waits on the pipe waits about 120 s: {so}{se}");
     assert!(so.contains("test: ok — 3 passed, 0 failed"), "a's result was read before the wait ran out: {so}");
     let log = fs::read_to_string(&r.job_logs()[0]).unwrap();
     assert!(log.contains("TRUNCATED") && log.contains("a started a grandchild"), "the cut is said, never silent, and what was read is kept: {log}");
