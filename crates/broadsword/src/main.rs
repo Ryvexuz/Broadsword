@@ -22,7 +22,6 @@ mod buildsrc;
 mod cleanup;
 mod config;
 mod donecheck;
-mod flake;
 mod git;
 mod install;
 mod job;

@@ -359,7 +359,7 @@ pub fn recover(cfg: &Config, mode: Mode) -> ExitCode {
             let first = steps.iter().position(|s| *s == r.get("step")).unwrap_or(0);
             println!("  read-only job: resuming `{kind} {project}` from step `{}`", steps[first]);
             let mut info = JobInfo::default();
-            let c = job::run_job_info(cfg, JobSpec { flaky: None, kind: kind.clone(), name: project.clone(), command: None, first_step: first, resumed_from: Some(id.clone()), resume_count: count + 1, task }, &mut info);
+            let c = job::run_job_info(cfg, JobSpec { kind: kind.clone(), name: project.clone(), command: None, first_step: first, resumed_from: Some(id.clone()), resume_count: count + 1, task }, &mut info);
             if c != 0 {
                 resumed_failed = true;
             }

@@ -243,7 +243,6 @@ pub(super) fn pre_merge_check(
     let code = job::run_job_info(
         cfg,
         JobSpec {
-            flaky: None,
             kind: "run".into(),
             name: project.to_string(),
             command: Some(command),
