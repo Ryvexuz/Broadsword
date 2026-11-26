@@ -44,6 +44,24 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(self.check(text.replace("## Evidence", "## Instructions"),
                                    gpt_preflight=True))
 
+    def test_b1_pointer_with_brackets(self):
+        for text, expected in (
+                ("See scratch/[draft].md.", "scratch/[draft].md"),
+                ("See scratch/[draft].md", "scratch/[draft].md"),
+                ("(see scratch/x.md)", "scratch/x.md"),
+                ("[See scratch/[draft].md]", "scratch/[draft].md"),
+                ("See scratch/[draft]]", "scratch/[draft]"),
+                ("See state\\[draft].md.", "state\\[draft].md")):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.check(text, gpt_preflight=True),
+                    [("B1", "FAIL", f"line 1: {expected}; paste the content "
+                      "(a coder cannot read scratch/ or state/)")])
+        self.assertEqual(self.check(
+            "<!-- See scratch/[draft].md -->\n"
+            "See scratch/<name>.md and scratch/*.md",
+            gpt_preflight=True), [])
+
     def test_b2_counts_bytes(self):
         self.assertEqual(self.check("a" * 29000, brief_max_kb=32, size_pct=90), [])
         result = self.check("a" * 29000 + "\u20ac" * 300,
@@ -77,6 +95,22 @@ class PreflightTests(unittest.TestCase):
                                         root=folder, cap_margin_pct=5)[0][0], "B4")
             self.assertEqual(self.check(base.format(" (new)", "under 600 lines"),
                                         root=folder, cap_margin_pct=5), [])
+
+    def test_b4_cap_inside_html_comment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (pathlib.Path(folder) / "a.py").write_bytes(b"x\n" * 586)
+            for cap in ("<!-- must stay under 600 lines -->",
+                        "must stay under 600 lines"):
+                with self.subTest(cap=cap):
+                    text = ("## Claims\n- `a.py`\n## Requirements\n" + cap
+                            + "\n<!-- See scratch/[draft].md -->")
+                    self.assertEqual(bl._brief.caps(cap), [600])
+                    self.assertEqual(
+                        self.check(text, root=folder, cap_margin_pct=5,
+                                   gpt_preflight=True),
+                        [("B4", "FAIL",
+                          'a.py has 586 lines, within 5% of the stated 600-line cap: '
+                          'mark its claim "wiring" or split first')])
 
     def cli(self, path, *flags):
         output, errors = io.StringIO(), io.StringIO()
