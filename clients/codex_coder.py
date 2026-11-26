@@ -9,6 +9,7 @@ The coder run:
      with a finished worktree whose recorded path is relative, has no `..`, lies inside worktrees_dir, has no symlink, junction
      or reparse point between the root and the worktree, and really is a linked Git worktree of a repo inside the root;
   2. passes two gates, both by import from openai_review.py, before any model is reached (each refuses with exit 2):
+     - before those gates, start_gate checks the GPT brief lint and brief Claims against the board (exit 2 if unready);
      - the CODER canary record: `codex --version` (rv.codex_version) must equal the codex_version in
        <state_dir>/canary/coder-last-pass.json (rv.read_last_pass), which only a CONFINED `--canary` run writes. A codex update
        therefore stops the route until the canary has passed again for the new version. The shadow reviewer's record
@@ -86,6 +87,9 @@ _spec = importlib.util.spec_from_file_location("openai_review_for_coder", HERE /
 rv = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rv)
 oc = rv.oc
+_sgspec = importlib.util.spec_from_file_location("start_gate_for_coder", HERE / "start_gate.py")
+sg = importlib.util.module_from_spec(_sgspec)
+_sgspec.loader.exec_module(sg)
 
 TEMPLATE = HERE.parent / "templates" / "coder-prompt-codex.md"
 
@@ -876,6 +880,9 @@ def run_coder(args, environ) -> tuple:
     wt = task_worktree(root, settings, rec)
     claims = claims_of(rec)
     brief = read_brief(args.brief, settings["reviewer_brief_max_kb"])
+    problems = sg.check(root, rec.get("project", ""), Path(args.brief), claims, settings["reviewer_brief_max_kb"])
+    if problems:
+        raise Refused("brief_not_ready: " + "; ".join(problems))
     try:
         template = TEMPLATE.read_text(encoding="utf-8")
     except OSError as e:
