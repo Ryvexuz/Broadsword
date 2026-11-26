@@ -1200,15 +1200,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("late.txt");
         // `start /b` leaves the inner cmd running with the outer one's stdout; the outer cmd exits 0 at once
-        let inner = format!("ping -n 8 127.0.0.1 >nul & echo late> {}", marker.display());
+        let inner = format!("ping -n 31 127.0.0.1 >nul & echo late> {}", marker.display());
         let args: Vec<String> = ["/C", "start", "/b", "cmd", "/C", &inner].iter().map(|s| s.to_string()).collect();
-        let lim = Limits { timeout: Duration::from_secs(3), tail_lines: 5, tail_bytes: 1000 };
+        let lim = Limits { timeout: Duration::from_secs(20), tail_lines: 5, tail_bytes: 1000 };
         let r = run_one(&cfg, Path::new("cmd.exe"), &dir, &args, &lim, &Secrets::collect(&dir, &[], 6));
         println!("{:?} after {:.1} s: {}", r.ended, r.secs, r.ended_text(&lim));
         assert_eq!(r.ended, Ended::LeftRunning { code: Some(0), killed: true });
         assert!(matches!(r.verdict(), Verdict::Fail(_)), "{:?}", r.verdict());
         assert!(r.ended_text(&lim).starts_with("DID NOT FINISH: the command exited (exit 0)"), "{}", r.ended_text(&lim));
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(14));
         assert!(!marker.exists(), "the grandchild was killed at the deadline, so it never wrote its marker");
         std::fs::remove_dir_all(&dir).unwrap();
     }
