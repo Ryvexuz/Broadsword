@@ -94,6 +94,7 @@ const BASE: &[(&str, &str)] = &[
     ("auto_agent_timeout_minutes", "90"),
     ("auto_agent_min_gap_minutes", "150"),
     ("auto_agent_max_starts_per_day", "6"),
+    ("ready_lint_args", "\"--max-lines 30 --max-bullets 8 --max-files 2 --max-done-lines 10 --min-hard-cases 2 --big-file-lines 1000\""),
     ("shadow_reviewer", "\"off\""),
     ("shadow_reviewer_model", "\"gpt-5.6-sol\""),
     ("shadow_reviewer_timeout_seconds", "5"),
