@@ -6,7 +6,7 @@ import re
 CAP = re.compile(
     r"\b(?:past|under|below|over|at most|cap of)\s+(?:about\s+)?(\d[\d,]*)\s+lines\b"
     r"|\b(\d[\d,]*)-line cap\b", re.I)
-POINTER = re.compile(r"(?<![\w/\\])(?:scratch|state)[/\\][^\s`'\"()\[\],;]+", re.I)
+POINTER = re.compile(r"(?<![\w/\\])(?:scratch|state)[/\\][^\s`'\"(),;]+", re.I)
 
 
 def caps(text):
@@ -50,6 +50,8 @@ def check(text, path, options, split_sections, claimed_paths, claim_blocks, clai
                 continue
             for match in POINTER.finditer(line):
                 p = match[0].rstrip(".:")
+                while p.endswith("]") and p.count("]") > p.count("["):
+                    p = p[:-1].rstrip(".:")
                 if "<" not in p and "*" not in p and len(pointers) < 5:
                     pointers.append(f"line {i + 1}: {p}")
         if pointers:
@@ -73,8 +75,8 @@ def check(text, path, options, split_sections, claimed_paths, claim_blocks, clai
                 result.append(("B2", "FAIL", f"{size} bytes, over {pct}% of "
                                f"reviewer_brief_max_kb = {n} ({limit} bytes): "
                                "replace sections in an amendment instead of appending"))
-    if options.cap_margin_pct is not None and caps(clean):
-        global_cap = min(caps(clean))
+    if options.cap_margin_pct is not None and caps(text):
+        global_cap = min(caps(text))
         items = [line for block in claim_blocks(lines, sections) for line in block.splitlines()]
         for p in sorted(claimed_paths(lines, sections)):
             own = [line for line in items if p in claim_paths(line)]
