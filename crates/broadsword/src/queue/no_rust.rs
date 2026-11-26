@@ -1,4 +1,4 @@
-//! A conservative Python-only pre-merge check; discovery errors keep the existing cargo check.
+//! Python pre-merge checks: conservative no-Rust eligibility and touched fast-subset scripts.
 
 use crate::config::Config;
 use crate::job::{self, JobInfo, JobSpec};
@@ -187,6 +187,88 @@ fn python_command(scripts: &[String]) -> Result<String, String> {
         .join(" && "))
 }
 
+// Keep discovery behind one call site so configured-script expansion stays shared.
+fn scripts_of<'a>(cfg: &'a Config, project: &str) -> &'a [String] {
+    job::python_scripts(cfg, project)
+}
+
+/// Git paths compare case-insensitively; only the script itself or its sibling module selects it.
+fn select_python(scripts: &[String], changed: &[String]) -> Vec<String> {
+    let changed: std::collections::BTreeSet<_> =
+        changed.iter().map(|p| p.to_ascii_lowercase()).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    scripts
+        .iter()
+        .filter(|script| {
+            let folded = script.to_ascii_lowercase();
+            let (folder, name) = folded.rsplit_once('/').unwrap_or(("", &folded));
+            let sibling = name.strip_prefix("test_").filter(|n| n.ends_with(".py"));
+            let touched = changed.contains(&folded)
+                || sibling.is_some_and(|module| {
+                    let path = if folder.is_empty() {
+                        module.to_string()
+                    } else {
+                        format!("{folder}/{module}")
+                    };
+                    changed.contains(&path)
+                });
+            touched && seen.insert(folded)
+        })
+        .cloned()
+        .collect()
+}
+
+pub(super) struct SubsetPython {
+    pub(super) command: String,
+    pub(super) selected: usize,
+    pub(super) of: usize,
+    pub(super) why: String,
+}
+
+fn subset_plan(
+    scripts: &[String],
+    dir: &Path,
+    changed: Result<Vec<String>, String>,
+) -> Result<Option<SubsetPython>, String> {
+    let (mut selected, why) = match changed {
+        Ok(paths) => (select_python(scripts, &paths), "touched by this diff".into()),
+        Err(error) => (
+            select_python(scripts, scripts),
+            format!("the changed files could not be read ({error}), so every configured script runs"),
+        ),
+    };
+    // Reject noncanonical configured paths before interpreting them as worktree-relative.
+    for script in &selected {
+        if !canonical_path(script) {
+            return Err(format!("Python test path is not shell-neutral: {script:?}"));
+        }
+    }
+    // Deleted scripts belong to the full main check's missing-script judgment, not this subset.
+    selected.retain(|script| dir.join(script).is_file());
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SubsetPython {
+        command: python_command(&selected)?,
+        selected: selected.len(),
+        of: scripts.len(),
+        why,
+    }))
+}
+
+pub(super) fn subset_python(
+    cfg: &Config,
+    project: &str,
+    task_id: &str,
+) -> Result<Option<SubsetPython>, String> {
+    let scripts = scripts_of(cfg, project);
+    if scripts.is_empty() {
+        return Ok(None);
+    }
+    let dir = job::job_folder(cfg, project, Some(task_id)).map_err(|(_, message)| message)?;
+    subset_plan(scripts, &dir, changed_paths(&dir))
+}
+
 fn plan(
     scripts: &[String],
     paths: Result<Vec<String>, String>,
@@ -224,7 +306,7 @@ pub(super) fn pre_merge_check(
     info: &mut JobInfo,
 ) -> Option<(u8, String)> {
     cfg.merge_fast_subset(project)?;
-    let scripts = job::python_scripts(cfg, project);
+    let scripts = scripts_of(cfg, project);
     if scripts.is_empty() {
         return None;
     }
@@ -262,6 +344,207 @@ mod tests {
 
     fn paths(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_changed_test_script_is_selected() {
+        assert_eq!(
+            select_python(
+                &paths(&["scripts/test_a.py", "scripts/test_b.py"]),
+                &paths(&["scripts/test_a.py"])
+            ),
+            paths(&["scripts/test_a.py"])
+        );
+    }
+
+    #[test]
+    fn the_module_next_to_a_test_selects_it() {
+        let scripts = paths(&["scripts/test_brief_lint.py"]);
+        assert_eq!(
+            select_python(&scripts, &paths(&["scripts/brief_lint.py"])),
+            scripts
+        );
+        assert!(select_python(&scripts, &paths(&["clients/brief_lint.py"])).is_empty());
+        assert_eq!(
+            select_python(&paths(&["test_a.py"]), &paths(&["a.py"])),
+            paths(&["test_a.py"])
+        );
+        for unrelated in ["scripts/test_other.py", "scripts/x/brief_lint.py"] {
+            assert!(select_python(&scripts, &paths(&[unrelated])).is_empty());
+        }
+        assert!(select_python(&paths(&["test_a.txt"]), &paths(&["a.txt"])).is_empty());
+    }
+
+    #[test]
+    fn an_unrelated_python_change_selects_nothing() {
+        assert!(select_python(
+            &paths(&["scripts/test_a.py", "scripts/test_b.py"]),
+            &paths(&["scripts/other.py", "docs/x.md", "src/a.rs"])
+        )
+        .is_empty());
+        assert!(select_python(&[], &paths(&["scripts/test_a.py"])).is_empty());
+        assert!(select_python(&paths(&["scripts/test_a.py"]), &[]).is_empty());
+    }
+
+    #[test]
+    fn selection_keeps_config_order_and_ignores_case() {
+        let scripts = paths(&["scripts/test_b.py", "scripts/test_a.py", "Scripts/TEST_A.py"]);
+        assert_eq!(
+            select_python(&scripts, &paths(&["Scripts/Test_A.py"])),
+            paths(&["scripts/test_a.py"])
+        );
+        assert_eq!(
+            select_python(
+                &scripts,
+                &paths(&["Scripts/Test_A.py", "SCRIPTS/B.PY", "scripts/test_a.py"])
+            ),
+            paths(&["scripts/test_b.py", "scripts/test_a.py"])
+        );
+    }
+
+    #[test]
+    fn the_5d2529499_train_selects_test_codex_coder() {
+        // Snapshot of broadsword's configured list, not a reference derived by the selector.
+        let scripts = paths(&[
+            "scripts/test_move_check.py",
+            "scripts/test_backup_status.py",
+            "scripts/test_baseline.py",
+            "scripts/test_baseline_extras.py",
+            "scripts/test_brief_lint.py",
+            "scripts/test_check_ci_workflow.py",
+            "scripts/test_cold_move.py",
+            "scripts/test_dev_metrics.py",
+            "scripts/test_fresh_clone_check.py",
+            "scripts/test_ledger_check.py",
+            "scripts/test_main_provenance.py",
+            "scripts/test_node_check.py",
+            "scripts/test_roadmap_status.py",
+            "scripts/test_session_end_check.py",
+            "scripts/test_shadow_adjudicate.py",
+            "scripts/test_shadow_canary.py",
+            "scripts/test_shadow_report.py",
+            "scripts/test_slot_check.py",
+            "scripts/test_usage_sum.py",
+            "clients/test_codex_coder.py",
+            "clients/test_openai_mcp.py",
+            "clients/test_openai_review.py",
+            "bench/coder/test_openai_provider.py",
+            "bench/coder/test_provider_errors.py",
+            "bench/coder/test_run_attempts.py",
+            "bench/coder/test_run_regrade.py",
+            "bench/coder/test_run_timeout.py",
+            "bench/drift/test_drift.py",
+            "bench/instruct/test_instruct.py",
+            "bench/reviewer/test_replay.py",
+            "bench/reviewer/test_run_codex.py",
+            "bench/reviewer/test_run_openai.py",
+            "bench/reviewer/test_score_hard.py",
+            "scripts/test_review_dispute.py",
+            "scripts/test_hotspots.py",
+            "scripts/test_wake_on_event.py",
+            "scripts/test_stall_restart.py",
+            "scripts/test_stale_claims.py",
+        ]);
+        let changed = paths(&[
+            "broadsword.toml",
+            "clients/codex_coder.py",
+            "clients/start_gate.py",
+            "clients/test_codex_coder.py",
+            "clients/test_start_gate.py",
+            "crates/broadsword/src/config.rs",
+            "crates/broadsword/src/queue/advisory.rs",
+            "crates/broadsword/src/queue/mod.rs",
+            "crates/broadsword/src/queue/review.rs",
+            "crates/broadsword/tests/queue_advisory.rs",
+            "crates/broadsword/tests/support/mod.rs",
+            "scripts/brief_lint.py",
+            "scripts/brief_preflight.py",
+            "scripts/coded_wait.py",
+            "scripts/test_brief_lint.py",
+            "scripts/test_brief_preflight.py",
+            "scripts/test_coded_wait.py",
+        ]);
+        assert_eq!(
+            select_python(&scripts, &changed),
+            paths(&["scripts/test_brief_lint.py", "clients/test_codex_coder.py"])
+        );
+    }
+
+    #[test]
+    fn subset_plans_fall_back_to_all_existing_scripts_and_reject_unsafe_paths() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scratch")
+            .join(format!("subset-python-{}", std::process::id()));
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        for script in ["test_a.py", "test_b.py", "test_unsafe&.py"] {
+            fs::write(dir.join("scripts").join(script), "").unwrap();
+        }
+        let scripts = paths(&[
+            "scripts/test_b.py",
+            "scripts/test_deleted.py",
+            "scripts/test_a.py",
+        ]);
+        let fallback = subset_plan(&scripts, &dir, Err("git failed".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fallback.command,
+            "python -I -B scripts/test_b.py && python -I -B scripts/test_a.py"
+        );
+        assert_eq!((fallback.selected, fallback.of), (2, 3));
+        assert_eq!(
+            fallback.why,
+            "the changed files could not be read (git failed), so every configured script runs"
+        );
+        let touched = subset_plan(&scripts, &dir, Ok(paths(&["scripts/a.py"])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(touched.command, "python -I -B scripts/test_a.py");
+        assert_eq!((touched.selected, touched.of), (1, 3));
+        assert_eq!(touched.why, "touched by this diff");
+        for changed in ["src/a.rs", "scripts/test_deleted.py"] {
+            assert!(subset_plan(&scripts, &dir, Ok(paths(&[changed])))
+                .unwrap()
+                .is_none());
+        }
+        for script in [
+            "scripts/test_unsafe&.py",
+            "../outside.py",
+            "C:/outside.py",
+            r"scripts\test_a.py",
+            "scripts/test_a\r.py",
+        ] {
+            let Err(error) = subset_plan(&paths(&[script]), &dir, Err("git failed".into())) else {
+                panic!("unsafe configured paths must fail closed");
+            };
+            assert!(error.contains("not shell-neutral"), "{error}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subset_discovery_needs_no_folder_without_scripts_but_reports_an_unknown_folder() {
+        let mut cfg = Config::from_text(
+            include_str!("../../../../broadsword.toml"),
+            Path::new("subset-python-unit-test"),
+        )
+        .unwrap();
+        cfg.python_tests.clear();
+        assert!(subset_python(&cfg, "not-a-project", "not-a-task")
+            .unwrap()
+            .is_none());
+        cfg.python_tests = vec![("not-a-project".into(), paths(&["scripts/test_a.py"]))];
+        assert!(subset_python(&cfg, "not-a-project", "not-a-task").is_err());
+    }
+
+    #[test]
+    fn selection_checks_the_end_of_a_large_diff() {
+        let mut changed = vec!["scripts/other.py".into(); 10_000];
+        changed.push("scripts/a.py".into());
+        assert_eq!(
+            select_python(&paths(&["scripts/test_a.py"]), &changed),
+            paths(&["scripts/test_a.py"])
+        );
     }
 
     fn rejected(path: &str, rule: &str) {

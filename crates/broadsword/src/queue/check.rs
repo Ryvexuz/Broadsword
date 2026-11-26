@@ -107,8 +107,9 @@ fn fast_plan(project: &str, tests: &[String], metadata: Result<String, String>) 
 /// THE ONE PRE-MERGE CHECK of an entry's commit in task `task_id`'s worktree (the single entry's own check, and every merge-train
 /// check: tip, bisect and alone). A listed project may run only Python tests for a proven no-Rust diff (`no_rust`); otherwise it
 /// gets the fast subset when `fast_plan` verifies its names:
-/// ONE `run` job of `fast_command` through the same job machinery as `check` (disk guard, build lock, log, scrubbed environment,
-/// redaction). Names that cannot be verified give the full `check`; a name cargo does not know refuses the check (exit 1, no job).
+/// ONE `run` job of `fast_command`, then any configured Python tests touched by the diff, through the same job machinery as
+/// `check` (disk guard, build lock, log, scrubbed environment, redaction). Unverifiable names or failed Python selection give the
+/// full `check`; a name cargo does not know refuses the check (exit 1, no job).
 /// Any other project gets the full `check`, exactly as before. Returns the exit code, normalised so a Python or subset command that
 /// failed is 1 like a failed check (a refusal or a disk kill keeps its own code: no verdict), and the line that says which check
 /// ran. That line ends the job's lines in the entry's `check_summary` and heads its `check_tail`, so neither a record nor the
@@ -135,10 +136,27 @@ fn pre_merge_check(cfg: &Config, project: &str, task_id: &str, info: &mut JobInf
             (1, format!("check: REFUSED ({why}); nothing ran. Fix merge_fast_tests in broadsword.toml"))
         }
         FastPlan::Subset(command) => {
+            let (command, python) = match super::no_rust::subset_python(cfg, project, task_id) {
+                Ok(None) => (command, String::new()),
+                Ok(Some(py)) => (
+                    format!("{command} && {}", py.command),
+                    format!(
+                        " + python ({} of {} script(s), {})",
+                        py.selected, py.of, py.why
+                    ),
+                ),
+                Err(why) => {
+                    println!("fast subset off for {project}: python selection failed ({why}); the FULL check runs instead");
+                    return (
+                        full(info),
+                        format!("check: full (python selection failed: {why})"),
+                    );
+                }
+            };
             println!("fast subset check of {project} --task {task_id} (merge_fast_tests): {command}; the full check runs on main after the merge");
             let code = job::run_job_info(cfg, JobSpec { kind: "run".into(), name: project.to_string(), command: Some(command.clone()), first_step: 0, resumed_from: None, resume_count: 0, task: Some(task_id.to_string()) }, info);
             let failed = code != 0 && info.summary.first().is_some_and(|l| l.starts_with("run: FAILED"));
-            let label = format!("check: fast subset ({}) = `{command}`, NOT the full suite: the full check runs on main right after the merge, and a failure there is reverted", tests.join(" "));
+            let label = format!("check: fast subset ({}){python} = `{command}`, NOT the full suite: the full check runs on main right after the merge, and a failure there is reverted", tests.join(" "));
             (if failed { 1 } else { code }, label)
         }
     }
