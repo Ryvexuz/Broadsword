@@ -15,6 +15,7 @@ import tomllib
 TASK = re.compile(r"(?<![\w-])t-\d{8}-\d{6}(?:-\d+)?(?![\w-])")
 PREREQUISITES = re.compile(r"^\s*(?:-\s*)?(?:Prerequisites|Depends on)\s*:\s*(.*)$", re.I)
 MODEL = re.compile(r"^\s*(?:-\s*)?Model\s*:\s*(.*)$", re.I)
+CLAIMS = re.compile(r"^\s*(?:-\s*)?Claims\s*:\s*(.*)$", re.I)
 
 
 def claims_overlap(a, b):
@@ -76,6 +77,20 @@ def check(row, brief, statuses, held, lint_ok):
                 return False, f"claim {claim.strip()} overlaps {other}"
     if not lint_ok:
         return False, "brief_lint not ok"
+    # Board membership is exact, not overlap: a folder, wildcard, or whole
+    # file must not silently stand in for a different brief claim.
+    board_claims = {claim.strip() for claim in row[5].split(", ")}
+    missing = []
+    for line in brief.splitlines():
+        match = CLAIMS.fullmatch(line.replace("**", ""))
+        if not match:
+            continue
+        for item in match[1].split(","):
+            claim = item.partition("(")[0].strip().strip("`").strip()
+            if claim and claim not in board_claims and claim not in missing:
+                missing.append(claim)
+    if missing:
+        return False, "brief claims not on the board: " + ", ".join(missing)
     return True, "ok"
 
 

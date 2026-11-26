@@ -80,6 +80,58 @@ class RuleTests(unittest.TestCase):
             readiness.check(row(), BRIEF, {}, [], False), (False, "brief_lint not ok"),
         )
 
+    def brief_claim_missing_from_board_is_not_startable(self):
+        brief = BRIEF + "**Claims:** `src/a.rs`, `src/b.rs`\n"
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: src/b.rs"),
+        )
+
+    # unittest discovers test_* methods; retain the amendment's exact name too.
+    test_brief_claim_missing_from_board_is_not_startable = (
+        brief_claim_missing_from_board_is_not_startable
+    )
+
+    def test_brief_claims_require_exact_board_membership(self):
+        for board, claimed in (
+            ("src", "src/a.rs"), ("*", "src/a.rs"),
+            ("src/a.rs", "src/a.rs#key"), ("src/a.rs#key", "src/a.rs"),
+            ("src/a.rs#one", "src/a.rs#two"),
+            ("src/a.rs", r"src\a.rs"), ("src/a.rs", r"C:\src\a.rs"),
+        ):
+            with self.subTest(board=board, claimed=claimed):
+                self.assertEqual(
+                    readiness.check(row(claim=board), BRIEF + "Claims: " + claimed, {}, [], True),
+                    (False, "brief claims not on the board: " + claimed),
+                )
+
+    def test_brief_claims_exact_matches_and_annotations(self):
+        brief = BRIEF + (
+            "- **Claims:** `src/a.rs` (existing), `config.toml#key` (new)\n"
+            "Claims: src/a.rs\n"
+        )
+        self.assertEqual(
+            readiness.check(row(claim="src/a.rs, config.toml#key"), brief, {}, [], True),
+            (True, "ok"),
+        )
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: config.toml#key"),
+        )
+
+    def test_all_brief_claim_lines_checked_and_missing_paths_reported(self):
+        brief = BRIEF + (
+            "**Claims:** src/b.rs, src/c.rs\n"
+            "Claims: src/b.rs, config.toml#key\n"
+        )
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: src/b.rs, src/c.rs, config.toml#key"),
+        )
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], False), (False, "brief_lint not ok"),
+        )
+
     def test_claim_overlap_board_rule(self):
         for a, b, expected in (
             ("*", "x", True), ("SRC/A.rs", "src/a.RS#key", True),
@@ -146,6 +198,15 @@ class GatherTests(unittest.TestCase):
     def test_lint_fail_is_never_startable(self):
         self.configure("fail")
         self.assertEqual(self.gather()[0][1:], (False, "brief_lint not ok"))
+
+    def test_brief_claim_missing_from_board_is_not_startable(self):
+        self.write_brief(OWN, BRIEF + "**Claims:** src/a.rs, src/b.rs\n")
+        self.assertEqual(
+            self.gather()[0][1:], (False, "brief claims not on the board: src/b.rs"),
+        )
+        self.assertEqual(
+            self.gather([row(claim="src/a.rs, src/b.rs")])[0][1:], (True, "ok"),
+        )
 
     def test_lint_crash_marks_all_not_startable(self):
         self.write_brief(DEP)
