@@ -180,9 +180,12 @@ impl<'a> Run<'a> {
         self.e.set("tokens_in", review.input_tokens.map(|n| n.to_string()).unwrap_or_default());
         self.e.set("tokens_out", review.output_tokens.map(|n| n.to_string()).unwrap_or_default());
         self.e.set("review_file", file.clone());
+        let advisory = self.prepare_advisory(&prompt);
         self.save()?;
         self.log("review", &format!("{} by `{model}` (gate: {}); {} blocking, {} minor; cost {} USD; full output in {file}", self.e.get("verdict"), self.e.get("gate"), verdict.blocking.len(), verdict.minor.len(), review.cost_usd.as_deref().unwrap_or("unknown")))?;
-        self.s_advisory(&prompt);
+        if let Some(advisory) = advisory {
+            advisory.start();
+        }
         self.s_shadow(&prompt)?;
         if verdict.pass {
             return Ok(());
