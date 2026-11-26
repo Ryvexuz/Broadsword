@@ -362,7 +362,8 @@ impl Config {
         }
         // read only by scripts/stall_restart.py, which loads these keys itself: validated here (missing or 0 refused at load), not stored
         // stale_claim_hours: read only by scripts/stale_claims.py
-        for k in ["stall_restart_lines", "stall_restart_timeout_seconds", "stale_claim_hours"] {
+        // auto_agent_*: read only by scripts/auto_agent.py
+        for k in ["stall_restart_lines", "stall_restart_timeout_seconds", "stale_claim_hours", "auto_agent_timeout_minutes", "auto_agent_min_gap_minutes", "auto_agent_max_starts_per_day"] {
             positive(k)?;
         }
         let reviewer_backend = get_str(&m, "reviewer_backend")?;
@@ -673,6 +674,9 @@ hotspot_commits = 5
 stall_restart_lines = 3
 stall_restart_timeout_seconds = 60
 stale_claim_hours = 4
+auto_agent_timeout_minutes = 90
+auto_agent_min_gap_minutes = 150
+auto_agent_max_starts_per_day = 6
 install_dir=\"build/bin\"\n";
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"worktrees\"\n"), Path::new("p")).is_ok());
         assert!(Config::from_text(&format!("{base}worktrees_dir=\"a/wt\"\n"), Path::new("p")).is_ok());
@@ -853,7 +857,7 @@ install_dir=\"build/bin\"\n";
     fn hotspot_keys_are_required_and_positive() {
         let text = include_str!("../../../broadsword.toml");
         assert!(Config::from_text(text, Path::new("p")).is_ok());
-        for key in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits", "stall_restart_lines", "stall_restart_timeout_seconds", "stale_claim_hours"] {
+        for key in ["hotspot_lines", "hotspot_window_hours", "hotspot_wait_hours", "hotspot_claims", "hotspot_commits", "stall_restart_lines", "stall_restart_timeout_seconds", "stale_claim_hours", "auto_agent_timeout_minutes", "auto_agent_min_gap_minutes", "auto_agent_max_starts_per_day"] {
             let e = Config::from_text(&without_key(text, key), Path::new("p")).unwrap_err();
             assert!(e.contains(key) && e.contains("missing"), "{key}: {e}");
             let zero: String = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == key) { format!("{key} = 0") } else { l.to_string() }).collect::<Vec<_>>().join("
@@ -966,6 +970,9 @@ hotspot_commits = 5
 stall_restart_lines = 3
 stall_restart_timeout_seconds = 60
 stale_claim_hours = 4
+auto_agent_timeout_minutes = 90
+auto_agent_min_gap_minutes = 150
+auto_agent_max_starts_per_day = 6
 worktrees_dir = \"worktrees\"\n";
         assert!(Config::from_text(&format!("{base}install_dir=\"build/bin\"\n"), Path::new("p")).is_ok());
         for bad in ["../b", "/b", "C:/b", ".", "scratch/bin", "state/x", "a/../../b"] {
@@ -1032,6 +1039,9 @@ hotspot_commits = 5
 stall_restart_lines = 3
 stall_restart_timeout_seconds = 60
 stale_claim_hours = 4
+auto_agent_timeout_minutes = 90
+auto_agent_min_gap_minutes = 150
+auto_agent_max_starts_per_day = 6
 merge_train_lanes = 1
 worktrees_dir = \"worktrees\"\n";
         for bad in ["../x", "C:/abs", "/abs", ".", "a/../../b"] {
@@ -1118,9 +1128,10 @@ worktrees_dir = \"worktrees\"\n";
         // the stall_restart_* keys are read only by scripts/stall_restart.py (exactly that file, exactly those keys)
         let stall_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/stall_restart.py")).unwrap();
         let stale_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/stale_claims.py")).unwrap();
-        let used_by_python = |k: &str| py.contains(&format!("\"{k}\"")) || (k.starts_with("hotspot_") && hotspots_py.contains(&format!("\"{k}\""))) || (k.starts_with("stall_restart_") && stall_py.contains(&format!("\"{k}\""))) || (k == "stale_claim_hours" && stale_py.contains(&format!("\"{k}\"")));
+        let auto_agent_py = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/auto_agent.py")).unwrap();
+        let used_by_python = |k: &str| py.contains(&format!("\"{k}\"")) || (k.starts_with("hotspot_") && hotspots_py.contains(&format!("\"{k}\""))) || (k.starts_with("stall_restart_") && stall_py.contains(&format!("\"{k}\""))) || (k == "stale_claim_hours" && stale_py.contains(&format!("\"{k}\""))) || (k == "auto_agent_timeout_minutes" && auto_agent_py.contains("\"auto_agent_timeout_minutes\"")) || (k == "auto_agent_min_gap_minutes" && auto_agent_py.contains("\"auto_agent_min_gap_minutes\"")) || (k == "auto_agent_max_starts_per_day" && auto_agent_py.contains("\"auto_agent_max_starts_per_day\""));
         let unused: Vec<&String> = keys.iter().filter(|k| !used(k) && !used(accessor(k)) && !used_by_python(k)).collect();
-        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name (hotspot_* keys: scripts/hotspots.py; stall_restart_* keys: scripts/stall_restart.py): {unused:?}");
+        assert!(unused.is_empty(), "keys in broadsword.toml that no Rust code outside config.rs uses as `.key` and no clients/*.py reads by its quoted name (hotspot_* keys: scripts/hotspots.py; stall_restart_* keys: scripts/stall_restart.py; auto_agent_timeout_minutes, auto_agent_min_gap_minutes, auto_agent_max_starts_per_day: scripts/auto_agent.py): {unused:?}");
     }
 
     #[test]
