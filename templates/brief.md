@@ -25,7 +25,7 @@ For a task from a plan (`docs/nodes/*.md` or a stage doc), copy the Requirements
 
 **If a check genuinely fails:** do not loosen it. Report the configuration and numbers.
 
-**Build route:** say how long the full suite takes, and that the coder runs it in the foreground and reads the result (never "run it in the background": a subagent cannot wait for its own background job). For `broadsword` tasks the verifier runs only the targeted tests and clippy (templates/verifier-prompt.md); the queue's pre-merge check is the one full suite, so write the full-suite line as a `broadsword test broadsword --task t-20261125-181320` done-check line (shown COVERED) and list the targeted tests separately.
+**Build route:** say how long the full suite takes, and that the coder runs it in the foreground and reads the result (never "run it in the background": a subagent cannot wait for its own background job). For `broadsword` tasks the verifier runs only the targeted tests and clippy (templates/verifier-prompt.md); the queue's pre-merge check is the one full suite, so write the full-suite line as a `broadsword test broadsword --task <id>` done-check line (shown COVERED) and list the targeted tests separately.
 
 **Done check (each line is a command and what it must show):**
 1. `broadsword test <project> --task <id>` → `test: ok`, including the new tests <name them if known>
