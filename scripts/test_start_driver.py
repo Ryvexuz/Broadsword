@@ -164,6 +164,27 @@ class StartDriverTests(unittest.TestCase):
             lines,
         )
 
+    def test_tracked_driver_refuses_missing_bash_before_queue_run(self):
+        lines = (HERE / "queue-driver-project.ps1").read_text(encoding="utf-8").splitlines()
+        fallback = next(
+            i for i, line in enumerate(lines)
+            if line.startswith("if (-not (Get-Command bash ") and "Test-Path" in line
+        )
+        refusal = [
+            "if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {",
+            "    [Console]::Error.WriteLine('queue driver: bash not found on PATH "
+            "(Git for Windows bin); not starting')",
+            "    exit 2",
+            "}",
+        ]
+        self.assertEqual(lines[fallback + 1:fallback + 1 + len(refusal)], refusal)
+        queue_runs = [
+            i for i, line in enumerate(lines)
+            if line.lstrip().startswith("& build/bin/broadsword.exe queue run ")
+        ]
+        self.assertTrue(queue_runs, "no queue run invocation found")
+        self.assertLess(fallback + len(refusal), min(queue_runs))
+
 
 if __name__ == "__main__":
     unittest.main()

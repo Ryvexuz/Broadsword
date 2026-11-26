@@ -11,6 +11,10 @@ Set-Location (Split-Path $PSScriptRoot -Parent)
 $env:BROADSWORD_REVIEWER_CLI = 'C:\Users\MrComputer\.local\bin\claude.exe'
 # orch 13 2026-11-23: a driver started without Git's bin on PATH failed every train ("bash is needed"); set it where the driver is spawned (playbook lesson 22)
 if (-not (Get-Command bash -ErrorAction SilentlyContinue) -and (Test-Path 'C:\Program Files\Git\bin\bash.exe')) { $env:Path = 'C:\Program Files\Git\bin;' + $env:Path }
+if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {
+    [Console]::Error.WriteLine('queue driver: bash not found on PATH (Git for Windows bin); not starting')
+    exit 2
+}
 $log = "scratch/queue-driver-$Project.log"
 while ($true) {
     $list = & build/bin/broadsword.exe queue list 2>&1
