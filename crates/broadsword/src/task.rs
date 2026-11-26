@@ -46,6 +46,8 @@ pub const EXIT_BUSY: u8 = 4;
 /// The claim that means the whole project.
 pub const WHOLE_PROJECT: &str = "*";
 
+mod archive;
+pub use archive::cmd_archive;
 mod claims;
 pub use claims::{normalize_claims, overlaps};
 #[cfg(test)]
@@ -185,7 +187,14 @@ pub fn load_task(cfg: &Config, id: &str) -> Result<Record, String> {
     if id.is_empty() || record::sanitize(id) != id {
         return Err(nope());
     }
-    let path = tasks_dir(cfg).join(format!("{id}.{EXT}"));
+    let mut path = tasks_dir(cfg).join(format!("{id}.{EXT}"));
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            path = archive::find(cfg, id)?.ok_or_else(nope)?;
+        }
+        Err(e) => return Err(format!("cannot inspect {}: {e}", path.display())),
+        Ok(_) => {}
+    }
     match record::load(&path) {
         Ok(mut r) if r.id() == id => {
             normalise_record(cfg, &mut r);
@@ -251,7 +260,11 @@ pub fn cmd_add(cfg: &Config, project: &str, title: &str, claims: &[&str]) -> Exi
         Ok(c) => c,
         Err(e) => return fail(EXIT_BAD_INPUT, e),
     };
-    let mut r = match record::create_ext(&tasks_dir(cfg), &format!("t-{}", job::file_stamp(now_secs())), EXT) {
+    let _lock = match board_lock(cfg) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let mut r = match archive::create_task(cfg, &format!("t-{}", job::file_stamp(now_secs()))) {
         Ok(r) => r,
         Err(e) => return fail(EXIT_ERROR, format!("cannot create a task record: {e}")),
     };
