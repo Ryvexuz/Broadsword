@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::job::{self, JobInfo, JobSpec};
+use crate::job::JobInfo;
 use crate::record;
 use crate::task;
 use crate::worktree;
@@ -153,11 +153,10 @@ impl<'a> Run<'a> {
     // -- step 6: main check -----------------------------------------------------------------
 
     fn s_main_check(&mut self) -> R<()> {
-        self.prepare_main_check()?;
-        let mut info = JobInfo::default();
-        let spec: JobSpec = super::postcheck::check_spec(self.e.get("project"));
-        let code = job::run_job_info(self.cfg, spec, &mut info);
-        self.judge_main_check(code, info)
+        let spec = self.planned_main_spec()?;
+        let full = spec.kind == "check";
+        let (code, info) = super::postcheck::run_check(self.cfg, spec);
+        self.judge_planned_main_check(full, code, info)
     }
 
     pub(super) fn prepare_main_check(&mut self) -> R<()> {
@@ -462,8 +461,7 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
     if super::postcheck::enabled(cfg, members[0].0.e.get("project")) {
         return super::postcheck::start(cfg, train_id, members, tip, rows, worst);
     }
-    // TP2 SEAM: tp2 (main == checked commit -> only a build on main) is not merged at this base, so this ONE main check is the full
-    // `check` of main, run by the last entry (its commit is the tip); the others record that it covers them.
+    // The last entry selects and judges the one planned main job; the others are covered by it.
     if let Err(c) = members[last].0.s_main_check() {
         let code = code_num(c);
         let reason = members[last].0.e.get("reason").to_string();
