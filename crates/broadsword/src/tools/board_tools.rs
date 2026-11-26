@@ -1,5 +1,25 @@
 use super::*;
 
+pub(super) const TASK_ARCHIVE: Tool = Tool {
+    name: "task_archive",
+    summary: "Move old ended tasks from the board into the archive.",
+    description: "Under the board lock, moves done, failed and abandoned records older than task_archive_days into state/tasks/archive/<yyyy-mm>/, by their UTC ended month. Never deletes or rewrites records and refuses existing targets. Tasks without ended times, with open queue entries or with worktrees not yet removed stay on the board. Show still finds archived tasks; list and start scan only the board.",
+    params: &[],
+    outputs: "One `archived <id> -> state/tasks/archive/<yyyy-mm>/<id>.task` line per move, then `archive: moved <n>, kept <m> ended task(s) younger than <days> days`.",
+    exit_codes: &[E0, ExitDoc { code: "1", meaning: "unreadable or invalid board or queue, an existing archive target, or a move failure" }, EXIT_BUSY_DOC],
+    read_only: false,
+    long_running: false,
+    changes_files: false,
+    destructive: false,
+    idempotent: true,
+    cli: "broadsword task archive",
+    cli_examples: &["task archive"],
+    parse: |a| parse_task(a, "archive", None, &[], &[]),
+    mcp_callable: true,
+    to_args: |_| vec!["task".into(), "archive".into()],
+    handler: |cfg, _| Ok(task::cmd_archive(cfg)),
+};
+
 pub(super) const TASK_ADD: Tool = Tool {
         name: "task_add",
         summary: "Add a task to the task board: a title, a project and the paths it will claim.",
