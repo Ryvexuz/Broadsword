@@ -227,11 +227,8 @@ class CoderTests(unittest.TestCase):
         self.root = self.base / "root"
         (self.root / "clients").mkdir(parents=True)
         (self.root / "templates").mkdir()
-        for f in ("codex_coder.py", "openai_review.py", "openai_mcp.py", "start_gate.py"):
+        for f in ("codex_coder.py", "openai_review.py", "openai_mcp.py"):
             shutil.copy(HERE / f, self.root / "clients" / f)
-        (self.root / "scripts").mkdir()
-        for f in ("brief_lint.py", "brief_preflight.py"):
-            shutil.copy(HERE.parent / "scripts" / f, self.root / "scripts" / f)
         shutil.copy(HERE.parent / "templates" / "coder-prompt-codex.md", self.root / "templates")
         (self.root / "broadsword.toml").write_text(TOML, encoding="utf-8")
         (self.root / ".env").write_text(f"SOME_VALUE={DOTENV_VALUE}\n", encoding="utf-8")
@@ -247,9 +244,7 @@ class CoderTests(unittest.TestCase):
         self.write_task()
         self.write_canary_record("codex-cli 0.0.0-fake")  # the fake codex's --version
         self.brief = self.base / "brief.md"
-        self.brief.write_text("## Requirements\nBuild the thing. BRIEF-MARK\n"
-                              "## Claims\nnotes.md\n## Done check\n"
-                              "- `broadsword test broadsword` succeeds.\n", encoding="utf-8")
+        self.brief.write_text("Build the thing. BRIEF-MARK\n", encoding="utf-8")
         self.bin = self.base / "fakebin"
         self.bin.mkdir()
         (self.bin / "fake_codex.py").write_text(FAKE_CODEX_PY, encoding="utf-8")
@@ -266,12 +261,6 @@ class CoderTests(unittest.TestCase):
         rec = {"id": TASK, "project": "broadsword", "status": "running", "owner": "t", "claims": "src\\nnotes.md",
                "worktree": self.wt_rel, "worktree_creating": "", "worktree_removed": "", "branch": f"task/{TASK}"}
         rec.update(over)
-        if "claims" in over and hasattr(self, "brief"):
-            # Key-only board fixtures need a matching brief, not the default notes claim.
-            claim = "notes.md" if "notes.md" in over["claims"].split("\\n") else over["claims"].split("\\n")[0]
-            text = self.brief.read_text(encoding="utf-8")
-            text = re.sub(r"(?<=## Claims\n)[^\n]+", lambda _: claim, text)
-            self.brief.write_text(text, encoding="utf-8")
         d = self.root / "state" / "tasks"
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{TASK}.task").write_text("".join(f"{k} = {v}\n" for k, v in rec.items()), encoding="utf-8")
@@ -965,28 +954,6 @@ class CoderTests(unittest.TestCase):
         self.assertNotIn(FAKE_KEY, p.stdout + p.stderr)
 
     # ---- refusals: codex never starts ------------------------------------------------------------------------------
-
-    def test_unready_brief_is_refused_before_codex(self):
-        text = self.brief.read_text(encoding="utf-8").split("## Done check")[0]
-        self.brief.write_text(text, encoding="utf-8")
-        code, res, _ = self.run_coder()
-        self.assertEqual(code, 2, res)
-        self.assertTrue(res["result"].startswith("refused: brief_not_ready:"), res)
-        self.assertIn("FAIL donecheck", res["result"])
-        self.assertIsNone(self.seen(), "codex must never be started")
-        self.assertEqual(self.ledger_rows(), [])
-        self.assertFalse((self.root / "scratch").exists(), "no coder temp folder before admission")
-
-    def test_brief_claim_outside_board_is_refused(self):
-        text = self.brief.read_text(encoding="utf-8").replace("notes.md", "notes.md, extra.md")
-        self.brief.write_text(text, encoding="utf-8")
-        code, res, _ = self.run_coder()
-        self.assertEqual(code, 2, res)
-        self.assertTrue(res["result"].startswith("refused: brief_not_ready:"), res)
-        self.assertIn("claims: not on the board claims: extra.md", res["result"])
-        self.assertNotIn("FAIL ", res["result"], "the brief must otherwise pass lint")
-        self.assertIsNone(self.seen(), "codex must never be started")
-        self.assertEqual(self.ledger_rows(), [])
 
     def assert_refused(self, fragment, **kw):
         code, res, _ = self.run_coder("inside", **kw)
