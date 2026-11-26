@@ -1,0 +1,309 @@
+# A rule with kind none is NOT YET IN FORCE by machine; adding a rule here without a check prints RULE UNCHECKED every run.
+
+[[rule]]
+id = "a-merge-queue"
+source = "AGENTS.md Standing rules (Orchestration)"
+text = "All code reaches main through the merge queue after an independent review"
+owner = "session-end"
+check = { kind = "none", note = "scripts/main_provenance.py checks it but took over 120 s on 2026-11-25; run by session_end_check.py" }
+
+[[rule]]
+id = "a-worktree-per-agent"
+source = "AGENTS.md Standing rules (Parallel work)"
+text = "Each agent works in its own worktree and branch"
+owner = "orchestrator"
+check = { kind = "none", note = "Would compare each running agent's worktree and branch identity" }
+
+[[rule]]
+id = "a-backlog-briefs"
+source = "AGENTS.md Standing rules (Work ahead)"
+text = "Every open task has a brief in state/backlog/<id>.md"
+owner = "planner"
+check = { kind = "open_tasks_have_briefs" }
+
+[[rule]]
+id = "a-fill-free-slot"
+source = "AGENTS.md Standing rules (Work ahead)"
+text = "An idle coder slot with a ready task is not allowed"
+owner = "orchestrator"
+check = { kind = "none", note = "slot_check.py prints it; exit code not a pass/fail yet" }
+
+[[rule]]
+id = "a-scope-current-stage"
+source = "AGENTS.md Standing rules (Scope)"
+text = "Work only on the current stage; ideas go to IDEAS.md"
+owner = "orchestrator"
+check = { kind = "none", note = "drift-3 daily sweep" }
+
+[[rule]]
+id = "a-done-verified"
+source = "AGENTS.md Standing rules (Done means verified; Testing)"
+text = "Done means verified, evidence saved; no faked tests"
+owner = "reviewer"
+check = { kind = "none", note = "Requires independent review of evidence and test behavior" }
+
+[[rule]]
+id = "a-build-through-broadsword"
+source = "AGENTS.md Standing rules (Build through Broadsword)"
+text = "Build and test only through broadsword, never plain cargo"
+owner = "orchestrator"
+check = { kind = "file_contains", path = ".claude/settings.json", text = "hook pre-tool" }
+
+[[rule]]
+id = "a-stage-audit"
+source = "AGENTS.md Standing rules (Review)"
+text = "A strong model that did not build it audits the whole project before each stage tag"
+owner = "orchestrator"
+check = { kind = "none", note = "Would correlate stage tags with independent whole-project audit records" }
+
+[[rule]]
+id = "a-disk-floor"
+source = "AGENTS.md Disk rules"
+text = "Free disk stays above disk_floor_gb"
+owner = "tick"
+check = { kind = "disk_floor" }
+
+[[rule]]
+id = "a-ask-first"
+source = "AGENTS.md Standing rules (Ask first)"
+text = "Ask Lazlo before money, credentials, publishing, deleting outside scratch"
+owner = "lazlo"
+check = { kind = "none", note = "Requires matching actions against explicit approvals" }
+
+[[rule]]
+id = "a-retro-ledger"
+source = "AGENTS.md Standing rules (Retrospective)"
+text = "Every process change has an improvement-ledger row in RETRO.md"
+owner = "orchestrator"
+check = { kind = "cmd", argv = ["{python}", "-I", "scripts/ledger_check.py", "--since", "{date_minus_7d}", "--max-pending-days", "7"], timeout_s = 60 }
+
+[[rule]]
+id = "a-playbook-synced"
+source = "AGENTS.md Standing rules (Retrospective)"
+text = "The shared playbook copy matches RETRO.md Portable lessons"
+owner = "orchestrator"
+check = { kind = "cmd", argv = ["{python}", "-I", "scripts/sync_playbook.py", "--check"] }
+
+[[rule]]
+id = "a-progress-fresh"
+source = "AGENTS.md Standing rules (Continuity)"
+text = "PROGRESS.md updated within 24 h"
+owner = "orchestrator"
+check = { kind = "file_age", paths = ["PROGRESS.md"], max_hours = 24 }
+
+[[rule]]
+id = "a-lab-log-fresh"
+source = "AGENTS.md Standing rules (Continuity)"
+text = "LAB_LOG.md updated within 24 h"
+owner = "orchestrator"
+check = { kind = "file_age", paths = ["LAB_LOG.md"], max_hours = 24 }
+
+[[rule]]
+id = "a-claude-md"
+source = "AGENTS.md Standing rules (AGENTS.md and CLAUDE.md)"
+text = "CLAUDE.md loads AGENTS.md"
+owner = "orchestrator"
+check = { kind = "file_contains", path = "CLAUDE.md", text = "@AGENTS.md" }
+
+[[rule]]
+id = "a-scratch-cleanup"
+source = "AGENTS.md Disk rules (Automatic cleanup)"
+text = "Scratch files older than scratch_max_age_hours are cleaned hourly"
+owner = "housekeeper"
+check = { kind = "none", note = "Would compare cleanup runs and remaining scratch mtimes against settings" }
+
+[[rule]]
+id = "a-worktree-removed"
+source = "AGENTS.md Disk rules (Git is the backup)"
+text = "Merged worktrees are removed"
+owner = "housekeeper"
+check = { kind = "none", note = "Would compare merged task branches with live worktree inventory" }
+
+[[rule]]
+id = "a-git-explained"
+source = "AGENTS.md Disk rules (Learning Git)"
+text = "Git commands beyond commit get a LAB_LOG line"
+owner = "orchestrator"
+check = { kind = "none", note = "Would correlate Git command records with LAB_LOG entries" }
+
+[[rule]]
+id = "a-claim-before-edit"
+source = "AGENTS.md Files, shared copies and VMs (Claim before editing)"
+text = "No two running tasks overlap claims"
+owner = "orchestrator"
+check = { kind = "none", note = "enforced in code by task start" }
+
+[[rule]]
+id = "a-env-ignored"
+source = "AGENTS.md Files, shared copies and VMs (Secrets)"
+text = ".env is git-ignored"
+owner = "orchestrator"
+check = { kind = "file_contains", path = ".gitignore", text = ".env" }
+
+[[rule]]
+id = "a-env-untracked"
+source = "AGENTS.md Files, shared copies and VMs (Secrets)"
+text = "No .env file is tracked"
+owner = "orchestrator"
+check = { kind = "tracked_absent", names = [".env"] }
+
+[[rule]]
+id = "a-no-abs-paths"
+source = "AGENTS.md Settings"
+text = "No absolute user paths in tracked code, scripts or config"
+owner = "orchestrator"
+check = { kind = "no_abs_paths", pathspecs = ["*.rs", "*.toml", "*.py", "*.ps1", "*.sh", "*.yml", "*.yaml", ":!evidence"], pattern = '(?i)\b[a-z]:[\\/]+users[\\/]', allow = ["crates/broadsword/src/pause.rs:253"] }
+
+[[rule]]
+id = "a-settings-read"
+source = "AGENTS.md Settings"
+text = "Every listed setting in broadsword.toml is read by code"
+owner = "orchestrator"
+check = { kind = "setting_read", keys = ["max_agents", "disk_floor_gb", "cleanup_every_hours", "scratch_max_age_hours", "cpu_warn_percent"], src = "crates/broadsword/src" }
+
+[[rule]]
+id = "a-fast-mode-off"
+source = "AGENTS.md Standing rules (Self-optimization)"
+text = "Claude fast mode stays off unless Lazlo turns it on"
+owner = "lazlo"
+check = { kind = "none", note = "Would inspect active session mode and explicit Lazlo approval" }
+
+[[rule]]
+id = "p-yes-before-destructive"
+source = "~/.claude/CLAUDE.md In every project"
+text = "Lazlo's yes before destructive, paid, secret, push, model promotion or third-party plugin actions"
+owner = "lazlo"
+check = { kind = "none", note = "Requires action-to-approval review" }
+
+[[rule]]
+id = "p-no-early-running"
+source = "~/.claude/CLAUDE.md In every project"
+text = "Never report work as running until it has reported real results"
+owner = "orchestrator"
+check = { kind = "none", note = "Would compare status reports with first real job result" }
+
+[[rule]]
+id = "p-context-40"
+source = "~/.claude/CLAUDE.md In every project"
+text = "Keep each session under ~40% context; hand off before"
+owner = "orchestrator"
+check = { kind = "none", note = "Needs session context telemetry" }
+
+[[rule]]
+id = "p-no-4th-round"
+source = "~/.claude/CLAUDE.md In every project"
+text = "No 4th plain review round; adjudicate, then split, redesign or escalate once"
+owner = "orchestrator"
+check = { kind = "none", note = "scripts/qadd.ps1 refuses a 4th round" }
+
+[[rule]]
+id = "p-no-retry-blocked"
+source = "~/.claude/CLAUDE.md In every project"
+text = "Never retry a safety-blocked step; report once"
+owner = "orchestrator"
+check = { kind = "none", note = "Would correlate safety refusals with subsequent actions" }
+
+[[rule]]
+id = "p-audit-3h"
+source = "~/.claude/CLAUDE.md In every project"
+text = "A fresh agent audits the process every 3 hours"
+owner = "orchestrator"
+check = { kind = "file_age", paths = ["state/staging/process-audit/audit-*.md"], max_hours = 3.5 }
+
+[[rule]]
+id = "p-template-diff"
+source = "~/.claude/CLAUDE.md In every project"
+text = "Every process audit runs new_project.py --diff and takes safe template updates"
+owner = "orchestrator"
+check = { kind = "none", note = "Would require diff evidence and update dispositions in each process audit" }
+
+[[rule]]
+id = "p-approval-per-project"
+source = "~/.claude/CLAUDE.md In every project"
+text = "An approval in one project does not carry to another"
+owner = "orchestrator"
+check = { kind = "none", note = "Would validate the project identity on each approval" }
+
+[[rule]]
+id = "s-batch-review"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "A batch review every 5 merges"
+owner = "orchestrator"
+check = { kind = "heartbeat", jobs = ["batch_review"], max_json_minutes = 30 }
+
+[[rule]]
+id = "s-tick-alive"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "The tick loop writes its heartbeat every ~10 min"
+owner = "orchestrator"
+check = { kind = "file_age", paths = ["state/tick-heartbeat.txt"], max_hours = 0.3 }
+
+[[rule]]
+id = "s-wake-watcher"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "The orchestrator's wake watcher (orch-wake.sh) is running"
+owner = "orchestrator"
+check = { kind = "heartbeat", jobs = ["wake_watcher"], max_json_minutes = 30 }
+
+[[rule]]
+id = "s-heartbeats-clean"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "No recurring job is overdue"
+owner = "orchestrator"
+check = { kind = "heartbeat", jobs = ["*"], max_json_minutes = 30 }
+
+[[rule]]
+id = "s-exe-fresh"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "The live broadsword.exe does not lag main"
+owner = "orchestrator"
+check = { kind = "cmd", argv = ["{python}", "-I", "state/staging/exe_staleness.py", "{root}"] }
+
+[[rule]]
+id = "s-throughput"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Throughput never slows; alarm below 80% of baseline or rejects over 25%"
+owner = "orchestrator"
+check = { kind = "cmd", argv = ["{python}", "-I", "state/staging/throughput_alarm.py", "{root}"] }
+
+[[rule]]
+id = "s-main-clean"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Main checkouts have no tracked changes"
+owner = "orchestrator"
+check = { kind = "git_clean", repos = [".", "projects/crash-sim", "projects/forge"] }
+
+[[rule]]
+id = "s-auto-push"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Reviewed main is pushed (normal fast-forward)"
+owner = "tick"
+check = { kind = "heartbeat", jobs = ["auto_push"], max_json_minutes = 30 }
+
+[[rule]]
+id = "s-gpt-carries-load"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "GPT carries most of the work, not Claude"
+owner = "orchestrator"
+check = { kind = "none", note = "Would compare completed workload by model family" }
+
+[[rule]]
+id = "s-lazlo-waits"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Asks for Lazlo go in one daily line; a wait over 2 h is an audit miss"
+owner = "orchestrator"
+check = { kind = "none", note = "Would inspect daily asks and approval wait timestamps" }
+
+[[rule]]
+id = "s-step-lessons"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Every ended queue entry gets a step-lessons line"
+owner = "tick"
+check = { kind = "none", note = "Would correlate ended queue entries with step-lessons records" }
+
+[[rule]]
+id = "s-greg-dropbox"
+source = "standing-orders.md 2026-11-25 (brief)"
+text = "Greg drop box imports are verified by SHA-256 before deletion"
+owner = "orchestrator"
+check = { kind = "none", note = "Would require verified source and imported SHA-256 records before deletion" }
