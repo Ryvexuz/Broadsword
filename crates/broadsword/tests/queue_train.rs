@@ -325,7 +325,7 @@ fn three_approved_entries_with_disjoint_claims_merge_as_one_train_with_one_check
     assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt", "task: src/c.txt"], "the commits are on main in queue order, as they are (no squash)");
     assert!(git(&r.p(), &["rev-list", "--merges", "HEAD"]).is_empty(), "a fast-forward, never a merge commit");
     assert_eq!(git(&r.p(), &["rev-list", "--count", &format!("{before}..HEAD")]), "3");
-    // ONE check of the chain tip and ONE main check (a full check on main at this base): two check jobs, no build job.
+    // ONE check of the chain tip and ONE main check (the first merge has no recorded full main check, so the plan says full): two check jobs, no build job.
     // Without the train: three checks of their own and three main checks.
     assert_eq!((jobs_of(&r, "check"), jobs_of(&r, "build")), (2, 0), "{}", o.stdout);
     assert_eq!(r.calls(), 3, "every entry is still reviewed on its own");
@@ -339,7 +339,7 @@ fn three_approved_entries_with_disjoint_claims_merge_as_one_train_with_one_check
         assert!(r.field(e, "check deferred to the train").is_empty(), "the deferral is cleared once the train checked it");
     }
     assert_eq!(r.field(&es[2].1, "main commit"), r.head());
-    assert!(r.field(&es[2].1, "main check").contains("full check of the train tip"), "{}", r.field(&es[2].1, "main check"));
+    assert!(r.field(&es[2].1, "main check").contains("full (no recorded full main check)"), "{}", r.field(&es[2].1, "main check"));
     assert!(r.field(&es[0].1, "main check").contains("one main check for the whole merge train"), "{}", r.field(&es[0].1, "main check"));
     // the table shows the train
     assert!(o.stdout.contains("\ttrain") && o.stdout.contains(&format!("{train}#2")), "{}", o.stdout);
@@ -398,8 +398,9 @@ fn merge_train_max_1_is_off_and_run_all_merges_every_entry_on_its_own() {
         assert!(o.stdout.lines().any(|l| l.starts_with(&format!("{e}\t")) && l.contains("\tmerged\t0\t")), "a summary row for {e}: {}", o.stdout);
     }
     assert!(!o.stdout.contains("merge train") && o.stdout.contains("entry\ttask\tstatus\texit\tseconds\tnote\n") && o.stdout.contains("worst exit: 0"), "{}", o.stdout);
-    // every entry checked on its own, then checked on main (no train): six check jobs
-    assert_eq!((jobs_of(&r, "check"), jobs_of(&r, "build")), (6, 0));
+    // every entry checked on its own (three checks), then main: the first merge has no recorded full main check (a full check),
+    // the next two merged tips are the fully checked commit, so main gets a quick build each: four check jobs, two build jobs
+    assert_eq!((jobs_of(&r, "check"), jobs_of(&r, "build")), (4, 2));
     assert_eq!(train_subjects(&r)[1..], ["task: src/a.txt", "task: src/b.txt", "task: src/c.txt"]);
     let stdin = fs::read_to_string(r.fake_out.join("stdin.txt")).unwrap();
     assert!(!stdin.contains("NOT RUN for this change alone") && stdin.contains("test: ok"), "{stdin}");
@@ -1180,7 +1181,9 @@ fn passing_lane_case(lanes: u64) {
             !overlap,
             "serial train intervals must not overlap: {a:?}, {b:?}"
         );
-        assert_eq!(main_checks, 2);
+        // two trains, two fast-forwards: the first main check is full (nothing recorded), the second is a quick build because
+        // main equals the second train's fully checked tip, so only one more check-kind job exists
+        assert_eq!(main_checks, 1);
         assert_eq!(forwards, 2);
         assert_eq!(trains[0], trains[1]);
         assert_eq!(trains[2], trains[3]);
