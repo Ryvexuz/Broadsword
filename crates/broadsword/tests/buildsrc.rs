@@ -1420,16 +1420,40 @@ fn a_run_notes_workspace_member_packages_and_marks_the_folder_if_one_is_unreadab
 #[test]
 fn run_holds_the_build_lock_while_it_runs() {
     let r = Root::new("runlock", 1);
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Err(e) = fs::remove_file(&self.0) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("could not release the run: {e}");
+                }
+            }
+        }
+    }
+    let release = Release(r.scratch("run-release.txt"));
+    fs::write(&release.0, "wait").unwrap();
     let flag = r.scratch("run-started.txt");
-    let flag_s = flag.to_string_lossy().replace('\\', "/");
-    let cmd: Vec<&str> = if cfg!(windows) { vec!["echo", "x>", &flag_s, "&&", "ping", "-n", "8", "127.0.0.1", ">nul"] } else { vec!["echo x >", &flag_s, "; sleep 8"] };
-    let mut args = vec!["run", "proj", "--"];
-    args.extend(cmd);
+    let quote = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            format!("'{}'", s.replace('\'', "''"))
+        } else {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+    };
+    let (flag_s, release_s) = (quote(&flag), quote(&release.0));
+    let cmd = if cfg!(windows) {
+        format!("powershell -NoProfile -NonInteractive -Command \"$ErrorActionPreference = 'Stop'; $timer = [Diagnostics.Stopwatch]::StartNew(); Set-Content -LiteralPath {flag_s} -Value x; while ((Test-Path -LiteralPath {release_s}) -and $timer.Elapsed.TotalSeconds -lt 120) {{ Start-Sleep -Milliseconds 200 }}\"")
+    } else {
+        format!("echo x > {flag_s}; deadline=$(($(date +%s) + 120)); while [ -e {release_s} ] && [ \"$(date +%s)\" -lt \"$deadline\" ]; do sleep 0.2; done")
+    };
+    let args = ["run", "proj", "--", &cmd];
     let j = r.cmd(&args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     assert!(wait_for(&flag, "x", 60), "the run command never started");
     let o = r.run(&["build", "proj"]);
     assert_eq!(o.code, 3, "{}", o.stderr);
     assert!(o.stderr.contains("build folder busy"), "{}", o.stderr);
+    fs::remove_file(&release.0).unwrap();
     finish(j, 60);
     r.ok(&["build", "proj"]);
 }
