@@ -250,14 +250,30 @@ class RuleTests(unittest.TestCase):
     def test_cmd_ok_exit(self):
         self.check("cmd", "ok", argv=self.script("raise SystemExit(3)"), ok_exit=[3])
 
+    def test_cmd_stdout_reason_preferred_over_stderr_warning(self):
+        detail = self.check("cmd", "broken", argv=self.script(
+            "import sys\nprint('earlier\\nreason\\n  \\n')\n"
+            "print('warn', file=sys.stderr)\nraise SystemExit(3)"))
+        self.assertEqual(detail, "exit 3: reason")
+
+    def test_cmd_empty_stdout_uses_stderr(self):
+        detail = self.check("cmd", "broken", argv=self.script(
+            "import sys\n"
+            "print('earlier\\noops\\n\\n', file=sys.stderr)\nraise SystemExit(3)"))
+        self.assertEqual(detail, "exit 3: oops")
+
     def test_cmd_timeout(self):
         self.assertEqual(self.check("cmd", "broken", argv=self.script(
             "import time\ntime.sleep(5)"), timeout_s=1), "timed out after 1 s")
 
     def test_cmd_inherited_pipe_deadline(self):
+        pid_file = self.root / "grandchild.pid"
+        grandchild = (
+            "import os, pathlib, time; "
+            "pathlib.Path('grandchild.pid').write_text(str(os.getpid())); time.sleep(4)")
         argv = self.script(
             "import subprocess, sys\n"
-            "subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(4)'])\n")
+            f"subprocess.Popen([sys.executable, '-I', '-c', {grandchild!r}])\n")
         readers = []
         thread = rc.threading.Thread
 
@@ -279,6 +295,30 @@ class RuleTests(unittest.TestCase):
             # This wait is outside the deadline assertion and precedes fixture cleanup.
             for reader in readers:
                 reader.join(timeout=10)
+            if sys.platform == "win32":
+                import ctypes
+                from ctypes import wintypes
+
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                kernel.OpenProcess.restype = wintypes.HANDLE
+                kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                kernel.WaitForSingleObject.restype = wintypes.DWORD
+                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel.CloseHandle.restype = wintypes.BOOL
+                pid = int(pid_file.read_text(encoding="utf-8"))
+                handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+                if handle:
+                    try:
+                        self.assertEqual(kernel.WaitForSingleObject(handle, 10_000), 0,
+                                         "grandchild did not exit before fixture cleanup")
+                    finally:
+                        if not kernel.CloseHandle(handle):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                else:
+                    error = ctypes.get_last_error()
+                    if error != 87:  # ERROR_INVALID_PARAMETER: pid already exited.
+                        raise ctypes.WinError(error)
             self.assertEqual(len(readers), 2)
             for reader in readers:
                 self.assertFalse(reader.is_alive(), "grandchild still holds an inherited pipe")
@@ -383,6 +423,40 @@ class RuleTests(unittest.TestCase):
             self.assertEqual(self.cli("--changed", str(self.root / "changed.json"))[0], 1)
             check.assert_not_called()
 
+    def test_changed_partial_write_preserves_old_state(self):
+        self.registry([{"kind": "none", "note": "fixture"}])
+        state = self.root / "changed.json"
+        state.write_bytes(b'[ "r-old" ]\n')
+        old_bytes = state.read_bytes()
+        write_text = Path.write_text
+        replace = os.replace
+
+        def partial_write(path, text, **kwargs):
+            write_text(path, text[:1], **kwargs)
+            raise OSError("fixture interrupted write")
+
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=partial_write):
+            with mock.patch.object(rc.os, "replace", wraps=replace) as replacement:
+                code, output = self.cli("--changed", str(state))
+                replacement.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn("fixture interrupted write", output)
+        self.assertEqual(state.read_bytes(), old_bytes)
+        self.assertEqual(state.with_name(state.name + ".tmp").read_bytes(), b"[")
+        self.assertEqual(self.cli("--changed", str(state))[0], 0)
+        self.assertEqual(state.read_text(encoding="utf-8"), "[]\n")
+        self.assertFalse(state.with_name(state.name + ".tmp").exists())
+
+    def test_changed_replace_failure_preserves_old_state(self):
+        self.registry([{"kind": "none", "note": "fixture"}])
+        state = self.write("changed.json", '[ "r-old" ]\n')
+        old_bytes = state.read_bytes()
+        with mock.patch.object(rc.os, "replace", side_effect=OSError("fixture replace failure")):
+            code, output = self.cli("--changed", str(state))
+        self.assertEqual(code, 1)
+        self.assertIn("fixture replace failure", output)
+        self.assertEqual(state.read_bytes(), old_bytes)
+
     def test_changed_write_failure_reported_with_summary(self):
         self.registry([{"kind": "none", "note": "fixture"}])
         code, output = self.cli("--changed", str(self.root / "missing" / "state.json"))
@@ -407,8 +481,28 @@ class RuleTests(unittest.TestCase):
         rules = rc.load_rules(path)
         self.assertEqual([rule["id"] for rule in rules], EXPECTED_IDS)
         self.assertEqual(len(rules), 44)
+        checks = {rule["id"]: rule["check"] for rule in rules}
+        self.assertEqual(checks["a-retro-ledger"]["timeout_s"], 180)
+        allow = checks["a-no-abs-paths"]["allow"]
+        self.assertIn("scripts/test_package_race.py:133", allow)
+        self.assertIn("scripts/test_package_race.py:143", allow)
+        self.assertNotIn("scripts/queue-driver-project.ps1:9", allow)
         for rule in rules:
             rc.validate_check(rule["check"])
+
+    def test_registry_abs_path_exceptions_leave_real_violation_reported(self):
+        path = Path(__file__).resolve().parent.parent / "docs/RULES.toml"
+        check = next(rule["check"] for rule in rc.load_rules(path)
+                     if rule["id"] == "a-no-abs-paths")
+        absolute = "C:" + chr(92) + "Users" + chr(92) + "fixture"
+        lines = [""] * 143
+        lines[132] = lines[142] = absolute
+        self.write("scripts/test_package_race.py", "\n".join(lines))
+        self.write("scripts/queue-driver-project.ps1", "\n" * 8 + absolute)
+        with mock.patch.object(rc, "git", return_value=(
+                "scripts/test_package_race.py\0scripts/queue-driver-project.ps1\0")):
+            self.assertEqual(rc.run_check(self.root, check),
+                             ("broken", "1 hits: scripts/queue-driver-project.ps1:9"))
 
 
 def shutil_usage(free):
