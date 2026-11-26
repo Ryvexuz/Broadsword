@@ -4,9 +4,13 @@
 # It drains only that project's entries (`queue run --all --project <p>`), exits when the project has no open entry,
 # exits 4 on a busy lock (another driver of the same project), and stops on exit 6 (main check failed; a human decides).
 param([Parameter(Mandatory=$true)][string]$Project)
+# TRAIN PRIORITY (orch 19, 2026-11-24 05:09Z): the driver and every child (queue run, its checks) run AboveNormal. Revert: delete this line.
+try { (Get-Process -Id $PID).PriorityClass = 'AboveNormal' } catch {}
 $ErrorActionPreference = 'Continue'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 $env:BROADSWORD_REVIEWER_CLI = 'C:\Users\MrComputer\.local\bin\claude.exe'
+# orch 13 2026-11-23: a driver started without Git's bin on PATH failed every train ("bash is needed"); set it where the driver is spawned (playbook lesson 22)
+if (-not (Get-Command bash -ErrorAction SilentlyContinue) -and (Test-Path 'C:\Program Files\Git\bin\bash.exe')) { $env:Path = 'C:\Program Files\Git\bin;' + $env:Path }
 $log = "scratch/queue-driver-$Project.log"
 while ($true) {
     $list = & build/bin/broadsword.exe queue list 2>&1
