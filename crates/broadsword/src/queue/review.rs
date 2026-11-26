@@ -65,7 +65,7 @@ fn same_model(a: &str, b: &str) -> bool {
 /// How the GPT client is named in a review file and the entry.
 const SHADOW_CLIENT_LABEL: &str = "clients/openai_review.py";
 
-pub(super) use super::advisory::REVIEW_KEYS as SHADOW_KEYS;
+pub(super) const SHADOW_KEYS: [&str; 9] = ["shadow_model", "shadow_model_used", "shadow_verdict", "shadow_reason", "shadow_blocking", "shadow_cost_usd", "shadow_tokens", "shadow_secs", "shadow_file"];
 
 /// Every call through clients/openai_review.py (the GPT gate and the GPT shadow) of this process holds this lock, so parallel
 /// reviews make their GPT calls one at a time: each call's daily-cap check sees every earlier call's ledger row.
@@ -180,12 +180,8 @@ impl<'a> Run<'a> {
         self.e.set("tokens_in", review.input_tokens.map(|n| n.to_string()).unwrap_or_default());
         self.e.set("tokens_out", review.output_tokens.map(|n| n.to_string()).unwrap_or_default());
         self.e.set("review_file", file.clone());
-        let advisory = self.prepare_advisory(&prompt);
         self.save()?;
         self.log("review", &format!("{} by `{model}` (gate: {}); {} blocking, {} minor; cost {} USD; full output in {file}", self.e.get("verdict"), self.e.get("gate"), verdict.blocking.len(), verdict.minor.len(), review.cost_usd.as_deref().unwrap_or("unknown")))?;
-        if let Some(advisory) = advisory {
-            advisory.start();
-        }
         self.s_shadow(&prompt)?;
         if verdict.pass {
             return Ok(());

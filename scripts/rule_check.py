@@ -10,7 +10,6 @@ import glob
 import io
 import json
 import math
-import os
 from pathlib import Path, PureWindowsPath
 import re
 import shutil
@@ -329,7 +328,7 @@ def evaluate(root, check):
         except subprocess.TimeoutExpired:
             return "broken", f"timed out after {timeout} s"
         if result.returncode not in check.get("ok_exit", [0]):
-            last = (result.stdout or result.stderr).decode("utf-8", "replace")
+            last = (result.stderr or result.stdout).decode("utf-8", "replace")
             issues.append(f"exit {result.returncode}: {last[:160]}")
     return ("broken", "; ".join(issues)) if issues else ("ok", "")
 
@@ -389,9 +388,7 @@ def main(argv=None):
         for ident in sorted(previous - broken):
             print(f"RULE FIXED {ident}")
         try:
-            temporary = args.changed.with_name(args.changed.name + ".tmp")
-            temporary.write_text(json.dumps(sorted(broken)) + "\n", encoding="utf-8")
-            os.replace(temporary, args.changed)
+            args.changed.write_text(json.dumps(sorted(broken)) + "\n", encoding="utf-8")
         except Exception as exc:
             print(f"rule_check: {args.changed}: {exc}")
             state_error = True

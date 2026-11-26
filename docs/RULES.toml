@@ -75,7 +75,7 @@ id = "a-retro-ledger"
 source = "AGENTS.md Standing rules (Retrospective)"
 text = "Every process change has an improvement-ledger row in RETRO.md"
 owner = "orchestrator"
-check = { kind = "cmd", argv = ["{python}", "-I", "scripts/ledger_check.py", "--since", "{date_minus_7d}", "--max-pending-days", "7"], timeout_s = 180 }
+check = { kind = "cmd", argv = ["{python}", "-I", "scripts/ledger_check.py", "--since", "{date_minus_7d}", "--max-pending-days", "7"], timeout_s = 60 }
 
 [[rule]]
 id = "a-playbook-synced"
@@ -152,7 +152,7 @@ id = "a-no-abs-paths"
 source = "AGENTS.md Settings"
 text = "No absolute user paths in tracked code, scripts or config"
 owner = "orchestrator"
-check = { kind = "no_abs_paths", pathspecs = ["*.rs", "*.toml", "*.py", "*.ps1", "*.sh", "*.yml", "*.yaml", ":!evidence"], pattern = '(?i)\b[a-z]:[\\/]+users[\\/]', allow = ["crates/broadsword/src/pause.rs:253", "scripts/test_package_race.py:133", "scripts/test_package_race.py:143"] }
+check = { kind = "no_abs_paths", pathspecs = ["*.rs", "*.toml", "*.py", "*.ps1", "*.sh", "*.yml", "*.yaml", ":!evidence"], pattern = '(?i)\b[a-z]:[\\/]+users[\\/]', allow = ["crates/broadsword/src/pause.rs:253"] }
 
 [[rule]]
 id = "a-settings-read"
