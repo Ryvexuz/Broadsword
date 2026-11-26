@@ -2,10 +2,6 @@
 
 use std::sync::OnceLock;
 
-/// The number of tools in `tools::TOOLS`; change it here when a tool is added or removed.
-pub const MCP_TOOL_COUNT: usize = 33;
-const _: () = assert!(MCP_TOOL_COUNT > 0);
-
 /// The path of a bin under test. A Broadsword job runs the tests from COPIED executables and points `CARGO_BIN_EXE_<bin>` at
 /// a copied bin at run time, so another job's build into the shared build folder cannot swap the binary mid-run. The
 /// compile-time `env!` path (the shared folder itself) is only the fallback, for a plain `cargo test`.
@@ -45,7 +41,6 @@ const BASE: &[(&str, &str)] = &[
     ("job_disk_reserve_gb", "0"),
     ("job_disk_poll_seconds", "1"),
     ("task_lock_wait_seconds", "10"),
-    ("task_archive_days", "30"),
     ("worktrees_dir", "\"worktrees\""),
     ("build_lock_wait_seconds", "10"),
     ("recover_lock_wait_seconds", "5"),

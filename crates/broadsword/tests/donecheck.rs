@@ -283,16 +283,15 @@ fn a_done_check_command_past_its_timeout_is_killed_and_rejects_the_entry() {
 /// A script that starts a DETACHED descendant, holding none of the command's output (Windows: `Start-Process`, which hands it
 /// no handle; elsewhere: redirected to /dev/null), which waits about `wait_s` seconds and then writes `late.txt` in the folder
 /// `up` levels above the script (0: the task's worktree; 3: the test root, outside it, since any untracked file in the worktree
-/// blocks a merge). It records the descendant's pid in `bgpid.txt` beside the marker and exits 0 at once.
-/// Returns (the committed file name, its content, the done-check command).
+/// blocks a merge); the script itself exits 0 at once. Returns (the committed file name, its content, the done-check command).
 fn detached(wait_s: u32, up: usize) -> (&'static str, String, &'static str) {
     if cfg!(windows) {
-        let ps = format!("$m = Join-Path $PSScriptRoot '{}late.txt'\r\n$p = Join-Path $PSScriptRoot '{}bgpid.txt'\r\n", "..\\".repeat(up), "..\\".repeat(up));
-        let ps = format!("{ps}$child = Start-Process -PassThru -ErrorAction Stop -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '/C', \"ping -n {} 127.0.0.1 >nul & echo late> `\"$m`\"\"\r\n$child.Id | Set-Content -Encoding ASCII -ErrorAction Stop -LiteralPath $p\r\nexit 0\r\n", wait_s + 1);
+        let ps = format!("$m = Join-Path $PSScriptRoot '{}late.txt'\r\n", "..\\".repeat(up));
+        let ps = format!("{ps}Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '/C', \"ping -n {} 127.0.0.1 >nul & echo late> `\"$m`\"\"\r\nexit 0\r\n", wait_s + 1);
         ("bg.ps1", ps, "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File bg.ps1")
     } else {
         let dir = std::iter::once("$(dirname \"$0\")").chain(std::iter::repeat_n("..", up)).collect::<Vec<_>>().join("/");
-        ("bg.sh", format!("(sleep {wait_s}; echo late > \"{dir}/late.txt\") </dev/null >/dev/null 2>&1 &\necho $! > \"{dir}/bgpid.txt\" || exit 1\nexit 0\n"), "sh bg.sh")
+        ("bg.sh", format!("(sleep {wait_s}; echo late > \"{dir}/late.txt\") </dev/null >/dev/null 2>&1 &\nexit 0\n"), "sh bg.sh")
     }
 }
 
@@ -304,13 +303,13 @@ fn first_secs(dc: &str) -> f64 {
 
 /// Review q-20261121-053038: a done-check command that exits 0 but leaves a descendant running that holds NONE of its output
 /// has not finished. It must not pass (DID NOT FINISH, not a timeout: the command itself exits), and the descendant is killed:
-/// it would write `late.txt` into the worktree ~110 s after it started, after the 90 s deadline. The longer deadline leaves
-/// room for the command to exit under load; polling its descendant's pid proves the kill without waiting for the marker.
-/// Not run on non-Windows machines (the `sh` variant is untested here).
+/// it would write `late.txt` into the worktree ~45 s after it started, after the 30 s deadline (on a loaded machine here the
+/// whole `broadsword run` of the ~3 s variant below took 21.1 s, so the deadline leaves room for the command to exit first). Not run
+/// on non-Windows machines (the `sh` variant is untested here).
 #[test]
 fn a_done_check_that_leaves_a_detached_descendant_running_fails_and_the_descendant_is_killed() {
-    let r = Root::new("detached", &[("done_check_timeout_seconds", "90")]);
-    let (file, content, cmd) = detached(110, 0);
+    let r = Root::new("detached", &[("done_check_timeout_seconds", "30")]);
+    let (file, content, cmd) = detached(45, 0);
     let (id, e) = r.queued(file, &content, &format!("1. `broadsword run p --task <id> -- {cmd}` -> exits 0\n"));
     let marker = r.wt(&id).join("late.txt");
     let t = Instant::now();
@@ -324,26 +323,9 @@ fn a_done_check_that_leaves_a_detached_descendant_running_fails_and_the_descenda
     assert!(!dc.contains("result: PASS"), "{dc}");
     assert!(dc.contains("DID NOT FINISH: the command exited (exit 0)") && dc.contains("everything it started was killed"), "{dc}");
     println!("ended after {:.1} s: {}", t.elapsed().as_secs_f64(), dc.lines().find(|l| l.contains("result:")).unwrap_or(""));
-    let pid_text = fs::read_to_string(r.wt(&id).join("bgpid.txt")).expect("read detached descendant pid");
-    let pid_text = pid_text.trim();
-    assert!(!pid_text.is_empty() && pid_text.bytes().all(|b| b.is_ascii_digit()), "invalid detached descendant pid: {pid_text:?}");
-    let pid: u32 = pid_text.parse().expect("detached descendant pid must be a u32");
-    assert_ne!(pid, 0, "detached descendant pid must be positive");
+    // the descendant started before the done check returned, so unkilled it would have written its marker within 45 s of now
     let back = Instant::now();
-    loop {
-        let alive = if cfg!(windows) {
-            let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output().expect("query detached descendant pid");
-            assert!(out.status.success(), "tasklist failed for pid {pid}: {}", String::from_utf8_lossy(&out.stderr));
-            let text = String::from_utf8_lossy(&out.stdout);
-            assert!(!text.trim().is_empty(), "tasklist returned no output for pid {pid}");
-            text.contains(&format!("\"{pid}\""))
-        } else {
-            Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().expect("query detached descendant pid").success()
-        };
-        if !alive {
-            break;
-        }
-        assert!(back.elapsed() < std::time::Duration::from_secs(15), "detached descendant pid {pid} is still alive after 15 s");
+    while back.elapsed().as_secs() < 48 {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     assert!(!marker.exists(), "the detached descendant outlived the done check and wrote {}", marker.display());
