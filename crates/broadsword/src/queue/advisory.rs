@@ -25,119 +25,35 @@ pub(super) const REVIEW_KEYS: [&str; 16] = [
 ];
 
 impl Run<'_> {
-    /// Deliberately returns no pipeline result: even a recording failure cannot veto the gate.
-    pub(super) fn s_advisory(&mut self, prompt: &str) {
-        let result = self.advisory_review(prompt, &reviewer::ClaudeCli);
-        if let Err(reason) = result {
-            let reason = self.secrets.redact(&reason);
-            eprintln!(
-                "queue entry {}: advisory recording error: {reason}",
-                self.e.id()
-            );
-            if let Err(error) = self.advisory_end("ERROR", &reason) {
-                eprintln!(
-                    "queue entry {}: cannot persist advisory ERROR: {}",
-                    self.e.id(),
-                    self.secrets.redact(&error)
-                );
-            }
-        }
-    }
-
-    fn advisory_review(&mut self, prompt: &str, backend: &dyn ReviewBackend) -> Result<(), String> {
+    /// Reserve once in the gate's existing save; no child or result I/O on the merge path.
+    pub(super) fn prepare_advisory(&mut self, prompt: &str) -> Option<Advisory> {
         let model = self.cfg.reviewer_model_low_advisory.clone();
         if model == "off"
             || self.e.get("risk") != "low"
             || self.e.get("verdict").is_empty()
             || !self.e.get("advisory_model").is_empty()
         {
-            return Ok(());
+            return None;
         }
-        self.e.set("advisory_model", model.clone());
+        self.e.set("advisory_model", self.secrets.redact(&model));
         for (role, other) in [
             ("gating reviewer", self.e.get("reviewer_model").to_string()),
             ("coder", self.e.get("coder").to_string()),
         ] {
             if reviewer::model_family(&model) == reviewer::model_family(&other) {
-                let reason = format!(
+                let reason = self.secrets.redact(&format!(
                     "the advisory model `{model}` is the same family as the {role} `{other}`"
+                ));
+                self.e.set("advisory_verdict", "SKIPPED");
+                self.e.set("advisory_reason", reason);
+                println!(
+                    "queue entry {}: advisory review SKIPPED (recorded only; the gating review decides)",
+                    self.e.id()
                 );
-                return self.advisory_end("SKIPPED", &reason);
+                return None;
             }
         }
-        // Persist the one-call reservation before preparing or starting a child. A crash leaves an
-        // explicit ERROR, not an invitation to spend again when this attempt is resumed.
-        self.e.set("advisory_verdict", "ERROR");
-        self.e.set(
-            "advisory_reason",
-            "advisory review interrupted before its result was recorded",
-        );
-        self.advisory_save()?;
-        let cli = match backend.prepare(self.cfg) {
-            Ok(cli) => cli,
-            Err(reason) => return self.advisory_end("ERROR", &reason),
-        };
-        self.advisory_log(&format!(
-            "calling the advisory reviewer {model} (recorded only, never gating)"
-        ))?;
-        let start = std::time::Instant::now();
-        let result = backend.call(
-            self.cfg,
-            &cli,
-            &model,
-            "",
-            reviewer::gate_system_prompt(self.e.get("risk")),
-            prompt,
-        );
-        self.e.set(
-            "advisory_secs",
-            format!("{:.1}", start.elapsed().as_secs_f64()),
-        );
-        let review = match result {
-            Ok(review) => review,
-            Err(CallError::Timeout(seconds)) => {
-                return self.advisory_end(
-                    "ERROR",
-                    &format!("no answer within {seconds} s (reviewer_timeout_seconds); it was killed"),
-                );
-            }
-            Err(CallError::Start(reason) | CallError::Failed(reason)) => {
-                return self.advisory_end("ERROR", &reason);
-            }
-        };
-        let verdict = reviewer::judge(&review);
-        self.e.set(
-            "advisory_cost_usd",
-            review.cost_usd.clone().unwrap_or_default(),
-        );
-        self.e.set("advisory_blocking", verdict.blocking.join("\n"));
-        let answer = if review.invalid.is_some() || !verdict.parsed {
-            "ERROR"
-        } else if verdict.pass {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        let attempt = self.e.get_num("attempt").unwrap_or(1);
-        let name = if attempt <= 1 {
-            format!("{}.advisory.review", self.e.id())
-        } else {
-            format!("{}.{attempt}.advisory.review", self.e.id())
-        };
-        let path = queue_dir(self.cfg).join(name);
-        let text = self.secrets.redact(&format!(
-            "entry: {}\nattempt: {attempt}\nadvisory review: recorded only, never gating\nmodel: {model}\nverdict: {answer}\nreason: {}\ncost_usd: {}\nsecs: {}\nblocking:\n{}\n--- raw advisory output ---\n{}\n",
-            self.e.id(),
-            verdict.note,
-            self.e.get("advisory_cost_usd"),
-            self.e.get("advisory_secs"),
-            self.e.get("advisory_blocking"),
-            review.raw
-        ));
-        let tmp = path.with_extension("review.tmp");
-        std::fs::write(&tmp, text)
-            .and_then(|_| std::fs::rename(&tmp, &path))
-            .map_err(|error| format!("cannot write advisory review {}: {error}", path.display()))?;
+        let path = queue_dir(self.cfg).join(format!("{}.advisory", self.e.id()));
         self.e.set(
             "advisory_file",
             path.strip_prefix(&self.cfg.root)
@@ -145,45 +61,107 @@ impl Run<'_> {
                 .to_string_lossy()
                 .replace('\\', "/"),
         );
-        self.advisory_end(answer, if answer == "ERROR" { &verdict.note } else { "" })
+        Some(Advisory {
+            cfg: self.cfg.clone(),
+            secrets: self.secrets.clone(),
+            model,
+            prompt: self.secrets.redact(prompt),
+            record: crate::record::Record::parse(&path, ""),
+        })
     }
+}
 
-    fn advisory_save(&mut self) -> Result<(), String> {
-        // These fields are not in entry.rs's legacy TEXT_KEYS. Scrub before *any* save or log.
-        for key in REVIEW_KEYS.iter().filter(|key| key.starts_with("advisory_")) {
-            let value = self.secrets.redact(self.e.get(key));
-            self.e.set(key, value);
-        }
-        self.e
-            .save()
-            .map_err(|error| format!("cannot save advisory entry: {error}"))
-    }
+/// Owns only the advisory file, never an entry snapshot or an entry path.
+pub(super) struct Advisory {
+    cfg: crate::config::Config,
+    secrets: reviewer::Secrets,
+    model: String,
+    prompt: String,
+    record: crate::record::Record,
+}
 
-    fn advisory_log(&mut self, text: &str) -> Result<(), String> {
-        let text = self.secrets.redact(text);
-        println!("queue entry {}: {text}", self.e.id());
-        let log = format!(
-            "{}\n{} advisory: {text}",
-            self.e.get("log"),
-            crate::pause::now_string()
-        );
-        self.e.set("log", log);
-        self.advisory_save()
-    }
-
-    fn advisory_end(&mut self, verdict: &str, reason: &str) -> Result<(), String> {
-        self.e.set("advisory_verdict", verdict);
-        self.e.set("advisory_reason", reason);
-        self.advisory_save()?;
-        let reason = self.secrets.redact(reason);
-        self.advisory_log(&format!(
-            "advisory review {verdict} (recorded only; the gating review decides){}",
-            if reason.is_empty() {
-                String::new()
-            } else {
-                format!(": {reason}")
+impl Advisory {
+    pub(super) fn start(self) {
+        // Dropping the handle detaches the worker. Process exit may leave STARTED; readers must
+        // treat that as ERROR (lost at exit), not as a completed review.
+        if let Err(error) = std::thread::Builder::new().spawn(move || {
+            if let Err(error) = self.run(&reviewer::ClaudeCli) {
+                eprintln!("advisory recording error: {error}");
             }
-        ))
+        }) {
+            eprintln!("cannot start detached advisory worker: {error}");
+        }
+    }
+
+    fn run(mut self, backend: &dyn ReviewBackend) -> Result<(), String> {
+        self.record.set("model", self.model.clone());
+        self.record.set("verdict", "STARTED");
+        self.record.set("started", crate::pause::now_string());
+        self.save()?;
+        println!(
+            "calling the advisory reviewer {} (recorded only, never gating)",
+            self.secrets.redact(&self.model)
+        );
+        let start = std::time::Instant::now();
+        let result = backend
+            .prepare(&self.cfg)
+            .map_err(CallError::Start)
+            .and_then(|cli| {
+                backend.call(
+                    &self.cfg,
+                    &cli,
+                    &self.model,
+                    "",
+                    reviewer::gate_system_prompt("low"),
+                    &self.prompt,
+                )
+            });
+        self.record
+            .set("secs", format!("{:.1}", start.elapsed().as_secs_f64()));
+        self.record.set("blocking", "");
+        self.record.set("cost_usd", "");
+        let (answer, reason) = match result {
+            Err(CallError::Timeout(seconds)) => (
+                "ERROR",
+                format!("no answer within {seconds} s (reviewer_timeout_seconds); it was killed"),
+            ),
+            Err(CallError::Start(reason) | CallError::Failed(reason)) => ("ERROR", reason),
+            Ok(review) => {
+                let verdict = reviewer::judge(&review);
+                self.record
+                    .set("cost_usd", review.cost_usd.unwrap_or_default());
+                self.record.set("blocking", verdict.blocking.join("\n"));
+                self.record.set("raw", review.raw);
+                let answer = if review.invalid.is_some() || !verdict.parsed {
+                    "ERROR"
+                } else if verdict.pass {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                (answer, verdict.note)
+            }
+        };
+        self.record.set("verdict", answer);
+        self.record.set("reason", reason);
+        self.save()?;
+        println!("advisory review {answer} (recorded only; the gating review decides)");
+        Ok(())
+    }
+
+    fn save(&mut self) -> Result<(), String> {
+        // Redact the entire record before escaping or persisting any content, including raw output.
+        for key in [
+            "model", "verdict", "started", "secs", "blocking", "cost_usd", "raw", "reason",
+        ] {
+            self.record.set(key, self.secrets.redact(self.record.get(key)));
+        }
+        self.record.save().map_err(|error| {
+            self.secrets.redact(&format!(
+                "cannot write advisory review {}: {error}",
+                self.record.path.display()
+            ))
+        })
     }
 }
 
@@ -278,6 +256,10 @@ mod tests {
             prompt: &str,
         ) -> Result<reviewer::Review, CallError> {
             self.calls.set(self.calls.get() + 1);
+            let path = queue_dir(cfg).join("unit.advisory");
+            let started = Record::parse(&path, &std::fs::read_to_string(&path).unwrap());
+            assert_eq!(started.get("verdict"), "STARTED");
+            assert!(!started.get("started").is_empty());
             assert_eq!(model, "sonnet");
             assert_eq!(effort, "");
             assert_eq!(system, reviewer::gate_system_prompt("low"));
@@ -290,6 +272,10 @@ mod tests {
             }
             if self.kind == "failed" {
                 return Err(CallError::Failed("advisory CLI failed".into()));
+            }
+            if self.kind == "write-error" {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
             }
             let text = match self.kind {
                 "fail" => "VERDICT: FAIL\nBLOCKING: src/lib.rs:1 - advisory finding\nMINOR: none",
@@ -315,6 +301,11 @@ mod tests {
         }
     }
 
+    fn result(fixture: &Fixture) -> Record {
+        let path = queue_dir(&fixture.cfg).join("unit.advisory");
+        Record::parse(&path, &std::fs::read_to_string(&path).unwrap())
+    }
+
     #[test]
     fn advisory_guard_is_at_the_call_entry_point() {
         for (key, value, expected) in [
@@ -326,18 +317,14 @@ mod tests {
         ] {
             let fixture = Fixture::new();
             let mut run = fixture.run();
-            let backend = Backend::new("pass");
             run.e.set(key, value);
-            run.advisory_review("same prompt", &backend).unwrap();
-            assert_eq!(backend.calls.get(), 0, "{key}");
+            assert!(run.prepare_advisory("same prompt").is_none(), "{key}");
             assert_eq!(run.e.get("advisory_verdict"), expected, "{key}");
         }
         let mut fixture = Fixture::new();
         fixture.cfg.reviewer_model_low_advisory = "off".into();
         let mut run = fixture.run();
-        let backend = Backend::new("pass");
-        run.advisory_review("same prompt", &backend).unwrap();
-        assert_eq!(backend.calls.get(), 0);
+        assert!(run.prepare_advisory("same prompt").is_none());
         assert!(run.e.get("advisory_model").is_empty());
     }
 
@@ -351,37 +338,104 @@ mod tests {
             ("timeout", "ERROR"),
             ("start", "ERROR"),
             ("failed", "ERROR"),
+            ("prepare", "ERROR"),
         ] {
             for gate in ["PASS", "FAIL"] {
                 let fixture = Fixture::new();
                 let mut run = fixture.run();
                 run.e.set("verdict", gate);
                 run.e.set("blocking", "original gating finding");
+                let worker = run.prepare_advisory("same prompt").unwrap();
+                run.e.save().unwrap();
+                let entry_before = std::fs::read_to_string(&run.e.path).unwrap();
                 let backend = Backend::new(kind);
-                run.advisory_review("same prompt", &backend).unwrap();
-                run.advisory_review("same prompt", &backend).unwrap();
-                assert_eq!(backend.calls.get(), 1, "{kind}");
+                worker.run(&backend).unwrap();
+                assert!(run.prepare_advisory("same prompt").is_none());
+                assert_eq!(backend.calls.get(), usize::from(kind != "prepare"));
+                let record = result(&fixture);
+                assert_eq!(record.get("verdict"), expected, "{kind}");
+                if expected == "ERROR" {
+                    assert!(!record.get("reason").is_empty(), "{kind}");
+                }
+                assert!(!record.get("started").is_empty());
+                assert!(!record.get("secs").is_empty());
                 assert_eq!(run.e.get("verdict"), gate);
                 assert_eq!(run.e.get("blocking"), "original gating finding");
                 assert_eq!(run.e.get("review_calls"), "1");
-                assert_eq!(run.e.get("advisory_verdict"), expected, "{kind}");
-                if expected == "ERROR" {
-                    assert!(!run.e.get("advisory_reason").is_empty(), "{kind}");
-                }
-                assert!(!run.e.get("advisory_secs").is_empty());
-                if matches!(kind, "pass" | "fail" | "malformed" | "invalid") {
-                    assert_eq!(run.e.get("advisory_cost_usd"), "0.0123");
-                    assert!(fixture.cfg.root.join(run.e.get("advisory_file")).is_file());
-                }
+                assert!(run.e.get("advisory_verdict").is_empty());
+                assert_eq!(std::fs::read_to_string(&run.e.path).unwrap(), entry_before);
             }
         }
+    }
+
+    #[test]
+    fn advisory_large_output_and_recording_failure_do_not_touch_the_entry() {
+        let fixture = Fixture::new();
+        let mut run = fixture.run();
+        let worker = run.prepare_advisory("same prompt").unwrap();
+        run.e.save().unwrap();
+        let before = std::fs::read_to_string(&run.e.path).unwrap();
+        worker.run(&Backend::new("large")).unwrap();
+        let record = result(&fixture);
+        assert!(record.get("raw").len() > fixture.cfg.reviewer_diff_max_kb as usize * 1024);
+        assert_eq!(record.get("verdict"), "PASS");
+        std::fs::remove_file(&record.path).unwrap();
+        std::fs::create_dir(&record.path).unwrap();
+        let mut retry = fixture.run();
+        let backend = Backend::new("fail");
+        let error = retry
+            .prepare_advisory("same prompt")
+            .unwrap()
+            .run(&backend)
+            .unwrap_err();
+        assert!(error.contains("cannot write advisory review"), "{error}");
+        assert_eq!(backend.calls.get(), 0, "no call if STARTED cannot be saved");
+        assert_eq!(std::fs::read_to_string(&run.e.path).unwrap(), before);
+    }
+
+    #[test]
+    fn advisory_final_write_failure_is_reported_without_changing_the_entry() {
+        let fixture = Fixture::new();
+        let mut run = fixture.run();
+        let worker = run.prepare_advisory("same prompt").unwrap();
+        run.e.save().unwrap();
+        let before = std::fs::read_to_string(&run.e.path).unwrap();
+        let backend = Backend::new("write-error");
+        let error = worker.run(&backend).unwrap_err();
+        assert!(error.contains("cannot write advisory review"), "{error}");
+        assert_eq!(backend.calls.get(), 1);
+        assert_eq!(std::fs::read_to_string(&run.e.path).unwrap(), before);
+    }
+
+    #[test]
+    fn advisory_redacts_before_escaping_and_keeps_hostile_output_in_values() {
+        let fixture = Fixture::new();
+        let mut run = fixture.run();
+        let secret = "advisory-synthetic\nsecret-value";
+        run.secrets = reviewer::Secrets::collect(
+            &fixture.cfg.root,
+            &[("SYNTHETIC_PASSWORD".into(), secret.into())],
+            fixture.cfg.redact_min_chars as usize,
+        );
+        let mut worker = run.prepare_advisory("same prompt").unwrap();
+        worker
+            .record
+            .set("raw", format!("{secret}\nverdict = PASS\rreason = fake"));
+        worker.record.set("verdict", "ERROR");
+        worker.save().unwrap();
+        let text = std::fs::read_to_string(&worker.record.path).unwrap();
+        assert!(!text.contains("advisory-synthetic"));
+        assert!(text.contains("[REDACTED]"));
+        let record = result(&fixture);
+        assert_eq!(record.get("verdict"), "ERROR");
+        assert!(record.get("reason").is_empty());
     }
 
     #[test]
     fn advisory_reset_keys_cover_every_advisory_field() {
         let keys: Vec<_> = REVIEW_KEYS
             .iter()
-            .filter(|key| key.starts_with("advisory_"))
+            .filter(|k| k.starts_with("advisory_"))
             .copied()
             .collect();
         assert_eq!(
@@ -393,22 +447,9 @@ mod tests {
                 "advisory_blocking",
                 "advisory_cost_usd",
                 "advisory_secs",
-                "advisory_file"
+                "advisory_file",
             ]
         );
-    }
-
-    #[test]
-    fn advisory_persistence_failure_cannot_change_the_gate() {
-        let fixture = Fixture::new();
-        let mut run = fixture.run();
-        run.e.path = queue_dir(&fixture.cfg); // A directory cannot be replaced by an entry file.
-        run.s_advisory("same prompt");
-        assert_eq!(run.e.get("verdict"), "PASS");
-        assert_eq!(run.e.get("advisory_verdict"), "ERROR");
-        assert!(run.e.get("advisory_reason").contains("cannot save advisory entry"));
-        assert!(run.e.get("status").is_empty());
-        assert!(run.e.get("error").is_empty());
     }
 
     #[test]
@@ -418,8 +459,8 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("reviewer_model_low_advisory ="))
             .unwrap();
-        let missing = text.replace(line, "");
-        let error = Config::from_text(&missing, std::path::Path::new("p")).unwrap_err();
+        let error =
+            Config::from_text(&text.replace(line, ""), std::path::Path::new("p")).unwrap_err();
         assert!(error.contains("reviewer_model_low_advisory"), "{error}");
         for invalid in [
             "",
@@ -430,68 +471,12 @@ mod tests {
             "a\rmodel",
             "a\nmodel",
         ] {
-            let changed = text.replace(
-                line,
-                &format!("reviewer_model_low_advisory = \"{invalid}\""),
-            );
+            let changed =
+                text.replace(line, &format!("reviewer_model_low_advisory = \"{invalid}\""));
             assert!(
                 Config::from_text(&changed, std::path::Path::new("p")).is_err(),
                 "{invalid:?}"
             );
         }
-    }
-
-    #[test]
-    fn advisory_large_output_and_recording_failure_preserve_the_first_reason() {
-        let fixture = Fixture::new();
-        let mut run = fixture.run();
-        run.advisory_review("same prompt", &Backend::new("large")).unwrap();
-        let file = fixture.cfg.root.join(run.e.get("advisory_file"));
-        let text = std::fs::read_to_string(file).unwrap();
-        assert!(text.len() > fixture.cfg.reviewer_diff_max_kb as usize * 1024);
-        assert_eq!(run.e.get("advisory_verdict"), "PASS");
-
-        let mut run = fixture.run();
-        let target = queue_dir(&fixture.cfg).join("unit.advisory.review");
-        std::fs::remove_file(&target).unwrap();
-        std::fs::create_dir(&target).unwrap();
-        let error = run.advisory_review("same prompt", &Backend::new("fail")).unwrap_err();
-        assert!(error.contains("cannot write advisory review"), "{error}");
-        run.advisory_end("ERROR", &error).unwrap();
-        assert_eq!(run.e.get("verdict"), "PASS");
-        assert_eq!(run.e.get("advisory_reason"), error);
-        assert!(run.e.get("advisory_file").is_empty());
-        assert_eq!(run.e.get("advisory_verdict"), "ERROR");
-    }
-
-    #[test]
-    fn advisory_prepare_errors_are_recorded_without_starting_a_call() {
-        let fixture = Fixture::new();
-        let mut run = fixture.run();
-        let backend = Backend::new("prepare");
-        run.advisory_review("same prompt", &backend).unwrap();
-        assert_eq!(backend.calls.get(), 0);
-        assert_eq!(run.e.get("advisory_verdict"), "ERROR");
-        assert_eq!(run.e.get("advisory_reason"), "advisory CLI refused");
-    }
-
-    #[test]
-    fn advisory_fields_and_log_redact_secrets_before_persistence() {
-        let fixture = Fixture::new();
-        let mut run = fixture.run();
-        let secret = "advisory-synthetic-secret-value";
-        run.secrets = reviewer::Secrets::collect(
-            &fixture.cfg.root,
-            &[("SYNTHETIC_PASSWORD".into(), secret.into())],
-            fixture.cfg.redact_min_chars as usize,
-        );
-        run.e.set("advisory_blocking", format!("src/file:1 - {secret}"));
-        run.e.set("advisory_model", secret);
-        run.e.set("advisory_cost_usd", secret);
-        run.advisory_end("ERROR", secret).unwrap();
-        let record = std::fs::read_to_string(&run.e.path).unwrap();
-        assert!(!record.contains(secret));
-        assert!(record.contains("[REDACTED]"));
-        assert!(!run.e.get("log").contains(secret));
     }
 }

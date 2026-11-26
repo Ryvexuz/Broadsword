@@ -26,9 +26,9 @@ fn main() {
         let entry = std::fs::read_to_string(std::env::var("ADVISORY_FIXTURE_ENTRY").unwrap()).unwrap();
         assert!(entry.lines().any(|l| l == "verdict = PASS" || l == "verdict = FAIL"),
             "the gating verdict must already be durable");
-        assert!(entry.contains("advisory_verdict = ERROR"), "the call must be reserved");
+        assert!(entry.contains("advisory_file = "), "the call must be reserved");
     }
-    let kind = std::env::var(if advisory { "ADVISORY_FIXTURE_KIND" } else { "GATE_FIXTURE_KIND" }).unwrap();
+    let kind = if model == "opus" { "pass".into() } else { std::env::var(if advisory { "ADVISORY_FIXTURE_KIND" } else { "GATE_FIXTURE_KIND" }).unwrap() };
     if kind == "timeout" {
         // Longer than the test root's configured reviewer timeout.
         let timeout: u64 = std::env::var("ADVISORY_FIXTURE_TIMEOUT").unwrap().parse().unwrap();
@@ -46,6 +46,31 @@ fn main() {
     println!("{{\"type\":\"result\",\"is_error\":false,\"result\":\"{text}\",\"total_cost_usd\":0.0123,\"modelUsage\":{{\"claude-{model}-4-5\":{{}}}}}}");
 }
 "#;
+
+const OBSERVER: &str = r#"
+#[test]
+fn observe_advisory_while_queue_is_alive() {
+    let entry = std::path::PathBuf::from(std::env::var("ADVISORY_FIXTURE_ENTRY").unwrap());
+    let path = entry.with_extension("advisory");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.lines().any(|l| matches!(l, "verdict = PASS" | "verdict = FAIL" | "verdict = ERROR")) {
+                break;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "advisory did not complete: {}", path.display());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+"#;
+
+fn record_field(text: &str, key: &str) -> String {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+        .unwrap_or("")
+        .to_string()
+}
 
 struct Root {
     dir: PathBuf,
@@ -179,7 +204,16 @@ impl Root {
     }
 
     fn run(&self, entry: &str, gate: &str, advisory: &str) -> Output {
-        self.command(&["queue", "run", "--entry", entry])
+        let drain = self.configured_advisory();
+        if drain {
+            self.keepalive();
+        }
+        let mut command = if drain {
+            self.command(&["queue", "run", "--all"])
+        } else {
+            self.command(&["queue", "run", "--entry", entry])
+        };
+        command
             .env("BROADSWORD_REVIEWER_CLI", &self.reviewer)
             .env("ADVISORY_FIXTURE_OUT", self.dir.join("fixture-out"))
             .env("ADVISORY_FIXTURE_ENTRY", self.entry_path(entry))
@@ -188,6 +222,58 @@ impl Root {
             .env("ADVISORY_FIXTURE_TIMEOUT", "5")
             .output()
             .unwrap()
+    }
+
+    fn configured_advisory(&self) -> bool {
+        fs::read_to_string(self.dir.join("broadsword.toml"))
+            .unwrap()
+            .contains("reviewer_model_low_advisory = \"sonnet\"")
+    }
+
+    fn keepalive(&self) {
+        // A second, high-risk entry keeps the real queue process alive while its check waits
+        // for the first entry's detached result. This is test harness lifetime management, not
+        // a production wait.
+        let task = self
+            .ok(&[
+                "task",
+                "add",
+                "p",
+                "--title",
+                "advisory observer",
+                "--claim",
+                "tests/advisory_observer.rs",
+            ])
+            .trim()
+            .to_string();
+        self.ok(&["task", "start", &task, "--owner", "observer", "--worktree"]);
+        let wt = self.dir.join("worktrees/p").join(&task);
+        fs::create_dir_all(wt.join("tests")).unwrap();
+        fs::write(wt.join("tests/advisory_observer.rs"), OBSERVER).unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-q", "-m", "observe detached advisory"]);
+        self.ok(&["queue", "add", &task, "--risk", "high", "--coder", "sonnet"]);
+    }
+
+    fn advisory(&self, entry: &str) -> String {
+        let path = self.field(entry, "advisory_file");
+        assert!(!path.is_empty(), "missing advisory reservation");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Ok(text) = fs::read_to_string(self.dir.join(&path)) {
+                if matches!(
+                    record_field(&text, "verdict").as_str(),
+                    "PASS" | "FAIL" | "ERROR"
+                ) {
+                    return text;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "advisory did not finish: {path}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn entry_path(&self, entry: &str) -> PathBuf {
@@ -242,11 +328,12 @@ fn advisory_fail_never_blocks_a_merge() {
     assert!(stdout.contains("advisory review FAIL (recorded only; the gating review decides)"));
     assert_eq!(root.field(&entry, "status"), "merged");
     assert_eq!(root.field(&entry, "verdict"), "PASS");
-    assert_eq!(root.field(&entry, "advisory_verdict"), "FAIL");
+    let record = root.advisory(&entry);
+    assert_eq!(record_field(&record, "verdict"), "FAIL");
     assert_eq!(root.field(&entry, "advisory_model"), "sonnet");
-    assert!(root.field(&entry, "advisory_blocking").contains("fixture finding"));
-    assert_eq!(root.field(&entry, "advisory_cost_usd"), "0.0123");
-    assert!(!root.field(&entry, "advisory_secs").is_empty());
+    assert!(record_field(&record, "blocking").contains("fixture finding"));
+    assert_eq!(record_field(&record, "cost_usd"), "0.0123");
+    assert!(!record_field(&record, "secs").is_empty());
     let file = root.field(&entry, "advisory_file");
     assert!(!file.is_empty());
     assert!(fs::read_to_string(root.dir.join(file))
@@ -257,15 +344,18 @@ fn advisory_fail_never_blocks_a_merge() {
         "1",
         "advisory has its own allowance"
     );
-    assert_eq!(root.calls(), "haiku\nsonnet\n");
+    assert_eq!(root.calls(), "haiku\nsonnet\nopus\n");
     root.assert_same_prompt();
     assert!(root.ok(&["task", "show", &task]).contains("status: done"));
     assert!(root.project().join("src/note.txt").is_file());
-    let rerun = root.run(&entry, "pass", "fail");
+    let rerun = root
+        .command(&["queue", "run", "--entry", &entry])
+        .output()
+        .unwrap();
     assert_eq!(rerun.status.code(), Some(2), "{rerun:?}");
     assert_eq!(
         root.calls(),
-        "haiku\nsonnet\n",
+        "haiku\nsonnet\nopus\n",
         "a completed entry never calls again"
     );
 }
@@ -279,9 +369,14 @@ fn advisory_pass_never_rescues_a_rejected_entry() {
     assert_eq!(output.status.code(), Some(5), "{output:?}");
     assert_eq!(root.field(&entry, "status"), "rejected");
     assert_eq!(root.field(&entry, "verdict"), "FAIL");
-    assert_eq!(root.field(&entry, "advisory_verdict"), "PASS");
-    assert_eq!(root.calls(), "haiku\nsonnet\n");
-    assert_eq!(git(&root.project(), &["rev-parse", "HEAD"]), before);
+    assert_eq!(record_field(&root.advisory(&entry), "verdict"), "PASS");
+    assert_eq!(root.calls(), "haiku\nsonnet\nopus\n");
+    assert_ne!(
+        git(&root.project(), &["rev-parse", "HEAD"]),
+        before,
+        "only the observer merged"
+    );
+    assert!(!root.project().join("src/note.txt").exists());
     assert!(root.ok(&["task", "show", &task]).contains("status: running"));
     root.assert_same_prompt();
 }
@@ -329,8 +424,9 @@ fn advisory_error_is_recorded_and_the_entry_goes_on() {
         success(root.run(&entry, "pass", kind));
         assert_eq!(root.field(&entry, "status"), "merged", "{kind}");
         assert_eq!(root.field(&entry, "verdict"), "PASS");
-        assert_eq!(root.field(&entry, "advisory_verdict"), "ERROR", "{kind}");
-        assert!(!root.field(&entry, "advisory_reason").is_empty(), "{kind}");
-        assert_eq!(root.calls(), "haiku\nsonnet\n");
+        let record = root.advisory(&entry);
+        assert_eq!(record_field(&record, "verdict"), "ERROR", "{kind}");
+        assert!(!record_field(&record, "reason").is_empty(), "{kind}");
+        assert_eq!(root.calls(), "haiku\nsonnet\nopus\n");
     }
 }
