@@ -68,6 +68,9 @@ pub(super) fn keep_main_bins(cfg: &Config, main: &str, pkg: &str, bins: &[String
             // unless a stale marker vouches for it (an earlier successful step whose refresh found the copy in use)
             if let Keep::AfterMainStep(step) = moment {
                 if !step.produced(profile, b, &from) && !vouched_by_marker(&to, &from) {
+                    if !to.is_file() {
+                        lines.push(format!("main.bins: `{b}` ({}) has no kept copy, and this build did not write that exe (cargo had nothing to compile), so it was not copied; the next main build that compiles it fills main.bins", profile.dir()));
+                    }
                     continue;
                 }
             }

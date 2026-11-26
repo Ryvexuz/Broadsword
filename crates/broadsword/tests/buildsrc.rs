@@ -1157,6 +1157,33 @@ fn a_link_planted_at_a_temp_name_beside_a_kept_exe_never_writes_outside() {
 }
 
 #[test]
+fn a_main_build_that_compiles_nothing_says_main_bins_has_no_kept_copy() {
+    let r = Root::new("nokept", 120);
+    let kept = r.dir.join("build/main.bins/proj/debug").join(format!("markprobe{}", std::env::consts::EXE_SUFFIX));
+    let note = PathBuf::from(format!("{}.source", kept.display()));
+    let line = "main.bins: `markprobe` (debug) has no kept copy, and this build did not write that exe (cargo had nothing to compile), so it was not copied; the next main build that compiles it fills main.bins";
+    let o = r.ok(&["build", "proj"]);
+    assert!(kept.is_file(), "the initial build kept its exe:\n{}", o.stdout);
+    assert!(note.is_file(), "the initial build wrote its note:\n{}", o.stdout);
+    assert!(!o.stdout.contains(line), "{}", o.stdout);
+    fs::remove_file(&kept).unwrap();
+    fs::remove_file(&note).unwrap();
+
+    let o = r.ok(&["build", "proj"]);
+    assert_eq!(o.stdout.lines().filter(|s| *s == line).count(), 1, "{}", o.stdout);
+    assert!(!o.stdout.contains("kept main's `markprobe`"), "{}", o.stdout);
+    assert!(!kept.exists(), "the cached exe was not copied:\n{}", o.stdout);
+    assert!(!note.exists(), "no kept note was written:\n{}", o.stdout);
+
+    set_marker(&r.dir.join("projects/proj"), "MARK-main2");
+    let o = r.ok(&["build", "proj"]);
+    assert!(o.stdout.contains("kept main's `markprobe` (debug"), "{}", o.stdout);
+    assert!(!o.stdout.contains(line), "{}", o.stdout);
+    assert!(kept.is_file(), "the rebuilt exe was kept:\n{}", o.stdout);
+    assert_eq!(fs::read_to_string(&note).unwrap().trim(), "projects/proj");
+}
+
+#[test]
 fn run_with_task_runs_in_the_worktree_and_checkpoints_it() {
     let r = Root::new("run", 120);
     let t1 = r.task("a", "MARK-t1");
