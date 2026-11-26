@@ -1,4 +1,4 @@
-//! One train's full check of main, settled before another fast-forward or the drain's summary.
+//! Planned checks of main, settled before another fast-forward or the drain's summary.
 
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -22,6 +22,7 @@ struct Pending {
     trunk: String,
     sha: String,
     train: String,
+    full: bool,
     check: JoinHandle<(u8, JobInfo)>,
 }
 
@@ -35,7 +36,7 @@ pub(super) enum MainPlan {
     Full(String),
 }
 
-/// Pure policy only: callers continue to run the full check until the wiring lands.
+/// Build only for an identical, fully checked commit while the full main check is fresh.
 pub(super) fn main_check_plan(
     cfg: &Config,
     project: &str,
@@ -190,10 +191,65 @@ pub(super) fn check_spec(project: &str) -> JobSpec {
     }
 }
 
-fn run_check(cfg: &Config, project: &str) -> (u8, JobInfo) {
+pub(super) fn run_check(cfg: &Config, spec: JobSpec) -> (u8, JobInfo) {
     let mut info = JobInfo::default();
-    let code = job::run_job_info(cfg, check_spec(project), &mut info);
+    let code = job::run_job_info(cfg, spec, &mut info);
     (code, info)
+}
+
+impl Run<'_> {
+    /// Every post-merge entry point selects its job here, after the same main-check guards.
+    pub(super) fn planned_main_spec(&mut self) -> R<JobSpec> {
+        self.prepare_main_check()?;
+        let branch = self.e.get("main_branch").to_string();
+        let merged = match super::merge::trunk_checkout(&self.dir, &branch) {
+            Ok((_, tip)) => tip,
+            Err(error) => return Err(self.internal(&error)),
+        };
+        let project = self.e.get("project").to_string();
+        let checked = if self.e.get("train_checked").is_empty() {
+            self.e.get("checked_tip")
+        } else {
+            self.e.get("train_checked")
+        };
+        let plan = main_check_plan(
+            self.cfg,
+            &project,
+            &merged,
+            checked,
+            self.e.get("check_summary"),
+            last_full_pass(self.cfg, &project),
+            crate::task::now_secs(),
+        );
+        let mut spec = check_spec(&project);
+        let reason = match plan {
+            MainPlan::Build(reason) => {
+                spec.kind = "build".into();
+                reason
+            }
+            MainPlan::Full(reason) => reason,
+        };
+        self.e.set("main_check", reason.clone());
+        self.log("main_check", &reason)?;
+        Ok(spec)
+    }
+
+    pub(super) fn judge_planned_main_check(
+        &mut self,
+        full: bool,
+        code: u8,
+        info: JobInfo,
+    ) -> R<()> {
+        self.judge_main_check(code, info)?;
+        if full {
+            if let Err(error) =
+                record_full_pass(self.cfg, self.e.get("project"), crate::task::now_secs())
+            {
+                return Err(self.internal(&error));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn start(
@@ -246,16 +302,15 @@ fn start_slot(
         eprintln!("broadsword: cannot start a main check without train members");
         return EXIT_ERROR;
     };
-    if let Err(c) = last.prepare_main_check() {
-        return finish(cfg, train, members, Err(c), rows, worst);
-    }
+    let spec = match last.planned_main_spec() {
+        Ok(spec) => spec,
+        Err(c) => return finish(cfg, train, members, Err(c), rows, worst),
+    };
+    let full = spec.kind == "check";
     let project = last.e.get("project").to_string();
     let trunk = last.e.get("main_branch").to_string();
     let owned_cfg = cfg.clone();
-    let owned_project = project.clone();
-    let check = match std::thread::Builder::new()
-        .spawn(move || run_check(&owned_cfg, &owned_project))
-    {
+    let check = match std::thread::Builder::new().spawn(move || run_check(&owned_cfg, spec)) {
         Ok(h) => h,
         Err(e) => {
             return fail_members(
@@ -276,6 +331,7 @@ fn start_slot(
         trunk,
         sha: sha.to_string(),
         train: train.to_string(),
+        full,
         check,
     });
     println!(
@@ -404,7 +460,7 @@ fn settle_slot(
                 // Normally this is already the last member's main_sha. If that record was lost,
                 // an earlier member still has the same pre_merge_sha and can judge the full range.
                 last.e.set("main_sha", pending.sha);
-                let judged = last.judge_main_check(code, info);
+                let judged = last.judge_planned_main_check(pending.full, code, info);
                 finish(cfg, &pending.train, members, judged, rows, worst)
             } else {
                 eprintln!(
@@ -492,6 +548,34 @@ mod tests {
     }
 
     const CHECKED: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn planned_main_job_refuses_a_non_trunk_checkout_before_running_or_recording() {
+        let root = crate::scrub::planted::config_root("postcheck-guard");
+        let cfg = Config::load_from(&root).unwrap();
+        let mut entry =
+            record::create_ext(&cfg.state_dir.join("queue"), "guarded-member", "entry").unwrap();
+        entry.set("project", "p");
+        entry.set("main_branch", "main");
+        entry.set("main_sha", CHECKED);
+        entry.set("checked_tip", CHECKED);
+        entry.set("check_summary", "check: full");
+        entry.set("status", super::super::APPROVED);
+        entry.save().unwrap();
+        let id = entry.id().to_string();
+        // This directory is not a Git checkout: even an otherwise build-eligible record
+        // must pass prepare_main_check before any job can be selected.
+        record_full_pass(&cfg, "p", crate::task::now_secs()).unwrap();
+        let stamp = last_full_pass(&cfg, "p");
+        let mut run = Run::new(&cfg, entry, root.clone());
+        assert!(run.planned_main_spec().is_err());
+        let entry = load_entry(&cfg, &id).unwrap();
+        assert_eq!(entry.status(), MERGED_CHECK_FAILED);
+        assert!(entry.get("reason").contains("refused before it started"));
+        assert_eq!(last_full_pass(&cfg, "p"), stamp);
+        assert!(!cfg.state_dir.join("jobs").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn plan(cfg: &Config, summary: &str, last: Option<u64>, now: u64) -> MainPlan {
         main_check_plan(cfg, "p", CHECKED, CHECKED, summary, last, now)
@@ -720,6 +804,7 @@ mod tests {
             trunk: "main".into(),
             sha: "merged-tip".into(),
             train: "panic-train".into(),
+            full: true,
             check: std::thread::spawn(|| panic!("a main check did not complete")),
         });
         let mut rows = Vec::new();
@@ -794,6 +879,7 @@ mod tests {
             trunk: "main".into(),
             sha: "first-tip".into(),
             train: "first-train".into(),
+            full: true,
             check: std::thread::spawn(|| (0, JobInfo::default())),
         });
         let code = start_slot(

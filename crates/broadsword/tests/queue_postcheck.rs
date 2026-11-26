@@ -342,7 +342,10 @@ fn number(r: &Record, key: &str) -> u64 {
 fn main_jobs(r: &Root) -> Vec<Record> {
     jobs(r)
         .into_iter()
-        .filter(|j| j["kind"] == "check" && j["source"].replace('\\', "/") == "scratch/projects/p")
+        .filter(|j| {
+            matches!(j["kind"].as_str(), "check" | "build")
+                && j["source"].replace('\\', "/") == "scratch/projects/p"
+        })
         .collect()
 }
 
@@ -350,6 +353,12 @@ fn overlap_case(asynchronous: bool) {
     let r = Root::new(
         if asynchronous { "overlap-on" } else { "overlap-off" },
         asynchronous,
+    );
+    // This test measures full-check overlap, not the full/build policy.
+    set(
+        &r.dir.join("broadsword.toml"),
+        "main_full_check_every_minutes",
+        "0",
     );
     let gate = r.dir.join("scratch/postcheck-barrier");
     fs::create_dir_all(&gate).unwrap();
@@ -461,6 +470,10 @@ fn a_failing_async_main_check_is_reverted_before_the_next_fast_forward() {
         main_jobs(&r).iter().any(|j| j["status"] == "failed"),
         "a real full main check must have failed"
     );
+    assert!(
+        !full_record(&r).exists(),
+        "neither a failed full main check nor the auto-revert re-check records a planned full pass"
+    );
 }
 
 #[test]
@@ -496,4 +509,245 @@ fn one_async_main_check_finishes_every_member_of_its_train() {
     assert!(a["log"].contains("covered by the one main check"));
     assert!(b["log"].contains("check on main passed"));
     assert_eq!(main_jobs(&r).len(), 1);
+}
+
+fn full_record(r: &Root) -> PathBuf {
+    r.dir.join("state/queue/main-full-check-p")
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn policy_root(tag: &str, mode: &str) -> Root {
+    let r = Root::new(tag, mode == "async");
+    if mode == "single" {
+        set(&r.dir.join("broadsword.toml"), "merge_train_max", "1");
+    }
+    r
+}
+
+fn merge_one(r: &Root, file: &str) -> Record {
+    let (_, id) = train_one(r, file, "a change\n");
+    r.ok(&["queue", "run", "--all"]);
+    let entry = r.entry(&id);
+    assert_eq!(entry["status"], "merged", "{entry:?}");
+    entry
+}
+
+fn assert_plan(entry: &Record, prefix: &str) {
+    assert!(
+        entry["main_check"].starts_with(prefix),
+        "expected plan {prefix:?}: {entry:?}"
+    );
+}
+
+fn assert_job(job: &Record, kind: &str) {
+    assert_eq!(job["kind"], kind, "{job:?}");
+    assert_eq!(job["status"], "done", "{job:?}");
+    assert_eq!(job["task"], "", "must run in main, not a task");
+    assert!(number(job, "ended") >= number(job, "started"));
+}
+
+#[test]
+fn two_back_to_back_identical_merges_run_full_then_build_only() {
+    for mode in ["single", "sync", "async"] {
+        let r = policy_root("full-build", mode);
+        let first = merge_one(&r, "src/first.txt");
+        assert_plan(&first, "full (no recorded full main check)");
+        let stamp = fs::read_to_string(full_record(&r)).unwrap();
+        let recorded: u64 = stamp.trim().parse().unwrap();
+        assert!(recorded > 0 && recorded <= now());
+        let (_, second_id) = train_one(&r, "src/second.txt", "second\n");
+        let last_id = if mode == "single" {
+            second_id.clone()
+        } else {
+            train_one(&r, "src/third.txt", "third\n").1
+        };
+        r.ok(&["queue", "run", "--all"]);
+        let second = r.entry(&last_id);
+        assert_eq!(second["status"], "merged", "{second:?}");
+        if mode != "single" {
+            let covered = r.entry(&second_id);
+            assert_eq!(covered["status"], "merged", "{covered:?}");
+            assert_eq!(covered["train"], second["train"]);
+            assert_eq!(
+                covered["main_check"],
+                format!(
+                    "one main check for the whole merge train {}, run by its last entry {last_id}",
+                    second["train"]
+                )
+            );
+            assert_ne!(covered["checked_tip"], second["train_checked"]);
+        }
+        let checked = if mode == "single" {
+            &second["checked_tip"]
+        } else {
+            &second["train_checked"]
+        };
+        assert_eq!(&second["main_sha"], checked);
+        assert!(second["check_summary"].lines().any(|s| s == "check: full"));
+        assert_plan(
+            &second,
+            &format!("build (main == checked commit {},", &checked[..10]),
+        );
+        assert_eq!(fs::read_to_string(full_record(&r)).unwrap(), stamp);
+        let main = main_jobs(&r);
+        assert_eq!(main.len(), 2, "{main:?}");
+        assert_job(&main[0], "check");
+        assert_job(&main[1], "build");
+        for (label, job, entry) in [("full", &main[0], &first), ("build", &main[1], &second)] {
+            let steps = entry["log"]
+                .lines()
+                .find(|line| line.contains("check on main passed"))
+                .expect("main-check step timings in the entry log");
+            println!(
+                "{mode}: main {label} job={} seconds={} steps={}",
+                job["id"],
+                number(job, "ended") - number(job, "started"),
+                steps
+            );
+        }
+        assert!(first["log"].lines().any(|line| {
+            line.contains("check on main passed") && line.contains("test: ok")
+        }));
+        assert!(second["log"].lines().any(|line| {
+            line.contains("check on main passed")
+                && line.contains("build: ok")
+                && !line.contains("test:")
+        }));
+    }
+}
+
+#[test]
+fn a_full_record_older_than_the_setting_runs_the_full_main_check() {
+    for mode in ["single", "sync", "async"] {
+        let r = policy_root("expired", mode);
+        set(
+            &r.dir.join("broadsword.toml"),
+            "main_full_check_every_minutes",
+            "1",
+        );
+        fs::create_dir_all(full_record(&r).parent().unwrap()).unwrap();
+        let old = now().checked_sub(Duration::from_secs(60).as_secs()).unwrap();
+        fs::write(full_record(&r), format!("{old}\n")).unwrap();
+        let entry = merge_one(&r, "src/expired.txt");
+        assert_plan(&entry, "full (last full main check over 1 min ago)");
+        let main = main_jobs(&r);
+        assert_eq!(main.len(), 1, "{main:?}");
+        assert_job(&main[0], "check");
+        let recorded: u64 = fs::read_to_string(full_record(&r))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(recorded > old && recorded <= now());
+    }
+}
+
+#[test]
+fn a_build_failure_on_main_is_merged_check_failed_like_a_check_failure() {
+    for mode in ["single", "sync", "async"] {
+        for outcome in ["no-revert", "green-revert", "held"] {
+            let r = policy_root("build-fails", mode);
+            set(
+                &r.dir.join("broadsword.toml"),
+                "queue_auto_revert",
+                if outcome == "no-revert" {
+                    "\"off\""
+                } else {
+                    "\"on\""
+                },
+            );
+            merge_one(&r, "src/first.txt");
+            let stamp = fs::read_to_string(full_record(&r)).unwrap();
+            if outcome == "held" {
+                // The task worktree still passes. Reverting the build failure restores a
+                // main-only test failure, so the unchanged full re-check must hold the lane.
+                r.commit(
+                    &r.p(),
+                    "tests/main_only.rs",
+                    r#"#[test]
+fn main_only_failure() {
+    assert!(!std::env::current_dir().unwrap().ends_with("scratch/projects/p"),
+        "deliberate revert re-check failure");
+}
+"#,
+                    "plant a main-only re-check failure",
+                );
+            }
+            let before = git(&r.p(), &["rev-parse", "HEAD"]);
+            let (_, id) = train_one(
+                &r,
+                "build.rs",
+                r#"fn main() {
+    let cwd = std::env::current_dir().unwrap();
+    assert!(!cwd.ends_with("scratch/projects/p"), "deliberate main-only build failure");
+}
+"#,
+            );
+            let out = r.run(&["queue", "run", "--all"]);
+            assert_eq!(out.code, 6, "{}{}", out.stdout, out.stderr);
+            let entry = r.entry(&id);
+            assert_eq!(entry["status"], "merged_check_failed", "{entry:?}");
+            assert_plan(&entry, "build (main == checked commit ");
+            assert!(entry["reason"].contains("did not pass"), "{entry:?}");
+            assert!(r.wt(&entry["task"]).is_dir(), "failed task must be kept");
+            assert_eq!(fs::read_to_string(full_record(&r)).unwrap(), stamp);
+            let main = main_jobs(&r);
+            assert_eq!(main[1]["kind"], "build", "{main:?}");
+            assert_eq!(main[1]["status"], "failed", "{main:?}");
+            let hold = r.dir.join("state/queue/hold-p");
+            if outcome != "no-revert" {
+                assert_eq!(main.len(), 3, "{main:?}");
+                assert_eq!(main[2]["kind"], "check");
+                if outcome == "held" {
+                    assert_eq!(main[2]["status"], "failed", "{main:?}");
+                    assert_ne!(entry.get("revert_check").map(String::as_str), Some("passed"));
+                    assert!(entry["reason"].contains("HELD"), "{entry:?}");
+                    let held = fs::read_to_string(&hold).unwrap();
+                    assert!(held.contains(&format!("entry = {id}")), "{held}");
+                } else {
+                    assert_job(&main[2], "check");
+                    assert_eq!(entry["revert_check"], "passed", "{entry:?}");
+                    assert!(!hold.exists());
+                }
+                assert_eq!(git(&r.p(), &["rev-parse", "HEAD^"]), entry["main_sha"]);
+                assert_eq!(
+                    git(&r.p(), &["rev-parse", "HEAD^{tree}"]),
+                    git(&r.p(), &["rev-parse", &format!("{before}^{{tree}}")])
+                );
+            } else {
+                assert_eq!(main.len(), 2, "{main:?}");
+                assert_eq!(git(&r.p(), &["rev-parse", "HEAD"]), entry["main_sha"]);
+                assert!(!hold.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_fast_subset_project_always_gets_the_full_main_check() {
+    for mode in ["single", "sync", "async"] {
+        let r = policy_root("fast-full", mode);
+        set(&r.dir.join("broadsword.toml"), "queue_auto_revert", "\"on\"");
+        set(&r.dir.join("broadsword.toml"), "merge_fast_tests", "\"p: smoke\"");
+        r.commit(
+            &r.p(),
+            "tests/smoke.rs",
+            "#[test]\nfn smoke() {}\n",
+            "add subset",
+        );
+        fs::create_dir_all(full_record(&r).parent().unwrap()).unwrap();
+        fs::write(full_record(&r), format!("{}\n", now())).unwrap();
+        let entry = merge_one(&r, "src/subset.txt");
+        assert!(entry["check_summary"].contains("check: fast subset"));
+        assert_plan(&entry, "full (the pre-merge check was not the full suite)");
+        let main = main_jobs(&r);
+        assert_eq!(main.len(), 1, "{main:?}");
+        assert_job(&main[0], "check");
+    }
 }
