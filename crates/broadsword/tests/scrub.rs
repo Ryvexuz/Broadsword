@@ -31,13 +31,13 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "test-only (#[cfg(test)]): makes a junction, no secret reaches it",
     ),
     (
-        "job/child.rs",
+        "job.rs",
         "Command::new(\"cmd\")",
         1,
         "already scrubbed via scrub::apply (shell_command's caller, the job step)",
     ),
     (
-        "job/child.rs",
+        "job.rs",
         "Command::new(\"sh\")",
         1,
         "already scrubbed via scrub::apply (shell_command's caller, the job step)",

@@ -87,19 +87,319 @@ fn panic_hook_active(cfg: &Config) -> bool {
     true
 }
 
-mod projects;
-pub use projects::{canonical_project, cmd_projects, guard_decision, hooked_free_source, list_projects, resolve_project};
-use projects::low_disk_cleanup;
+// ---- projects ---------------------------------------------------------------------------
 
-mod child;
-pub use child::{run_child, Outcome, StepRun};
-use child::{cargo_command, kill_tree, run_child_opts, shell_command, Log};
+/// Known project names: `broadsword` plus every folder in `projects_dir` holding a Cargo.toml.
+pub fn list_projects(cfg: &Config) -> Vec<String> {
+    let mut names = vec![SELF_PROJECT.to_string()];
+    let mut found: Vec<String> = std::fs::read_dir(&cfg.projects_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().join("Cargo.toml").is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n != SELF_PROJECT)
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    names.extend(found);
+    names
+}
 
-mod steps;
-pub use steps::{create_log, file_stamp, step_line_build, step_line_run, step_line_test, steps_for};
-use steps::exit_text;
-#[cfg(test)]
-pub use steps::{parse_test_results, TestCounts};
+/// The ONE place a project name is accepted: the canonical name (the folder's real name as `list_projects` gives it,
+/// or `broadsword`), matched case-insensitively. A name is one plain folder name; `..`, separators, absolute paths
+/// and names ending in a dot or space (Windows treats `Crash.` as `Crash`) are rejected, so `Crash`, `crash` and
+/// `Crash.` can never be different projects.
+pub fn canonical_project(projects_dir: &Path, name: &str) -> Result<String, String> {
+    let mut comps = Path::new(name).components();
+    let plain = matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None)) && !name.contains(['/', '\\', ':']) && !name.ends_with(['.', ' ']);
+    if !plain {
+        return Err(format!("invalid project name `{name}`: use a plain folder name, no path, `..`, absolute path, or trailing dot or space"));
+    }
+    let want = name.to_lowercase();
+    if want == SELF_PROJECT {
+        return Ok(SELF_PROJECT.to_string());
+    }
+    let mut found: Vec<String> = std::fs::read_dir(projects_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|rd| rd.flatten())
+        .filter(|e| e.path().join("Cargo.toml").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.to_lowercase() == want)
+        .collect();
+    found.sort();
+    found.into_iter().next().ok_or_else(|| format!("unknown project `{name}`"))
+}
+
+/// Name -> project folder (see `canonical_project` for what a name may be).
+pub fn resolve_project(root: &Path, projects_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let canon = canonical_project(projects_dir, name)?;
+    Ok(if canon == SELF_PROJECT { root.to_path_buf() } else { projects_dir.join(canon) })
+}
+
+pub fn cmd_projects(cfg: &Config) -> ExitCode {
+    for n in list_projects(cfg) {
+        let dir = resolve_project(&cfg.root, &cfg.projects_dir, &n).unwrap_or_default();
+        println!("{n}\t{}", dir.display());
+    }
+    ExitCode::SUCCESS
+}
+
+// ---- disk guard -------------------------------------------------------------------------
+
+/// Pure decision. Err(message) = refuse to start. Free space minus the reserve landing exactly on the floor is allowed.
+pub fn guard_decision(paused: bool, free: u64, reserve: u64, floor: u64) -> Result<(), String> {
+    if paused {
+        return Err("Broadsword is paused (see `broadsword status`); run `broadsword resume` once space is freed".into());
+    }
+    if free < floor.saturating_add(reserve) {
+        return Err(format!(
+            "free space {} minus the {} job reserve would be below the {} floor",
+            pause::gb(free),
+            pause::gb(reserve),
+            pause::gb(floor)
+        ));
+    }
+    Ok(())
+}
+
+/// Free-space source for a running job. Normally the real disk. TEST ONLY: if the env var
+/// `BROADSWORD_INTERNAL_TEST_FREE_BYTES_FILE` names a file inside this root's scratch folder, its
+/// whitespace-separated byte counts are used one per call (the last repeats) to simulate the disk
+/// filling mid-job. Every reading is `min(hook value, real free space)`, so the hook can only make
+/// the disk look fuller, never emptier: it can never switch off the real guard. Files outside
+/// scratch are ignored, and use is announced on stderr.
+pub fn hooked_free_source(cfg: &Config) -> Box<dyn FnMut() -> u64> {
+    let root = cfg.root.clone();
+    if let Ok(v) = std::env::var(TEST_FREE_HOOK_ENV) {
+        let path = PathBuf::from(&v);
+        let inside = match (path.canonicalize(), cfg.scratch_dir.canonicalize()) {
+            (Ok(p), Ok(s)) => p.starts_with(s),
+            _ => false,
+        };
+        if inside {
+            eprintln!("broadsword: TEST HOOK ACTIVE: free space is read from {v} (never above the real free space)");
+            let mut n = 0usize;
+            return Box::new(move || {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let vals: Vec<u64> = text.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                let hooked = vals.get(n.min(vals.len().saturating_sub(1))).copied().unwrap_or(0);
+                n += 1;
+                hooked.min(real_free(&root))
+            });
+        }
+        eprintln!("broadsword: ignoring {TEST_FREE_HOOK_ENV}: file is not inside the scratch folder");
+    }
+    Box::new(move || real_free(&root))
+}
+
+/// The cleanup a low-disk kill or refusal runs, once: the same pass as `broadsword cleanup` (scratch by age, log caps, the
+/// build-folder sweep if cargo-sweep is installed), measured with the job's own free-space source. It re-measures and pauses
+/// only if free space is still below the floor (`context` goes into the pause reason). Prints what was freed.
+fn low_disk_cleanup(cfg: &Config, free_src: &mut dyn FnMut() -> u64, context: &str) -> crate::cleanup::Report {
+    let r = crate::cleanup::cleanup_pass_in(cfg, SystemTime::now(), free_src, true, context);
+    crate::cleanup::print_report(&r);
+    r
+}
+
+/// Real free space on the root's disk.
+fn real_free(root: &Path) -> u64 {
+    sys::disk(root).map(|d| d.free).unwrap_or_else(|e| {
+        eprintln!("disk check failed: {e}");
+        0
+    })
+}
+
+// ---- output parsing ---------------------------------------------------------------------
+
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct TestCounts {
+    pub passed: u64,
+    pub failed: u64,
+    pub ignored: u64,
+    pub binaries: u64,
+}
+
+/// Sum every `test result: ... N passed; N failed; N ignored; ...` line. None if no such line exists.
+pub fn parse_test_results(output: &str) -> Option<TestCounts> {
+    let mut c = TestCounts::default();
+    for line in output.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("test result:") else { continue };
+        c.binaries += 1;
+        for part in rest.split([';', '.']) {
+            let mut words = part.split_whitespace();
+            if let (Some(n), Some(label)) = (words.next(), words.next()) {
+                if let Ok(n) = n.parse::<u64>() {
+                    match label {
+                        "passed" => c.passed += n,
+                        "failed" => c.failed += n,
+                        "ignored" => c.ignored += n,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (c.binaries > 0).then_some(c)
+}
+
+// ---- running cargo ----------------------------------------------------------------------
+
+pub enum Outcome {
+    Exited(Option<i32>),
+    DiskDropped(u64),
+}
+
+pub struct StepRun {
+    pub outcome: Outcome,
+    pub stdout: String,
+    pub secs: f64,
+}
+
+type Log = Arc<Mutex<std::fs::File>>;
+
+/// Every line is redacted (every `.env` value becomes `[REDACTED]`) before it reaches the terminal, the job log or the kept
+/// output. Per line: a secret split across two lines is a known limit.
+fn tee(src: impl Read, to_stderr: bool, echo: bool, log: Log, keep: Option<Arc<Mutex<Vec<u8>>>>, secrets: Arc<Secrets>) {
+    let mut r = std::io::BufReader::new(src);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        {
+            let text = String::from_utf8_lossy(&buf);
+            let red = secrets.redact(&text);
+            if red != text {
+                buf = red.into_bytes();
+            }
+        }
+        if !echo {
+            // machine output (cargo's JSON): kept for the caller only, never echoed or logged
+        } else if to_stderr {
+            let _ = std::io::stderr().write_all(&buf);
+        } else {
+            let _ = std::io::stdout().write_all(&buf);
+            let _ = std::io::stdout().flush();
+        }
+        if echo {
+            if let Ok(mut f) = log.lock() {
+                let _ = f.write_all(&buf);
+            }
+        }
+        if let Some(k) = &keep {
+            if let Ok(mut k) = k.lock() {
+                k.extend_from_slice(&buf);
+            }
+        }
+    }
+}
+
+fn kill_tree(child: &mut std::process::Child) {
+    // cargo starts rustc and build scripts, a shell starts its commands: take the whole tree down.
+    sys::kill_tree(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run a prepared command, polling `free` every `poll`; below the floor the job is killed.
+/// `on_spawn` gets the child's pid as soon as it exists (recorded so recovery can find an orphan).
+pub fn run_child(
+    cfg: &Config,
+    cmd: Command,
+    log: &Log,
+    free: &mut dyn FnMut() -> u64,
+    poll: Duration,
+    on_spawn: &mut dyn FnMut(u32),
+    secrets: &Arc<Secrets>,
+) -> Result<StepRun, String> {
+    run_child_opts(cfg, cmd, log, free, poll, on_spawn, secrets, true)
+}
+
+/// `run_child`, with `echo_stdout` false for machine output (cargo's JSON): stdout is then only kept (redacted), never printed
+/// or logged; stderr is printed and logged as always.
+#[allow(clippy::too_many_arguments)]
+fn run_child_opts(
+    cfg: &Config,
+    mut cmd: Command,
+    log: &Log,
+    free: &mut dyn FnMut() -> u64,
+    poll: Duration,
+    on_spawn: &mut dyn FnMut(u32),
+    secrets: &Arc<Secrets>,
+    echo_stdout: bool,
+) -> Result<StepRun, String> {
+    let start = Instant::now();
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start `{}`: {e}", cmd.get_program().to_string_lossy()))?;
+    on_spawn(child.id());
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let (out, err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let t_out = {
+        let (l, k, sc) = (Arc::clone(log), Arc::clone(&kept), Arc::clone(secrets));
+        std::thread::spawn(move || tee(out, false, echo_stdout, l, Some(k), sc))
+    };
+    let t_err = {
+        let (l, sc) = (Arc::clone(log), Arc::clone(secrets));
+        std::thread::spawn(move || tee(err, true, true, l, None, sc))
+    };
+    let mut next_poll = Instant::now() + poll;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Outcome::Exited(status.code()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("waiting for the job failed: {e}")),
+        }
+        if Instant::now() >= next_poll {
+            let f = free();
+            if pause::below_floor(f, cfg.floor_bytes()) {
+                kill_tree(&mut child);
+                break Outcome::DiskDropped(f);
+            }
+            next_poll = Instant::now() + poll;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if matches!(outcome, Outcome::Exited(_)) {
+        let _ = t_out.join();
+        let _ = t_err.join();
+    } // after a kill the readers are left to finish on their own: never block on orphaned pipes
+    let stdout = String::from_utf8_lossy(&kept.lock().map(|k| k.clone()).unwrap_or_default()).into_owned();
+    Ok(StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() })
+}
+
+/// `cargo <sub> --offline` in `project_dir` (the caller sets the shared build folder).
+fn cargo_command(cfg: &Config, project_dir: &Path, sub: &str) -> Command {
+    let mut c = buildsrc::cargo(cfg); // the one cargo factory: scrubbed environment
+    c.arg(sub).arg("--offline").current_dir(project_dir);
+    c
+}
+
+/// An arbitrary command line run through the system shell in `project_dir` (the caller sets the shared build folder).
+fn shell_command(project_dir: &Path, line: &str) -> Command {
+    #[cfg(windows)]
+    let mut c = {
+        use std::os::windows::process::CommandExt;
+        let mut c = Command::new("cmd");
+        c.arg("/C").raw_arg(format!("\"{line}\"")); // cmd strips one outer pair of quotes
+        c
+    };
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(line);
+        c
+    };
+    c.current_dir(project_dir);
+    c
+}
 
 mod python;
 pub use python::{python_scripts, step_line_python, PyTests, PYTHON};
@@ -111,6 +411,74 @@ pub use teststep::parse_artifacts;
 use teststep::{refresh_main_bins, TestStep};
 
 // ---- commands ---------------------------------------------------------------------------
+
+pub fn file_stamp(secs: u64) -> String {
+    // "YYYY-MM-DD HH:MM:SS UTC" -> "YYYYMMDD-HHMMSS"
+    pause::format_utc(secs).chars().take(19).filter(|c| c.is_ascii_digit() || *c == ' ').map(|c| if c == ' ' { '-' } else { c }).collect()
+}
+
+fn exit_text(c: Option<i32>) -> String {
+    c.map(|c| format!("exit {c}")).unwrap_or_else(|| "terminated".into())
+}
+
+pub fn step_line_build(run: &StepRun) -> (String, bool) {
+    match run.outcome {
+        Outcome::Exited(Some(0)) => (format!("build: ok ({:.1} s)", run.secs), true),
+        Outcome::Exited(c) => (format!("build: FAILED ({})", exit_text(c)), false),
+        Outcome::DiskDropped(_) => ("build: KILLED (disk below floor)".into(), false),
+    }
+}
+
+pub fn step_line_run(run: &StepRun) -> (String, bool) {
+    match run.outcome {
+        Outcome::Exited(Some(0)) => (format!("run: ok ({:.1} s)", run.secs), true),
+        Outcome::Exited(c) => (format!("run: FAILED ({})", exit_text(c)), false),
+        Outcome::DiskDropped(_) => ("run: KILLED (disk below floor)".into(), false),
+    }
+}
+
+pub fn step_line_test(run: &StepRun) -> (String, bool) {
+    let counts = parse_test_results(&run.stdout);
+    let code_ok = matches!(run.outcome, Outcome::Exited(Some(0)));
+    let line = match (&run.outcome, counts) {
+        (Outcome::DiskDropped(_), _) => "test: KILLED (disk below floor)".to_string(),
+        (Outcome::Exited(c), Some(n)) if !code_ok || n.failed > 0 => {
+            format!("test: FAILED ({}) — {} passed, {} failed", exit_text(*c), n.passed, n.failed)
+        }
+        (_, Some(n)) => {
+            let ign = if n.ignored > 0 { format!(", {} ignored", n.ignored) } else { String::new() };
+            format!("test: ok — {} passed, {} failed{ign}", n.passed, n.failed)
+        }
+        (Outcome::Exited(Some(0)), None) => "test: ok — no `test result:` lines found, so no counts".to_string(),
+        (Outcome::Exited(c), None) => format!("test: FAILED ({}) — no `test result:` lines found", exit_text(*c)),
+    };
+    let ok = code_ok && counts.is_none_or(|n| n.failed == 0);
+    (line, ok)
+}
+
+/// Create `<base>.log`, or `<base>-2.log`, `-3`... if taken: an earlier log is never overwritten.
+pub fn create_log(dir: &Path, base: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for n in 1u32.. {
+        let file = if n == 1 { format!("{base}.log") } else { format!("{base}-{n}.log") };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// The steps of a job kind, in order. `run` is one step: the user's command.
+pub fn steps_for(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "build" => &["build"],
+        "test" => &["test"],
+        "run" => &["run"],
+        _ => &["build", "test"],
+    }
+}
 
 pub struct JobSpec {
     pub kind: String,
