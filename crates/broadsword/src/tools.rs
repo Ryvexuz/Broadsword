@@ -576,11 +576,11 @@ mod tests {
     }
 
     /// `task_start` must state what max_agents counts (tasks waiting in the merge queue are not counted) and show both cap
-    /// refusals as task.rs prints them. The refusal fragments are also required to occur in task.rs, so the two cannot drift.
+    /// refusals as task/start.rs prints them. The refusal fragments are also required to occur in task/start.rs, so the two cannot drift.
     #[test]
     fn task_start_description_states_the_cap_rules_and_refusal_texts() {
         let full = tool_full(find("task_start").unwrap());
-        let task_rs = include_str!("task.rs");
+        let task_rs = include_str!("task/start.rs");
         for must in [
             "tasks are running with a working coder, the max_agents cap in broadsword.toml is",
             "running tasks whose merge-queue entry is queued, running or approved are not counted",
