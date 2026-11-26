@@ -92,6 +92,23 @@ class RuleTests(unittest.TestCase):
         brief_claim_missing_from_board_is_not_startable
     )
 
+    def standard_claims_form_checks_the_first_path(self):
+        brief = BRIEF + (
+            "**Claims:** (the only files you may change) src/zzz.rs, src/a.rs (new)\n"
+        )
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: src/zzz.rs"),
+        )
+        self.assertEqual(
+            readiness.check(row(claim="src/zzz.rs, src/a.rs"), brief, {}, [], True),
+            (True, "ok"),
+        )
+
+    test_standard_claims_form_checks_the_first_path = (
+        standard_claims_form_checks_the_first_path
+    )
+
     def test_brief_claims_require_exact_board_membership(self):
         for board, claimed in (
             ("src", "src/a.rs"), ("*", "src/a.rs"),
