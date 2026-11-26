@@ -41,6 +41,7 @@ const BASE: &[(&str, &str)] = &[
     ("job_disk_reserve_gb", "0"),
     ("job_disk_poll_seconds", "1"),
     ("task_lock_wait_seconds", "10"),
+    ("task_archive_days", "30"),
     ("worktrees_dir", "\"worktrees\""),
     ("build_lock_wait_seconds", "10"),
     ("recover_lock_wait_seconds", "5"),
