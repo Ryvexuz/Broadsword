@@ -39,6 +39,10 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
             new (new, add, introduce, accept), else WARN.
   R4  FAIL  "new required setting/key" in Requirements without config.rs, broadsword.toml and
             tests/support/mod.rs claimed.
+  R4b FAIL  with --root, a broadsword.toml#K claim for a key absent from the root TOML needs
+            crates/broadsword/src/config.rs#K and crates/broadsword/tests/support/mod.rs#K
+            claimed (whole-file claims also count); the loader makes every key required.
+  R4c FAIL  with --root, that new-key claim also needs the exact NEW-KEY RULE paragraph.
   R5  WARN  only with --root: each backticked function or symbol (snake_case, `::` or `()`) of
             Requirements or the Done check, and the files `git grep` finds it in that are not claimed.
   R6  FAIL  hot whole-file claims need a Hot file: reason. With --root, flagged hotspot
@@ -52,6 +56,8 @@ the Claims (a claim covers a path when it equals it, is a folder prefix of it, o
             count needs "wiring" in its own Claims bullet or a claimed (new) file
             anywhere in the same project (any folder).
             New files are not counted; outside-root or unreadable paths WARN.
+  R12 FAIL  with --root, a claimed new .rs file under crates/broadsword/src/queue/ needs
+            crates/broadsword/src/queue/mod.rs claimed for the queue::SOURCE list.
   R11 FAIL  with --min-pasted-lines, a GPT Model in Board naming an outside-repo path
             needs a Pasted or Pasted protocol section with that many non-empty body lines.
 
@@ -290,6 +296,15 @@ SYMBOL_RE = re.compile(r"^[A-Za-z_]\w*(?:::\w+)*(?:\(\))?$")
 SENT_RE = re.compile(r"(?<=[.!?])\s+|;\s+|\n")
 TOOLS_RS = "crates/broadsword/src/tools.rs"
 CONFIG_NEEDS = ("config.rs", "broadsword.toml", "tests/support/mod.rs")
+NEW_KEY_RULE = (
+    "NEW-KEY RULE (keeper 2026-11-25 21:20Z, after coder stops on 195123-3, 195124-2, "
+    "202441, 184437): a config.rs#K claim covers every config.rs line about K: the Config "
+    "field, its parse line, the Config initializer, and one `K = <shipped value>` line in "
+    "EACH inline toml fixture in config.rs tests (the fixtures holding a "
+    r'`python_tests = \\"\\"` line, near config.rs:658, :949 and :1013), placed after that '
+    "python_tests line. The tests/support/mod.rs#K claim covers its one fixture entry. "
+    "Nothing else in config.rs changes."
+)
 
 
 def section_text(lines, secs, names):
@@ -402,7 +417,7 @@ def named_paths(text):
 
 def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_lines=None,
                min_pasted_lines=None):
-    """Return [(rule, level, message)] for R1-R11; level is FAIL or WARN. Empty when clean."""
+    """Return [(rule, level, message)] for R1-R12; level is FAIL or WARN. Empty when clean."""
     for name, value in (("min_hard_cases", min_hard_cases), ("big_file_lines", big_file_lines),
                         ("min_pasted_lines", min_pasted_lines)):
         if value is not None and (type(value) is not int or value < 1):
@@ -502,6 +517,7 @@ def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_
 
     if root:
         res.extend(size_warnings(claim_blocks(lines, secs), root))
+        res.extend(claim_completeness_gaps(lines, secs, root))
 
     if CONFIG_KEY_RE.search(req):
         miss = [n for n in CONFIG_NEEDS if not any(c == n or c.endswith("/" + n) for c in claims)]
@@ -568,6 +584,66 @@ def claim_gaps(text, root=None, reported=None, *, min_hard_cases=None, big_file_
         if outside and pasted < min_pasted_lines:
             res.append(("R11", "FAIL", f"pasted protocol: GPT brief names an outside-repo path; "
                         f"need >= {min_pasted_lines} non-empty Pasted lines (found {pasted})"))
+    return res
+
+
+def claim_completeness_gaps(lines, secs, root):
+    """R4b/R4c/R12: compare explicit claims with the root, independent of requirement wording."""
+    tokens = {tok.rstrip(".:").replace("\\", "/")
+              for block in claim_blocks(lines, secs)
+              for tok in re.split(r"[\s,;()\[\]`'\"]+", block) if tok}
+    keys = sorted({tok.partition("#")[2] for tok in tokens
+                   if tok.startswith("broadsword.toml#") and tok.partition("#")[2]})
+    claims = claimed_paths(lines, secs)
+    queue = "crates/broadsword/src/queue/"
+    queue_files = sorted(p for p in claims if p.startswith(queue) and p.endswith(".rs"))
+    res = []
+    if not keys and not queue_files:
+        return res
+    try:
+        base = pathlib.Path(root).resolve()
+    except (OSError, ValueError, RuntimeError) as e:
+        return [(rule, "FAIL", f"cannot resolve claim root: {e}")
+                for rule, applies in (("R4b", keys), ("R12", queue_files)) if applies]
+    try:
+        if keys:
+            config = (base / "broadsword.toml").resolve()
+            if not config.is_relative_to(base):
+                raise ValueError("broadsword.toml outside root")
+            with config.open("rb") as f:
+                existing = tomllib.load(f)
+            for key in keys:
+                if key in existing:
+                    continue
+                needed = ("crates/broadsword/src/config.rs",
+                          "crates/broadsword/tests/support/mod.rs")
+                missing = [f"{p}#{key}" for p in needed
+                           if p not in tokens and f"{p}#{key}" not in tokens]
+                if missing:
+                    res.append(("R4b", "FAIL", f"new key {key}: missing claims: "
+                                + ", ".join(missing)
+                                + "; the config loader test "
+                                "every_key_in_the_real_toml_is_required_by_the_loader_and_used_by_code "
+                                "makes every key required, so there are no optional keys"))
+                if NEW_KEY_RULE not in lines:
+                    res.append(("R4c", "FAIL", f"new key {key}: add the NEW-KEY RULE paragraph"))
+    except (OSError, ValueError, RuntimeError) as e:
+        res.append(("R4b", "FAIL", f"cannot check new-key claims under --root: {e}"))
+        # Queue checks still run if the TOML cannot be read.
+    for path in queue_files:
+        try:
+            target = (base / path).resolve()
+            if not target.is_relative_to(base):
+                raise ValueError("claimed queue path outside root")
+            try:
+                target.stat()
+            except FileNotFoundError:
+                if not covers(claims, queue + "mod.rs"):
+                    res.append(("R12", "FAIL", f"new queue file {path}: claim {queue}mod.rs for "
+                                "queue::SOURCE list (the queue module test "
+                                "source_lists_every_file_of_the_queue_folder)"))
+        except (OSError, ValueError, RuntimeError) as e:
+            res.append(("R12", "FAIL", f"cannot check queue claim {path}: {e}"))
     return res
 
 
