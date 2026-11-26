@@ -27,7 +27,12 @@ pub(super) fn find(cfg: &Config, id: &str) -> Result<Option<PathBuf>, String> {
     plain_path(&dir, true)?;
     let mut found = None;
     for entry in entries {
-        let path = entry.map_err(|e| e.to_string())?.path();
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        // Inspect the entry itself, without following links: stray files are not archive months.
+        if !entry.file_type().map_err(|e| format!("cannot inspect {}: {e}", path.display()))?.is_dir() {
+            continue;
+        }
         plain_path(&path, true)?;
         let candidate = path.join(format!("{id}.{EXT}"));
         match std::fs::symlink_metadata(&candidate) {

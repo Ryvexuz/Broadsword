@@ -143,6 +143,28 @@ fn archive_moves_old_ended_tasks_and_show_still_finds_them() {
 }
 
 #[test]
+fn archive_stray_file_does_not_break_task_add_or_show() {
+    let r = Root::new("archive-stray-file");
+    let old = r.add("p", "old", &["src"]);
+    archive_record(&r, &old, &[("status", "done"), ("ended", "946684800")]);
+    let o = r.run(&["task", "archive"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let archive = r.dir.join("state/tasks/archive");
+    let archived = archive.join("2000-01").join(format!("{old}.task"));
+    let before = fs::read(&archived).unwrap();
+    let readme = archive.join("README");
+    fs::write(&readme, b"Archive notes, not a month directory.\n").unwrap();
+
+    assert_eq!(r.status_of(&old), "done");
+    let current = r.add("p", "new", &["src"]);
+    assert_ne!(current, old);
+    assert_eq!(r.status_of(&current), "open");
+    assert_eq!(r.status_of(&old), "done");
+    assert_eq!(fs::read(&archived).unwrap(), before);
+    assert_eq!(fs::read(&readme).unwrap(), b"Archive notes, not a month directory.\n");
+}
+
+#[test]
 fn archive_never_moves_open_running_or_young_tasks() {
     let r = Root::new("archive-keeps");
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
