@@ -83,7 +83,6 @@ pub struct Config {
     pub job_disk_poll_seconds: u64,
     /// How long a `task` command waits for the board lock before exiting "board busy".
     pub task_lock_wait_seconds: u64,
-    pub task_archive_days: u64,
     /// How long a build, test or check job waits for the build lock (state/build.lock) before it is refused.
     pub build_lock_wait_seconds: u64,
     /// Where each task's Git worktree lives: `<worktrees_dir>/<project>/<task id>` (broadsword worktree ...).
@@ -95,8 +94,6 @@ pub struct Config {
     pub reviewer_cli: String,
     /// The reviewer model for a `--risk low` / `--risk high` queue entry.
     pub reviewer_model_low: String,
-    /// Optional recorded-only Claude review of low-risk entries; `off` disables it.
-    pub reviewer_model_low_advisory: String,
     pub reviewer_model_high: String,
     /// The `--risk high` reviewer when `reviewer_model_high` is the coder's own family.
     pub reviewer_model_high_fallback: String,
@@ -429,7 +426,6 @@ impl Config {
             reviewer_backend,
             reviewer_cli,
             reviewer_model_low: model("reviewer_model_low")?,
-            reviewer_model_low_advisory: model("reviewer_model_low_advisory")?,
             reviewer_model_high: model("reviewer_model_high")?,
             reviewer_model_high_fallback: model("reviewer_model_high_fallback")?,
             reviewer_model_high_gpt: model("reviewer_model_high_gpt")?,
@@ -478,7 +474,6 @@ impl Config {
             job_disk_reserve_gb: get_int(&m, "job_disk_reserve_gb")?,
             job_disk_poll_seconds: positive("job_disk_poll_seconds")?,
             task_lock_wait_seconds: positive("task_lock_wait_seconds")?,
-            task_archive_days: positive("task_archive_days")?,
             build_lock_wait_seconds: positive("build_lock_wait_seconds")?,
             worktrees_dir,
             root,
@@ -646,7 +641,7 @@ mod tests {
 codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_low_advisory = \"off\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_lanes = 1
@@ -665,7 +660,6 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
-task_archive_days = 30
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -689,23 +683,6 @@ install_dir=\"build/bin\"\n";
         assert!(Config::from_text(base, Path::new("p")).is_err(), "worktrees_dir is required");
         for bad in ["../w", "/w", "C:/w", ".", "a/../../w", "scratch", "scratch/w", "build/w", "state/w", "state"] {
             assert!(Config::from_text(&format!("{base}worktrees_dir=\"{bad}\"\n"), Path::new("p")).is_err(), "worktrees_dir {bad}");
-        }
-    }
-
-    #[test]
-    fn task_archive_days_is_required_and_positive() {
-        let text = include_str!("../../../broadsword.toml");
-        assert_eq!(Config::from_text(text, Path::new("p")).unwrap().task_archive_days, 30);
-        let without = text.lines().filter(|l| !l.trim_start().starts_with("task_archive_days")).collect::<Vec<_>>().join("\n");
-        let e = Config::from_text(&without, Path::new("p")).unwrap_err();
-        assert!(e.contains("task_archive_days"), "{e}");
-        for value in ["0", "-1", "\"\""] {
-            let bad = format!("{without}\ntask_archive_days = {value}\n");
-            let e = Config::from_text(&bad, Path::new("p")).unwrap_err();
-            assert!(e.contains("task_archive_days"), "{value}: {e}");
-        }
-        for value in ["1.5", "18446744073709551616"] {
-            assert!(Config::from_text(&format!("{without}\ntask_archive_days = {value}\n"), Path::new("p")).is_err(), "{value}");
         }
     }
 
@@ -960,7 +937,7 @@ install_dir=\"build/bin\"\n";
 codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_low_advisory = \"off\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_lanes = 1
@@ -979,7 +956,6 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
-task_archive_days = 30
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -1031,7 +1007,7 @@ worktrees_dir = \"worktrees\"\n";
 codex_coder_timeout_seconds = 5
 sweep_older_than_days = 7
 redact_min_chars = 6
-reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_low_advisory = \"off\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
+reviewer_backend = \"claude\"\nreviewer_cli = \"claude\"\nreviewer_model_low = \"haiku\"\nreviewer_model_high = \"opus\"\nreviewer_model_high_fallback = \"sonnet\"\nreviewer_model_high_gpt = \"gpt-6.1-sol\"\nreviewer_effort_high = \"high\"\nreviewer_timeout_seconds = 5\nreviewer_diff_max_kb = 200\nreviewer_brief_max_kb = 32\nreviewer_check_tail_kb = 8\nqueue_lock_wait_seconds = 2
 reviewer_max_calls_per_entry = 3
 merge_train_max = 4
 merge_train_wait_minutes = 20
@@ -1049,7 +1025,6 @@ queue_auto_revert = \"on\"
 merge_fast_tests = \"\"
 queue_main_check_async = \"off\"
 python_tests = \"\"
-task_archive_days = 30
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40

@@ -49,7 +49,6 @@ mcp_output_max_kb = 1024        # an MCP tools/call keeps at most the last N KB 
 
 # Task board (broadsword task ...): claims and who runs what, in state_dir/tasks
 task_lock_wait_seconds = 10     # a task command waits at most this long for the board lock (state/tasks/board.lock), then exits 4 "board busy"
-task_archive_days = 30          # move ended board tasks older than this many days into the archive
 
 # Worktrees (broadsword task start --worktree | broadsword worktree ...): one Git worktree per task at <worktrees_dir>/<project>/<task id>, on branch task/<task id>
 worktrees_dir = "worktrees"     # inside root; not inside scratch, build or state (a worktree holds unmerged work). Git-ignored. After moving the project run `broadsword worktree repair`
@@ -61,7 +60,6 @@ build_lock_wait_seconds = 900   # a build/test/check job holds the build lock wh
 reviewer_backend = "claude"        # which backend reviews a queued branch. Only "claude" exists (Claude Code CLI, headless); an "openai" one can be added later
 reviewer_cli = "claude"            # the CLI program, resolved on PATH. A machine-specific path goes in the env var BROADSWORD_REVIEWER_CLI (never in this file). The resolved path is printed and recorded on every review. The override must point OUTSIDE the project root (like the real Claude install) or inside scratch_dir (a TEST HOOK: loudly announced, and the review is marked test_hook: true); any other path inside the root, build/ included, is refused so the shipped fake reviewer can never be used by accident
 reviewer_model_low = "haiku"       # reviewer for `queue add --risk low` (cheap first pass, ~$0.006 per review in the benchmark)
-reviewer_model_low_advisory = "off" # optional second Claude model for low risk, recorded only after the gating verdict; never gates
 reviewer_model_high = "opus"       # reviewer for `queue add --risk high`: deletion, locks, secrets, safety guards (~$0.18 per review). Must differ from the entry's --coder, or the fallback below is used
 reviewer_model_high_fallback = "sonnet"  # reviewer for a `--risk high` entry whose --coder is the reviewer_model_high family (Opus-coded work); it too must differ from the coder, or the entry is blocked
 reviewer_model_high_gpt = "gpt-6.1-sol"  # gating reviewer of a `--risk high` entry whose --coder is the reviewer_model_high family (Opus-coded work): an OpenAI model asked through clients/openai_review.py, so it is under the same $20/day cap and ledger as the shadow review (the shadow is skipped then). A SKIPPED call (cap reached, GPT unavailable, error, timeout, another model answering) falls back to reviewer_model_high_fallback in the same run. "off" = no GPT gate

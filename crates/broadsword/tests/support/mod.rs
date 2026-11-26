@@ -41,7 +41,6 @@ const BASE: &[(&str, &str)] = &[
     ("job_disk_reserve_gb", "0"),
     ("job_disk_poll_seconds", "1"),
     ("task_lock_wait_seconds", "10"),
-    ("task_archive_days", "30"),
     ("worktrees_dir", "\"worktrees\""),
     ("build_lock_wait_seconds", "10"),
     ("recover_lock_wait_seconds", "5"),
@@ -50,7 +49,6 @@ const BASE: &[(&str, &str)] = &[
     ("reviewer_backend", "\"claude\""),
     ("reviewer_cli", "\"claude\""),
     ("reviewer_model_low", "\"haiku\""),
-    ("reviewer_model_low_advisory", "\"off\""),
     ("reviewer_model_high", "\"opus\""),
     ("reviewer_model_high_fallback", "\"sonnet\""),
     // "off" so no test can reach a real GPT call by accident; a GPT-gate test sets it and points BROADSWORD_SHADOW_REVIEWER_SCRIPT at a fake
