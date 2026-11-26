@@ -14,6 +14,10 @@ queue_entry_read_wait_ms = 2000  # task start re-reads (with backoff) a queue en
 stall_restart_lines = 3
 stall_restart_timeout_seconds = 60
 stale_claim_hours = 4 # scripts/stale_claims.py: a running task with no commit or worktree change for this many hours is reported (report only)
+# auto-agent (scripts/auto_agent.py, read only by it): the tick starts an overdue process audit / batch review itself
+auto_agent_timeout_minutes = 90       # a run still going after this is killed (process tree) and logged as timeout
+auto_agent_min_gap_minutes = 150      # no new start of the same job within this many minutes of its last start
+auto_agent_max_starts_per_day = 6     # per job, per UTC day; a cap reached prints one line and starts nothing
 
 # Paths, relative to root
 scratch_dir = "scratch"    # temp files, logs, test output; can be wiped at any time
