@@ -326,7 +326,7 @@ class ReportClaimRules(unittest.TestCase):
 
     def test_report_does_not_override_original_hot_rules(self):
         self.report([(path, "split") for path in bl.HOT])
-        self.assertEqual(self.check("`broadsword.toml#key`"), [])
+        self.assertEqual(self.check("`broadsword.toml#hotspot_lines`"), [])
         result = self.check("`crates/broadsword/src/queue.rs#key`",
                             "Split first: t-20261123-224420\n")
         self.assertIn(("R6", "FAIL"), {(r, lv) for r, lv, _ in result})
@@ -759,6 +759,122 @@ class Cli(unittest.TestCase):
     def test_limits_are_required_flags(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(bl.main([self.write("g.md", GOOD)]), 2)
+
+
+class ClaimCompletenessRules(unittest.TestCase):
+    PARAGRAPH = (
+        "NEW-KEY RULE (keeper 2026-11-25 21:20Z, after coder stops on 195123-3, 195124-2, "
+        "202441, 184437): a config.rs#K claim covers every config.rs line about K: the Config "
+        "field, its parse line, the Config initializer, and one `K = <shipped value>` line in "
+        "EACH inline toml fixture in config.rs tests (the fixtures holding a "
+        r'`python_tests = \\"\\"` line, near config.rs:658, :949 and :1013), placed after that '
+        "python_tests line. The tests/support/mod.rs#K claim covers its one fixture entry. "
+        "Nothing else in config.rs changes."
+    )
+    KEY_CLAIMS = ("`broadsword.toml#reviewer_low_gate`, "
+                  "`crates/broadsword/src/config.rs#reviewer_low_gate`, "
+                  "`crates/broadsword/tests/support/mod.rs#reviewer_low_gate`")
+    QUEUE_FILE = "crates/broadsword/src/queue/fresh.rs"
+    QUEUE_MOD = "crates/broadsword/src/queue/mod.rs"
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="test_brief_claims_"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "broadsword.toml").write_text(
+            'existing_key = true\n# reviewer_low_gate = false\n'
+            'description = "reviewer_low_gate = true"\n', encoding="utf-8")
+
+    def gaps(self, claims, paragraph=None):
+        text = brief(claims, "- adjust optional setting or queue implementation")
+        if paragraph is not None:
+            text += "\n" + paragraph + "\n"
+        lines = text.splitlines()
+        return bl.claim_completeness_gaps(lines, bl.split_sections(lines), self.root)
+
+    def test_r4c_new_key_without_rule_paragraph_fails(self):
+        expected = [("R4c", "FAIL",
+                     "new key reviewer_low_gate: add the NEW-KEY RULE paragraph")]
+        self.assertEqual(self.gaps(self.KEY_CLAIMS), expected)
+        self.assertEqual(self.gaps(self.KEY_CLAIMS, self.PARAGRAPH), [])
+        for changed in ("NEW-KEY RULE", self.PARAGRAPH.replace("EACH", "each"),
+                        "See " + self.PARAGRAPH):
+            with self.subTest(paragraph=changed):
+                self.assertEqual(self.gaps(self.KEY_CLAIMS, changed), expected)
+
+    def test_r4b_new_key_without_fixture_fails(self):
+        claims = ("`broadsword.toml#reviewer_low_gate`, "
+                  "`crates/broadsword/src/config.rs#reviewer_low_gate`")
+        gaps = self.gaps(claims, self.PARAGRAPH)
+        self.assertEqual([(r, lv) for r, lv, _ in gaps], [("R4b", "FAIL")])
+        self.assertIn("new key reviewer_low_gate", gaps[0][2])
+        self.assertIn("crates/broadsword/tests/support/mod.rs#reviewer_low_gate", gaps[0][2])
+        self.assertIn("every_key_in_the_real_toml_is_required_by_the_loader_and_used_by_code",
+                      gaps[0][2])
+        self.assertIn("there are no optional keys", gaps[0][2])
+        for missing in ("crates/broadsword/src/config.rs",
+                        "crates/broadsword/tests/support/mod.rs"):
+            wrong = self.KEY_CLAIMS.replace(missing + "#reviewer_low_gate", missing + "#other")
+            result = self.gaps(wrong, self.PARAGRAPH)
+            self.assertEqual([(r, lv) for r, lv, _ in result], [("R4b", "FAIL")])
+            self.assertIn(missing + "#reviewer_low_gate", result[0][2])
+        whole = self.KEY_CLAIMS.replace(".rs#reviewer_low_gate", ".rs")
+        self.assertEqual(self.gaps(whole, self.PARAGRAPH), [])
+        self.assertEqual(self.gaps(self.KEY_CLAIMS.replace("/", "\\"), self.PARAGRAPH), [])
+
+    def test_r4b_existing_key_passes(self):
+        self.assertEqual(self.gaps("`broadsword.toml#existing_key`"), [])
+        self.assertEqual(self.gaps("`other/broadsword.toml#reviewer_low_gate`"), [])
+        for content in ("", "duplicate = 1\nduplicate = 2\n"):
+            (self.root / "broadsword.toml").write_text(content, encoding="utf-8")
+            result = self.gaps("`broadsword.toml#reviewer_low_gate`")
+            self.assertIn(("R4b", "FAIL"), [(r, lv) for r, lv, _ in result])
+        (self.root / "broadsword.toml").unlink()
+        self.assertIn(("R4b", "FAIL"),
+                      [(r, lv) for r, lv, _ in self.gaps(self.KEY_CLAIMS)])
+
+    def test_r12_new_queue_file_without_mod_fails(self):
+        gaps = self.gaps(f"`{self.QUEUE_FILE}`")
+        self.assertEqual(gaps, [
+            ("R12", "FAIL", f"new queue file {self.QUEUE_FILE}: claim {self.QUEUE_MOD} for "
+             "queue::SOURCE list (the queue module test source_lists_every_file_of_the_queue_folder)")])
+        self.assertEqual(self.gaps(f"`{self.QUEUE_FILE}` (new)"), gaps)
+        target = self.root / self.QUEUE_FILE
+        target.parent.mkdir(parents=True)
+        target.write_text("// existing\n", encoding="utf-8")
+        self.assertEqual(self.gaps(f"`{self.QUEUE_FILE}`"), [])
+        for path in ("crates/other/src/queue/new.rs", "crates/broadsword/src/queue2/new.rs",
+                     "crates/broadsword/src/queue/notes.md"):
+            self.assertEqual(self.gaps(f"`{path}`"), [])
+
+    def test_r12_with_mod_claim_passes(self):
+        self.assertEqual(self.gaps(f"`{self.QUEUE_FILE}`, `{self.QUEUE_MOD}`"), [])
+        wrong = f"`{self.QUEUE_FILE}`, `crates/other/src/queue/mod.rs`"
+        self.assertEqual([(r, lv) for r, lv, _ in self.gaps(wrong)], [("R12", "FAIL")])
+        windows = f"`{self.QUEUE_FILE}`, `{self.QUEUE_MOD}`".replace("/", "\\")
+        self.assertEqual(self.gaps(windows), [])
+
+    def test_root_gates_rules_and_claim_gaps_calls_them(self):
+        text = brief(f"{self.KEY_CLAIMS}, `{self.QUEUE_FILE}`", "- adjust implementation")
+        self.assertEqual(bl.claim_gaps(text), [])
+        result = bl.claim_gaps(text, self.root, reported=set())
+        self.assertEqual({r for r, lv, _ in result if lv == "FAIL"}, {"R4c", "R12"})
+        lines = text.splitlines()
+        with mock.patch.object(pathlib.Path, "stat", side_effect=PermissionError("denied")):
+            result = bl.claim_completeness_gaps(lines, bl.split_sections(lines), self.root)
+        self.assertTrue(any(r == "R12" and lv == "FAIL" and "denied" in msg
+                            for r, lv, msg in result))
+
+    def test_claim_completeness_cli_reports_failures(self):
+        path = self.root / "brief.md"
+        cases = (("`broadsword.toml#reviewer_low_gate`", {"R4b", "R4c"}),
+                 (f"`{self.QUEUE_FILE}`", {"R12"}))
+        for claims, expected in cases:
+            with self.subTest(claims=claims):
+                path.write_text(brief(claims, "- adjust implementation"), encoding="utf-8")
+                code, out, err = run_cli(Cli.FLAGS + ["--root", str(self.root), str(path)])
+                self.assertEqual(code, 1, out + err)
+                for rule in expected:
+                    self.assertIn("FAIL claimgap-" + rule + ":", out)
 
 
 class OptInClaimRules(unittest.TestCase):
