@@ -175,6 +175,8 @@ pub struct Config {
     /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
     /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
     pub python_tests: Vec<(String, Vec<String>)>,
+    /// Projects whose queue checks require a runnable bash on PATH.
+    pub bash_projects: Vec<String>,
     /// Scripts at once after cargo's tests and doc-tests, when test_parallel_binaries is 1.
     pub python_parallel: usize,
     /// The merge queue's DONE CHECK (donecheck.rs): a done-check command the queue runs is killed (its whole tree) after this long.
@@ -411,11 +413,24 @@ impl Config {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
+        let bash_projects = get_str(&m, "bash_projects")?
+            .split_whitespace()
+            .map(|name| {
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
+                    return Err(format!("bash_projects: `{name}` is not a project name (use only A-Za-z0-9._-)"));
+                }
+                Ok(name.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let projects_dir = root.join(inside_root(&m, "projects_dir", true)?);
         let merge_fast_tests = check_merge_fast_tests(parse_merge_fast_tests(&get_str(&m, "merge_fast_tests")?)?, queue_auto_revert)?;
         Ok(Config {
             merge_fast_tests,
             python_tests,
+            bash_projects,
             python_parallel: usize::try_from(positive("python_parallel")?)
                 .map_err(|_| "python_parallel: does not fit this platform's pool width")?,
             done_check_timeout_seconds: positive("done_check_timeout_seconds")?,
@@ -660,6 +675,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+bash_projects = \"\"
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -956,6 +972,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+bash_projects = \"\"
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40
@@ -1025,6 +1042,7 @@ queue_auto_revert = \"on\"
 merge_fast_tests = \"\"
 queue_main_check_async = \"off\"
 python_tests = \"\"
+bash_projects = \"\"
 main_full_check_every_minutes = 60
 done_check_timeout_seconds = 600
 done_check_tail_lines = 40

@@ -11,6 +11,8 @@ use super::check::main_check_now;
 use super::entry::{load_entry, queue_dir};
 use super::{EXIT_BAD_INPUT, EXIT_BUSY, EXIT_ERROR, EXIT_RETRY};
 
+mod bash_gate;
+
 /// One of the queue's two lock files, waiting at most `queue_lock_wait_seconds`; `Err` is the exit code, message printed.
 fn take(cfg: &Config, file: &str, what: &str) -> Result<Lock, ExitCode> {
     let wait = cfg.queue_lock_wait_seconds;
@@ -165,7 +167,7 @@ pub(super) fn lane_for(cfg: &Config, entry: Option<&str>, project: Option<&str>)
         let e = load_entry(cfg, id).map_err(|m| fail(EXIT_BAD_INPUT, m))?;
         lane_key(cfg, e.get("project")).map_err(|m| fail(EXIT_BAD_INPUT, format!("queue entry {id}: its project `{}` cannot have a run lock: {m}; nothing was run", e.get("project"))))
     };
-    match (entry, project) {
+    let key = match (entry, project) {
         (_, Some(p)) => {
             let k = project_key(cfg, p)?;
             if let Some(id) = entry {
@@ -174,11 +176,13 @@ pub(super) fn lane_for(cfg: &Config, entry: Option<&str>, project: Option<&str>)
                     return Err(fail(EXIT_BAD_INPUT, format!("queue entry {id} is of project `{ek}`, not `{k}`; nothing was run")));
                 }
             }
-            Ok(Some(k))
+            Some(k)
         }
-        (Some(id), None) if cfg.queue_per_project => Ok(Some(of_entry(id)?)),
-        _ => Ok(None),
-    }
+        (Some(id), None) if cfg.queue_per_project => Some(of_entry(id)?),
+        _ => None,
+    };
+    bash_gate::require_bash(cfg, key.as_deref(), entry)?;
+    Ok(key)
 }
 
 pub(super) fn entries_lock(cfg: &Config) -> Result<Lock, ExitCode> {
