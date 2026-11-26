@@ -136,7 +136,7 @@ def main(argv=None, run=subprocess.run):
             raise VerifyError("invalid commit")
         try:
             sha = invoke(run, [
-                "git", "-C", args.repo_dir, "rev-parse", "--verify",
+                "git", "rev-parse", "--verify",
                 "--end-of-options", args.sha + "^{commit}",
             ], args.repo_dir).strip()
         except VerifyError:

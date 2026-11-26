@@ -39,11 +39,13 @@ class VerifyTests(unittest.TestCase):
         }
         self.calls = []
         self.bad = None
+        self.repo_dir = "."
 
     def runner(self, argv, **kwargs):
         self.assertIsInstance(argv, list)
         self.assertEqual(kwargs, {
-            "cwd": ".", "capture_output": True, "text": True, "timeout": 60,
+            "cwd": self.repo_dir, "capture_output": True, "text": True,
+            "timeout": 60,
         })
         self.calls.append(argv)
         if argv[0] == "git":
@@ -70,6 +72,29 @@ class VerifyTests(unittest.TestCase):
                          "branch=main queue_min=1.0 wall_min=2.0 billable_min=4.0\n")
         self.assertIn("--commit", self.calls[1])
         self.assertIn(SHA, self.calls[1])
+
+    def test_relative_repo_dir_applied_once(self):
+        self.repo_dir = "scripts"
+        expected_directory = Path("scripts").resolve()
+
+        def relative_runner(argv, **kwargs):
+            if argv[0] == "git":
+                effective_directory = Path(kwargs["cwd"]).resolve()
+                if "-C" in argv:
+                    effective_directory /= argv[argv.index("-C") + 1]
+                self.assertEqual(effective_directory.resolve(),
+                                 expected_directory)
+            return self.runner(argv, **kwargs)
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = verify.main(
+                ["--repo-dir", self.repo_dir, "--sha", "main"],
+                run=relative_runner,
+            )
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("completed success run=123", output.getvalue())
+        self.assertEqual(self.calls[0][0], "git")
+        self.assertEqual(len(self.calls), 4)
 
     def test_failure(self):
         self.runs[0]["conclusion"] = "failure"
