@@ -85,10 +85,18 @@ def check(row, brief, statuses, held, lint_ok):
         match = CLAIMS.fullmatch(line.replace("**", ""))
         if not match:
             continue
-        # The standard heading includes a parenthetical before the first path.
-        claims_text = re.sub(r"^\s*\([^)]*\)\s*", "", match[1])
-        for item in claims_text.split(","):
-            claim = item.partition("(")[0].strip().strip("`").strip()
+        # Remove annotations before splitting, including nested commas.
+        depth = 0
+        claims_text = []
+        for char in match[1]:
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth:
+                depth -= 1
+            elif not depth:
+                claims_text.append(char)
+        for item in "".join(claims_text).split(","):
+            claim = item.strip().strip("`").strip()
             if claim and claim not in board_claims and claim not in missing:
                 missing.append(claim)
     if missing:

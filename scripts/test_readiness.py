@@ -136,6 +136,40 @@ class RuleTests(unittest.TestCase):
             (False, "brief claims not on the board: config.toml#key"),
         )
 
+    def test_claims_with_comma_inside_parentheses_are_one_claim(self):
+        brief = BRIEF + "Claims: first.rs (new, generated), second.rs\n"
+        self.assertEqual(
+            readiness.check(row(claim="first.rs, second.rs"), brief, {}, [], True),
+            (True, "ok"),
+        )
+
+    def test_nested_parentheses_give_no_claim(self):
+        for annotation in ("(a (b), c)", "(a, (b, (c)), d)"):
+            with self.subTest(annotation=annotation):
+                brief = BRIEF + f"Claims: {annotation} src/a.rs\n"
+                self.assertEqual(
+                    readiness.check(row(), brief, {}, [], True), (True, "ok"),
+                )
+
+    def test_backticked_key_claim_keeps_exact_text(self):
+        brief = BRIEF + "Claims: `a.rs#k` (key only, existing)\n"
+        self.assertEqual(
+            readiness.check(row(claim="a.rs#k"), brief, {}, [], True), (True, "ok"),
+        )
+        for board in ("a.rs", "a.rs#other", "*"):
+            with self.subTest(board=board):
+                self.assertEqual(
+                    readiness.check(row(claim=board), brief, {}, [], True),
+                    (False, "brief claims not on the board: a.rs#k"),
+                )
+
+    def test_missing_claim_still_reported_after_annotation(self):
+        brief = BRIEF + "Claims: src/a.rs (new, generated), missing.rs\n"
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: missing.rs"),
+        )
+
     def test_all_brief_claim_lines_checked_and_missing_paths_reported(self):
         brief = BRIEF + (
             "**Claims:** src/b.rs, src/c.rs\n"
@@ -294,4 +328,4 @@ class GatherTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
