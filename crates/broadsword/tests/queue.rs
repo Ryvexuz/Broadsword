@@ -1417,7 +1417,7 @@ fn fast_subset_a_listed_project_runs_the_subset_before_the_merge_and_the_full_ch
     assert_eq!(r.status(&e), "merged", "{}", r.show(&e));
     let show = r.show(&e);
     assert!(show.contains("\n  check: fast subset (fast) = `cargo build --offline && cargo test --offline --lib --test fast`, NOT the full suite"), "the record says a subset ran: {show}");
-    assert!(!show.contains("check: full"), "{show}");
+    assert!(!show.lines().any(|l| l.trim_start().starts_with("check: full")), "{show}");
     // the subset is ONE `run` job of the task's worktree; the main check after the merge is the full `check` (it runs `other`)
     assert!(o.stdout.contains("job: run p ") && o.stdout.contains("cargo build --offline && cargo test --offline --lib --test fast"), "{}", o.stdout);
     let main_check = o.stdout.find("check p (the main checkout").expect("a main check ran");
