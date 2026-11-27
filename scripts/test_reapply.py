@@ -70,8 +70,7 @@ class ReapplyTests(unittest.TestCase):
     def git(self, directory, *args):
         proc = subprocess.run(
             ["git", "-C", str(directory), *args], env=self.env, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT,
-        )
+            text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT)
         self.assertEqual(proc.returncode, 0, f"fixture git {args}: {proc.stdout}{proc.stderr}")
         return proc.stdout.strip()
 
@@ -109,7 +108,7 @@ class ReapplyTests(unittest.TestCase):
                    train_up=neighbor, pre_merge_sha=pre, main_sha=tip, revert_sha=revert)
         verdict = self.verdict_dir / f"{task} verdict.md"
         verdict.write_text("Judged innocent\n", "utf-8")
-        brief = (self.scratch / "briefs" / ("custom brief.md" if custom_brief else f"{task}.md"))
+        brief = self.scratch / "briefs" / ("custom brief.md" if custom_brief else f"{task}.md")
         brief.write_text("Task brief\n", "utf-8")
         row = "\t".join((task, entry_id, str(verdict.relative_to(self.root)), "high", "coder-codex",
                          str(brief.relative_to(self.root)) if custom_brief else ""))
@@ -118,21 +117,21 @@ class ReapplyTests(unittest.TestCase):
     def rows(self, *rows):
         self.tsv.write_bytes(("\r\n".join(rows) + "\r\n").encode("utf-8"))
 
-    def run_cli(self, code=0):
+    def run_cli(self, code=0, *, error=None):
         proc = subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), str(self.root)], env=self.env,
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT,
-        )
+            [sys.executable, "-I", str(SCRIPT), str(self.root)], env=self.env, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT)
         self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
+        if error:
+            self.assertIn(error, proc.stderr)
         return proc.stdout
 
     def calls(self):
         return self.log.read_text("utf-8").splitlines() if self.log.exists() else []
 
     def assert_call(self, line, task, brief, verdict):
-        self.assertEqual(line.split("\t"), [
-            task, "high", "coder-codex", str(brief), str(verdict), str(self.root),
-        ])
+        self.assertEqual(line.split("\t"),
+                         [task, "high", "coder-codex", str(brief), str(verdict), str(self.root)])
 
     def test_clean_row_is_cherry_picked_and_queued_once(self):
         task, wt, row, verdict, brief = self.row(2, train=True, custom_brief=True)
@@ -142,8 +141,7 @@ class ReapplyTests(unittest.TestCase):
         self.assertIn(f"REAPPLY QUEUED: {task} onto {main_sha[:10]} (2 commits; verdict {verdict})",
                       out.splitlines())
         self.assertIn(f"stub qadd last line: {task}", out.splitlines())
-        self.assertIn("GIT: ", out)
-        self.assertIn("rev-list --reverse", out)
+        self.assertRegex(out, r"GIT: [^\n]*rev-list --reverse")
         self.assertEqual(len(self.calls()), 1, self.calls())
         self.assert_call(self.calls()[0], task, brief, verdict)
         self.assertEqual(self.git(wt, "rev-list", "--count", "main..HEAD"), "2")
@@ -158,7 +156,7 @@ class ReapplyTests(unittest.TestCase):
     def test_conflicting_row_prints_conflict_and_leaves_worktree_clean(self):
         clean, _, clean_row, verdict, brief = self.row(2)
         other, wt, conflict_row, _, _ = self.row(3, conflict=True)
-        _, later_wt, later_row, _, _ = self.row(4)
+        later, later_wt, later_row, _, _ = self.row(4)
         self.rows(clean_row, conflict_row, later_row)
         main_sha = self.git(self.root, "rev-parse", "HEAD")
         later_sha = self.git(later_wt, "rev-parse", "HEAD")
@@ -167,6 +165,7 @@ class ReapplyTests(unittest.TestCase):
         out = self.run_cli(2)
         self.assertIn(f"REAPPLY CONFLICT: {other} x.txt", out.splitlines())
         self.assertIn("cherry-pick --abort", out)
+        self.assertNotIn(later, out)
         self.assertEqual(self.git(wt, "status", "--porcelain"), "")
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
         self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), main_sha)
@@ -175,16 +174,16 @@ class ReapplyTests(unittest.TestCase):
         self.assertFalse((wt / f"{other}.txt").exists(), "first pick must also be aborted")
         self.assertEqual(len(self.calls()), 1, self.calls())
         self.assert_call(self.calls()[0], clean, brief, verdict)
-        self.rows(conflict_row)
         # An operation present before this run is never ours to abort.
+        self.rows(conflict_row, later_row)
         meta = Path(self.git(wt, "rev-parse", "--absolute-git-dir"))
         pending = meta / "CHERRY_PICK_HEAD"
         pending.write_text(main_sha + "\n", "utf-8")
         refused = self.run_cli(2)
-        self.assertIn(f"REAPPLY CONFLICT: {other}", refused)
+        self.assertIn(f"REAPPLY CONFLICT: {other} an existing Git operation", refused)
         self.assertNotIn("cherry-pick --abort", refused)
+        self.assertNotIn(later, refused)
         self.assertEqual(pending.read_text("utf-8").strip(), main_sha)
-        self.assertEqual(len(self.calls()), 1, self.calls())
         pending.unlink()
         # No Git mutation is allowed through a .git pointer to another checkout.
         git_file = wt / ".git"
@@ -198,34 +197,31 @@ class ReapplyTests(unittest.TestCase):
         finally:
             git_file.unlink()
             git_file.write_bytes(original)
-        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
-        self.assertEqual(len(self.calls()), 1, self.calls())
-        (wt / "untracked.txt").write_text("local work\n", "utf-8")
+        local = wt / "untracked.txt"
+        local.write_text("local work\n", "utf-8")
+        dirty = self.git(wt, "status", "--porcelain")
         refused = self.run_cli(2)
-        self.assertIn(f"REAPPLY CONFLICT: {other}", refused)
-        self.assertNotIn("merge --ff-only", refused)
-        self.assertEqual((wt / "untracked.txt").read_text("utf-8"), "local work\n")
-        self.assertEqual(len(self.calls()), 1, self.calls())
+        self.assertIn(f"REAPPLY CONFLICT: {other} task worktree is not clean", refused)
+        self.assertIn(f"REAPPLY QUEUED: {later}", refused)
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
+        self.assertEqual(self.git(wt, "status", "--porcelain"), dirty)
+        self.assertEqual(local.read_text("utf-8"), "local work\n")
+        self.assertEqual([line.split("\t")[0] for line in self.calls()], [clean, later])
 
     def test_row_without_adjudication_file_is_never_queued(self):
         task, wt, row, verdict, _ = self.row(2)
         before = self.git(wt, "rev-parse", "HEAD")
         self.rows(row)
-        for case in ("missing", "empty", "directory"):
-            with self.subTest(case=case):
-                if verdict.exists():
-                    verdict.unlink()
-                if case == "empty":
-                    verdict.touch()
-                elif case == "directory":
-                    verdict.mkdir()
-                out = self.run_cli()
-                if case == "directory":
-                    verdict.rmdir()
-                self.assertIn(f"REAPPLY SKIP: {task} no adjudication file {verdict}", out)
+        verdict.unlink()
+        for create, remove in ((None, None), (verdict.touch, verdict.unlink), (verdict.mkdir, verdict.rmdir)):
+            with self.subTest(create=create):
+                if create:
+                    create()
+                self.assertIn(f"REAPPLY SKIP: {task} no adjudication file {verdict}", self.run_cli())
+                if remove:
+                    remove()
                 self.assertEqual(self.calls(), [])
                 self.assertEqual(self.git(wt, "rev-parse", "HEAD"), before)
-
         # A verdict swapped for a link at the spawn gate must leave no replay behind.
         verdict.write_text("Judged innocent\n", "utf-8")
         app = load_script()
@@ -234,13 +230,12 @@ class ReapplyTests(unittest.TestCase):
         old_entry = app.eligible(cfg, parsed)
         self.assertIsNotNone(old_entry)
         actual_lstat, enqueue = Path.lstat, app.enqueue
+        main_sha = self.git(self.root, "rev-parse", "HEAD")
 
         def switched(path):
             if path == verdict:
                 return os.stat_result((stat.S_IFLNK,) + (0,) * 9)
             return actual_lstat(path)
-
-        main_sha = self.git(self.root, "rev-parse", "HEAD")
 
         def late_enqueue(*args):
             self.assertNotEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
@@ -248,7 +243,7 @@ class ReapplyTests(unittest.TestCase):
                 return enqueue(*args)
 
         with patch.dict(os.environ, self.env, clear=True), patch.object(app, "enqueue", late_enqueue):
-            self.assertIs(app.replay(cfg, parsed, old_entry), app.Outcome.SKIPPED)
+            self.assertIs(app.replay(cfg, parsed, old_entry), app.Outcome.STOP)
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
         self.assertEqual(self.git(wt, "status", "--porcelain"), "")
@@ -258,12 +253,10 @@ class ReapplyTests(unittest.TestCase):
         self.rows(row)
         before = self.git(wt, "rev-parse", "HEAD")
         hold = self.queue / "hold-broadsword"
-        hold.write_text("reason = current main did not pass\n", "utf-8")
-        self.assertIn(f"REAPPLY SKIP: {task} lane held or busy", self.run_cli())
-        hold.unlink()
-        hold.mkdir()
-        self.assertIn(f"REAPPLY SKIP: {task} lane held or busy", self.run_cli())
-        hold.rmdir()
+        for make, remove in ((hold.touch, hold.unlink), (hold.mkdir, hold.rmdir)):
+            make()
+            self.assertIn(f"REAPPLY SKIP: {task} lane held or busy", self.run_cli())
+            remove()
         app = load_script()
         cfg = app.Settings.load(self.root)
         parsed = app.Row.parse(cfg, row.encode())
@@ -277,7 +270,7 @@ class ReapplyTests(unittest.TestCase):
             return actual_lstat(path)
 
         with patch.object(Path, "lstat", unreadable):
-            self.assertIs(app.enqueue(cfg, parsed, round_entry, before, 2), app.Outcome.SKIPPED)
+            self.assertIs(app.enqueue(cfg, parsed, round_entry, before, 2), app.Handoff.CHECK_QUEUE)
         self.assertEqual(self.calls(), [])
         for status in ("queued", "running", "approved", "interrupted"):
             with self.subTest(status=status):
@@ -300,43 +293,54 @@ class ReapplyTests(unittest.TestCase):
     def test_only_one_row_per_run(self):
         first, _, first_row, _, _ = self.row(2)
         second, wt, second_row, _, _ = self.row(3)
-        self.rows(first_row, second_row)
-        before = self.git(wt, "rev-parse", "HEAD")
+        later, later_wt, later_row, _, _ = self.row(4)
+        self.rows(first_row, second_row, later_row)
+        before, later_sha = [self.git(tree, "rev-parse", "HEAD") for tree in (wt, later_wt)]
+        main_sha = self.git(self.root, "rev-parse", "HEAD")
         app = load_script()
-        cfg = app.Settings.load(self.root)
         with app.open_input(self.root, self.tsv) as stream:
             self.assertTrue(app.try_lock_tsv(stream))
             self.assertIn("REAPPLY SKIP: another reapply run is using reapply.tsv", self.run_cli())
             self.assertEqual(self.calls(), [])
-        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), before)
-
         out = self.run_cli()
         self.assertIn(f"REAPPLY QUEUED: {first}", out)
-        self.assertNotIn(f"REAPPLY QUEUED: {second}", out)
         self.assertEqual(len(self.calls()), 1, self.calls())
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), before)
-
-        self.entry("q-20261126-205950-4", first, "merged")
-        self.qadd.write_text(STUB.replace("exit 0", "exit 7"), "utf-8")
+        self.rows(second_row, later_row)
+        self.qadd.write_text(STUB.replace("exit 0", f"if ($Task -eq '{second}') {{ exit 7 }}\nexit 0"), "utf-8")
         out = self.run_cli(2)
+        self.assertIn("cherry-pick ", out)
         self.assertIn(f"REAPPLY QADD FAILED: {second} exit 7", out)
-        self.assertNotIn("REAPPLY QUEUED:", out)
+        self.assertNotIn(later, out)  # A failure after a replay must not reach the next row.
+        self.assertEqual(self.git(later_wt, "rev-parse", "HEAD"), later_sha)
+        self.assertIn("reset --keep", out)
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), main_sha)
         self.assertEqual(self.git(wt, "status", "--porcelain"), "")
         self.assertEqual(len(self.calls()), 2, self.calls())
-        with self.subTest(stage="rollback"):
-            self.assertEqual(self.git(wt, "rev-parse", "HEAD"), self.git(self.root, "rev-parse", "HEAD"))
         # Retry reaches qadd again. This time queue add succeeds but the driver fails.
-        accepted = self.entry("q-20261126-205950-5", second, "queued")
+        self.rows(second_row)
+        accepted_id = "q-20261126-205950-6"
+        accepted = self.entry(accepted_id, second, "queued")
         accepted.rename(self.root / accepted.name)
         move = f"Move-Item -LiteralPath '{accepted.name}' -Destination '{accepted.relative_to(self.root)}'"
         self.qadd.write_text(STUB.replace("exit 0", f"{move}\nexit 7"), "utf-8")
-        out = self.run_cli(2)
+        out = self.run_cli(2, error="cleanup failed: newer queue entry exists")
         self.assertIn(f"REAPPLY QADD FAILED: {second} exit 7", out)
-        self.assertNotIn("REAPPLY CONFLICT:", out)
+        self.assertNotIn("reset --keep", out)
         self.assertEqual(self.git(wt, "rev-list", "--count", "main..HEAD"), "2")
         self.assertEqual(len(self.calls()), 3, self.calls())
         self.assertEqual(self.run_cli(), "")
+        self.entry(accepted_id, second, "merged")
+        self.rows(later_row)
+        relative_wt = str(later_wt.relative_to(self.root)).replace("'", "''")
+        move_head = f"& git -C '{relative_wt}' commit --allow-empty -qm 'advanced after replay'"
+        self.qadd.write_text(STUB.replace("exit 0", f"{move_head}\nif ($?) {{ exit 7 }}\nexit 8"), "utf-8")
+        out = self.run_cli(2, error="cleanup failed: task HEAD changed after replay")
+        self.assertNotIn("reset --keep", out)
+        self.assertEqual(self.git(later_wt, "log", "-1", "--format=%s"), "advanced after replay")
+        self.assertEqual(self.git(later_wt, "rev-list", "--count", "main..HEAD"), "3")
         # Low-level capture must fail on a large reply or inherited pipe.
+        cfg = app.Settings.load(self.root)
         with self.subTest(child="output cap"):
             child = f"import sys; sys.stdout.write('x' * {cfg.max_bytes + 1})"
             with self.assertRaisesRegex(app.CommandError, "output exceeds mcp_output_max_kb"):
@@ -354,19 +358,16 @@ class ReapplyTests(unittest.TestCase):
         second, _, next_row, _, _ = self.row(2)
         wedged, wedged_wt, wedged_row, _, _ = self.row(3)
         self.git(wedged_wt, "commit", "--allow-empty", "-qm", "existing unpublished commit")
-        wedged_sha = self.git(wedged_wt, "rev-parse", "HEAD")
+        before, wedged_sha = [self.git(tree, "rev-parse", "HEAD") for tree in (wt, wedged_wt)]
         # Same-second suffix 10 is newer than suffix 9; an older entry is not a veto.
         self.entry("q-20261126-205950-10", task, "rejected")
         self.entry("q-20261126-205950", second, "rejected", brief=r"Other text\nstatus = queued")
         self.rows(row, wedged_row, next_row)
-        before = self.git(wt, "rev-parse", "HEAD")
-        out = self.run_cli()
+        out = self.run_cli(2)
         self.assertNotIn(task, out)
-        self.assertIn(f"REAPPLY SKIP: {wedged} task tip is not an ancestor of main", out)
-        self.assertNotIn("REAPPLY CONFLICT:", out)
+        self.assertIn(f"REAPPLY CONFLICT: {wedged} task tip is not an ancestor of main", out)
         self.assertIn(f"REAPPLY QUEUED: {second}", out)
-        self.assertEqual(len(self.calls()), 1, self.calls())
-        self.assertEqual(self.calls()[0].split("\t")[0], second)
+        self.assertEqual([line.split("\t")[0] for line in self.calls()], [second])
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), before)
         self.assertEqual(self.git(wedged_wt, "rev-parse", "HEAD"), wedged_sha)
 
@@ -380,13 +381,12 @@ class ReapplyTests(unittest.TestCase):
             "\t".join([*fields[:2], r"..\verdict.md", *fields[3:]]),
             "\t".join([*fields[:2], r"C:verdict.md", *fields[3:]]),
             "\t".join([*fields[:4], "coder\rcodex", fields[-1]]),
-            "x" * (SETTINGS["mcp_output_max_kb"] * 1024 + 1),
         ]
-        long_comment = "#" + "x" * (SETTINGS["mcp_output_max_kb"] * 1024)
-        self.rows("\ufeff" + long_comment, "", *malformed, row)
+        oversized = "x" * (SETTINGS["mcp_output_max_kb"] * 1024 + 1)
+        self.rows("\ufeff#" + oversized, "", *malformed, oversized, row)
         out = self.run_cli()
         reports = [line for line in out.splitlines() if line.startswith("REAPPLY BAD ROW:")]
-        self.assertEqual(len(reports), len(malformed), reports)
+        self.assertEqual(len(reports), len(malformed) + 1, reports)
         for ordinal, report in enumerate(reports, 3):
             self.assertTrue(report.startswith(f"REAPPLY BAD ROW: {ordinal} "), report)
         self.assertIn(f"REAPPLY QUEUED: {task}", out)
