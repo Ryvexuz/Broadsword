@@ -11,8 +11,12 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import stat
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -131,7 +135,7 @@ class HoldConflictTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = pathlib.Path(self.tmp.name)
+        self.root = pathlib.Path(self.tmp.name).resolve()
         self.queue = self.root / "state" / "queue"
         self.queue.mkdir(parents=True)
         self.pauses = self.root / "state" / "pauses.tsv"
@@ -184,7 +188,7 @@ class HoldConflictTests(unittest.TestCase):
             ])
 
     def test_unregistered_hold_gets_one_pause_row_across_two_runs(self):
-        reason = "long\tvalue\r\ncontinuation " + "x" * 10000
+        reason = "long\tvalue\r\nproject = still reason\ncontinuation " + "x" * 10000
         self.hold(reason=reason)
         original = b"# append-only\nEND\t2026-11-26T20:00:00Z\thold-p\n"
         self.pauses.write_bytes(original)
@@ -197,7 +201,8 @@ class HoldConflictTests(unittest.TestCase):
         fields = added[0].split("\t")
         self.assertGreaterEqual(len(fields), 6)
         self.assertEqual(fields[:5], ["PAUSE", "2026-11-26T20:30:00Z", "queue", "hold-p", ""])
-        self.assertEqual(fields[5], "registered by slot_check: long value continuation " + "x" * 10000)
+        self.assertEqual(fields[5], "registered by slot_check: long value project = still reason continuation "
+                         + "x" * 10000)
         # Pasted guard format: valid UTC times, default expiry, no subsequent END.
         start = datetime.strptime(fields[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         expiry = start + timedelta(minutes=60)
@@ -223,6 +228,144 @@ class HoldConflictTests(unittest.TestCase):
             lines = slot_check.hold_lines(self.root, self.now)
             self.assertTrue(any(line.startswith("HOLD NOT REGISTERED:") for line in lines))
             self.assertEqual(self.pauses.read_text(encoding="utf-8"), bad)
+
+    def test_concurrent_hold_registration_appends_one_pause_row(self):
+        self.hold()
+        original = b"# append-only\n"
+        self.pauses.write_bytes(original)
+        first_read = threading.Event()
+        release_first = threading.Event()
+        second_progress = threading.Event()
+        worker = threading.local()
+        attempts = []
+        open_path, sleep = pathlib.Path.open, time.sleep
+        gate_timeout = 5  # Test harness only: a missed gate is a failure, not a hang.
+
+        def open_with_read_gate(path, *args, **kwargs):
+            stream = open_path(path, *args, **kwargs)
+            if path != self.pauses or not getattr(worker, "role", None):
+                return stream
+
+            def read(*args, **kwargs):
+                content = stream.read(*args, **kwargs)
+                if worker.role == "first":
+                    first_read.set()
+                    if not release_first.wait(gate_timeout):
+                        raise AssertionError("first appender never released")
+                else:
+                    attempts.append("read")
+                    second_progress.set()
+                return content
+
+            guarded = mock.MagicMock(wraps=stream)
+            guarded.__enter__.return_value = guarded
+            guarded.__exit__.side_effect = stream.__exit__
+            guarded.read.side_effect = read
+            return guarded
+
+        def observe_lock_retry(seconds):
+            if getattr(worker, "role", None) == "second":
+                attempts.append("retry")
+                second_progress.set()
+            sleep(seconds)
+
+        def poll(role, now):
+            worker.role = role
+            return slot_check.hold_lines(self.root, now)
+
+        with (
+            mock.patch.object(pathlib.Path, "open", open_with_read_gate),
+            mock.patch.object(time, "sleep", observe_lock_retry),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(poll, "first", self.now)
+            try:
+                self.assertTrue(first_read.wait(gate_timeout), "first appender never read pauses")
+                # The second poll may carry an earlier clock reading than the first.
+                second = pool.submit(poll, "second", self.now - timedelta(seconds=1))
+                self.assertTrue(second_progress.wait(gate_timeout), "second appender never attempted registration")
+                if attempts[0] == "read":
+                    # Without the lock the second poll saw the same old snapshot. Let it
+                    # finish appending before the first writes its now-stale decision.
+                    second.result(timeout=gate_timeout)
+            finally:
+                release_first.set()
+            first_lines = first.result(timeout=gate_timeout)
+            second_lines = second.result(timeout=gate_timeout)
+
+        after = self.pauses.read_bytes()
+        self.assertTrue(after.startswith(original))
+        added = after[len(original):].splitlines()
+        self.assertEqual(len(added), 1, f"concurrent polls appended {len(added)} rows: {added!r}")
+        self.assertEqual(added[0].split(b"\t")[:5], [b"PAUSE", b"2026-11-26T20:30:00Z", b"queue", b"hold-p", b""])
+        self.assertEqual(attempts[0], "retry")
+        self.assertIn("HOLD REGISTERED: hold-p until 2026-11-26T21:30:00Z", first_lines)
+        self.assertEqual(second_lines, ["HOLD: p since 2026-11-26T20:24:40Z entry q-1"])
+
+    def test_pauses_lock_timeout_reports_hold_without_writing(self):
+        self.hold()
+        original = b"# append-only\n"
+        self.pauses.write_bytes(original)
+        with slot_check._locked_pauses(self.root):
+            with mock.patch.object(slot_check, "PAUSES_LOCK_WAIT_SECONDS", 0):
+                lines = slot_check.hold_lines(self.root, self.now)
+        self.assertEqual(lines[0], "HOLD: p since 2026-11-26T20:24:40Z entry q-1")
+        self.assertIn("HOLD NOT REGISTERED: hold-p: timed out waiting for pauses file lock:", lines[1])
+        self.assertEqual(self.pauses.read_bytes(), original)
+        self.assertIn("HOLD REGISTERED: hold-p until 2026-11-26T21:30:00Z",
+                      slot_check.hold_lines(self.root, self.now))
+
+    def test_pauses_path_replaced_by_reparse_point_is_not_appended(self):
+        self.hold()
+        original = b"# append-only\n"
+        self.pauses.write_bytes(original)
+        original_stat = self.pauses.lstat()
+        lstat = pathlib.Path.lstat
+        pauses_stat = slot_check._pauses_stat
+        checks = 0
+
+        def simulate_replacement(path, *args, **kwargs):
+            if path == self.pauses:
+                return mock.Mock(wraps=original_stat, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            return lstat(path, *args, **kwargs)
+
+        def check(root):
+            nonlocal checks
+            checks += 1
+            if checks < 3:
+                return pauses_stat(root)
+            # Simulate the swap just before append without creating a link.
+            with mock.patch.object(pathlib.Path, "lstat", simulate_replacement):
+                return pauses_stat(root)
+
+        with mock.patch.object(slot_check, "_pauses_stat", side_effect=check):
+            lines = slot_check.hold_lines(self.root, self.now)
+        self.assertIn("HOLD NOT REGISTERED: hold-p: linked runtime path:", lines[1])
+        self.assertEqual(self.pauses.read_bytes(), original)
+        self.assertIn("HOLD REGISTERED: hold-p until 2026-11-26T21:30:00Z",
+                      slot_check.hold_lines(self.root, self.now))
+
+    def test_partial_append_fails_loudly_and_is_not_retried_on_torn_row(self):
+        self.hold()
+        original = b"# append-only\n"
+        self.pauses.write_bytes(original)
+        open_path = pathlib.Path.open
+
+        def open_with_short_write(path, *args, **kwargs):
+            stream = open_path(path, *args, **kwargs)
+            if path != self.pauses:
+                return stream
+            guarded = mock.Mock(wraps=stream)
+            guarded.write.side_effect = lambda row: stream.write(row[:len(b"PAUSE\t")])
+            return guarded
+
+        with mock.patch.object(pathlib.Path, "open", open_with_short_write):
+            lines = slot_check.hold_lines(self.root, self.now)
+        self.assertIn("HOLD NOT REGISTERED: hold-p: incomplete pauses append", lines)
+        self.assertEqual(self.pauses.read_bytes(), original + b"PAUSE\t")
+        lines = slot_check.hold_lines(self.root, self.now)
+        self.assertTrue(lines[1].startswith("HOLD NOT REGISTERED: hold-p: malformed pauses row:"))
+        self.assertEqual(self.pauses.read_bytes(), original + b"PAUSE\t")
 
 
 class ClaimBlameTests(unittest.TestCase):

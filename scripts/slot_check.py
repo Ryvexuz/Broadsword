@@ -10,28 +10,80 @@ same rule `task start` uses for max_agents. The only write is appending missing 
 
   python -I scripts/slot_check.py <root>
 
-<root> holds broadsword.toml, build/bin/broadsword.exe and state/queue. Every path is read relative to it.
+<root> holds broadsword.toml, build/bin/broadsword.exe and state/queue. Runtime data paths are relative to it.
 """
+import importlib.util
+import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+
+sys.dont_write_bytecode = True
+# -I does not add the script directory to sys.path. The live copy runs from scratch/.
+_lock_spec = importlib.util.spec_from_file_location(
+    "_slot_check_auto_agent", pathlib.Path(__file__).resolve().parent.parent / "scripts" / "auto_agent.py"
+)
+_lock_helpers = importlib.util.module_from_spec(_lock_spec)
+_lock_spec.loader.exec_module(_lock_helpers)
 
 WAITING_STATUSES = {"queued", "running"}
 FAILED_STATUSES = ("rejected", "check_failed", "merged_check_failed")
 LOOP_ROUNDS = 3
 PAUSES_TSV_EMPTY_EXPIRY_MIN = 60  # Format rule of state/pauses.tsv header, not a tunable.
+PAUSES_TSV = pathlib.Path("state") / "pauses.tsv"
+PAUSES_LOCK_WAIT_SECONDS = 2  # A TSV append should be quick; don't hold up a poll behind a stuck writer.
+PAUSES_LOCK_RETRY_SECONDS = 0.05  # Avoid busy-waiting while another poll owns the file.
+
+
+def _pauses_stat(root):
+    path = _lock_helpers.local_path(root, PAUSES_TSV)
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError(f"not a regular pauses file: {path}")
+    return info
+
+
+@contextmanager
+def _locked_pauses(root):
+    """Lock the existing file itself; use that same handle for reading and appending."""
+    path = root / PAUSES_TSV
+    original = _pauses_stat(root)
+    deadline = time.monotonic() + PAUSES_LOCK_WAIT_SECONDS
+    while True:
+        with _lock_helpers.file_lock(path, create=False) as stream:
+            if stream is None:
+                raise FileNotFoundError(f"pauses file disappeared: {path}")
+            if stream is not False:
+                opened = os.fstat(stream.fileno())
+                if not os.path.samestat(original, opened) or not os.path.samestat(
+                    opened, _pauses_stat(root)
+                ):
+                    raise ValueError(f"pauses file changed while opening: {path}")
+                yield stream, opened
+                return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(PAUSES_LOCK_RETRY_SECONDS, remaining))
+            if time.monotonic() < deadline:
+                continue
+        raise TimeoutError(f"timed out waiting for pauses file lock: {path}")
 
 
 def hold_lines(root, now=None):
     """Report every hold, appending registrations only to an existing readable pauses file."""
-    now = now or datetime.now(timezone.utc)
-    now = now.replace(microsecond=0)
+    root = root.resolve()
 
     def stamp(value):
-        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def parse_time(value):
         if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value):
@@ -46,7 +98,10 @@ def hold_lines(root, now=None):
         except (OSError, UnicodeError) as error:
             lines.append(f"HOLD: {fallback} since unknown entry unknown (unreadable: {error})")
             continue
-        fields = dict(re.findall(r"(?m)^(\w+) = (.*)$", text))
+        # Reason is the final field and can contain lines that look like metadata.
+        reason_start = re.search(r"(?m)^reason = ", text)
+        metadata = text[:reason_start.start()] if reason_start else text
+        fields = dict(re.findall(r"(?m)^(\w+) = (.*)$", metadata))
         project = fields.get("project", "").strip() or fallback
         entry = fields.get("entry", "").strip() or "unknown"
         raw_time = fields.get("time", "").strip()
@@ -61,11 +116,16 @@ def hold_lines(root, now=None):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", project):
             lines.append(f"HOLD NOT REGISTERED: invalid project: {project!r}")
             continue
-        pauses = root / "state" / "pauses.tsv"
+        # Prepare the complete reason before taking the lock.
+        reason = " ".join(text[reason_start.end():].splitlines()) if reason_start else ""
+        reason = reason.replace("\t", " ")
         try:
-            # r+ never creates a missing file. Preserve all existing bytes on append.
-            with pauses.open("r+", encoding="utf-8", newline="") as stream:
-                content = stream.read()
+            with _locked_pauses(root) as (stream, opened):
+                start_now = now if now is not None else datetime.now(timezone.utc)
+                if not isinstance(start_now, datetime) or start_now.utcoffset() is None:
+                    raise ValueError("registration time must be a timezone-aware datetime")
+                start_now = start_now.astimezone(timezone.utc).replace(microsecond=0)
+                content = stream.read().decode("utf-8")
                 active = []
                 for row in content.splitlines():
                     if not row.strip() or row.startswith("#"):
@@ -76,7 +136,7 @@ def hold_lines(root, now=None):
                         expiry = (parse_time(parts[4]) if parts[4] else
                                   start + timedelta(minutes=PAUSES_TSV_EMPTY_EXPIRY_MIN))
                         if parts[3] == what:
-                            active.append(start >= hold_time and start <= now < expiry)
+                            active.append(start >= hold_time and start_now < expiry)
                     elif parts[0] == "END" and len(parts) >= 3:
                         parse_time(parts[1])
                         if parts[2] == what:
@@ -85,15 +145,24 @@ def hold_lines(root, now=None):
                         raise ValueError(f"malformed pauses row: {row!r}")
                 if any(active):
                     continue
-                # Keep the entire reason, including continuation lines, on one TSV line.
-                match = re.search(r"(?ms)^reason = (.*?)(?=^\w+ = |\Z)", text)
-                reason = " ".join(match.group(1).splitlines()) if match else ""
-                reason = reason.replace("\t", " ")
-                expiry = now + timedelta(minutes=PAUSES_TSV_EMPTY_EXPIRY_MIN)
+                if start_now < hold_time:
+                    raise ValueError("hold time is after registration time")
+                expiry = start_now + timedelta(minutes=PAUSES_TSV_EMPTY_EXPIRY_MIN)
                 if content and not content.endswith("\n"):
                     raise ValueError("pauses file lacks final newline; refusing to change its last line")
+                row = (
+                    f"PAUSE\t{stamp(start_now)}\tqueue\t{what}\t\tregistered by slot_check: {reason}\n"
+                ).encode("utf-8")
                 stream.seek(0, 2)
-                stream.write(f"PAUSE\t{stamp(now)}\tqueue\t{what}\t\tregistered by slot_check: {reason}\n")
+                current = _pauses_stat(root)
+                if (
+                    not os.path.samestat(opened, current)
+                    or opened.st_size != current.st_size
+                    or opened.st_mtime_ns != current.st_mtime_ns
+                ):
+                    raise ValueError("pauses file changed before append")
+                if stream.write(row) != len(row):
+                    raise OSError("incomplete pauses append")
                 stream.flush()
             lines.append(f"HOLD REGISTERED: {what} until {stamp(expiry)}")
         except (OSError, UnicodeError, ValueError, OverflowError) as error:
