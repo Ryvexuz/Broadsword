@@ -196,7 +196,7 @@ mod tests {
             &mut || u64::MAX,
             Duration::from_secs(cfg.job_disk_poll_seconds),
             &mut |_| {},
-            &Arc::new(Secrets::collect(&root, &[], cfg.redact_min_chars)),
+            &Arc::new(Secrets::collect(&root, &[], usize::try_from(cfg.redact_min_chars).unwrap())),
         );
         let text = std::fs::read_to_string(&path).unwrap();
         drop(log);

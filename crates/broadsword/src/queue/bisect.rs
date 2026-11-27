@@ -576,6 +576,18 @@ fn failing_names<'a>(info: &JobInfo, log: &'a str) -> Result<Failures<'a>, Strin
     Ok(all)
 }
 
+/// One line in the allow-list format of `flake::parse_list` (that module is test-only in the binary, so the
+/// shape is checked here and the unit test below proves `parse_list` accepts it).
+fn candidate_line(project: &str, arg: &str, name: &str, id: &str, utc: &str) -> Result<String, String> {
+    let line = format!("{project} {arg} {name} # candidate from {id} {utc}\n");
+    let words = if arg == "--lib" { 3 } else { 4 };
+    let body = line.split_once(" # ").map(|(body, _)| body).unwrap_or("");
+    if body.split_whitespace().count() != words || line.trim_end().chars().any(char::is_control) {
+        return Err("malformed flake candidate line".into());
+    }
+    Ok(line)
+}
+
 fn append_candidates(run: &Run<'_>, failures: &Failures<'_>) -> Result<(), String> {
     let project = run.e.get("project");
     let path = main_record_path(run.cfg, project, "flake-candidates")?;
@@ -586,11 +598,10 @@ fn append_candidates(run: &Run<'_>, failures: &Failures<'_>) -> Result<(), Strin
     let utc = crate::pause::format_utc(crate::task::now_secs());
     let mut text = String::new();
     for (arg, name) in failures {
-        let line = format!("{project} {arg} {name} # candidate from {id} {utc}\n");
+        let line = candidate_line(project, arg, name, id, &utc)?;
         if run.secrets.redact(&line) != line {
             return Err("a flake candidate contains a redacted value".into());
         }
-        crate::flake::parse_list(&line)?;
         text.push_str(&line);
     }
     let append = || -> std::io::Result<()> {
@@ -771,6 +782,14 @@ mod tests {
             let line = format!("error: test failed, to rerun pass `{arg}` (exit 101, src/lib.rs)\n");
             assert!(failing_args(&line).is_err(), "{arg:?}");
         }
+        for (arg, words) in [("--test full", 4), ("--lib", 3), ("--bin b", 4)] {
+            let line = candidate_line("p", arg, "module::fails", "q-1", "2026-11-27 05:00:00 UTC").unwrap();
+            let parsed = crate::flake::parse_list(&line).unwrap();
+            assert_eq!(parsed.len(), 1, "{line}");
+            assert_eq!((parsed[0].target.as_str(), parsed[0].name.as_str()), (arg, "module::fails"));
+            assert_eq!(line.split(" # ").next().unwrap().split_whitespace().count(), words);
+        }
+        assert!(candidate_line("p", "--test full", "a b", "q-1", "t").is_err());
         let root = crate::scrub::planted::config_root("bisect-evidence-size");
         let path = root.join("large.log");
         fs::write(&path, SELECTOR.repeat(100_000)).unwrap();
