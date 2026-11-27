@@ -139,8 +139,9 @@ class HoldConflictTests(unittest.TestCase):
 
     def hold(self, name="p", project="p", reason="whole reason"):
         path = self.queue / ("hold-" + name)
-        path.write_text(f"time = 2026-11-26 20:24:40 UTC\nentry = q-1\n"
-                        f"project = {project}\nreason = {reason}\n", encoding="utf-8")
+        # write_bytes: write_text would turn the reason's \r\n into \r\r\n on Windows.
+        path.write_bytes((f"time = 2026-11-26 20:24:40 UTC\nentry = q-1\n"
+                          f"project = {project}\nreason = {reason}\n").encode("utf-8"))
         return path
 
     def test_hold_line_per_hold_file(self):
