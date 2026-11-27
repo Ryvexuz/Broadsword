@@ -348,10 +348,6 @@ fn check_folders_apart(scratch: &Path, build: &Path, state: &Path, install: &Pat
     Ok(())
 }
 
-// Lexical path check; a file of its own because config.rs is large, shared with tests that include this file.
-#[path = "job/flaky.rs"]
-mod flaky;
-
 impl Config {
     /// Build a Config from parsed text. `config_dir` is the folder holding broadsword.toml;
     /// `root` and every path in the file are resolved relative to it.
@@ -425,7 +421,7 @@ impl Config {
         }
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
         let flaky_tests_file = get_str(&m, "flaky_tests_file")?;
-        flaky::check_flaky_path(&flaky_tests_file)?;
+        Self::check_flaky_path(&flaky_tests_file)?;
         let bash_projects = get_str(&m, "bash_projects")?
             .split_whitespace()
             .map(|name| {
@@ -509,6 +505,25 @@ impl Config {
             worktrees_dir,
             root,
         })
+    }
+
+    // Check only the path syntax; the empty string (off) needs no special case.
+    fn check_flaky_path(value: &str) -> Result<(), String> {
+        let has_drive_prefix =
+            matches!(value.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic());
+        if value.starts_with('/')
+            || value.contains('\\')
+            || has_drive_prefix
+            || value.split('/').any(|part| part == "..")
+            || value
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err(format!(
+                "flaky_tests_file = {value:?}: expected a root-relative path using `/`, without `..`, a drive prefix, control characters, or line breaks"
+            ));
+        }
+        Ok(())
     }
 
     /// THE ONE place the queue reads `merge_fast_tests`: the test names listed for `project` (any case), or None (the full check).
@@ -945,6 +960,61 @@ install_dir=\"build/bin\"\n";
         let with = |v: &str| text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "python_tests") { format!("python_tests = \"{v}\"") } else { l.to_string() }).collect::<Vec<_>>().join("\n");
         assert!(Config::from_text(&with("p: ../x.py"), Path::new("p")).unwrap_err().contains("python_tests"));
         assert!(Config::from_text(&with(""), Path::new("p")).unwrap().python_tests.is_empty());
+    }
+
+    #[test]
+    fn flaky_tests_file_empty_is_off() {
+        let text = include_str!("../../../broadsword.toml");
+        let key = "flaky_tests_file";
+        let load = |text: &str| Config::from_text(text, Path::new("p"));
+        assert_eq!(Config::check_flaky_path(""), Ok(()));
+        assert_eq!(load(text).unwrap().flaky_tests_file, "");
+        let error = load(&without_key(text, key)).unwrap_err();
+        assert!(error.contains(key) && error.contains("missing"), "{error}");
+
+        // A quoted `#` belongs to the path, not the trailing comment.
+        let relative = "state/flaky # tests.txt";
+        let configured = real_toml_with(&[(key, relative)]);
+        assert_eq!(load(&configured).unwrap().flaky_tests_file, relative);
+    }
+
+    #[test]
+    fn flaky_tests_file_refuses_unsafe_paths() {
+        let long_path = format!("{}..", "dir/".repeat(16_384));
+        for value in [
+            "..",
+            "state/../list",
+            "/abs",
+            "C:x",
+            "c:/abs",
+            r"a\b",
+            "x\n",
+            "x\r",
+            "x\t",
+            "x\0",
+            "x\u{2028}",
+            "x\u{2029}",
+            long_path.as_str(),
+        ] {
+            let Err(error) = Config::check_flaky_path(value) else {
+                panic!("accepted unsafe path: {value:?}");
+            };
+            let prefix = format!("flaky_tests_file = {value:?}: ");
+            assert!(error.starts_with(&prefix), "{error}");
+        }
+
+        let key = "flaky_tests_file";
+        let value = "state/../list";
+        let shipped = include_str!("../../../broadsword.toml");
+        // The effective value must be checked even when it comes from a later assignment.
+        for text in [
+            real_toml_with(&[(key, value)]),
+            format!("{shipped}\n{key} = \"{value}\"\n"),
+        ] {
+            let error = Config::from_text(&text, Path::new("p")).unwrap_err();
+            let prefix = format!("{key} = {value:?}: ");
+            assert!(error.starts_with(&prefix), "{error}");
+        }
     }
 
     #[test]
