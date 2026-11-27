@@ -673,7 +673,9 @@ fn with_the_gpt_gate_off_an_opus_coded_high_entry_goes_straight_to_sonnet() {
 /// A merge-train root (merge_train_max 4) with review_parallel `n` and three queued entries with disjoint claims; the second one's
 /// diff holds PLANTED_BUG, so the fake reviewer FAILs it. Returns (root, [(task, entry)]).
 fn parallel_root(name: &str, n: u64, shadow: bool) -> (Root, Vec<(String, String)>) {
-    let r = if shadow { Root::with_shadow(name, 60) } else { Root::new(name, 60) };
+    // The reviewer timeout must let all three held calls start under suite load (60 s blocked entries in 20261127-203238 and 20261127-210219).
+    let make_root = if shadow { Root::with_shadow } else { Root::new };
+    let r = make_root(name, FAKE_HANG_CAP_SECONDS);
     train_set(&r, "merge_train_max", "4");
     train_set(&r, "review_parallel", &n.to_string());
     let es = vec![train_one(&r, "src/a.txt", "a\n"), train_one(&r, "src/b.txt", "b PLANTED_BUG\n"), train_one(&r, "src/c.txt", "c\n")];
