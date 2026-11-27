@@ -117,6 +117,7 @@ mod tests {
         let mut main_bins_failed = None;
         let result = TestStep {
             cfg: &cfg,
+            project: tag,
             priority: crate::lock::Priority::Agent,
             job_id: tag,
             project_dir: &dir,

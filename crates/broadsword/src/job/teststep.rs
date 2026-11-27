@@ -214,6 +214,8 @@ pub(super) fn refresh_main_bins(cfg: &Config, project_dir: &Path, source: &str, 
 /// The test step's context: everything `run_child` needs, borrowed from the job.
 pub(super) struct TestStep<'a> {
     pub(super) cfg: &'a Config,
+    /// The canonical project name, not the task's worktree directory.
+    pub(super) project: &'a str,
     pub(super) priority: crate::lock::Priority,
     pub(super) job_id: &'a str,
     pub(super) project_dir: &'a Path,
@@ -255,6 +257,8 @@ impl TestStep<'_> {
     /// like the old single `cargo test`: the kept stdout of every executable, cargo's exit code, the whole step's time; and the
     /// result of the project's Python tests `scripts` (SCALING F9), `None` when cargo's tests did not pass (then none counts).
     pub(super) fn run(&mut self, mut cmd: Command, hold: &mut Option<BuildHold>, scripts: &[String]) -> Result<(StepRun, Option<PyTests>), String> {
+        // Carry the inputs for flake-3 without opening the list or changing how tests run.
+        let _flaky_context = (self.project, self.cfg.flaky_tests_file.as_str());
         let start = Instant::now();
         let done = |outcome: Outcome, stdout: String| StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() };
         // 1. compile (under the lock)

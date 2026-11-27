@@ -82,6 +82,7 @@ const BASE: &[(&str, &str)] = &[
     ("merge_fast_tests", "\"\""),
     // no test project runs Python tests unless its test sets this (SCALING F9)
     ("python_tests", "\"\""),
+    ("flaky_tests_file", "\"\""),
     ("bash_projects", "\"\""),
     ("python_parallel", "1"),
     ("done_check_timeout_seconds", "600"),

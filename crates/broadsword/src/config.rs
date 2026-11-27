@@ -178,6 +178,8 @@ pub struct Config {
     /// SCALING F9: the Python test scripts each project's `test` and `check` run after cargo's tests, as `(project, scripts)`.
     /// Parsed from the required key `python_tests` by `parse_python_tests`; a project not named in it has no Python tests.
     pub python_tests: Vec<(String, Vec<String>)>,
+    /// Root-relative flaky-test allow-list path; empty means off.
+    pub flaky_tests_file: String,
     /// Projects whose queue checks require a runnable bash on PATH.
     pub bash_projects: Vec<String>,
     /// Scripts at once after cargo's tests and doc-tests, when test_parallel_binaries is 1.
@@ -346,6 +348,10 @@ fn check_folders_apart(scratch: &Path, build: &Path, state: &Path, install: &Pat
     Ok(())
 }
 
+// Lexical path check; a file of its own because config.rs is large, shared with tests that include this file.
+#[path = "job/flaky.rs"]
+mod flaky;
+
 impl Config {
     /// Build a Config from parsed text. `config_dir` is the folder holding broadsword.toml;
     /// `root` and every path in the file are resolved relative to it.
@@ -418,6 +424,8 @@ impl Config {
             return Err(format!("shadow_reviewer = \"{shadow_reviewer}\": must be \"openai\" or \"off\""));
         }
         let python_tests = parse_python_tests(&get_str(&m, "python_tests")?)?;
+        let flaky_tests_file = get_str(&m, "flaky_tests_file")?;
+        flaky::check_flaky_path(&flaky_tests_file)?;
         let bash_projects = get_str(&m, "bash_projects")?
             .split_whitespace()
             .map(|name| {
@@ -435,6 +443,7 @@ impl Config {
         Ok(Config {
             merge_fast_tests,
             python_tests,
+            flaky_tests_file,
             bash_projects,
             python_parallel: usize::try_from(positive("python_parallel")?)
                 .map_err(|_| "python_parallel: does not fit this platform's pool width")?,
@@ -682,6 +691,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+flaky_tests_file = \"\"
 bash_projects = \"\"
 task_archive_days = 30
 main_full_check_every_minutes = 60
@@ -1030,6 +1040,7 @@ queue_auto_revert = \"on\"
 queue_main_check_async = \"off\"
 merge_fast_tests = \"\"
 python_tests = \"\"
+flaky_tests_file = \"\"
 bash_projects = \"\"
 task_archive_days = 30
 main_full_check_every_minutes = 60
@@ -1102,6 +1113,7 @@ queue_auto_revert = \"on\"
 merge_fast_tests = \"\"
 queue_main_check_async = \"off\"
 python_tests = \"\"
+flaky_tests_file = \"\"
 bash_projects = \"\"
 task_archive_days = 30
 main_full_check_every_minutes = 60

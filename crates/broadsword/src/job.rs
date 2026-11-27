@@ -523,6 +523,7 @@ fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, direct: boo
             let parallel = cfg.test_parallel_binaries as usize;
             let mut t = TestStep {
                 cfg,
+                project: name,
                 priority,
                 job_id: &job_id,
                 project_dir: &project_dir,
