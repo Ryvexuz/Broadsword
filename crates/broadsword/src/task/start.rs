@@ -2,8 +2,8 @@ use super::*;
 
 /// Test-only hook, like `job::TEST_FREE_HOOK_ENV`: when set to a file path inside this root's scratch folder, `start`
 /// waits until that file exists before it touches the board, so a race test can start many processes and release them
-/// together. The wait is capped at 600 seconds, independently of the board lock wait. The hook is ignored for any
-/// path outside scratch, and announces itself on stderr. The long name is deliberate: it cannot be
+/// together. It waits at most 3 x task_lock_wait_seconds (derived from that setting, so no separate limit exists), is
+/// ignored for any path outside scratch, and announces itself on stderr. The long name is deliberate: it cannot be
 /// set by accident.
 pub const TEST_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_TASK_START_GATE_FILE";
 
@@ -23,7 +23,7 @@ pub fn wait_for_gate(cfg: &Config, env: &str, what: &str) {
         return;
     }
     eprintln!("broadsword: TEST HOOK ACTIVE: {what} waits for {} to exist", gate.display());
-    let end = std::time::Instant::now() + Duration::from_secs(600);
+    let end = std::time::Instant::now() + Duration::from_secs(cfg.task_lock_wait_seconds * 3);
     while !gate.exists() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
     }

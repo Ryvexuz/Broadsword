@@ -23,7 +23,7 @@ your claim, say the key is needed). Never put a key or secret in code. Do not co
 orchestrator commits.
 
 **Self-check before you report.** Before you finish, apply every item below to your own diff and put the results in your
-report. (This is the Broadsword self-check block, adapted to your sandbox: you can read every file in your worktree and run read-only shell commands (for example ls, cat, grep, wc), but builds, tests, formatters and Git do not work in your sandbox, so the mechanical
+report. (This is the Broadsword self-check block, adapted to your sandbox: you cannot run commands, so the mechanical
 checks (`broadsword check`, clippy, `rustfmt --check` on the files you changed) are run by the orchestrator after you finish. Write code that
 passes them: no new warnings, your changed files formatted as `rustfmt` would leave them (never run rustfmt or cargo fmt in write mode on files you did not change, including files that declare child modules; judge only diff hunks inside your changed files). Never add an allow attribute to silence a lint.)
 

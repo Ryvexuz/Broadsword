@@ -178,8 +178,6 @@ pub(crate) const SOURCE: &str = concat!(
     "\n",
     include_str!("locks.rs"),
     "\n",
-    include_str!("locks/bash_gate.rs"),
-    "\n",
     include_str!("merge.rs"),
     "\n",
     include_str!("no_rust.rs"),
@@ -190,13 +188,7 @@ pub(crate) const SOURCE: &str = concat!(
     "\n",
     include_str!("review.rs"),
     "\n",
-    include_str!("review/gate.rs"),
-    "\n",
-    include_str!("review/shadow.rs"),
-    "\n",
     include_str!("train.rs"),
-    "\n",
-    include_str!("train/lanes.rs"),
     "\n",
     include_str!("view.rs"),
 );
@@ -781,28 +773,16 @@ mod tests {
         assert_eq!(worst_exit(std::iter::empty(), 0), 0);
     }
 
-    /// SOURCE is exactly every .rs file of src/queue/ and its direct subfolders, each once, joined by one line break.
-    /// A missing file would let the source-text tests in tools.rs and task.rs pass without ever reading it.
+    /// SOURCE is exactly every .rs file of src/queue/, each once, joined by one line break: a file missing from it would let the
+    /// source-text tests in tools.rs and task.rs pass without ever reading that file.
     #[test]
     fn source_lists_every_file_of_the_queue_folder() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("queue");
         let mut files: Vec<String> = Vec::new();
-        let mut read_rs = |e: std::fs::DirEntry| {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "rs")
-                && e.file_type().expect("src/queue entry type").is_file()
-            {
-                files.push(std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("{}: {err}", p.display())));
-            }
-        };
         for e in std::fs::read_dir(&dir).expect("src/queue can be listed") {
-            let e = e.expect("src/queue entry");
-            if e.file_type().expect("src/queue entry type").is_dir() {
-                for child in std::fs::read_dir(e.path()).expect("cannot list queue subfolder") {
-                    read_rs(child.expect("src/queue subfolder entry"));
-                }
-            } else {
-                read_rs(e);
+            let p = e.expect("src/queue entry").path();
+            if p.extension().is_some_and(|x| x == "rs") {
+                files.push(std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("{}: {err}", p.display())));
             }
         }
         assert!(files.len() > 1, "src/queue holds the facade and its child modules");

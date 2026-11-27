@@ -1,20 +1,12 @@
 # Tracked copy of scratch/qadd.ps1 (task t-20261121-201016); scratch/ copy stays in use until the references move.
 # queue add + start the project's driver in one step (the driver exits when idle; an add without a driver strands the entry).
-# usage: powershell -NoProfile -File scripts/qadd.ps1 <task> <low|high> <coder> [brief] [-Adjudicated <file>]; omitted brief copies backlog to scratch/briefs.
+# usage: powershell -NoProfile -File scripts/qadd.ps1 <task> <low|high> <coder> [brief] [-Adjudicated <file>]
 # LOOP BREAKER (Lazlo 2026-11-21 06:39Z "can we fix them all?"): a task with 3 or more failed queue rounds is refused
 # unless -Adjudicated names an existing file that records each finding's REAL/FALSE/KNOWN verdict and the split,
 # design change or escalation decided. No 4th plain round.
 param([Parameter(Mandatory=$true)][string]$Task, [Parameter(Mandatory=$true)][string]$Risk, [Parameter(Mandatory=$true)][string]$Coder, [string]$Brief, [string]$Adjudicated)
 Set-Location (Split-Path $PSScriptRoot -Parent)
-if (-not $Brief) {
-    $src = "state/backlog/$Task.md"
-    if (-not (Test-Path -LiteralPath $src)) { "qadd: no brief $src"; exit 2 }
-    try {
-        New-Item -ItemType Directory -Path "scratch/briefs" -Force -ErrorAction Stop | Out-Null
-        Copy-Item -LiteralPath $src -Destination "scratch/briefs/$Task.md" -Force -ErrorAction Stop
-    } catch { "qadd: could not copy ${src}: $_"; exit 2 }
-    $Brief = "scratch/briefs/$Task.md"
-}
+if (-not $Brief) { $Brief = "state/backlog/$Task.md" }
 $failed = @(& build/bin/broadsword.exe queue list 2>&1 | Where-Object { $_ -match '^q-' } | ForEach-Object { ,($_ -split "`t") } |
     Where-Object { $_[2] -eq $Task -and $_[1] -in 'rejected','check_failed','perf_failed','conflict','merged_check_failed' }).Count
 if ($failed -ge 3) {
