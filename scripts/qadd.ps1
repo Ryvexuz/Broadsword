@@ -6,7 +6,7 @@
 # design change or escalation decided. No 4th plain round.
 param([Parameter(Mandatory=$true)][string]$Task, [Parameter(Mandatory=$true)][string]$Risk, [Parameter(Mandatory=$true)][string]$Coder, [string]$Brief, [string]$Adjudicated)
 Set-Location (Split-Path $PSScriptRoot -Parent)
-if (-not $Brief) { $Brief = "scratch/briefs/$Task.md" }
+if (-not $Brief) { $Brief = "state/backlog/$Task.md" }
 $failed = @(& build/bin/broadsword.exe queue list 2>&1 | Where-Object { $_ -match '^q-' } | ForEach-Object { ,($_ -split "`t") } |
     Where-Object { $_[2] -eq $Task -and $_[1] -in 'rejected','check_failed','perf_failed','conflict','merged_check_failed' }).Count
 if ($failed -ge 3) {
