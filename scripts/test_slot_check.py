@@ -13,6 +13,8 @@ import io
 import pathlib
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("slot_check", HERE / "slot_check.py")
@@ -21,8 +23,9 @@ spec.loader.exec_module(slot_check)
 
 FAKE = """import sys
 root = __import__("pathlib").Path(__file__).resolve().parent
-status = sys.argv[sys.argv.index("--status") + 1]
-sys.stdout.write((root / ("tasks-" + status + ".tsv")).read_text(encoding="utf-8"))
+statuses = [sys.argv[sys.argv.index("--status") + 1]] if "--status" in sys.argv else ["running", "open"]
+for status in statuses:
+    sys.stdout.write((root / ("tasks-" + status + ".tsv")).read_text(encoding="utf-8"))
 """
 
 
@@ -122,6 +125,103 @@ class SlotCheckTests(unittest.TestCase):
             "blocked by own claim: a.rs x1",
             "LOOP: h has 3 failed queue rounds: adjudicate, then split or escalate once; no plain retry",
         ])
+
+
+class HoldConflictTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.queue = self.root / "state" / "queue"
+        self.queue.mkdir(parents=True)
+        self.pauses = self.root / "state" / "pauses.tsv"
+        self.now = datetime(2026, 11, 26, 20, 30, tzinfo=timezone.utc)
+
+    def hold(self, name="p", project="p", reason="whole reason"):
+        path = self.queue / ("hold-" + name)
+        path.write_text(f"time = 2026-11-26 20:24:40 UTC\nentry = q-1\n"
+                        f"project = {project}\nreason = {reason}\n", encoding="utf-8")
+        return path
+
+    def test_hold_line_per_hold_file(self):
+        self.hold("z", "")
+        self.hold("a", "other")
+        lines = slot_check.hold_lines(self.root, self.now)
+        self.assertEqual([line for line in lines if line.startswith("HOLD:")], [
+            "HOLD: other since 2026-11-26T20:24:40Z entry q-1",
+            "HOLD: z since 2026-11-26T20:24:40Z entry q-1",
+        ])
+
+    def test_unreadable_hold_is_printed_not_skipped(self):
+        path = self.hold()
+        original = pathlib.Path.read_text
+
+        def read(target, *args, **kwargs):
+            if target == path:
+                raise PermissionError("denied")
+            return original(target, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "read_text", read):
+            self.assertEqual(slot_check.hold_lines(self.root, self.now), [
+                "HOLD: p since unknown entry unknown (unreadable: denied)"])
+
+    def test_conflict_line_names_files_of_newest_entry_only(self):
+        def entry(number, task_id, status, reason):
+            (self.queue / f"q-{number}.entry").write_text(
+                f"id = q-{number}\ntask = {task_id}\nstatus = {status}\nreason = {reason}\n",
+                encoding="utf-8")
+        reason = "rebase conflicts in: broadsword.toml, src/a.rs. The rebase was aborted"
+        entry("001", "t1", "conflict", reason)
+        entry("002", "t1", "queued", "")
+        entry("003", "t2", "conflict", reason)
+        entry("004", "t3", "conflict", "")
+        entry("005", "t4", "conflict", reason)
+        self.assertEqual(slot_check.conflict_lines(self.root, [
+            ["t1", "open"], ["t2", "failed"], ["t3", "running"], ["t4", "done"]]), [
+                "CONFLICT: t2 q-003 broadsword.toml, src/a.rs",
+                "CONFLICT: t3 q-004 unknown",
+            ])
+
+    def test_unregistered_hold_gets_one_pause_row_across_two_runs(self):
+        reason = "long\tvalue\r\ncontinuation " + "x" * 10000
+        self.hold(reason=reason)
+        original = b"# append-only\nEND\t2026-11-26T20:00:00Z\thold-p\n"
+        self.pauses.write_bytes(original)
+        first = slot_check.hold_lines(self.root, self.now)
+        self.assertIn("HOLD REGISTERED: hold-p until 2026-11-26T21:30:00Z", first)
+        after = self.pauses.read_bytes()
+        self.assertTrue(after.startswith(original))
+        added = after[len(original):].decode("utf-8").splitlines()
+        self.assertEqual(len(added), 1)
+        fields = added[0].split("\t")
+        self.assertGreaterEqual(len(fields), 6)
+        self.assertEqual(fields[:5], ["PAUSE", "2026-11-26T20:30:00Z", "queue", "hold-p", ""])
+        self.assertEqual(fields[5], "registered by slot_check: long value continuation " + "x" * 10000)
+        # Pasted guard format: valid UTC times, default expiry, no subsequent END.
+        start = datetime.strptime(fields[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        expiry = start + timedelta(minutes=60)
+        self.assertLess(self.now, expiry)
+        self.assertGreaterEqual(start, datetime(2026, 11, 26, 20, 24, 40, tzinfo=timezone.utc))
+        self.assertFalse(any(row.startswith("END\t") for row in added[1:]))
+        second = slot_check.hold_lines(self.root, self.now)
+        self.assertFalse(any(line.startswith("HOLD REGISTERED:") for line in second))
+        self.assertEqual(self.pauses.read_bytes(), after)
+
+    def test_registered_hold_and_missing_pauses_file_write_nothing(self):
+        self.hold()
+        lines = slot_check.hold_lines(self.root, self.now)
+        self.assertFalse(self.pauses.exists())
+        self.assertTrue(any(line.startswith("HOLD NOT REGISTERED:") for line in lines))
+        original = b"PAUSE\t2026-11-26T20:25:00Z\tMAIN\thold-p\t\talready held\n"
+        self.pauses.write_bytes(original)
+        lines = slot_check.hold_lines(self.root, self.now)
+        self.assertEqual(lines, ["HOLD: p since 2026-11-26T20:24:40Z entry q-1"])
+        self.assertEqual(self.pauses.read_bytes(), original)
+        for bad in ("PAUSE\tbad\n", "PAUSE\tbad\tMAIN\thold-p\t\treason\n"):
+            self.pauses.write_text(bad, encoding="utf-8")
+            lines = slot_check.hold_lines(self.root, self.now)
+            self.assertTrue(any(line.startswith("HOLD NOT REGISTERED:") for line in lines))
+            self.assertEqual(self.pauses.read_text(encoding="utf-8"), bad)
 
 
 class ClaimBlameTests(unittest.TestCase):

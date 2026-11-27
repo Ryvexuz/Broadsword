@@ -6,7 +6,7 @@ exist and the board is full, or when headroom is large (RAM < 50% and CPU < 50%)
 When open tasks are blocked, prints holders and the blocked tasks' overlapping own claims (top three each).
 
 A running task is WAITING (not an active coder) when its merge-queue entry is queued or running; this is the
-same rule `task start` uses for max_agents. Read-only.
+same rule `task start` uses for max_agents. The only write is appending missing hold registrations to state/pauses.tsv.
 
   python -I scripts/slot_check.py <root>
 
@@ -17,10 +17,107 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 WAITING_STATUSES = {"queued", "running"}
 FAILED_STATUSES = ("rejected", "check_failed", "merged_check_failed")
 LOOP_ROUNDS = 3
+PAUSES_TSV_EMPTY_EXPIRY_MIN = 60  # Format rule of state/pauses.tsv header, not a tunable.
+
+
+def hold_lines(root, now=None):
+    """Report every hold, appending registrations only to an existing readable pauses file."""
+    now = now or datetime.now(timezone.utc)
+    now = now.replace(microsecond=0)
+
+    def stamp(value):
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def parse_time(value):
+        if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value):
+            raise ValueError(f"bad time: {value!r}")
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    lines = []
+    for path in sorted((root / "state" / "queue").glob("hold-*")):
+        fallback = path.name[len("hold-"):]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            lines.append(f"HOLD: {fallback} since unknown entry unknown (unreadable: {error})")
+            continue
+        fields = dict(re.findall(r"(?m)^(\w+) = (.*)$", text))
+        project = fields.get("project", "").strip() or fallback
+        entry = fields.get("entry", "").strip() or "unknown"
+        raw_time = fields.get("time", "").strip()
+        try:
+            hold_time = parse_time(raw_time.replace(" ", "T", 1).replace(" UTC", "Z"))
+        except ValueError as error:
+            lines.extend([f"HOLD: {project} since unknown entry {entry}",
+                          f"HOLD NOT REGISTERED: {path.name}: {error}"])
+            continue
+        lines.append(f"HOLD: {project} since {stamp(hold_time)} entry {entry}")
+        what = "hold-" + project
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", project):
+            lines.append(f"HOLD NOT REGISTERED: invalid project: {project!r}")
+            continue
+        pauses = root / "state" / "pauses.tsv"
+        try:
+            # r+ never creates a missing file. Preserve all existing bytes on append.
+            with pauses.open("r+", encoding="utf-8", newline="") as stream:
+                content = stream.read()
+                active = []
+                for row in content.splitlines():
+                    if not row.strip() or row.startswith("#"):
+                        continue
+                    parts = row.split("\t")
+                    if parts[0] == "PAUSE" and len(parts) >= 6:
+                        start = parse_time(parts[1])
+                        expiry = (parse_time(parts[4]) if parts[4] else
+                                  start + timedelta(minutes=PAUSES_TSV_EMPTY_EXPIRY_MIN))
+                        if parts[3] == what:
+                            active.append(start >= hold_time and start <= now < expiry)
+                    elif parts[0] == "END" and len(parts) >= 3:
+                        parse_time(parts[1])
+                        if parts[2] == what:
+                            active.clear()
+                    else:
+                        raise ValueError(f"malformed pauses row: {row!r}")
+                if any(active):
+                    continue
+                # Keep the entire reason, including continuation lines, on one TSV line.
+                match = re.search(r"(?ms)^reason = (.*?)(?=^\w+ = |\Z)", text)
+                reason = " ".join(match.group(1).splitlines()) if match else ""
+                reason = reason.replace("\t", " ")
+                expiry = now + timedelta(minutes=PAUSES_TSV_EMPTY_EXPIRY_MIN)
+                if content and not content.endswith("\n"):
+                    raise ValueError("pauses file lacks final newline; refusing to change its last line")
+                stream.seek(0, 2)
+                stream.write(f"PAUSE\t{stamp(now)}\tqueue\t{what}\t\tregistered by slot_check: {reason}\n")
+                stream.flush()
+            lines.append(f"HOLD REGISTERED: {what} until {stamp(expiry)}")
+        except (OSError, UnicodeError, ValueError, OverflowError) as error:
+            lines.append(f"HOLD NOT REGISTERED: {what}: {error}")
+    return lines
+
+
+def conflict_lines(root, board_rows):
+    """Only the newest queue entry can signal a conflict for a non-done task."""
+    eligible = {row[0] for row in board_rows if len(row) >= 2 and row[1] != "done"}
+    newest = {}
+    for path in (root / "state" / "queue").glob("*.entry"):
+        fields = dict(re.findall(r"(?m)^(\w+) = (.*)$", path.read_text(encoding="utf-8")))
+        task = fields.get("task")
+        entry = fields.get("id", path.stem)
+        if task in eligible and (task not in newest or entry > newest[task][0]):
+            newest[task] = (entry, fields)
+    lines = []
+    for task, (entry, fields) in sorted(newest.items()):
+        if fields.get("status") == "conflict":
+            match = re.search(r"conflicts in: (.*?)(?:\. |$)", fields.get("reason", ""))
+            files = match.group(1).strip() if match else ""
+            lines.append(f"CONFLICT: {task} {entry} {files or 'unknown'}")
+    return lines
 
 
 def broadsword_cmd(root):
@@ -163,6 +260,11 @@ def main(argv):
     for t, n in sorted(fails.items(), key=lambda x: -x[1]):
         if n >= LOOP_ROUNDS:
             print(f"LOOP: {t} has {n} failed queue rounds: adjudicate, then split or escalate once; no plain retry")
+    for alert in hold_lines(root):
+        print(alert)
+    board_rows = rows(run_cli(root, "task", "list"))
+    for alert in conflict_lines(root, board_rows):
+        print(alert)
 
 
 if __name__ == "__main__":
