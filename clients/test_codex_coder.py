@@ -335,6 +335,8 @@ class CoderTests(unittest.TestCase):
         self.assertEqual(res["codex_items"], ["agent_message", "command_execution", "file_change"])
 
     def test_changed_toml_under_its_key_claim_is_covered_but_not_under_a_loader_key(self):
+        with (self.root / "broadsword.toml").open("a", encoding="utf-8") as f:
+            f.write("alpha = 1\n")  # an existing key: the start gate's new-key rule (R4b) does not apply
         (self.wt / "broadsword.toml").write_text("alpha = 0\n", encoding="utf-8")
         self.write_task(claims="broadsword.toml#alpha")
         code, res, _ = self.run_coder("settings")
