@@ -190,8 +190,8 @@ pub struct Config {
     pub done_check_tail_lines: u64,
     /// The test step runs up to this many copied test executables (and Python test scripts) at once; 1 = one after another.
     pub test_parallel_binaries: u64,
-    /// Side by side, a test child that has exited has its output pipes waited for at most this many seconds (a process it
-    /// started may hold them open); then its output is printed as far as it got, marked TRUNCATED. Never blocks the pool.
+    /// After any job child exits, wait at most this many seconds for its output pipes (a process it started may hold
+    /// them open). On timeout mark the output TRUNCATED; in the side-by-side pool other children continue meanwhile.
     pub test_output_wait_seconds: u64,
 }
 

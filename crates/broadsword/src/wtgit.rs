@@ -78,6 +78,19 @@ pub fn head_commit(dir: &Path) -> Result<String, String> {
     ok(dir, &["rev-parse", "HEAD"])
 }
 
+/// Resolve a commit's tree to compare checkout contents even when the commits differ.
+pub fn tree_of(dir: &Path, rev: &str) -> Result<String, String> {
+    ok(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{tree}}"),
+        ],
+    )
+}
+
 /// The branch names a project's trunk may have. The trunk is the one of these that exists in the project's repo.
 pub const TRUNK_NAMES: [&str; 2] = ["main", "master"];
 

@@ -6,7 +6,8 @@ use crate::worktree;
 use crate::{tools, wtgit};
 use std::path::Path;
 use std::process::ExitCode;
-use super::check::{main_check_now, PassInfo};
+use super::bisect::{self, Bisect, Boundary};
+use super::check::PassInfo;
 use super::entry::load_entry;
 use super::locks::{lane_hold, write_hold};
 use super::{BLOCKED, code_num, EXIT_ERROR, EXIT_MERGED_BAD, EXIT_RETRY, MERGED, MERGED_CHECK_FAILED, R, Row, Run, STALE, STEP_MERGE};
@@ -17,7 +18,12 @@ use super::view::{short, some};
 /// main is green again and `queue run --all` goes on with the next entry; anything else (no revert, a failed one, a held lane, an
 /// entry that cannot be read) stops the drain as before (fail closed).
 pub(super) fn green_revert(cfg: &Config, id: &str) -> bool {
-    load_entry(cfg, id).is_ok_and(|e| e.status() == MERGED_CHECK_FAILED && e.get("revert_check") == "passed" && lane_hold(cfg, e.get("project")).is_none())
+    load_entry(cfg, id).is_ok_and(|e| {
+        let check = e.get("revert_check");
+        e.status() == MERGED_CHECK_FAILED
+            && (check == "passed" || bisect::recorded_green_release(check, e.get("flake")))
+            && lane_hold(cfg, e.get("project")).is_none()
+    })
 }
 
 impl<'a> Run<'a> {
@@ -34,7 +40,7 @@ impl<'a> Run<'a> {
             self.s_merge()?;
         }
         if start <= 5 {
-            self.s_main_check()?;
+            self.s_main_check(&mut Bisect::new([Boundary::of(self)]))?;
         }
         self.s_done()
     }
@@ -152,11 +158,11 @@ impl<'a> Run<'a> {
 
     // -- step 6: main check -----------------------------------------------------------------
 
-    fn s_main_check(&mut self) -> R<()> {
-        let spec = self.planned_main_spec()?;
+    fn s_main_check(&mut self, bisect: &mut Bisect) -> R<()> {
+        let (spec, checked_sha) = self.planned_main_spec()?;
         let full = spec.kind == "check";
         let (code, info) = super::postcheck::run_check(self.cfg, spec);
-        self.judge_planned_main_check(full, code, info)
+        self.judge_planned_main_check(full, code, &info, &checked_sha, bisect)
     }
 
     pub(super) fn prepare_main_check(&mut self) -> R<()> {
@@ -183,7 +189,13 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    pub(super) fn judge_main_check(&mut self, code: u8, info: JobInfo) -> R<()> {
+    pub(super) fn judge_main_check(
+        &mut self,
+        code: u8,
+        info: &JobInfo,
+        checked_sha: &str,
+        bisect: &mut Bisect,
+    ) -> R<()> {
         let (project, sha, mb) = (self.e.get("project"), self.e.get("main_sha"), self.e.get("main_branch"));
         let loud = |code: String, extra: &str| {
             format!("commit {sha} is ALREADY on `{mb}` of project `{project}`, and `check {project}` there did not pass ({code}){extra}. Main was NOT reset or reverted. A human decides: fix forward, or `git revert` the commit. The task was NOT marked done and its worktree is kept")
@@ -195,19 +207,29 @@ impl<'a> Run<'a> {
                 return Err(self.end(MERGED_CHECK_FAILED, &loud(format!("exit {code}, job {job_id}"), &extra), EXIT_MERGED_BAD));
             }
             let failed = format!("commit {sha} is on `{mb}` of project `{project}`, and `check {project}` there did not pass (exit {code}, job {job_id}){extra}.");
-            let reason = self.auto_revert(&failed, &job_id);
+            let plan = bisect.choose(self, checked_sha, info);
+            let start = match &plan {
+                Ok(None) => return Ok(()),
+                Ok(Some(start)) => start.clone(),
+                Err(_) => self.e.get("pre_merge_sha").to_string(),
+            };
+            let triggering =
+                (!checked_sha.is_empty() && checked_sha == self.e.get("main_sha")).then_some(info);
+            let (reason, reverted) = self.auto_revert(&failed, &job_id, &start, triggering);
+            bisect.record_revert(self, &plan, reverted);
             return Err(self.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD));
         }
         self.log("main_check", &format!("check on main passed ({})", info.summary.join("; ")))
     }
 
-    /// AUTO-REVERT (queue_auto_revert = "on"), after a main check that ran and failed: undo exactly the commits this entry (or the
-    /// merge train it ended) fast-forwarded, `pre_merge_sha..main_sha`, with ONE new revert commit on the trunk, then check main
-    /// again. Never a reset, never a force, never a push. Refused (nothing is touched) when no pre-merge commit is recorded, when the
-    /// main checkout is not on the trunk, when the trunk moved since the merge, or when the checkout has changes. Any refusal, a revert
-    /// or commit that fails (aborted with `git revert --abort`), or a re-check that fails HOLDS the lane (`write_hold`). Returns the
-    /// entry's reason text; `failed` says what failed first.
-    fn auto_revert(&mut self, failed: &str, job_id: &str) -> String {
+    /// Commit one revert of the chosen suffix, then check the restored main. Returns the reason and whether Git committed the revert.
+    fn auto_revert(
+        &mut self,
+        failed: &str,
+        job_id: &str,
+        start: &str,
+        info: Option<&JobInfo>,
+    ) -> (String, bool) {
         let project = self.e.get("project").to_string();
         let held = |cfg: &Config, id: &str, why: &str| -> String {
             let note = match write_hold(cfg, &project, id, why) {
@@ -217,25 +239,22 @@ impl<'a> Run<'a> {
             format!("{failed} The automatic revert did not complete: {why}. {note}. Main was NOT reset. A human decides: fix forward, or `git revert` the commits. The task was NOT marked done and its worktree is kept")
         };
         let id = self.e.id().to_string();
-        match self.revert_merged(job_id) {
-            Err(why) => held(self.cfg, &id, &why),
+        match self.revert_merged(job_id, start) {
+            Err(why) => (held(self.cfg, &id, &why), false),
             Ok((range, rsha)) => {
                 let _ = self.log("main_check", &format!("main check failed; reverted {range} as {rsha}; checking main again"));
                 println!("queue entry {id}: main check failed; reverted {range} as {rsha}; check {project} again");
-                match main_check_now(self.cfg, &self.dir, &project) {
-                    Ok(job) => {
-                        // the one mark `green_revert` trusts: main is green again, so `queue run --all` may go on
-                        self.e.set("revert_check", "passed");
-                        format!("{failed} The merged commits {range} were reverted as {rsha} (one new commit; nothing was reset); main check after the revert passed (job {job}). The task was NOT marked done and its worktree is kept: fix it and queue it again")
-                    }
-                    Err(m) => held(self.cfg, &id, &format!("the merged commits {range} were reverted as {rsha}, but the main check after the revert did not pass: {m}")),
-                }
+                let reason = match bisect::check_revert(self, &rsha, info) {
+                    Ok(note) => format!("{failed} The merged commits {range} were reverted as {rsha} (one new commit; nothing was reset); main check after the revert {note}. The task was NOT marked done and its worktree is kept: fix it and queue it again"),
+                    Err(m) => held(self.cfg, &id, &self.secrets.redact(&format!("the merged commits {range} were reverted as {rsha}, but the main check after the revert did not pass: {m}"))),
+                };
+                (reason, true)
             }
         }
     }
 
     /// The revert itself (see `auto_revert`): `Ok((range, revert commit))`, or why nothing (or nothing left) was reverted.
-    fn revert_merged(&mut self, job_id: &str) -> Result<(String, String), String> {
+    fn revert_merged(&mut self, job_id: &str, start: &str) -> Result<(String, String), String> {
         let (dir, mb) = (self.dir.clone(), self.e.get("main_branch").to_string());
         let pre = self.e.get("pre_merge_sha").to_string();
         let last = self.e.get("main_sha").to_string();
@@ -250,11 +269,21 @@ impl<'a> Run<'a> {
         if pre == last || !wtgit::is_ancestor(&dir, &pre, &last)? {
             return Err(format!("the recorded pre-merge commit {pre} is not before the merged commit {last}; nothing was reverted"));
         }
+        if start != pre
+            && (start.is_empty()
+                || start == last
+                || !wtgit::is_ancestor(&dir, &pre, start)?
+                || !wtgit::is_ancestor(&dir, start, &last)?)
+        {
+            return Err(format!(
+                "revert start {start} is outside {pre}..{last}; nothing was reverted"
+            ));
+        }
         let dirty = wtgit::status_porcelain_plain(&dir)?;
         if !dirty.is_empty() {
             return Err(format!("the main checkout has uncommitted or untracked changes ({}); nothing was reverted", some(&dirty)));
         }
-        let range = format!("{pre}..{last}");
+        let range = format!("{start}..{last}");
         let commits = wtgit::commit_subjects(&dir, &range)?;
         if commits.is_empty() {
             return Err(format!("git lists no commit in {range}; nothing was reverted"));
@@ -462,7 +491,8 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
         return super::postcheck::start(cfg, train_id, members, tip, rows, worst);
     }
     // The last entry selects and judges the one planned main job; the others are covered by it.
-    if let Err(c) = members[last].0.s_main_check() {
+    let mut bisect = Bisect::new(members.iter().map(|(r, _)| Boundary::of(r)));
+    if let Err(c) = members[last].0.s_main_check(&mut bisect) {
         let code = code_num(c);
         let reason = members[last].0.e.get("reason").to_string();
         for (i, (mut r, t)) in members.into_iter().enumerate() {
@@ -470,7 +500,13 @@ pub(super) fn merge_members(cfg: &Config, train_id: &str, members: Vec<(Run<'_>,
                 finish_member(cfg, r, code, t, rows, worst);
                 continue;
             }
-            let c2 = if code == EXIT_MERGED_BAD { r.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD) } else { r.internal(&format!("the main check of merge train {train_id} did not complete: {reason}")) };
+            let c2 = if let Some(note) = bisect.kept_log(i, train_id) {
+                bisect::kept_done(&mut r, &note).unwrap_or_else(|c| c)
+            } else if code == EXIT_MERGED_BAD {
+                r.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD)
+            } else {
+                r.internal(&format!("the main check of merge train {train_id} did not complete: {reason}"))
+            };
             finish_member(cfg, r, code_num(c2), t, rows, worst);
         }
         // the members' rows keep their exit 6; only a revert that left main green lets the drain go on (`green_revert`)

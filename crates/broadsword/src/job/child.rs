@@ -124,9 +124,31 @@ pub(super) fn run_child_opts(
         std::thread::sleep(Duration::from_millis(50));
     };
     if matches!(outcome, Outcome::Exited(_)) {
-        let _ = t_out.join();
-        let _ = t_err.join();
-    } // after a kill the readers are left to finish on their own: never block on orphaned pipes
+        let start_drain = Instant::now();
+        let wait = Duration::from_secs(cfg.test_output_wait_seconds);
+        let poll = Duration::from_millis(50);
+        loop {
+            if t_out.is_finished() && t_err.is_finished() {
+                let _ = t_out.join();
+                let _ = t_err.join();
+                break;
+            }
+            let remaining = wait.saturating_sub(start_drain.elapsed());
+            if remaining.is_zero() {
+                let note = format!(
+                    "broadsword: TRUNCATED: this command exited, but a process it started still held its output open {} s later (test_output_wait_seconds); its output above is as far as it got",
+                    wait.as_secs()
+                );
+                if let Ok(mut f) = log.lock() {
+                    // A trailing partial line must not hide the verdict marker.
+                    let _ = writeln!(f, "\n{note}");
+                }
+                eprintln!("\n{note}");
+                break;
+            }
+            std::thread::sleep(poll.min(remaining));
+        }
+    } // on timeout or kill the readers are left to finish on their own
     let stdout = String::from_utf8_lossy(&kept.lock().map(|k| k.clone()).unwrap_or_default()).into_owned();
     Ok(StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() })
 }
@@ -155,4 +177,61 @@ pub(super) fn shell_command(project_dir: &Path, line: &str) -> Command {
     };
     c.current_dir(project_dir);
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_shell(tag: &str, line: &str) -> (StepRun, String) {
+        let root = crate::scrub::planted::config_root(tag);
+        let mut cfg = Config::from_text(include_str!("../../../../broadsword.toml"), &root).unwrap();
+        cfg.test_output_wait_seconds = 1;
+        let path = root.join("child.log");
+        let log = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let run = run_child(
+            &cfg,
+            shell_command(&root, line),
+            &log,
+            &mut || u64::MAX,
+            Duration::from_secs(cfg.job_disk_poll_seconds),
+            &mut |_| {},
+            &Arc::new(Secrets::collect(&root, &[], cfg.redact_min_chars)),
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        drop(log);
+        // A detached reader can still own the log handle on Windows. Files in the
+        // scratch fixture can then be removed by the normal scratch cleanup.
+        let _ = std::fs::remove_dir_all(&root);
+        (run.unwrap(), text)
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_stall_run_child() {
+        let line = if cfg!(windows) {
+            r#"start /b "" ping -n 31 127.0.0.1 & echo hi"#
+        } else {
+            "sleep 30 & echo hi"
+        };
+        let (run, log) = run_shell("child-orphan-pipe", line);
+        println!("grandchild pipe: elapsed={} s; log={log:?}", run.secs);
+        assert!(matches!(run.outcome, Outcome::Exited(Some(0))));
+        assert!(run.stdout.lines().any(|l| l == "hi"), "{:?}", run.stdout);
+        assert!(
+            log.lines().any(|l| {
+                l.starts_with("broadsword: TRUNCATED:")
+                    && l.contains("open 1 s later (test_output_wait_seconds)")
+            }),
+            "{log}"
+        );
+        assert!(run.secs < 10.0, "pipe held the job for {} s", run.secs);
+    }
+
+    #[test]
+    fn a_child_without_grandchildren_is_joined_whole() {
+        let (run, log) = run_shell("child-closed-pipe", "echo hi");
+        assert!(matches!(run.outcome, Outcome::Exited(Some(0))));
+        assert_eq!(run.stdout.trim_end(), "hi");
+        assert_eq!(log.trim_end(), "hi");
+    }
 }

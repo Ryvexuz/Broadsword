@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::job::{self, JobInfo, JobSpec};
 use crate::perfgate;
 
+use super::bisect::{self, Bisect, Boundary};
 use super::entry::load_entry;
 use super::merge::green_revert;
 use super::train::{fail_members, finish_member};
@@ -21,6 +22,7 @@ struct Pending {
     project: String,
     trunk: String,
     sha: String,
+    checked_sha: String,
     train: String,
     full: bool,
     check: JoinHandle<(u8, JobInfo)>,
@@ -47,7 +49,7 @@ pub(super) fn main_check_plan(
     now: u64,
 ) -> MainPlan {
     let full = |reason: &str| MainPlan::Full(format!("full ({reason})"));
-    if full_pass_path(cfg, project).is_err() {
+    if main_record_path(cfg, project, "main-full-check").is_err() {
         return full("invalid project name");
     }
     if merged.is_empty() || checked.is_empty() || merged != checked {
@@ -91,7 +93,11 @@ pub(super) fn main_check_plan(
     ))
 }
 
-fn full_pass_path(cfg: &Config, project: &str) -> Result<std::path::PathBuf, String> {
+pub(super) fn main_record_path(
+    cfg: &Config,
+    project: &str,
+    prefix: &str,
+) -> Result<std::path::PathBuf, String> {
     if project.is_empty()
         || project.contains("..")
         || project.ends_with('.')
@@ -101,7 +107,7 @@ fn full_pass_path(cfg: &Config, project: &str) -> Result<std::path::PathBuf, Str
     {
         return Err("invalid project name for full main check record".into());
     }
-    Ok(super::entry::queue_dir(cfg).join(format!("main-full-check-{project}")))
+    Ok(super::entry::queue_dir(cfg).join(format!("{prefix}-{project}")))
 }
 
 pub(super) fn record_full_pass(cfg: &Config, project: &str, now: u64) -> Result<(), String> {
@@ -109,7 +115,7 @@ pub(super) fn record_full_pass(cfg: &Config, project: &str, now: u64) -> Result<
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let path = full_pass_path(cfg, project)?;
+    let path = main_record_path(cfg, project, "main-full-check")?;
     let dir = super::entry::queue_dir(cfg);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create full main check record directory: {e}"))?;
@@ -145,7 +151,7 @@ pub(super) fn record_full_pass(cfg: &Config, project: &str, now: u64) -> Result<
 pub(super) fn last_full_pass(cfg: &Config, project: &str) -> Option<u64> {
     use std::io::Read;
 
-    let path = full_pass_path(cfg, project).ok()?;
+    let path = main_record_path(cfg, project, "main-full-check").ok()?;
     let file = std::fs::File::open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
@@ -199,7 +205,7 @@ pub(super) fn run_check(cfg: &Config, spec: JobSpec) -> (u8, JobInfo) {
 
 impl Run<'_> {
     /// Every post-merge entry point selects its job here, after the same main-check guards.
-    pub(super) fn planned_main_spec(&mut self) -> R<JobSpec> {
+    pub(super) fn planned_main_spec(&mut self) -> R<(JobSpec, String)> {
         self.prepare_main_check()?;
         let branch = self.e.get("main_branch").to_string();
         let merged = match super::merge::trunk_checkout(&self.dir, &branch) {
@@ -231,21 +237,36 @@ impl Run<'_> {
         };
         self.e.set("main_check", reason.clone());
         self.log("main_check", &reason)?;
-        Ok(spec)
+        // The green record and bisect need evidence of the committed tree, not of a dirty checkout.
+        let checked_sha = if spec.kind == "check"
+            && crate::wtgit::status_porcelain_plain(&self.dir).is_ok_and(|s| s.is_empty())
+        {
+            merged
+        } else {
+            String::new()
+        };
+        Ok((spec, checked_sha))
     }
 
     pub(super) fn judge_planned_main_check(
         &mut self,
         full: bool,
         code: u8,
-        info: JobInfo,
+        info: &JobInfo,
+        checked_sha: &str,
+        bisect: &mut Bisect,
     ) -> R<()> {
-        self.judge_main_check(code, info)?;
+        self.judge_main_check(code, info, checked_sha, bisect)?;
         if full {
             if let Err(error) =
                 record_full_pass(self.cfg, self.e.get("project"), crate::task::now_secs())
             {
                 return Err(self.internal(&error));
+            }
+            if code == 0 {
+                if let Err(error) = bisect::record_planned_green(self, checked_sha, info) {
+                    return Err(self.internal(&error));
+                }
             }
         }
         Ok(())
@@ -302,9 +323,9 @@ fn start_slot(
         eprintln!("broadsword: cannot start a main check without train members");
         return EXIT_ERROR;
     };
-    let spec = match last.planned_main_spec() {
-        Ok(spec) => spec,
-        Err(c) => return finish(cfg, train, members, Err(c), rows, worst),
+    let (spec, checked_sha) = match last.planned_main_spec() {
+        Ok(planned) => planned,
+        Err(c) => return finish(cfg, train, members, Err(c), &Bisect::default(), rows, worst),
     };
     let full = spec.kind == "check";
     let project = last.e.get("project").to_string();
@@ -330,6 +351,7 @@ fn start_slot(
         project,
         trunk,
         sha: sha.to_string(),
+        checked_sha,
         train: train.to_string(),
         full,
         check,
@@ -456,17 +478,29 @@ fn settle_slot(
                     rows,
                     worst,
                 )
-            } else if let Some((last, _)) = members.last_mut() {
+            } else {
+                let mut bisect = if read_error {
+                    Bisect::default()
+                } else {
+                    Bisect::new(members.iter().map(|(r, _)| Boundary::of(r)))
+                };
+                let Some((last, _)) = members.last_mut() else {
+                    eprintln!(
+                        "broadsword: main check could not be settled: no train member could be reloaded"
+                    );
+                    return EXIT_ERROR;
+                };
                 // Normally this is already the last member's main_sha. If that record was lost,
                 // an earlier member still has the same pre_merge_sha and can judge the full range.
                 last.e.set("main_sha", pending.sha);
-                let judged = last.judge_planned_main_check(pending.full, code, info);
-                finish(cfg, &pending.train, members, judged, rows, worst)
-            } else {
-                eprintln!(
-                    "broadsword: main check could not be settled: no train member could be reloaded"
+                let judged = last.judge_planned_main_check(
+                    pending.full,
+                    code,
+                    &info,
+                    &pending.checked_sha,
+                    &mut bisect,
                 );
-                EXIT_ERROR
+                finish(cfg, &pending.train, members, judged, &bisect, rows, worst)
             }
         }
     };
@@ -478,12 +512,13 @@ fn settle_slot(
 }
 
 /// Same train judgment as merge_members: the last member judges the one result, the rest are
-/// covered by it; only a successful check can reach the existing done step.
+/// covered by it; a passing check or a proven retained prefix reaches the done step.
 fn finish(
     cfg: &Config,
     train: &str,
     members: Vec<(Run<'_>, Instant)>,
     judged: R<()>,
+    bisect: &Bisect,
     rows: &mut Vec<Row>,
     worst: &mut u8,
 ) -> u8 {
@@ -500,6 +535,8 @@ fn finish(
         let code = if let Some(code) = failed {
             if i == n - 1 {
                 code
+            } else if let Some(note) = bisect.kept_log(i, train) {
+                code_num(bisect::kept_done(&mut r, &note).unwrap_or_else(|c| c))
             } else if code == EXIT_MERGED_BAD {
                 code_num(r.end(MERGED_CHECK_FAILED, &reason, EXIT_MERGED_BAD))
             } else {
@@ -715,7 +752,7 @@ mod tests {
     fn the_record_round_trips_and_garbage_reads_as_none() {
         let root = crate::scrub::planted::config_root("postcheck-full-pass");
         let cfg = Config::load_from(&root).unwrap();
-        let path = full_pass_path(&cfg, "p").unwrap();
+        let path = main_record_path(&cfg, "p", "main-full-check").unwrap();
         assert_eq!(path.file_name().unwrap(), "main-full-check-p");
         assert_eq!(last_full_pass(&cfg, "p"), None);
         for now in [0, 1, u64::MAX] {
@@ -803,6 +840,7 @@ mod tests {
             project: "p".into(),
             trunk: "main".into(),
             sha: "merged-tip".into(),
+            checked_sha: "merged-tip".into(),
             train: "panic-train".into(),
             full: true,
             check: std::thread::spawn(|| panic!("a main check did not complete")),
@@ -878,6 +916,7 @@ mod tests {
             project: "p".into(),
             trunk: "main".into(),
             sha: "first-tip".into(),
+            checked_sha: "first-tip".into(),
             train: "first-train".into(),
             full: true,
             check: std::thread::spawn(|| (0, JobInfo::default())),

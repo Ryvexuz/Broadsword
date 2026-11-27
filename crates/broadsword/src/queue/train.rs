@@ -468,7 +468,10 @@ fn chain_tip(chain: &[(Run<'_>, std::time::Instant)], i: usize) -> String {
 ///    proven prefix instead would turn e2 into a plain `conflict` but put e1 on main while its partner is unknown; that is a later
 ///    choice for the measurement window, not this phase. Every round removes at least one entry, so it ends.
 /// 6. A main check that fails after the fast-forward: every entry of the merge is `merged_check_failed` (exit 6), main is NOT reset, the
-///    drain stops. A check that cannot run to a verdict leaves all its entries `approved` and stops the drain, unless the reason is
+///    drain stops. With `queue_auto_revert` on, the failing test binaries are re-run once: a pass followed by a passing full main
+///    check is a flake and nothing is reverted. Otherwise, when the member boundaries identify a first failing member, only its
+///    commits and those after it are reverted, and earlier members are `merged`; without a verdict the whole merge is reverted.
+///    A check that cannot run to a verdict leaves all its entries `approved` and stops the drain, unless the reason is
 ///    one entry's own worktree (`TrainCheck::EntryBlocked`): then only that entry ends `blocked`, the rest stay `approved` for the
 ///    next drain, and this drain goes on.
 ///

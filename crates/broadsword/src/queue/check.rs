@@ -12,12 +12,20 @@ use super::view::{short, some};
 /// `check <project>` of the project's main checkout `dir`, only while it has its trunk checked out: the job id when it passed, else why
 /// not (refused, or the job's exit and summary).
 pub(super) fn main_check_now(cfg: &Config, dir: &Path, project: &str) -> Result<String, String> {
+    main_check_info(cfg, dir, project, &mut JobInfo::default())
+}
+
+pub(super) fn main_check_info(
+    cfg: &Config,
+    dir: &Path,
+    project: &str,
+    info: &mut JobInfo,
+) -> Result<String, String> {
     trunk_checkout(dir, "")?;
     if let Some(code) = tools::guard_refusal(cfg, project, None) {
         return Err(format!("the check of main was refused before it started, exit {code}"));
     }
-    let mut info = JobInfo::default();
-    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, &mut info);
+    let code = job::run_job_info(cfg, JobSpec { kind: "check".into(), name: project.to_string(), command: None, first_step: 0, resumed_from: None, resume_count: 0, task: None }, info);
     let job_id = info.id.clone().unwrap_or_else(|| "none".into());
     if code != 0 {
         return Err(format!("exit {code}, job {job_id}: {}", info.summary.join("; ")));

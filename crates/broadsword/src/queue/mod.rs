@@ -24,8 +24,10 @@
 //!   rejected             the reviewer said FAIL (or gave no usable verdict); the task stays running and its worktree is kept;
 //!                        fix, commit, `queue add` again [5]
 //!   merged_check_failed  the branch was merged but `check` failed on main; main was NOT reset. With queue_auto_revert on, the queue
-//!                        reverted the merged commits with one new commit (`Run::auto_revert`) and checked main again; if that
-//!                        could not be done or did not pass, the lane is HELD (`hold_gate`) until a check of main passes [6]
+//!                        re-runs failing binaries; a passing re-run and full main check leave everything merged. Otherwise the
+//!                        queue reverts the failing suffix (the whole merge without a verdict) with one new commit. The lane is
+//!                        HELD (`hold_gate`) unless the revert completes and the restored main passes a check or is released by
+//!                        matching prior green-tree evidence [6]
 //!   cancelled            dropped by `queue cancel`
 //!
 //! SHADOW REVIEW. When `shadow_reviewer` is `openai`, a second model reviews the same prompt after the gating verdict is recorded; its
@@ -126,6 +128,7 @@
 
 mod add;
 mod advisory;
+mod bisect;
 mod cancel;
 mod check;
 mod entry;
@@ -165,6 +168,8 @@ pub(crate) const SOURCE: &str = concat!(
     "\n",
     include_str!("add.rs"),
     concat!("\n", include_str!("advisory.rs"), "\n"),
+    include_str!("bisect.rs"),
+    "\n",
     include_str!("cancel.rs"),
     "\n",
     include_str!("check.rs"),
@@ -291,6 +296,7 @@ fn claim(cfg: &Config, pick: impl FnOnce(&[Record]) -> Result<Option<Record>, Ex
         for k in [
             "train", "train_pos", "train_job", "train_up", "train_onto", "train_checked", "train_bisect", "alone_tip", "reviewed_orig_tip", "check_deferred", "main_check", "step", "reason", "error", "pre_rebase", "pre_rebase_ref", "base_head", "rebased_tip", "checked_tip", "reviewed_tip", "reviewer_cli", "test_hook", "check_job", "check_exit", "check_summary", "check_tail", "perf", "done_check", "done_check_file",
             "reviewer_model", "gate", "gate_model_used", "verdict", "blocking", "minor", "cost_usd", "tokens_in", "tokens_out", "review_file", "main_sha", "main_branch", "ended", "pre_merge_sha", "revert_sha", "revert_check",
+            "main_bisect", "revert_from", "flake_rerun", "revert_flake", "flake",
         ] {
             e.set(k, "");
         }
