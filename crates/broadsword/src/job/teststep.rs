@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) mod flakerun;
+
 // ---- the test step: compile under the lock, test from copies ------------------------------
 
 /// The folder (inside scratch) a job's copied test and bin executables live in while its test step runs.
@@ -229,6 +231,7 @@ pub(super) struct TestStep<'a> {
     pub(super) secrets: &'a Arc<Secrets>,
     /// `test_parallel_binaries`: how many test executables (and Python scripts) run at once. 1 = one after another, streamed.
     pub(super) parallel: usize,
+    pub(super) flaky: &'a mut Option<flakerun::Used>,
     /// Set when refreshing main.bins after the compile failed (see `refresh_main_bins`); the tests still run, and the job
     /// reports it after its summary and fails.
     pub(super) main_bins_failed: &'a mut Option<String>,
@@ -257,8 +260,6 @@ impl TestStep<'_> {
     /// like the old single `cargo test`: the kept stdout of every executable, cargo's exit code, the whole step's time; and the
     /// result of the project's Python tests `scripts` (SCALING F9), `None` when cargo's tests did not pass (then none counts).
     pub(super) fn run(&mut self, mut cmd: Command, hold: &mut Option<BuildHold>, scripts: &[String]) -> Result<(StepRun, Option<PyTests>), String> {
-        // Carry the inputs for flake-3 without opening the list or changing how tests run.
-        let _flaky_context = (self.project, self.cfg.flaky_tests_file.as_str());
         let start = Instant::now();
         let done = |outcome: Outcome, stdout: String| StepRun { outcome, stdout, secs: start.elapsed().as_secs_f64() };
         // 1. compile (under the lock)
@@ -305,6 +306,7 @@ impl TestStep<'_> {
         } else {
             (self.run_copies(&copied, &mut kept), None)
         };
+        self.note_parallel_flaky_failure(&result);
         let _ = std::fs::remove_dir_all(&dir);
         match result? {
             Outcome::Exited(Some(0)) => {}
@@ -422,13 +424,19 @@ impl TestStep<'_> {
         for c in copied {
             self.note(&format!("     Running {} ({})", c.art.src_path, c.copy.display()));
             let cmd = self.command_for(c);
-            let r = self.child(cmd)?;
+            let r = match self.child(cmd) {
+                Ok(r) => r,
+                Err(e) => return self.flaky_child_error(e),
+            };
             kept.push_str(&r.stdout);
             match r.outcome {
                 Outcome::Exited(Some(0)) => {}
-                Outcome::DiskDropped(f) => return Ok(Outcome::DiskDropped(f)),
+                Outcome::DiskDropped(f) => return Ok(self.flaky_disk_drop(f)),
                 Outcome::Exited(code) => {
                     self.note(&format!("error: test failed, to rerun pass `{}` ({}, {})", rerun_arg(&c.art), exit_text(code), c.art.src_path));
+                    if self.try_flaky_reruns(c, code, &r.stdout) {
+                        continue;
+                    }
                     return Ok(Outcome::Exited(Some(101)));
                 }
             }

@@ -128,6 +128,7 @@ mod tests {
             on_live: &mut on_live,
             secrets: &secrets,
             parallel: 1,
+            flaky: &mut None,
             main_bins_failed: &mut main_bins_failed,
             step_bins: None,
         }

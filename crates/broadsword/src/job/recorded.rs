@@ -291,6 +291,7 @@ pub(super) fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, 
             }
         };
         let mut py: Option<PyTests> = None;
+        let mut flaky = None;
         let ran = if *step == "test" && kind != "run" {
             let parallel = cfg.test_parallel_binaries as usize;
             let mut t = TestStep {
@@ -306,6 +307,7 @@ pub(super) fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, 
                 on_live: &mut on_live,
                 secrets: &secrets,
                 parallel,
+                flaky: &mut flaky,
                 main_bins_failed: &mut main_bins_failed,
                 step_bins: step_bins.as_ref(),
             };
@@ -322,6 +324,9 @@ pub(super) fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, 
         } else {
             run_child(cfg, cmd, &log, &mut *free_src, poll, &mut |pid| on_live(&[pid]), &secrets)
         };
+        if let Some(u) = &flaky {
+            rec.set("flaky_rerun", teststep::flakerun::record(u));
+        }
         let run = match ran {
             Ok(r) => r,
             Err(e) => {
@@ -362,6 +367,8 @@ pub(super) fn run_job_recorded(cfg: &Config, spec: JobSpec, info: &mut JobInfo, 
             }
             None => (line, ok),
         };
+        let (line, ok) =
+            teststep::flakerun::step_line((line, ok), flaky.as_ref(), &run, py.as_ref());
         summary.push(line);
         if !ok {
             all_ok = false;
