@@ -958,15 +958,47 @@ install_dir=\"build/bin\"\n";
         for bad in ["broadsword", "broadsword:", "a: x; A: y", "a: --lib", "a: ../x", "a: x.rs", "a b: x"] {
             assert!(parse_merge_fast_tests(bad).is_err(), "{bad}");
         }
-        // the shipped value lists the self project with test files of this crate (the queue checks the names against cargo metadata
-        // at every pre-merge check; this only keeps the shipped value from naming a file that is gone), and needs auto-revert on
+        // The shipped value is "" (every project runs the full check before a merge,
+        // batch review 10, 2026-11-26).
         let shipped = Config::from_text(text, Path::new("p")).unwrap();
-        let names = shipped.merge_fast_subset("broadsword").expect("the shipped value lists broadsword");
+        assert_eq!(shipped.merge_fast_subset("broadsword"), None);
+        assert_eq!(shipped.merge_fast_subset("BroadSword"), None);
+        assert_eq!(shipped.merge_fast_subset("not-listed"), None);
+
+        // A non-empty subset must name test files of this crate and needs auto-revert on.
+        let subset_text = text
+            .lines()
+            .map(|l| {
+                if l.split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == "merge_fast_tests")
+                {
+                    "merge_fast_tests = \"broadsword: queue tasks\""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let subset = Config::from_text(&subset_text, Path::new("p")).unwrap();
+        let names = subset
+            .merge_fast_subset("broadsword")
+            .expect("the fixture lists broadsword");
         let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
         assert!(!names.is_empty() && names.iter().all(|n| tests_dir.join(format!("{n}.rs")).is_file()), "{names:?}");
-        assert_eq!(shipped.merge_fast_subset("not-listed"), None);
-        assert_eq!(shipped.merge_fast_subset("BroadSword"), Some(names));
-        let off = text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k.trim() == "queue_auto_revert") { "queue_auto_revert = \"off\"" } else { l }).collect::<Vec<_>>().join("\n");
+        assert_eq!(subset.merge_fast_subset("BroadSword"), Some(names));
+        let off = subset_text
+            .lines()
+            .map(|l| {
+                if l.split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == "queue_auto_revert")
+                {
+                    "queue_auto_revert = \"off\""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(Config::from_text(&off, Path::new("p")).unwrap_err().contains("merge_fast_tests needs queue_auto_revert = on"));
     }
 
