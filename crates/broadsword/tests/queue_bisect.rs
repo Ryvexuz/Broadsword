@@ -12,6 +12,7 @@ mod support;
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 const GOOD: &str = "#[test]\nfn full_only() {}\n";
 const BAD: &str = "#[test]\nfn full_only() { assert_eq!(1, 2); }\n";
+const FLAKY_LIST: &str = "state/flaky-tests.txt";
 const ROOT: &str = r#"
 fn root() -> std::path::PathBuf {
     std::env::current_dir().unwrap().ancestors()
@@ -85,6 +86,10 @@ struct Root {
 
 impl Root {
     fn new(asynchronous: bool) -> Self {
+        Self::with_flaky_rerun(asynchronous, false)
+    }
+
+    fn with_flaky_rerun(asynchronous: bool, flaky: bool) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scratch")
@@ -92,6 +97,7 @@ impl Root {
         fs::create_dir_all(dir.join("state/perf")).unwrap();
         let dir = fs::canonicalize(dir).unwrap();
         let dir = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\"));
+        let flaky_file = if flaky { FLAKY_LIST } else { "" };
         let config = support::config(&[
             ("projects_dir", "\"scratch/projects\""),
             ("merge_train_max", "4"),
@@ -103,9 +109,13 @@ impl Root {
             ("merge_fast_tests", "\"p: smoke\""),
             ("reviewer_timeout_seconds", "30"),
             ("build_lock_wait_seconds", "120"),
-            ("test_parallel_binaries", "8"),
+            ("test_parallel_binaries", if flaky { "1" } else { "8" }),
+            ("flaky_tests_file", &format!("{flaky_file:?}")),
         ]);
         fs::write(dir.join("broadsword.toml"), config).unwrap();
+        if flaky {
+            fs::write(dir.join(FLAKY_LIST), "p --test a_flaky once\n").unwrap();
+        }
         let exe = Path::new(support::fake_claude());
         let fake = dir.join("scratch/reviewer").join(exe.file_name().unwrap());
         fs::create_dir_all(fake.parent().unwrap()).unwrap();
@@ -264,6 +274,83 @@ fn a_train_of_three_whose_third_member_breaks_a_test_reverts_only_the_third() {
             git(&r.p(), &["ls-tree", "-r", &b["main_sha"]])
         );
     }
+}
+
+#[test]
+fn a_flaky_binary_on_main_does_not_get_an_innocent_member_reverted() {
+    let r = Root::with_flaky_rerun(false, true);
+    let flaky = r#"
+#[test]
+fn once() {
+    let path = root().join("a-flaky-calls");
+    let calls: u32 = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    std::fs::write(&path, (calls + 1).to_string()).unwrap();
+    assert_eq!(calls, 1, "only the second invocation passes");
+}
+"#;
+    fs::write(r.dir.join("a-flaky-calls"), "0").unwrap();
+    commit(&r.p(), "tests/a_flaky.rs", &format!("{ROOT}{flaky}"));
+    commit(&r.p(), "tests/full.rs", GOOD);
+    let (_, a) = r.train_one("src/a.txt", "a\n");
+    let (_, b) = r.train_one("src/b.txt", "b\n");
+    let (_, c) = r.train_one("tests/full.rs", BAD);
+    let out = r.run(&["queue", "run", "--all"], 6);
+    let (a, b, entry) = (r.entry(&a), r.entry(&b), r.entry(&c));
+    println!(
+        "first={}, second={}, third={}, main_bisect={}",
+        a["status"], b["status"], entry["status"], entry["main_bisect"]
+    );
+    for kept in [&a, &b] {
+        assert_eq!(kept["status"], "merged", "{kept:?}\n{out}");
+        assert_eq!(kept["train"], entry["train"]);
+    }
+    assert_eq!(entry["status"], "merged_check_failed");
+    assert_eq!(entry["revert_from"], c);
+    assert!(entry["main_bisect"].contains("(position 3 of 3)"));
+    assert_eq!(
+        git(&r.p(), &["rev-parse", "HEAD^{tree}"]),
+        git(&r.p(), &["rev-parse", &format!("{}^{{tree}}", b["main_sha"])])
+    );
+    // The post-revert full checks still see the recurring flake and hold the lane.
+    assert!(r.queue("hold-p").is_file(), "{entry:?}");
+
+    let mut main_job = None;
+    let mut reruns = 0;
+    for path in fs::read_dir(r.dir.join("state/jobs")).unwrap() {
+        let path = path.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "rec") {
+            continue;
+        }
+        let job = record(&path);
+        let selectors = job["command"]
+            .strip_prefix("cargo build --offline && cargo test --offline --no-fail-fast ");
+        if job["kind"] != "check" && selectors.is_none() {
+            continue;
+        }
+        let log_file = Path::new(&job["log"]).file_name().unwrap();
+        let log = fs::read_to_string(r.dir.join("scratch/logs/jobs").join(log_file)).unwrap();
+        if let Some(selectors) = selectors {
+            reruns += 1;
+            assert_eq!(selectors, "--test full", "{job:?}");
+            assert!(!log.contains("a_flaky"), "{log}");
+        } else if let Some(passed) =
+            log.find("flaky rerun: passed --test a_flaky once (first run failed)")
+        {
+            let failed = log
+                .find("error: test failed, to rerun pass `--test full`")
+                .unwrap();
+            assert!(passed < failed, "{log}");
+            assert!(main_job.replace(job["id"].clone()).is_none(), "{log}");
+        }
+    }
+    let job = main_job.expect("one main-check log must show the passing flaky rerun and full failure");
+    println!("main check job={job}, bisect rerun jobs={reruns}");
+    assert_eq!(reruns, 2, "the tip and the second member must be probed");
+    let note = format!(
+        "merge train bisect: 1 test binary excused by a passing flaky rerun in job {job}: --test a_flaky"
+    );
+    assert_eq!(out.lines().filter(|line| *line == note).count(), 1, "{out}");
+    assert!(entry["log"].contains(&note), "{entry:?}");
 }
 
 fn flake_on_tip(asynchronous: bool, binaries: &[&str]) {

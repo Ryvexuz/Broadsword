@@ -210,6 +210,67 @@ fn failure_evidence<'a>(info: &JobInfo, log: &'a str) -> Result<Vec<&'a str>, St
     Ok(args)
 }
 
+fn excused_by_rerun<'a>(log: &'a str, args: &[&str]) -> Result<BTreeSet<&'a str>, String> {
+    const RUNNING: &str = "     Running ";
+    complete_log(log)?;
+    let selectors: BTreeSet<_> = args.iter().copied().collect();
+    let mut lines = log.lines().peekable();
+    let mut excused = BTreeSet::new();
+    let boundary = |l: &&str| l.starts_with(RUNNING) || l.starts_with(RERUN_LINE);
+    let bad_char = |c: char| c.is_whitespace() || c.is_control() || "#/\\".contains(c);
+    while let Some(title) = lines.find_map(|line| line.strip_prefix(RUNNING)) {
+        let mut names = BTreeSet::new();
+        let mut valid = true;
+        while let Some(line) = lines.next_if(|l| !boundary(l)) {
+            let test = line.strip_prefix("test ");
+            if let Some(name) = test.and_then(|s| s.strip_suffix(" ... FAILED")) {
+                valid &= !name.is_empty() && !name.contains(bad_char) && names.insert(name);
+            }
+        }
+        let Some(line) = lines.next_if(|l| l.starts_with(RERUN_LINE)) else {
+            continue;
+        };
+        let (arg, detail) = rerun_line(line)?;
+        let src = detail.strip_prefix("exit 101, ").ok_or("invalid rerun source")?;
+        valid &= !src.is_empty() && title.starts_with(&format!("{src} ("));
+        valid &= selectors.contains(arg) && !names.is_empty();
+        // Consume the rerun block without letting its output count as first-run failures.
+        while let Some(line) = lines.next_if(|l| !boundary(l)) {
+            if let Some(pass) = line.strip_prefix("flaky rerun: passed") {
+                let (target, name) = pass
+                    .strip_suffix(" (first run failed)")
+                    .and_then(|s| s.strip_prefix(' ')?.rsplit_once(' '))
+                    .ok_or("malformed flaky rerun pass line")?;
+                valid &= target == arg && names.remove(name);
+            } else if line.starts_with("flaky rerun:") {
+                valid = false;
+            }
+        }
+        if valid && names.is_empty() {
+            excused.insert(arg);
+        }
+    }
+    Ok(excused)
+}
+
+fn bisect_selectors<'a>(
+    log: &'a str,
+    mut args: Vec<&'a str>,
+    note: impl FnOnce(BTreeSet<&'a str>) -> Result<(), String>,
+) -> Result<Vec<&'a str>, String> {
+    match excused_by_rerun(log, &args) {
+        Ok(excused) if !excused.is_empty() => {
+            args.retain(|arg| !excused.contains(arg));
+            note(excused)?;
+        }
+        Err(why) => eprintln!("merge train bisect: keeping all selectors: {why}"),
+        _ => {}
+    }
+    let why = "every failing test binary passed its flaky rerun; no selector to bisect";
+    let remaining = (!args.is_empty()).then_some(args);
+    remaining.ok_or_else(|| why.into())
+}
+
 pub(super) struct Boundary {
     entry: String,
     task: String,
@@ -291,6 +352,22 @@ impl Bisect {
         if args.iter().any(|arg| run.secrets.redact(arg) != *arg) {
             return Err("a test selector contains a redacted value".into());
         }
+        let args = if run.cfg.flaky_tests_file.is_empty() {
+            args
+        } else {
+            bisect_selectors(&log, args, |excused| {
+                let n = excused.len();
+                let kind = if n == 1 { "binary" } else { "binaries" };
+                let job = info.id.as_deref().unwrap_or("none");
+                let excused = excused.into_iter().collect::<Vec<_>>().join(", ");
+                let note = run.secrets.redact(&format!(
+                    "merge train bisect: {n} test {kind} excused by a passing flaky rerun in job {job}: {excused}"
+                ));
+                println!("{note}");
+                run.log("main_check", &note)
+                    .map_err(|_| "could not record the flaky rerun excusal in the entry log".into())
+            })?
+        };
         let n = self.members.len();
         let tip = &self.members[n - 1];
         let start = Instant::now();
@@ -796,6 +873,65 @@ mod tests {
         let oversize = read_text(&path, SELECTOR.len() as u64).unwrap_err();
         assert!(oversize.contains("over the size limit"), "{oversize}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    const A_PASS: &str = "flaky rerun: passed --test a t1 (first run failed)\n";
+    fn a_log(rerun: &str) -> String {
+        format!(
+            "     Running tests/a.rs (build/a)\ntest t1 ... FAILED\n{FAILED}\
+             error: test failed, to rerun pass `--test a` (exit 101, tests/a.rs)\n{rerun}"
+        )
+    }
+    fn filtered(log: &str) -> Result<Vec<&str>, String> {
+        bisect_selectors(log, failing_args(log)?, |_| Ok(()))
+    }
+
+    #[test]
+    fn a_binary_that_passed_its_flaky_rerun_is_not_a_bisect_selector() {
+        let log = format!(
+            "{}     Running tests/full.rs (build/full)\ntest t2 ... FAILED\n{FAILED}{SELECTOR}\
+             flaky rerun: none (one rerun already used in this job)\n",
+            a_log(A_PASS)
+        );
+        let excused = excused_by_rerun(&log, &["--test a", "--test full"]).unwrap();
+        assert_eq!(excused, BTreeSet::from(["--test a"]));
+        assert_eq!(filtered(&log).unwrap(), ["--test full"]);
+    }
+    #[test]
+    fn a_binary_whose_rerun_failed_is_still_blamed() {
+        let log = a_log(&format!("{A_PASS}flaky rerun: failed (exit 101) — --test a t1\n"));
+        assert_eq!(filtered(&log).unwrap(), ["--test a"]);
+    }
+    #[test]
+    fn a_partly_rerun_binary_is_not_excused() {
+        let log = a_log(A_PASS)
+            .replace("test result:", "test t2 ... FAILED\ntest result:")
+            .replace("1 failed;", "2 failed;");
+        assert_eq!(filtered(&log).unwrap(), ["--test a"]);
+    }
+    #[test]
+    fn a_passed_line_for_another_binary_or_name_excuses_nothing() {
+        for rerun in [A_PASS.replace(" a ", " b "), A_PASS.replace("t1", "t9"), A_PASS.repeat(2)] {
+            assert_eq!(filtered(&a_log(&rerun)).unwrap(), ["--test a"], "{rerun:?}");
+        }
+    }
+    #[test]
+    fn a_refused_rerun_excuses_nothing() {
+        let log = a_log("flaky rerun: none (unlisted failure: t1)\n");
+        assert_eq!(filtered(&log).unwrap(), ["--test a"]);
+    }
+    #[test]
+    fn every_selector_excused_is_no_verdict() {
+        assert_eq!(
+            filtered(&a_log(A_PASS)).unwrap_err(),
+            "every failing test binary passed its flaky rerun; no selector to bisect"
+        );
+    }
+    #[test]
+    fn without_rerun_lines_the_selectors_are_unchanged() {
+        let lib = "error: test failed, to rerun pass `--lib` (exit 101, src/lib.rs)\r\n";
+        let log = format!("test a ... FAILED\n{SELECTOR}{lib}");
+        assert_eq!(filtered(&log).unwrap(), failing_args(&log).unwrap());
     }
 
     #[test]
