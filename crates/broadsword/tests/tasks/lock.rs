@@ -131,7 +131,7 @@ fn two_overlapping_starts_in_a_race_one_wins_every_round() {
 #[test]
 fn eight_mutually_overlapping_starts_in_a_race_exactly_one_runs() {
     const ROUNDS: usize = 10;
-    let r = Root::new("race8");
+    let r = Root::with_wait("race8", Some(30));
     let t0 = Instant::now();
     for round in 0..ROUNDS {
         let _ = fs::remove_dir_all(r.dir.join("state/tasks"));
