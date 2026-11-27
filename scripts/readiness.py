@@ -88,13 +88,19 @@ def check(row, brief, statuses, held, lint_ok):
         # Remove annotations before splitting, including nested commas.
         depth = 0
         claims_text = []
-        for char in match[1]:
+        group_start = 0
+        for index, char in enumerate(match[1]):
             if char == "(":
+                if not depth:
+                    group_start = index
                 depth += 1
             elif char == ")" and depth:
                 depth -= 1
             elif not depth:
                 claims_text.append(char)
+        # An unclosed group is literal text, so its commas still delimit claims.
+        if depth:
+            claims_text.extend(match[1][group_start:])
         for item in "".join(claims_text).split(","):
             claim = item.strip().strip("`").strip()
             if claim and claim not in board_claims and claim not in missing:

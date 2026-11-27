@@ -170,6 +170,28 @@ class RuleTests(unittest.TestCase):
             (False, "brief claims not on the board: missing.rs"),
         )
 
+    def test_unclosed_parenthesis_does_not_hide_missing_claim(self):
+        brief = BRIEF + "Claims: src/a.rs (new, missing.rs\n"
+        self.assertEqual(
+            readiness.check(row(), brief, {}, [], True),
+            (False, "brief claims not on the board: src/a.rs (new, missing.rs"),
+        )
+
+    def test_unclosed_nested_annotations_are_literal(self):
+        for text, missing in (
+            ("src/a.rs (new (generated), missing.rs",
+             "src/a.rs (new (generated), missing.rs"),
+            ("src/a.rs (new, generated) (unfinished, missing.rs",
+             "src/a.rs  (unfinished, missing.rs"),
+            ("(unfinished, src/a.rs, missing.rs",
+             "(unfinished, missing.rs"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    readiness.check(row(), BRIEF + "Claims: " + text, {}, [], True),
+                    (False, "brief claims not on the board: " + missing),
+                )
+
     def test_all_brief_claim_lines_checked_and_missing_paths_reported(self):
         brief = BRIEF + (
             "**Claims:** src/b.rs, src/c.rs\n"
