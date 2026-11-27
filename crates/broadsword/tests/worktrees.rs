@@ -3,9 +3,9 @@
 //! each root is its own Git repo under `projects/`; the real Broadsword repo and the crash sim are never touched.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[allow(dead_code)]
@@ -494,23 +494,58 @@ fn repair_fixes_the_links_after_the_root_moves() {
 
 const ADD_GATE_ENV: &str = "BROADSWORD_INTERNAL_TEST_WORKTREE_ADD_GATE_FILE";
 
+struct ParkedStart {
+    child: Option<Child>,
+    gate: PathBuf,
+}
+
+impl Drop for ParkedStart {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        // Release by existence alone, without overwriting a gate that was already opened.
+        match fs::File::create_new(&self.gate) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "could not release {}: {e}", self.gate.display());
+                if let Err(e) = child.kill() {
+                    let _ = writeln!(io::stderr(), "could not kill parked start: {e}");
+                    return;
+                }
+            }
+        }
+        // Reap before Root removes the gate; close the readers so full pipes cannot block the child.
+        drop(child.stdout.take());
+        drop(child.stderr.take());
+        if let Err(e) = child.wait() {
+            let _ = writeln!(io::stderr(), "could not wait for parked start: {e}");
+        }
+    }
+}
+
 /// Start `task start <id> --owner a --worktree` with `git worktree add` parked on a gate file (scratch only), and wait until
-/// the task shows `running` (step 1 done, lock released). Returns the child and the gate path.
-#[allow(clippy::zombie_processes)] // the caller waits on (or kills and waits on) the returned child
-fn parked_start(r: &Root, id: &str, tag: &str) -> (std::process::Child, PathBuf) {
+/// the task shows `running` (step 1 done, lock released). The guard releases and reaps the child on unwind.
+fn parked_start(r: &Root, id: &str, tag: &str) -> ParkedStart {
     let gate = r.dir.join("scratch").join(format!("gate-{tag}"));
-    let child = Command::new(bin())
-        .args(["task", "start", id, "--owner", "a", "--worktree"])
-        .env(ADD_GATE_ENV, &gate)
-        .current_dir(&r.dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let parked = ParkedStart {
+        child: Some(
+            Command::new(bin())
+                .args(["task", "start", id, "--owner", "a", "--worktree"])
+                .env(ADD_GATE_ENV, &gate)
+                .current_dir(&r.dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ),
+        gate,
+    };
     for _ in 0..2000 {
         if r.status_of(id) == "running" {
-            return (child, gate);
+            return parked;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -521,7 +556,7 @@ fn parked_start(r: &Root, id: &str, tag: &str) -> (std::process::Child, PathBuf)
 fn a_slow_worktree_creation_does_not_hold_the_board_lock() {
     let r = Root::new("slow");
     let id = r.add("p", "src");
-    let (child, gate) = parked_start(&r, &id, "slow");
+    let mut parked = parked_start(&r, &id, "slow");
     // creation is parked in `git worktree add`; the board is free:
     let other = r.add("p", "docs");
     let o = r.run(&["task", "start", &other, "--owner", "b"]);
@@ -538,8 +573,8 @@ fn a_slow_worktree_creation_does_not_hold_the_board_lock() {
     assert_eq!(r.run(&["worktree", "prune"]).code, 0);
     assert!(r.run(&["worktree", "list"]).stdout.contains("creating"));
     // release: the start finishes and records the worktree
-    fs::write(&gate, "go").unwrap();
-    let o = child.wait_with_output().unwrap();
+    fs::write(&parked.gate, "go").unwrap();
+    let o = parked.child.take().unwrap().wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     assert_eq!(o.status.code(), Some(0), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(out.contains("is running") && out.contains(&format!("branch: task/{id}")), "{out}");
@@ -553,10 +588,10 @@ fn a_slow_worktree_creation_does_not_hold_the_board_lock() {
 fn a_creation_that_fails_after_the_lock_was_released_rolls_back_and_never_says_running() {
     let r = Root::new("latefail");
     let id = r.add("p", "src");
-    let (child, gate) = parked_start(&r, &id, "late");
+    let mut parked = parked_start(&r, &id, "late");
     git(&r.p(), &["branch", &format!("task/{id}")]); // someone takes the branch while the add is parked
-    fs::write(&gate, "go").unwrap();
-    let o = child.wait_with_output().unwrap();
+    fs::write(&parked.gate, "go").unwrap();
+    let o = parked.child.take().unwrap().wait_with_output().unwrap();
     let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
     assert_eq!(o.status.code(), Some(1), "{out}{err}");
     assert!(err.contains("rolled back to `open`"), "{err}");
@@ -577,7 +612,8 @@ fn a_creation_that_fails_after_the_lock_was_released_rolls_back_and_never_says_r
 fn a_stale_creating_state_is_recovered_by_worktree_create_or_ended_by_abandon() {
     let r = Root::new("stale");
     let id = r.add("p", "src");
-    let (mut child, _gate) = parked_start(&r, &id, "stale");
+    let mut parked = parked_start(&r, &id, "stale");
+    let child = parked.child.as_mut().unwrap();
     child.kill().unwrap(); // the creator dies between step 1 and step 2
     let _ = child.wait();
     assert_eq!(r.status_of(&id), "running");
@@ -607,7 +643,8 @@ fn a_stale_creating_state_is_recovered_by_worktree_create_or_ended_by_abandon() 
 
     // abandon clears the state and keeps any folder, recorded so prune manages it
     let id = r.add("p", "lib");
-    let (mut child, _g) = parked_start(&r, &id, "stale2");
+    let mut parked = parked_start(&r, &id, "stale2");
+    let child = parked.child.as_mut().unwrap();
     child.kill().unwrap();
     let _ = child.wait();
     assert_eq!(r.run(&["task", "abandon", &id]).code, 0);
