@@ -51,12 +51,18 @@ class PreflightTests(unittest.TestCase):
                 ("(see scratch/x.md)", "scratch/x.md"),
                 ("[See scratch/[draft].md]", "scratch/[draft].md"),
                 ("See scratch/[draft]]", "scratch/[draft]"),
-                ("See state\\[draft].md.", "state\\[draft].md")):
+                ("See state\\[draft].md.", "state\\[draft].md"),
+                ("See [scratch/x.md][ref*]", "scratch/x.md"),
+                ("See [scratch/x.md][ref]", "scratch/x.md")):
             with self.subTest(text=text):
                 self.assertEqual(
                     self.check(text, gpt_preflight=True),
                     [("B1", "FAIL", f"line 1: {expected}; paste the content "
                       "(a coder cannot read scratch/ or state/)")])
+        self.assertEqual(
+            self.check("See [scratch/a.md][scratch/b.md]", gpt_preflight=True),
+            [("B1", "FAIL", "line 1: scratch/a.md; line 1: scratch/b.md; "
+              "paste the content (a coder cannot read scratch/ or state/)")])
         self.assertEqual(self.check(
             "<!-- See scratch/[draft].md -->\n"
             "See scratch/<name>.md and scratch/*.md",
