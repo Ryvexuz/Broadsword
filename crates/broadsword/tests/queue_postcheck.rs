@@ -702,10 +702,13 @@ fn main_only_failure() {
             assert_eq!(main[1]["status"], "failed", "{main:?}");
             let hold = r.dir.join("state/queue/hold-p");
             if outcome != "no-revert" {
-                assert_eq!(main.len(), 3, "{main:?}");
+                // held: the post-revert check (main[2]) fails and the bisect's post-revert re-run (main[3]) fails too
+                assert_eq!(main.len(), if outcome == "held" { 4 } else { 3 }, "{main:?}");
                 assert_eq!(main[2]["kind"], "check");
                 if outcome == "held" {
                     assert_eq!(main[2]["status"], "failed", "{main:?}");
+                    assert_eq!(main[3]["kind"], "check", "{main:?}");
+                    assert_eq!(main[3]["status"], "failed", "{main:?}");
                     assert_ne!(entry.get("revert_check").map(String::as_str), Some("passed"));
                     assert!(entry["reason"].contains("HELD"), "{entry:?}");
                     let held = fs::read_to_string(&hold).unwrap();
