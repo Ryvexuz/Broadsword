@@ -3,7 +3,7 @@
 Run from the orchestrator's serialized tick (or by hand with the tick idle).
 The TSV is locked against another reapply run, not against independent queue
 writers. Keep the lane idle outside this script until qadd has taken over.
-A refused row or a safely undone qadd failure does not block the next row.
+Only an unchanged pre-write refusal lets an eligible row yield to the next.
 """
 
 from contextlib import contextmanager
@@ -306,10 +306,9 @@ def eligible(cfg, row, *, expected=None):
 
 
 class CommandError(ValueError):
-    def __init__(self, message, code=None, *, incomplete=False):
+    def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
-        self.incomplete = incomplete
 
 
 def capture(cfg, argv, cwd, *, git=False):
@@ -342,12 +341,12 @@ def capture(cfg, argv, cwd, *, git=False):
         if reader.is_alive():
             first = f"{errors[0]}; " if errors else ""
             raise CommandError(first + "output did not close before mcp_call_timeout_seconds",
-                               proc.poll(), incomplete=True)
+                               proc.poll())
         code = proc.wait(timeout=max(0, deadline - time.monotonic()))
         if errors:
             raise CommandError(str(errors[0]), code)
     except subprocess.TimeoutExpired as exc:
-        raise CommandError("process exceeded mcp_call_timeout_seconds", incomplete=True) from exc
+        raise CommandError("process exceeded mcp_call_timeout_seconds") from exc
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -442,13 +441,35 @@ def safe_filters(work):
     return overrides
 
 
+@dataclass(frozen=True)
+class WorktreeState:
+    ref: str
+    status: str
+    head: str
+
+    def refusal(self, branch):
+        if self.ref != f"refs/heads/{branch}":
+            return "wrong task branch"
+        if self.status:
+            return "task worktree is not clean (including ignored files)"
+        return None
+
+
+def worktree_state(work, git_dir):
+    if has_state(git_dir, PICK_STATE + OTHER_STATE):
+        raise ValueError("an existing Git operation is present")
+    ref = work("verify the exact task ref", "symbolic-ref", "-q", "HEAD", ok=(0, 1)).strip()
+    status = work("protect local files, including ignored ones", "status", "--porcelain",
+                  "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none")
+    head = oid(work("record the exact worktree HEAD", "rev-parse", "HEAD").strip(), "task HEAD")
+    return WorktreeState(ref, status, head)
+
+
 def require_idle(work, git_dir, branch):
-    actual = work("verify the exact task ref", "symbolic-ref", "HEAD").strip()
-    if actual != f"refs/heads/{branch}" or has_state(git_dir, PICK_STATE + OTHER_STATE):
-        raise ValueError("wrong task branch or an existing Git operation")
-    if work("protect local files, including ignored ones", "status", "--porcelain",
-            "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"):
-        raise ValueError("task worktree is not clean (including ignored files)")
+    state = worktree_state(work, git_dir)
+    if reason := state.refusal(branch):
+        raise ValueError(reason)
+    return state.head
 
 
 def require_own_pick(cfg, git_dir, main, commits):
@@ -467,41 +488,35 @@ def require_own_pick(cfg, git_dir, main, commits):
 
 
 class Outcome(Enum):
-    SKIPPED = auto()
-    FAILED = auto()  # Reported failure; safe to try a later row.
-    STOP = auto()    # Git operation failed or queue handoff may have happened.
+    SKIPPED = auto()  # A conflict line was printed, but no Git writes were attempted.
+    STOP = auto()
     QUEUED = auto()
 
 
-def finish_unqueued(cfg, row, entry, work, git_dir, branch, main, replay_head, outcome):
+class Handoff(Enum):
+    CHECK_QUEUE = auto()  # No spawn or a complete qadd failure; check for a newer entry.
+    UNCERTAIN = auto()
+    QUEUED = auto()
+
+
+def finish_unqueued(cfg, row, entry, work, git_dir, branch, main, replay_head, handoff):
     """Restore only our replay, and only when it was not handed to the queue."""
     try:
+        if handoff is not Handoff.CHECK_QUEUE:
+            raise ValueError("qadd outcome uncertain; retaining replay for inspection")
         # qadd adds the entry *before* starting the driver, which can fail separately.
         _, newer = open_or_newer(cfg, cfg.state / "queue", row, entry["project"])
         if newer:
-            if outcome is Outcome.SKIPPED:
-                return outcome
-            say(f"reapply: {row.task}: newer queue entry exists; retaining replay", file=sys.stderr)
-            return Outcome.STOP
-        if outcome is Outcome.STOP:
-            # A timed-out child can leave descendants alive (including queue add).
-            say(f"reapply: {row.task}: qadd outcome uncertain; retaining replay for inspection",
-                file=sys.stderr)
-            return outcome
-        require_idle(work, git_dir, branch)
-        if work("confirm HEAD still names only this run's replay", "rev-parse", "HEAD").strip() != replay_head:
+            raise ValueError("newer queue entry exists; retaining replay")
+        if require_idle(work, git_dir, branch) != replay_head:
             raise ValueError("task HEAD changed after replay; refusing to rewind")
         work("return the task to the replay base, keeping local work and reflog history",
              "reset", "--keep", main)
-        require_idle(work, git_dir, branch)
-        if work("verify the task is ready for a fresh attempt", "rev-parse", "HEAD").strip() != main:
+        if require_idle(work, git_dir, branch) != main:
             raise ValueError("task HEAD differs from the replay base")
     except (OSError, ValueError, KeyboardInterrupt) as exc:
         say(f"reapply: {row.task}: cleanup failed: {line_text(exc)}", file=sys.stderr)
-        if outcome is Outcome.SKIPPED:
-            say(f"REAPPLY CONFLICT: {row.task} ")
-        return Outcome.STOP
-    return outcome
+    return Outcome.STOP
 
 
 def replay(cfg, row, entry):
@@ -509,7 +524,6 @@ def replay(cfg, row, entry):
     repo = cfg.root if project.lower() == "broadsword" else cfg.projects / project
     worktree = cfg.worktrees / project / row.task
     overrides = ()
-    merging = False
     picking = False
     try:
         branch = f"task/{row.task}"
@@ -542,31 +556,39 @@ def replay(cfg, row, entry):
         for commit in commits:
             oid(commit, "rev-list commit")
         if not eligible(cfg, row, expected=entry):
+            raise ValueError("eligibility changed before fast-forward")
+        before = worktree_state(work, git_dir)
+        refusal = before.refusal(branch)
+        if not refusal:
+            try:
+                # Refuse a non-fast-forward with a read-only check, before invoking merge.
+                work("refuse to overwrite a divergent or already replayed task tip",
+                     "merge-base", "--is-ancestor", before.head, main)
+            except CommandError as exc:
+                if exc.code != 1:
+                    raise
+                refusal = "task tip is not an ancestor of main; inspect its commits"
+        if refusal:
+            try:
+                if worktree_state(work, git_dir) != before:
+                    raise ValueError("task worktree changed during refusal")
+            except INPUT_ERRORS as exc:
+                raise ValueError(f"{refusal}; cannot verify unchanged worktree: {exc}") from exc
+            say(f"REAPPLY CONFLICT: {row.task} {refusal}")
             return Outcome.SKIPPED
-        require_idle(work, git_dir, branch)
-        try:
-            work("refuse to overwrite a divergent or already replayed task tip",
-                 "merge-base", "--is-ancestor", "HEAD", main)
-        except CommandError as exc:
-            if exc.code != 1:
-                raise
-            say(f"REAPPLY SKIP: {row.task} task tip is not an ancestor of main; inspect its commits")
-            return Outcome.SKIPPED
-        merging = True
         work("fast-forward the task to main without replacing local files",
              "merge", "--ff-only", "--no-overwrite-ignore", main)
         if not eligible(cfg, row, expected=entry):
-            return Outcome.SKIPPED
-        require_idle(work, git_dir, branch)
-        if work("verify the cherry-pick will start exactly at the fast-forwarded tip",
-                "rev-parse", "HEAD").strip() != main:
+            raise ValueError("eligibility changed after fast-forward")
+        if require_idle(work, git_dir, branch) != main:
             raise ValueError("task HEAD is not at the pinned main tip")
         picking = True
         work("replay the reverted patches as new commits, without skipping any",
              "cherry-pick", *commits)
         replay_head = oid(work("record the tip created by this replay", "rev-parse", "HEAD").strip(),
                           "replay tip")
-        require_idle(work, git_dir, branch)
+        if require_idle(work, git_dir, branch) != replay_head:
+            raise ValueError("task HEAD changed while verifying the replay")
         count = work("verify the replay has one new commit per original commit",
                      "rev-list", "--count", f"{main}..{replay_head}").strip()
         if count != str(len(commits)):
@@ -587,17 +609,16 @@ def replay(cfg, row, entry):
                     require_own_pick(cfg, git_dir, main, commits)
                     work("abort only this run's cherry-pick; retain the fast-forward",
                          "cherry-pick", "--abort")
-                require_idle(work, git_dir, branch)
-                if work("verify the original replay base survived the abort", "rev-parse", "HEAD").strip() != main:
+                if require_idle(work, git_dir, branch) != main:
                     raise ValueError("task HEAD differs from the replay base; inspect it manually")
             except INPUT_ERRORS as abort_error:
                 say(f"reapply: cleanup failed: {line_text(abort_error)}", file=sys.stderr)
-        say(f"REAPPLY CONFLICT: {row.task} {line_text(files)}")
-        return Outcome.STOP if merging or isinstance(exc, KeyboardInterrupt) else Outcome.FAILED
-    outcome = enqueue(cfg, row, entry, main, len(commits))
-    if outcome is Outcome.QUEUED:
-        return outcome
-    return finish_unqueued(cfg, row, entry, work, git_dir, branch, main, replay_head, outcome)
+        say(f"REAPPLY CONFLICT: {row.task} {line_text(files or exc)}")
+        return Outcome.STOP
+    handoff = enqueue(cfg, row, entry, main, len(commits))
+    if handoff is Handoff.QUEUED:
+        return Outcome.QUEUED
+    return finish_unqueued(cfg, row, entry, work, git_dir, branch, main, replay_head, handoff)
 
 
 def enqueue(cfg, row, entry, main, count):
@@ -606,7 +627,8 @@ def enqueue(cfg, row, entry, main, count):
     starting = False
     try:
         if not eligible(cfg, row, expected=entry):
-            return Outcome.SKIPPED
+            say(f"REAPPLY CONFLICT: {row.task} eligibility changed before qadd")
+            return Handoff.CHECK_QUEUE
         inside(cfg.root, script, kind=stat.S_ISREG)
         starting = True
         code, output = capture(cfg, [
@@ -617,17 +639,16 @@ def enqueue(cfg, row, entry, main, count):
         code = exc.code if isinstance(exc, CommandError) else None
         say(f"REAPPLY QADD FAILED: {row.task} exit {code if code is not None else 'unavailable'} "
             f"({line_text(exc) or type(exc).__name__})")
-        incomplete = isinstance(exc, (KeyboardInterrupt, subprocess.TimeoutExpired)) or (
-            isinstance(exc, CommandError) and exc.incomplete
-        )
-        return Outcome.STOP if starting and incomplete else Outcome.FAILED
-    if code or not output.strip():
-        detail = "" if code else " (no output)"
+        # An interrupted or incomplete capture can leave queue-add descendants alive.
+        return Handoff.UNCERTAIN if starting else Handoff.CHECK_QUEUE
+    reply = output.strip()
+    if code or not reply:
+        detail = "" if reply else " (no output)"
         say(f"REAPPLY QADD FAILED: {row.task} exit {code}{detail}")
-        return Outcome.FAILED
+        return Handoff.CHECK_QUEUE if code > 0 and reply else Handoff.UNCERTAIN
     say(f"REAPPLY QUEUED: {row.task} onto {main[:10]} ({count} commits; verdict {line_text(row.verdict)})")
-    say(line_text(output.strip().splitlines()[-1]))
-    return Outcome.QUEUED
+    say(line_text(reply.splitlines()[-1]))
+    return Handoff.QUEUED
 
 
 def main(argv=None):
@@ -661,12 +682,11 @@ def main(argv=None):
                 entry = eligible(cfg, row)
                 if entry is not None:
                     outcome = replay(cfg, row, entry)
-                    if outcome is Outcome.STOP:
-                        return 2
                     if outcome is Outcome.QUEUED:
                         return status
-                    if outcome is Outcome.FAILED:
-                        status = 2
+                    if outcome is not Outcome.SKIPPED:
+                        return 2
+                    status = 2  # An unchanged refusal is still a reported conflict.
     except INPUT_ERRORS as exc:
         say(f"reapply: cannot read root or reapply.tsv: {line_text(exc)}", file=sys.stderr)
         return 1
