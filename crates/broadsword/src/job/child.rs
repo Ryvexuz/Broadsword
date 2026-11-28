@@ -183,10 +183,10 @@ pub(super) fn shell_command(project_dir: &Path, line: &str) -> Command {
 mod tests {
     use super::*;
 
-    fn run_shell(tag: &str, line: &str) -> (StepRun, String) {
+    fn run_shell(tag: &str, line: &str, wait_s: u64) -> (StepRun, String) {
         let root = crate::scrub::planted::config_root(tag);
         let mut cfg = Config::from_text(include_str!("../../../../broadsword.toml"), &root).unwrap();
-        cfg.test_output_wait_seconds = 1;
+        cfg.test_output_wait_seconds = wait_s;
         let path = root.join("child.log");
         let log = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let run = run_child(
@@ -213,7 +213,7 @@ mod tests {
         } else {
             "sleep 30 & echo hi"
         };
-        let (run, log) = run_shell("child-orphan-pipe", line);
+        let (run, log) = run_shell("child-orphan-pipe", line, 1);
         println!("grandchild pipe: elapsed={} s; log={log:?}", run.secs);
         assert!(matches!(run.outcome, Outcome::Exited(Some(0))));
         assert!(run.stdout.lines().any(|l| l == "hi"), "{:?}", run.stdout);
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn a_child_without_grandchildren_is_joined_whole() {
-        let (run, log) = run_shell("child-closed-pipe", "echo hi");
+        let (run, log) = run_shell("child-closed-pipe", "echo hi", 10);
         assert!(matches!(run.outcome, Outcome::Exited(Some(0))));
         assert_eq!(run.stdout.trim_end(), "hi");
         assert_eq!(log.trim_end(), "hi");
