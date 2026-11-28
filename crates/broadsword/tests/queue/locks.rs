@@ -39,7 +39,8 @@ fn a_second_queue_run_gets_busy_while_one_is_running() {
 /// A root with projects `p` and `q`, one queued entry in each (own files), `queue_per_project` set to `lanes` ("on" / "off").
 /// Returns (root, p's entry, q's entry).
 fn two_project_root(name: &str, lanes: &str) -> (Root, String, String) {
-    let r = Root::new(name, 120);
+    // The reviewer timeout must outlast the held review across callers' waits under suite load (120 s blocked p's entry in check 20261128-025023).
+    let r = Root::new(name, FAKE_HANG_CAP_SECONDS);
     train_set(&r, "queue_per_project", &format!("\"{lanes}\""));
     init_project(&r.dir.join(r.projects).join("q"), "q");
     let pt = r.started("src/a.txt");
@@ -99,7 +100,7 @@ fn per_project_lock_lets_two_projects_drain_at_once_and_refuses_a_second_driver_
     let st = b.wait().unwrap();
     assert_eq!(st.code(), Some(0), "q's drain: reason = {}", r.field(&qe, "reason"));
     assert_eq!(r.status(&qe), "merged", "reason = {}", r.field(&qe, "reason"));
-    assert!(r.status(&pe).starts_with("running (interrupted"), "p's entry was interrupted: {}", r.status(&pe));
+    assert!(r.status(&pe).starts_with("running (interrupted"), "p's entry was interrupted: {} (reason = {})", r.status(&pe), r.field(&pe, "reason"));
     // nothing the dead driver left blocks p: the next drain of p takes the lock at once, resumes the entry and merges it
     // no timing bound on the drain: the test root's queue_lock_wait_seconds is 2 s, so a stale holder makes the drain give up after 2 s
     // with exit 4 ("queue busy"), which the exit code and stderr asserts below catch; how long the build and merge take is not the point
