@@ -224,7 +224,8 @@ mod tests {
             }),
             "{log}"
         );
-        assert!(run.secs < 10.0, "pipe held the job for {} s", run.secs);
+        // The grandchild holds the pipe ~30 s: a sub-30 s bound rules out run_child waiting for it; 10 s failed under suite load (20261127-202709, 20261128-023251).
+        assert!(run.secs < 25.0, "pipe held the job for {} s", run.secs);
     }
 
     #[test]
